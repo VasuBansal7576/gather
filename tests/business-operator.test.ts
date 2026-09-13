@@ -16,6 +16,7 @@ import {
 import {
   buildBookingOffer,
   decideOperator,
+  intakeOperatorCandidate,
   persistPreparedProposal,
   prepareBookingProposal,
   type OperatorDeps,
@@ -459,6 +460,113 @@ test("confirming a ghost candidate is not found, and actors stay server-side", a
   }
 });
 
+function persistedAction(w: World, bookingId: string) {
+  return buildBookingOffer(w.deps, {
+    ...withBusiness(w, {}),
+    bookingId, calendarId: CAL,
+  }).then((built) => {
+    const persisted = persistPreparedProposal(w.deps, built, { email: email(), expiresAt: EXPIRES });
+    assert.ok(!("missing" in persisted), `expected persistable offer, got ${JSON.stringify((persisted as { missing?: unknown }).missing)}`);
+    if ("missing" in persisted) throw new Error("unreachable");
+    return { built, persisted };
+  });
+}
+
+test("persisted payload carries the exact commercial snapshot bound by fingerprint", async () => {
+  const w = world();
+  try {
+    confirmAll(w);
+    const booking = w.store.createBooking({ businessId: w.businessId, eventName: "E", status: "pending_approval", sourceReferences: SRC("demo://inq/1") });
+    const { built, persisted } = await persistedAction(w, booking.id);
+    const primary = built.offer.offers.find((item) => item.rank === "primary")!;
+    const payload = persisted.action.payload as Record<string, unknown>;
+    const offer = payload.offer as Record<string, unknown>;
+    assert.equal(payload.offerPreparationFingerprint, built.offer.fingerprint);
+    assert.deepEqual(offer.lines, primary.lines);
+    assert.equal(offer.totalCents, primary.totalCents);
+    assert.equal(offer.depositCents, primary.depositCents);
+    assert.equal(offer.currency, primary.currency);
+    assert.equal(offer.spaceId, primary.spaceId);
+    assert.equal(offer.guestCount, primary.guestCount);
+    assert.deepEqual(offer.consequences, primary.consequences);
+    assert.deepEqual(offer.unknownCostIds, primary.unknownCostIds);
+    // The snapshot is a copy: mutating the built offer cannot rewrite history.
+    (primary.lines as unknown as Record<string, unknown>[]).push({ lineId: "forged" });
+    const rereadOffer = (w.store.getProposedAction(persisted.action.id).payload as Record<string, unknown>).offer as Record<string, unknown>;
+    assert.equal((rereadOffer.lines as unknown[]).length, (offer.lines as unknown[]).length);
+  } finally {
+    w.cleanup();
+  }
+});
+
+test("price-only change persists a new action that cannot reuse the old approval", async () => {
+  const w = world();
+  try {
+    confirmAll(w);
+    const booking = w.store.createBooking({ businessId: w.businessId, eventName: "E", status: "pending_approval", sourceReferences: SRC("demo://inq/1") });
+    const first = await persistedAction(w, booking.id);
+    const oldApproval = w.store.approveProposedAction(first.persisted.action.id, OWNER);
+    decideOperator(w.deps, "correct", {
+      businessId: w.businessId, key: "price_line", subjectId: "dinner", expectedRevision: 1,
+      value: { lineId: "dinner", label: "Dinner", pricingBasis: "per_guest", unitCents: 12000 },
+    });
+    const second = await persistedAction(w, booking.id);
+    assert.notEqual(second.persisted.action.id, first.persisted.action.id);
+    assert.notEqual(second.persisted.action.proposalFingerprint, first.persisted.action.proposalFingerprint);
+    assert.equal(second.persisted.reused, false);
+    // The old exact-version approval stays bound to the old terms: it does
+    // not transfer to the repriced action.
+    assert.deepEqual(w.store.listApprovals(second.persisted.action.id), []);
+    const freshApproval = w.store.approveProposedAction(second.persisted.action.id, OWNER);
+    assert.notEqual(freshApproval.id, oldApproval.id);
+    assert.equal(freshApproval.proposalFingerprint, second.persisted.action.proposalFingerprint);
+  } finally {
+    w.cleanup();
+  }
+});
+
+test("deposit-only change persists a new action", async () => {
+  const w = world();
+  try {
+    confirmAll(w);
+    const booking = w.store.createBooking({ businessId: w.businessId, eventName: "E", status: "pending_approval", sourceReferences: SRC("demo://inq/1") });
+    const first = await persistedAction(w, booking.id);
+    const before = (first.persisted.action.payload as Record<string, unknown>).offer as Record<string, unknown>;
+    assert.equal(before.depositCents, null);
+    decideOperator(w.deps, "correct", {
+      businessId: w.businessId, key: "pricing_bounds", expectedRevision: 1,
+      value: { currency: "USD", floorCents: 100000, costsComplete: false, depositBps: 2000 },
+    });
+    const second = await persistedAction(w, booking.id);
+    assert.notEqual(second.persisted.action.id, first.persisted.action.id);
+    const after = (second.persisted.action.payload as Record<string, unknown>).offer as Record<string, unknown>;
+    assert.ok(typeof after.depositCents === "number" && after.depositCents > 0, "deposit rule change must surface in the snapshot");
+    assert.equal(after.totalCents, before.totalCents);
+  } finally {
+    w.cleanup();
+  }
+});
+
+test("space change persists a new action; identical replay reuses", async () => {
+  const w = world();
+  try {
+    confirmAll(w);
+    const booking = w.store.createBooking({ businessId: w.businessId, eventName: "E", status: "pending_approval", sourceReferences: SRC("demo://inq/1") });
+    const first = await persistedAction(w, booking.id);
+    decideOperator(w.deps, "correct", {
+      businessId: w.businessId, key: "space", subjectId: "hall", expectedRevision: 1,
+      value: { spaceId: "hall", name: "Grand Hall", capacityMin: 10, capacityMax: 100 },
+    });
+    const second = await persistedAction(w, booking.id);
+    assert.notEqual(second.persisted.action.id, first.persisted.action.id);
+    const replayed = await persistedAction(w, booking.id);
+    assert.equal(replayed.persisted.action.id, second.persisted.action.id);
+    assert.equal(replayed.persisted.reused, true);
+  } finally {
+    w.cleanup();
+  }
+});
+
 test("malformed nested sources are rejected before owner corrections", async () => {
   const w = world();
   try {
@@ -474,6 +582,67 @@ test("malformed nested sources are rejected before owner corrections", async () 
       code = (error as { code?: string }).code ?? "";
     }
     assert.equal(code, "INVALID_REQUEST");
+  } finally {
+    w.cleanup();
+  }
+});
+
+test("candidate intake validates every source at the host boundary and the service", () => {
+  const w = world();
+  try {
+    const good = {
+      businessId: w.businessId, key: "space", subjectId: "hall",
+      value: { spaceId: "hall", name: "Hall", capacityMin: 1, capacityMax: 5 },
+      confidence: "probable" as const, sourceReferences: SRC("demo://kb/strict"),
+    };
+    // Well-formed intake passes both layers.
+    assert.equal(intakeOperatorCandidate(w.deps, good).status, "pending");
+    const rejected = (fn: () => unknown): boolean => {
+      try {
+        fn();
+      } catch (error) {
+        const code = (error as { code?: string }).code ?? "";
+        return code === "INVALID_REQUEST" || code === "invalid";
+      }
+      return false;
+    };
+    for (const malformed of [
+      { ...good, sourceReferences: [{ kind: "telepathy", locator: "x" }] },
+      { ...good, sourceReferences: [{ kind: "email", locator: "" }] },
+      { ...good, sourceReferences: [{ kind: "email", locator: "x", fictional: "yes" }] },
+      { ...good, sourceReferences: [{ kind: "email", locator: "x", label: 42 }] },
+      { ...good, sourceReferences: new Array(101).fill({ kind: "email", locator: "x" }) },
+      { ...good, intakeId: "" },
+    ]) {
+      assert.ok(rejected(() => intakeOperatorCandidate(w.deps, malformed)), "host boundary must reject malformed intake");
+      assert.ok(
+        rejected(() => new KnowledgeService(w.store).intakeCandidate(malformed as never)),
+        "service layer must reject malformed intake even on direct calls",
+      );
+    }
+    // Nothing malformed persisted.
+    assert.equal(new KnowledgeService(w.store).listCandidates(w.businessId).length, 1);
+  } finally {
+    w.cleanup();
+  }
+});
+
+test("availability reads carry a canonical binding digest plus a fresh nonce", async () => {
+  const w = world();
+  try {
+    confirmAll(w);
+    const booking = w.store.createBooking({ businessId: w.businessId, eventName: "E", status: "pending_approval", sourceReferences: SRC("demo://inq/1") });
+    const request = { ...withBusiness(w, {}), bookingId: booking.id, calendarId: CAL, expiresAt: EXPIRES, email: email() };
+    await prepareBookingProposal(w.deps, request);
+    await prepareBookingProposal(w.deps, request);
+    assert.equal(w.readerCalls.length, 2);
+    const [first, second] = w.readerCalls.map((call) => call.split("|")[0]!);
+    const bindingOf = (key: string): string => key.split(":").slice(0, 6).join(":");
+    // Same canonical booking/business/calendar/window digest across reads...
+    assert.equal(bindingOf(first), bindingOf(second));
+    assert.match(bindingOf(first), new RegExp(`^operator-prepare:${booking.id}:gather:calendar:availability:[0-9a-f]{16}$`));
+    // ...with a fresh per-read time+nonce suffix so reads are never cached-reused.
+    assert.notEqual(first, second);
   } finally {
     w.cleanup();
   }

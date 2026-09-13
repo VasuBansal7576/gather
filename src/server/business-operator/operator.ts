@@ -5,6 +5,7 @@ import { getActiveIdentityLink, ensureBookingIdentityTables } from "../../identi
 import { KnowledgeService } from "../../knowledge/service.ts";
 import type { IntakeCandidateInput } from "../../knowledge/service.ts";
 import type { CalendarAvailabilityReader } from "../../connectors/contracts.ts";
+import { availabilityOperationKey } from "../../connectors/contracts.ts";
 import { adaptBusinessFacts, buildAvailabilityEvidence } from "../../offers/adapters.ts";
 import { prepareOffer } from "../../offers/prepare.ts";
 import type { OfferPreparationResult } from "../../offers/index.ts";
@@ -65,12 +66,16 @@ function ownerActor(deps: OperatorDeps): { kind: "owner"; id: string } {
 /**
  * Strict nested source validation before anything reaches owner decisions:
  * every element must be a real source object (known kind, locator, typed
- * optionals). Malformed provenance is rejected here, never laundered into
- * verified authority downstream.
+ * optionals) within sensible bounds. Malformed provenance is rejected here,
+ * never laundered into verified authority downstream.
  */
+const MAX_SOURCE_REFS = 100;
+const MAX_LOCATOR_LENGTH = 500;
+const MAX_LABEL_LENGTH = 500;
+
 function readStrictSources(value: unknown, path: string): SourceReference[] {
-  if (!Array.isArray(value) || value.length === 0) {
-    throw new ServiceError("INVALID_REQUEST", `${path} must be a non-empty array`, false);
+  if (!Array.isArray(value) || value.length === 0 || value.length > MAX_SOURCE_REFS) {
+    throw new ServiceError("INVALID_REQUEST", `${path} must be a non-empty array of at most ${MAX_SOURCE_REFS} references`, false);
   }
   return value.map((entry, index) => {
     const where = `${path}[${index}]`;
@@ -78,9 +83,11 @@ function readStrictSources(value: unknown, path: string): SourceReference[] {
     if (typeof entry.kind !== "string" || !KNOWN_SOURCE_KINDS.has(entry.kind)) {
       throw new ServiceError("INVALID_REQUEST", `${where} has an unknown kind`, false);
     }
-    if (!nonEmptyString(entry.locator)) throw new ServiceError("INVALID_REQUEST", `${where} needs a locator`, false);
-    if (entry.label !== undefined && typeof entry.label !== "string") {
-      throw new ServiceError("INVALID_REQUEST", `${where}.label must be a string`, false);
+    if (!nonEmptyString(entry.locator) || (entry.locator as string).length > MAX_LOCATOR_LENGTH) {
+      throw new ServiceError("INVALID_REQUEST", `${where} needs a non-empty locator of at most ${MAX_LOCATOR_LENGTH} characters`, false);
+    }
+    if (entry.label !== undefined && (typeof entry.label !== "string" || (entry.label as string).length > MAX_LABEL_LENGTH)) {
+      throw new ServiceError("INVALID_REQUEST", `${where}.label must be a string of at most ${MAX_LABEL_LENGTH} characters`, false);
     }
     if (entry.fictional !== undefined && typeof entry.fictional !== "boolean") {
       throw new ServiceError("INVALID_REQUEST", `${where}.fictional must be a boolean`, false);
@@ -308,7 +315,8 @@ async function fetchAvailability(
   endAt: string,
   nowIso: string,
 ): Promise<FetchedAvailability> {
-  const operationKey = `operator-prepare:${bookingId}:${randomUUID().slice(0, 8)}`;
+  const operationKey =
+    `operator-prepare:${bookingId}:${availabilityOperationKey({ calendarId, startAt, endAt })}:${nowIso}:${randomUUID().slice(0, 8)}`;
   let result;
   try {
     result = await deps.availability.checkAvailability({ operationKey, calendarId, startAt, endAt });
@@ -469,6 +477,56 @@ export async function buildBookingOffer(deps: OperatorDeps, request: OperatorPre
   };
 }
 
+/**
+ * Validated immutable copy of the reviewed primary's commercial terms for
+ * the persisted payload. No model or raw-request offer snapshot is ever
+ * accepted here — the input is always the primary already built from
+ * confirmed knowledge, fresh availability, and validated inquiry — and the
+ * copy is validated field by field so a malformed primary fails persistence
+ * instead of persisting invented terms.
+ */
+function validatedOfferSnapshot(primary: OfferPreparationResult["offers"][number]): Record<string, unknown> {
+  const fail = (detail: string): never => {
+    throw new ServiceError("INVALID_REQUEST", `Primary offer snapshot invalid: ${detail}`, false);
+  };
+  if (!isRecord(primary)) fail("primary offer must be an object");
+  if (!Array.isArray(primary.lines) || primary.lines.length === 0) fail("at least one priced line is required");
+  if (!nonEmptyString(primary.currency)) fail("currency is required");
+  if (!nonEmptyString(primary.spaceId) || !nonEmptyString(primary.spaceName)) fail("space identity is required");
+  if (typeof primary.guestCount !== "number" || !Number.isInteger(primary.guestCount) || primary.guestCount < 0) {
+    fail("guestCount must be a non-negative integer");
+  }
+  if (!Array.isArray(primary.consequences) || primary.consequences.length === 0) fail("consequences are required");
+  if (!Array.isArray(primary.unknownCostIds) || !Array.isArray(primary.unknownPriceIds)) {
+    fail("unknown-cost honesty lists are required");
+  }
+  if (primary.totalCents !== null && (typeof primary.totalCents !== "number" || !Number.isInteger(primary.totalCents) || primary.totalCents < 0)) {
+    fail("totalCents must be a non-negative integer or null");
+  }
+  if (primary.depositCents !== null && (typeof primary.depositCents !== "number" || !Number.isInteger(primary.depositCents) || primary.depositCents < 0)) {
+    fail("depositCents must be a non-negative integer or null");
+  }
+  return {
+    offerId: primary.offerId,
+    version: primary.version,
+    rank: primary.rank,
+    startAt: primary.startAt,
+    endAt: primary.endAt,
+    spaceId: primary.spaceId,
+    spaceName: primary.spaceName,
+    guestCount: primary.guestCount,
+    currency: primary.currency,
+    lines: structuredClone(primary.lines),
+    totalCents: primary.totalCents,
+    totalKnown: primary.totalKnown,
+    depositCents: primary.depositCents,
+    unknownCostIds: [...primary.unknownCostIds],
+    unknownPriceIds: [...primary.unknownPriceIds],
+    profitabilityClaimed: primary.profitabilityClaimed,
+    consequences: [...primary.consequences],
+  };
+}
+
 function missingEmail(args: { email?: OperatorPrepareEmail }): ProposalMissingItem[] {
   const missing: ProposalMissingItem[] = [];
   const email = args.email;
@@ -518,6 +576,13 @@ export function persistPreparedProposal(
   }
   if (missing.length > 0) return { missing };
   const email = args.email as OperatorPrepareEmail;
+  // The persisted exact snapshot: a validated immutable copy of the reviewed
+  // primary's commercial terms (lines, totals, deposit, currency, space,
+  // guests, consequences, unknown-cost honesty) plus the preparation
+  // fingerprint. All of it sits inside the canonical proposalFingerprint,
+  // so a price-only, deposit-only, or space/terms change can never reuse a
+  // prior action or approval — it persists as a new action instead.
+  const offerSnapshot = validatedOfferSnapshot(primary);
   const payload = {
     startAt: primary.startAt,
     endAt: primary.endAt,
@@ -526,6 +591,8 @@ export function persistPreparedProposal(
     emailTo: email.to,
     emailSubject: email.subject,
     emailBody: email.body,
+    offer: offerSnapshot,
+    offerPreparationFingerprint: built.offer.fingerprint,
   };
   try {
     resolveHoldParams(payload, { nowMs: clockMs(deps) });
@@ -543,6 +610,20 @@ export function persistPreparedProposal(
     try {
       verifySnapshotCurrent(deps, built);
       action = findProposal(deps, built.bookingId, fingerprint);
+      if (action) {
+        // The reuse path still verifies: the found row must be live and
+        // carry a live status — a deleted ghost or a superseded version is
+        // never reused, and stale fact checks above are never bypassed.
+        let live;
+        try {
+          live = deps.store.getProposedAction(action.id);
+        } catch {
+          live = undefined;
+        }
+        if (!live || (live.status !== "pending_approval" && live.status !== "approved")) {
+          action = undefined;
+        }
+      }
       if (!action) {
         action = deps.store.createProposedAction({ bookingId: built.bookingId, kind, payload, sourceReferences });
       } else {

@@ -62,6 +62,22 @@ const KNOWN_FACT_KEYS: ReadonlySet<string> = new Set([
   "pricing_bounds",
 ]);
 
+/** Provenance kinds the host boundary accepts (mirrors the domain SourceKind). */
+const KNOWN_SOURCE_KINDS: ReadonlySet<string> = new Set([
+  "connected_account",
+  "document",
+  "email",
+  "calendar",
+  "manual",
+  "fixture",
+]);
+
+/** Sensible bound for free-text provenance fields and client-chosen ids. */
+const MAX_SOURCE_FIELD = 500;
+
+/** Sensible bound for the reference set per candidate. */
+const MAX_SOURCE_REFS = 100;
+
 type SqlRow = Record<string, unknown>;
 
 function row<T extends SqlRow>(value: unknown): T {
@@ -292,8 +308,33 @@ export class KnowledgeService {
       );
     }
     if (!isRecord(input.value)) throw new KnowledgeError("invalid", "value must be an object");
-    if (!Array.isArray(input.sourceReferences) || input.sourceReferences.length === 0) {
-      throw new KnowledgeError("invalid", "candidates must carry at least one attributable source reference");
+    if (!Array.isArray(input.sourceReferences) || input.sourceReferences.length === 0 || input.sourceReferences.length > MAX_SOURCE_REFS) {
+      throw new KnowledgeError("invalid", "candidates must carry a bounded non-empty set of attributable source references");
+    }
+    // Defense in depth with the host boundary: every reference must be a
+    // real source object (known kind, bounded locator, typed optionals) even
+    // for direct service callers — malformed provenance never persists.
+    input.sourceReferences.forEach((entry, index) => {
+      const where = `sourceReferences[${index}]`;
+      if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+        throw new KnowledgeError("invalid", `${where} must be an object`);
+      }
+      const ref = entry as unknown as Record<string, unknown>;
+      if (typeof ref.kind !== "string" || !KNOWN_SOURCE_KINDS.has(ref.kind)) {
+        throw new KnowledgeError("invalid", `${where} has an unknown kind`);
+      }
+      if (!isNonEmptyString(ref.locator) || ref.locator.length > MAX_SOURCE_FIELD) {
+        throw new KnowledgeError("invalid", `${where} needs a non-empty bounded locator`);
+      }
+      if (ref.label !== undefined && (typeof ref.label !== "string" || ref.label.length > MAX_SOURCE_FIELD)) {
+        throw new KnowledgeError("invalid", `${where}.label must be a bounded string`);
+      }
+      if (ref.fictional !== undefined && typeof ref.fictional !== "boolean") {
+        throw new KnowledgeError("invalid", `${where}.fictional must be a boolean`);
+      }
+    });
+    if (input.intakeId !== undefined && (!isNonEmptyString(input.intakeId) || input.intakeId.length > MAX_SOURCE_FIELD)) {
+      throw new KnowledgeError("invalid", "intakeId must be a non-empty bounded string when present");
     }
     const primary = input.sourceReferences[0]!;
     if (!isNonEmptyString(primary.locator)) {

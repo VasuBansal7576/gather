@@ -28,7 +28,7 @@ export async function POST(request: NextRequest, context: { params: Promise<{ bo
     const body: unknown = await request.json().catch(() => undefined);
     if (!isRecord(body)) return unknownErrorResponse(new Error("Request body must be a JSON object"));
     const runtime = getRuntime();
-    const response = prepareBookingProposal(
+    const response = await prepareBookingProposal(
       { store: runtime.store, booking: runtime.deps, ownerId: ownerId(), availability: runtime.deps.calendar },
       { ...(body as Record<string, unknown>), bookingId } as unknown as OperatorPrepareRequest,
     );
