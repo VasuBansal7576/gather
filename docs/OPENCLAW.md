@@ -3,10 +3,11 @@
 `src/runtime/` implements the isolated, supported OpenClaw backend adapter for
 Gather. It supervises a dedicated `openclaw gateway` child process, talks to it
 over the Gateway WebSocket protocol with the published client package, and
-exposes Gather-owned tools to the agent through a loopback MCP boundary.
+exposes Gather-owned tools to the agent through an authenticated loopback MCP
+boundary.
 
-Everything the instance touches — config, state, workspace, secrets, temp —
-lives under one Gather-owned root (`.runtime/openclaw`, gitignored). The
+Everything the instance touches — config, state, workspace, secrets, temp,
+logs — lives under one Gather-owned root (`.runtime/openclaw`, gitignored). The
 developer's personal `~/.openclaw` install, credentials, and memory are never
 read or written.
 
@@ -14,23 +15,14 @@ read or written.
 
 | Package | Pinned | Evidence |
 | --- | --- | --- |
-| `openclaw` (runtime binary) | host-installed `2026.9.4` (`/opt/homebrew/bin/openclaw`) | `openclaw --version`; bin entry `openclaw.mjs` per `npm view openclaw bin` |
-| `@openclaw/gateway-client` | `2026.9.4` | `npm view @openclaw/gateway-client versions` — `2026.8.1` exists but `2026.9.4` is pinned to match the verified gateway; exports `.` (Node client), `./browser`, `./timeouts`, `./readiness`, `./scope-upgrade`, `./websocket-data` |
+| `openclaw` (runtime binary) | host-installed `2026.9.4`, resolved as an explicit absolute path and verified via `--version` (`OpenClaw x.y.z` banner required) | `npm view openclaw bin` → `openclaw.mjs` entry; `resolveInstalledPackageEntry()` mirrors the embedding doc's `import.meta.resolve("openclaw")` + sibling `openclaw.mjs` pattern |
+| `@openclaw/gateway-client` | `2026.9.4` | exports `GatewayClient`, `GatewayClientOptions`, `GatewayClientRequestError`, `GatewayClientRequestTimeoutError`, `GatewayTransport`, readiness helpers |
 | `@openclaw/gateway-protocol` | `2026.9.4` (transitive) | `ConnectParamsSchema` / `HelloOkSchema` in `dist/frames-*.d.mts` |
 | `@modelcontextprotocol/sdk` | `1.30.0` | `McpServer.registerTool`, `StreamableHTTPServerTransport` in `dist/esm/server/` |
 | `zod` | `4.6.4` | satisfies the SDK's `^3.25 \|\| ^4.0` dependency |
 
-Used API surface (from `node_modules/@openclaw/gateway-client/dist/*.d.mts`):
-
-- `new GatewayClient(opts)` — `url`, `token`, `role`, `scopes`, `mode`,
-  `requestTimeoutMs`, `onHelloOk`, `onEvent`, `onClose`, `onReconnectPaused`,
-  `minProtocol`/`maxProtocol`.
-- `client.start()`, `client.stopAndWait({timeoutMs})`,
-  `client.request<T>(method, params, {timeoutMs})`.
-- `GatewayClientRequestError` / `GatewayClientRequestTimeoutError`.
-
-RPC methods used (all verified present in the installed server's method table
-`dist/method-scopes-*.mjs` and `dist/agent-*.mjs`, `run-wait-*.mjs`):
+RPC methods used (all verified in the installed server's method table and the
+RPC reference at `docs.openclaw.ai/gateway/protocol/rpc-methods`):
 
 | Method | Scope | Use |
 | --- | --- | --- |
@@ -39,15 +31,14 @@ RPC methods used (all verified present in the installed server's method table
 | `chat.history` | `operator.read` | session transcript for evidence display |
 | `sessions.list` | `operator.read` | durable session index |
 | `status` | `operator.read` | gateway status summary |
+| `config.get` | `operator.write` | redacted config snapshot — proves the written config was accepted |
 
-Doc citations: `docs.openclaw.ai/gateway/external-apps` (agent + agent.wait
-path, wait-timeout semantics), `/gateway/protocol` (connect handshake, roles,
-scopes), `/gateway/operator-scopes` (closed scope set), `/gateway/embedding`
-(child-process supervision contract), `/gateway/multiple-gateways` (isolation
-checklist), `/gateway/config-gateway` (`gateway.*` config),
-`/gateway/config-secrets-env` + `/help/environment` (env precedence, `${VAR}`
-substitution), `/tools/mcp` (`mcp.servers` client definitions),
-`/concepts/agent-loop` (run lifecycle, wait timeout defaults).
+Every RPC response is validated at the boundary (`tasks.ts`): a malformed
+`agent` reply (missing `runId`/`acceptedAt`) or `chat.history` reply
+(non-array `messages`) throws instead of being trusted. An `agent.wait`
+status outside the known set maps to `"unknown"` with
+`executionMayContinue: true` — an unrecognized status can never imply the
+remote run finished.
 
 ## Isolation contract
 
@@ -63,6 +54,7 @@ Child environment is built by `buildGatewayChildEnv` in
 | `OPENCLAW_WORKSPACE_DIR` | `<root>/workspace` | per-instance agent workspace |
 | `OPENCLAW_GATEWAY_PORT` | configured port | unique per instance |
 | `OPENCLAW_GATEWAY_TOKEN` | generated per provision, stored `<root>/secrets/gateway-token` (0600) | shared-token auth |
+| `GATHER_MCP_TOKEN` | generated per provision, stored `<root>/secrets/mcp-token` (0600) | MCP boundary bearer auth |
 | `TMPDIR` | `<root>/tmp` | scratch files stay Gather-owned |
 | `OPENCLAW_CONFIG_READONLY` | `1` | config is externally managed |
 | `OPENCLAW_SKIP_CHANNELS` | `1` | control-plane only; Gather owns Gmail/Calendar connectors |
@@ -70,94 +62,153 @@ Child environment is built by `buildGatewayChildEnv` in
 | `OPENCLAW_DISABLE_BONJOUR` | `1` | host owns discovery |
 | `OPENCLAW_EXEC_SHELL_SNAPSHOT` | `0` | no login-shell snapshot |
 
-`OPENCLAW_LOAD_SHELL_ENV` is never set, and provider keys are absent because
-the env is a whitelist, not inherited.
+`OPENCLAW_LOAD_SHELL_ENV` is never set. Caller-supplied `extraEnv` is restricted
+to an explicit diagnostic allowlist (`EXTRA_ENV_ALLOWLIST`):
+`OPENCLAW_LOG_LEVEL`, `OPENCLAW_DIAGNOSTICS`,
+`OPENCLAW_DIAGNOSTICS_TIMELINE_PATH`, `OPENCLAW_DEBUG_SSE`,
+`OPENCLAW_DEBUG_MODEL_TRANSPORT`. Everything else — including isolation keys,
+runtime toggles (`NO_RESPAWN`, `SKIP_CHANNELS`, `CONFIG_READONLY`,
+`EXEC_SHELL_SNAPSHOT`), `OPENCLAW_LOAD_SHELL_ENV`, and `NODE_OPTIONS` — is
+rejected, so no personal imports or policy weakening can ride along.
 
-The materialized `openclaw.json` contains no secrets:
-`gateway.auth.token` is the literal `${OPENCLAW_GATEWAY_TOKEN}` substitution.
-Config pins `gateway.mode: "local"`, `bind: "loopback"`, `auth.mode: "token"`,
-and `agents.defaults.workspace` to the Gather-owned workspace. When MCP tools
-are registered it also writes `mcp.servers.gather` (`streamable-http`,
-loopback URL, `toolFilter.include` = registered tool names).
+## Materialized config (`config.ts`)
+
+Written `openclaw.json` contains no secrets (env substitution for both
+tokens):
+
+- `gateway`: `mode: "local"`, `bind: "loopback"`, configured port,
+  `auth.mode: "token"`, `token: "${OPENCLAW_GATEWAY_TOKEN}"`.
+- `agents.defaults.workspace`: Gather-owned workspace.
+- `tools`: `profile: "messaging"` plus a deny list (`GATHER_TOOL_DENY`)
+  covering `group:runtime` (exec/process/code_execution), `group:fs`
+  (read/write/edit/apply_patch), `group:web`, `browser`, `cron`, `subagents`,
+  `sessions_spawn`, `image_generate`, `music_generate`, `video_generate`.
+  Per `docs.openclaw.ai/gateway/config-tools/tool-policy`: profiles are the
+  base allowlist and deny always wins; `messaging` keeps MCP tools visible
+  (`minimal` hides them) while the deny list is the hard stop for every
+  mutating/arbitrary surface — the agent's only business capability is the
+  Gather MCP boundary. Sandboxing stays off (no backend provisioned); exec/fs
+  denies make host mutation unreachable.
+- `logging.file`: `<root>/logs/gateway.log` — supported config
+  (`docs.openclaw.ai/logging`, `/gateway/config-observability`), so gateway
+  file logs stay inside the Gather-owned root instead of the shared
+  `/tmp/openclaw` default.
+- `mcp.servers.gather` (when tools are registered): `transport:
+  "streamable-http"`, loopback URL, `headers.authorization: "Bearer
+  ${GATHER_MCP_TOKEN}"` (the `headers` field is marked *sensitive* in the
+  OpenClaw config schema — it resolves via env substitution and is redacted
+  from config snapshots and logs), and `toolFilter.include` = registered tool
+  names.
 
 ## Lifecycle semantics
 
-- **Boot**: `OpenClawGatewayProcess.start()` spawns `openclaw gateway`.
-  Exit `78` (`EX_CONFIG`) triggers one `openclaw doctor --fix --yes
-  --non-interactive` repair under the same env and one retry, then fails with
-  the stderr tail. Process survival is not readiness.
-- **Readiness**: `GatherGatewayConnection.connect()` resolves on `hello-ok` —
-  the documented application-readiness signal — within a caller deadline
+- **Executable**: `resolveOpenClawExecutable` requires either an explicit
+  absolute validated path or the installed `openclaw` package entry
+  (`import.meta.resolve` + sibling `openclaw.mjs`); bare PATH commands are
+  rejected — the adapter never selects an arbitrary runtime. `start()` then
+  verifies the executable via `--version` (`OpenClaw x.y.z` required) under
+  the minimal env before spawning.
+- **Boot**: spawn `openclaw gateway`. A spawn-level error (missing or
+  unexecutable binary) rejects `start()` immediately — it is never mistaken
+  for a running child. Exit `78` (`EX_CONFIG`) triggers one
+  `doctor --fix --yes --non-interactive` repair under the same env and one
+  retry. Process survival is not readiness.
+- **Readiness**: `connect()` resolves on `hello-ok` within a caller deadline
   (default 30 s). The library retries `startup-sidecars` closes internally.
 - **Reconnect**: the client owns backoff/reconnect; the adapter surfaces
-  `connecting`/`ready`/`reconnecting`/`closed` via `onStateChange` and
-  `onReconnectPaused`.
+  `connecting`/`ready`/`reconnecting`/`closed`.
 - **Shutdown**: `stop()` closes the WS client (`stopAndWait`), then SIGTERMs
-  the child and SIGKILLs after the grace window (default 10 s). The gateway
-  drains active work on SIGTERM (observed: `received SIGTERM; shutting down`,
-  `shutdown completed cleanly`).
+  the child and waits for the *observed* exit event; SIGKILL follows after
+  the grace window. If no exit is observed even after SIGKILL the state is
+  `failed` (never `stopped`), resources are retained, and `stop()` rejects —
+  "stopped" always means the exit was observed.
 
 ## Task API
 
 `GatherRuntimeTasks`:
 
-- `submitTask({bookingId, message, idempotencyKey, ...})` → `agent` RPC on the
-  stable per-booking session `agent:<agentId>:gather:booking:<bookingId>`
-  (valid `agent:<id>:<rest>` shape). `deliver: false` — Gather renders results
-  itself. Idempotency keys derive via `stableTaskIdempotencyKey` (sha256 over
-  sorted identity) — this is the duplicate-run prevention hook.
+- `submitTask({bookingId, message, idempotencyKey, ...})` → `agent` RPC on
+  the stable per-booking session `agent:<agentId>:gather:booking:<slug>-<digest>`,
+  where the digest is sha256 over the exact bookingId+agentId — sanitization
+  can never alias distinct bookings ("a/b" ≠ "a-b"). `deliver: false` — Gather
+  renders results itself. `stableTaskIdempotencyKey` derives the required
+  `idempotencyKey` (sha256 over sorted identity) — the duplicate-run
+  prevention hook.
 - `waitForRun({runId, timeoutMs})` → `agent.wait`. **`status: "timeout"` is
   wait-only** — `executionMayContinue: true`; the remote run may still be
-  executing. Reconcile before retrying. `stopReason: "superseded"` is
-  preserved verbatim.
-- `sessionHistory({sessionKey})` → `chat.history` (evidence, not truth).
-- `listSessions()` / `gatewayStatus()` → `sessions.list` / `status`.
+  executing. `stopReason: "superseded"` preserved verbatim. Unknown statuses
+  → `"unknown"` + `executionMayContinue: true`.
+- `sessionHistory` → `chat.history`; `listSessions` → `sessions.list`;
+  `gatewayStatus` → `status`; `configSnapshot` → `config.get`.
 
 ## MCP tool boundary
 
 `GatherMcpBoundary` hosts the `gather` MCP server on loopback with the
-official SDK's stateful Streamable HTTP transport. Tools are narrowly typed
-injected handlers — the dependent integration wires them to the verified
-Gather backend.
+official SDK's stateful Streamable HTTP transport.
 
-Authority rules enforced structurally:
+**Authorization** (loopback alone is not authorization):
 
+- `Authorization: Bearer <token>` required on every request — a locally
+  generated secret shared with the gateway only through the supported
+  `mcp.servers.gather.headers` config field (sensitive/redacted, never a
+  config literal, never logged).
+- Host header must match the bound loopback address; a present Origin header
+  must match the bound origin — DNS-rebinding defense implemented in this
+  middleware (the SDK's own `allowedHosts`/`allowedOrigins` options are
+  deprecated in favor of external middleware).
+
+**Session lifecycle**: one transport per MCP session — the SDK's stateful
+transport serves exactly one initialization, so each `initialize` creates a
+fresh session entry (this is the reconnect path after an MCP client restart);
+`DELETE` and boundary `close()` reap sessions. Non-initialize requests with
+missing/unknown session ids get `404` per the MCP spec.
+
+**Authority rules** (structural):
+
+- Tools are registered via `defineGatherTool` — typed handlers with a zod
+  input schema, erased to `unknown` args only after SDK-side validation
+  (no `any`).
 - Every tool declares `execution: "live" | "simulated"` — no silent default.
-- Simulated tools get `[SIMULATED — not a verified integration]` prepended to
-  their description and every result, `gather:simulated: true`, and any
-  `verified` claim stripped.
+  Simulated tools get `[SIMULATED — not a verified integration]` in their
+  description and results, `gather:simulated: true`, and any `verified`
+  claim stripped.
 - Every result is stamped `gather:authority: "advisory"`. This boundary never
   mints booking receipts: durable `ActionExecution` records are created only
   by Gather's own store through approved-action execution. Model prose and
   arbitrary tool calls cannot manufacture a verified receipt here, and
-  OpenClaw's own tool-approval system is a separate mechanism that confers no
-  Gather booking authority.
+  OpenClaw's tool approval is a separate mechanism that confers no Gather
+  booking authority.
 
 ## Verification
 
 - `npm run typecheck` — clean.
-- `npm test` — 24 tests pass; `tests/runtime.test.ts` covers isolation,
-  config materialization, session/idempotency keys, mock-transport protocol
-  (connect/hello-ok/request/error mapping, reconnect state), `agent.wait`
-  timeout semantics, and real loopback MCP initialize/tools-list/tools-call
-  with simulated and live-declared handlers.
-- `node scripts/openclaw-doctor.mjs` — actual isolated boot on the host
-  `openclaw@2026.9.4`: provision → spawn → `hello-ok` (protocol 4, 424
-  methods) → `status` + `sessions.list` → clean SIGTERM shutdown. Contract
-  tests use a mock transport; the doctor script is the real-process proof.
-  No model/provider invocation occurs.
+- `npm test` — 35 tests pass. `tests/runtime.test.ts` covers isolation,
+  config materialization, env allowlist rejection, executable validation,
+  collision-proof session keys, mock-transport protocol (connect/hello-ok,
+  malformed responses, wait-status mapping), spawn-error and observed-exit
+  shutdown semantics, real loopback MCP (auth/Host/Origin, two-session
+  reconnect, simulated labeling), and a real-boot doctor sentinel test.
+- `node scripts/openclaw-doctor.mjs` — actual isolated boot on host
+  `openclaw@2026.9.4`: unique `.runtime/openclaw-doctor-*` root → verified
+  `--version` → spawn → `hello-ok` (protocol 4, 424 methods) → `status`,
+  `sessions.list`, `config.get` (proves `tools.profile=messaging` +
+  `mcp.servers=[gather]` accepted) → observed SIGTERM exit → removes only the
+  directory it created. Contract tests use a mock transport; the doctor and
+  the sentinel test are real-process proofs. No model/provider invocation
+  occurs.
 
 ## Known limitations
 
-1. The gateway writes its log file to the host-shared `/tmp/openclaw/`
-   (`resolveSecureTempRoot` prefers that fixed path when safe); `TMPDIR`
-   covers other scratch but not this log path — no supported override exists.
-2. `agent.wait` returns a terminal snapshot; full reply text requires
+1. `agent.wait` returns a terminal snapshot; full reply text requires
    `chat.history`/session events.
-3. OpenClaw session/transcript durability lives in its own SQLite inside the
+2. OpenClaw session/transcript durability lives in its own SQLite inside the
    Gather-owned state dir — private layout; the adapter never reads it.
    Gather's store remains the source of truth for action records.
-4. Inbound customer replies must be injected by Gather via `agent` RPC —
+3. Inbound customer replies must be injected by Gather via `agent` RPC —
    channels are intentionally disabled (`OPENCLAW_SKIP_CHANNELS=1`).
-5. `agent` runs require a configured model provider; the doctor verifies
+4. `agent` runs require a configured model provider; the doctor verifies
    control-plane only. No live model or Google API call has been made.
+5. The gateway tool policy constrains *which tools exist*; MCP tool calls
+   still flow through OpenClaw's tool-policy layer, which is advisory for
+   Gather business authority — the Gather-side approval/action store remains
+   the authority boundary.

@@ -1,8 +1,13 @@
 import { writeGatewayConfig, type GatherMcpServerRef } from "./config.ts";
 import { GatherGatewayConnection, type GatewayConnectionState } from "./client.ts";
 import { ensureLayoutDirectories, resolveGatherOpenClawLayout, type GatherOpenClawLayout } from "./layout.ts";
-import { GatherMcpBoundary, type AnyGatherToolDefinition } from "./mcp.ts";
-import { OpenClawGatewayProcess, type OpenClawExecutable, type GatewayProcessState } from "./process.ts";
+import { GatherMcpBoundary, type GatherTool } from "./mcp.ts";
+import {
+  ensureMcpToken,
+  OpenClawGatewayProcess,
+  type GatewayProcessState,
+  type OpenClawExecutable,
+} from "./process.ts";
 import { GatherRuntimeTasks } from "./tasks.ts";
 
 /**
@@ -10,7 +15,7 @@ import { GatherRuntimeTasks } from "./tasks.ts";
  * for the Gather-owned isolated OpenClaw gateway.
  *
  * Lifecycle is explicit at every step:
- *   provision()  — create Gather-owned dirs, generate token, write config
+ *   provision()  — create Gather-owned dirs, generate tokens, write config
  *   start()      — spawn `openclaw gateway`, connect WS, resolve on hello-ok
  *   tasks        — submitTask / waitForRun / sessionHistory / listSessions
  *   stop()       — close WS client, then SIGTERM (SIGKILL after grace)
@@ -22,17 +27,19 @@ export interface GatherOpenClawRuntimeOptions {
   /** Dedicated loopback port for the gateway WS/HTTP listener. */
   gatewayPort: number;
   /** Optional Gather-owned MCP tools to expose to the isolated agent. */
-  mcpTools?: readonly AnyGatherToolDefinition[];
+  mcpTools?: readonly GatherTool[];
   /** Port for the MCP boundary; 0 = ephemeral (recommended). */
   mcpPort?: number;
-  /** Executable override for the openclaw package entry. */
+  /**
+   * Explicit validated executable (absolute path). When omitted, the
+   * installed openclaw package entry is resolved; a bare PATH lookup is
+   * never used.
+   */
   executable?: OpenClawExecutable;
   connectTimeoutMs?: number;
   stopTimeoutMs?: number;
   log?: (line: string) => void;
 }
-
-export type GatherRuntimeState = GatewayProcessState | GatewayConnectionState;
 
 export class GatherOpenClawRuntime {
   readonly layout: GatherOpenClawLayout;
@@ -41,6 +48,7 @@ export class GatherOpenClawRuntime {
   private connection: GatherGatewayConnection | null = null;
   private mcpBoundary: GatherMcpBoundary | null = null;
   private mcpRef: GatherMcpServerRef | null = null;
+  private mcpToken: string | null = null;
   private provisioned = false;
 
   constructor(options: GatherOpenClawRuntimeOptions) {
@@ -65,9 +73,6 @@ export class GatherOpenClawRuntime {
   /** Creates Gather-owned directories and writes the isolated config. */
   provision(): { configPath: string } {
     ensureLayoutDirectories(this.layout);
-    if (this.options.mcpTools) {
-      this.mcpBoundary = new GatherMcpBoundary({ tools: this.options.mcpTools });
-    }
     const configPath = writeGatewayConfig(this.layout, {
       gatherMcp: this.mcpRef ?? undefined,
     });
@@ -77,12 +82,18 @@ export class GatherOpenClawRuntime {
 
   /**
    * Starts the MCP boundary (if configured), rewrites config with its bound
-   * URL, spawns the gateway, and resolves after protocol hello-ok.
+   * URL and auth header, spawns the gateway, and resolves after protocol
+   * hello-ok.
    */
   async start(): Promise<void> {
     if (!this.provisioned) this.provision();
 
-    if (this.mcpBoundary) {
+    if (this.options.mcpTools && this.options.mcpTools.length > 0) {
+      this.mcpToken = ensureMcpToken(this.layout);
+      this.mcpBoundary = new GatherMcpBoundary({
+        tools: this.options.mcpTools,
+        authToken: this.mcpToken,
+      });
       const bound = await this.mcpBoundary.listen({
         host: "127.0.0.1",
         port: this.options.mcpPort ?? 0,
@@ -97,6 +108,7 @@ export class GatherOpenClawRuntime {
     this.process = new OpenClawGatewayProcess({
       layout: this.layout,
       executable: this.options.executable,
+      mcpToken: this.mcpToken ?? undefined,
       log: this.options.log,
     });
     await this.process.start();
@@ -117,15 +129,23 @@ export class GatherOpenClawRuntime {
       await this.connection.close().catch(() => {});
       this.connection = null;
     }
+    let stopError: unknown = null;
     if (this.process) {
-      await this.process.stop(this.options.stopTimeoutMs ?? 10000).catch(() => {});
-      this.process = null;
+      try {
+        await this.process.stop(this.options.stopTimeoutMs ?? 10000);
+        this.process = null;
+      } catch (error) {
+        // Child exit was not observed: keep the reference, release nothing.
+        stopError = error;
+      }
     }
     if (this.mcpBoundary) {
       await this.mcpBoundary.close().catch(() => {});
       this.mcpBoundary = null;
       this.mcpRef = null;
+      this.mcpToken = null;
     }
+    if (stopError) throw stopError;
   }
 
   get state(): { process: GatewayProcessState; connection: GatewayConnectionState } {

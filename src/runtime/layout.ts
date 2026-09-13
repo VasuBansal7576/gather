@@ -29,8 +29,10 @@ export interface GatherOpenClawLayout {
   workspaceDir: string;
   /** Gather-owned secrets, e.g. the generated gateway token (mode 0600). */
   secretsDir: string;
-  /** Gather-owned TMPDIR so gateway logs/scratch never land in the OS temp dir. */
+  /** Gather-owned TMPDIR so gateway scratch never lands in the OS temp dir. */
   tmpDir: string;
+  /** Gather-owned gateway file logs (config `logging.file`). */
+  logsDir: string;
   /** Loopback port dedicated to this instance. */
   port: number;
 }
@@ -51,6 +53,7 @@ export function resolveGatherOpenClawLayout(input: {
     workspaceDir: join(rootDir, "workspace"),
     secretsDir: join(rootDir, "secrets"),
     tmpDir: join(rootDir, "tmp"),
+    logsDir: join(rootDir, "logs"),
     port: input.port,
   };
 }
@@ -63,6 +66,7 @@ export function ensureLayoutDirectories(layout: GatherOpenClawLayout): void {
     layout.workspaceDir,
     layout.secretsDir,
     layout.tmpDir,
+    layout.logsDir,
   ]) {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
   }
