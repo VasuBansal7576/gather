@@ -86,6 +86,22 @@ function parseJson<T>(value: unknown, fallback: T): T {
   return JSON.parse(value) as T;
 }
 
+/** Bounded attempts for acquiring the write lock under true concurrency. */
+const MAX_TXN_ATTEMPTS = 25;
+
+function isBusyError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const err = error as { errcode?: unknown; code?: unknown; message?: unknown };
+  if (err.errcode === 5) return true;
+  const code = typeof err.code === "string" ? err.code : "";
+  const message = typeof err.message === "string" ? err.message : "";
+  return code === "ERR_SQLITE_ERROR" && /database is locked|database table is locked/i.test(message);
+}
+
+function backoffSleep(attempt: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.min(5 + attempt * 5, 50));
+}
+
 function canonical(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
   if (isRecord(value)) {
@@ -135,7 +151,10 @@ export class KnowledgeService {
 
   constructor(store: KnowledgeStorePort) {
     this.store = store;
-    this.store.db.exec(`
+    // Idempotent schema setup tolerates concurrent first-start DDL the same
+    // way mutations do: busy retries, genuine errors propagate.
+    this.transact(() => {
+      this.store.db.exec(`
       CREATE TABLE IF NOT EXISTS knowledge_candidates (
         id TEXT PRIMARY KEY,
         business_id TEXT NOT NULL,
@@ -187,6 +206,51 @@ export class KnowledgeService {
       CREATE INDEX IF NOT EXISTS idx_knowledge_decisions_business
         ON knowledge_decisions(business_id, created_at);
     `);
+    });
+  }
+
+  /**
+   * Run fn inside exactly one BEGIN IMMEDIATE transaction with bounded
+   * lock-busy retries. Only lock contention (SQLITE_BUSY) is retried, up to
+   * MAX_TXN_ATTEMPTS with a short backoff; anything else — including UNIQUE
+   * constraint conflicts and application errors — rolls back and propagates
+   * unchanged, so a real conflict is never swallowed or converted. When
+   * retries are exhausted a KnowledgeError("busy") names the honest outcome:
+   * retry the whole command.
+   */
+  private transact<T>(fn: () => T): T {
+    let attempt = 0;
+    for (;;) {
+      try {
+        this.store.db.exec("BEGIN IMMEDIATE");
+      } catch (error) {
+        if (isBusyError(error) && attempt < MAX_TXN_ATTEMPTS) {
+          attempt += 1;
+          backoffSleep(attempt);
+          continue;
+        }
+        if (isBusyError(error)) throw new KnowledgeError("busy", "knowledge store is busy; retry the command");
+        throw error;
+      }
+      try {
+        const out = fn();
+        this.store.db.exec("COMMIT");
+        return out;
+      } catch (error) {
+        try {
+          this.store.db.exec("ROLLBACK");
+        } catch {
+          // Nothing to roll back; surface the original failure.
+        }
+        if (isBusyError(error) && attempt < MAX_TXN_ATTEMPTS) {
+          attempt += 1;
+          backoffSleep(attempt);
+          continue;
+        }
+        if (isBusyError(error)) throw new KnowledgeError("busy", "knowledge store is busy; retry the command");
+        throw error;
+      }
+    }
   }
 
   // ---------- candidate intake (untrusted side) ----------
@@ -230,10 +294,11 @@ export class KnowledgeService {
 
     // The transaction covers the dedupe check through commit, so concurrent
     // connections on the shared store serialize here instead of inserting
-    // duplicate candidates for the same observation.
-    this.store.db.exec("BEGIN IMMEDIATE");
+    // duplicate candidates for the same observation. Lock contention retries
+    // with backoff; genuine conflicts propagate unchanged.
     let insertedId: string | undefined;
-    try {
+    let dedupedId: string | undefined;
+    this.transact(() => {
       // Idempotent re-ingest: same business+key+subject+locator+value. The
       // source revision is deliberately NOT part of the identity: a revision
       // bump with identical canonical content is a re-observation, and the
@@ -254,8 +319,8 @@ export class KnowledgeService {
             $revision: input.sourceRevision, $id: String(found.id),
           });
         }
-        this.store.db.exec("COMMIT");
-        return this.getCandidate(String(found.id));
+        dedupedId = String(found.id);
+        return;
       }
 
       const id = input.intakeId ?? `kc_${randomUUID()}`;
@@ -290,19 +355,17 @@ export class KnowledgeService {
       this.store.db.prepare(
         `UPDATE knowledge_revisions SET review_state = 'review'
            WHERE status = 'active' AND business_id = $businessId AND key = $key AND subject_id = $subjectId
-             AND candidate_id IN (
-               SELECT id FROM knowledge_candidates
-                 WHERE source_locator = $locator AND value_json != $value
-             )`,
+              AND candidate_id IN (
+                SELECT id FROM knowledge_candidates
+                  WHERE source_locator = $locator AND value_json != $value
+              )`,
       ).run({
         $businessId: business.id, $key: input.key, $subjectId: subjectId,
         $locator: primary.locator, $value: valueJson,
       });
-      this.store.db.exec("COMMIT");
-    } catch (error) {
-      this.store.db.exec("ROLLBACK");
-      throw error;
-    }
+    });
+    if (dedupedId !== undefined) return this.getCandidate(dedupedId);
+    if (insertedId === undefined) throw new KnowledgeError("not_found", "candidate intake recorded nothing");
     return this.readCandidate(row(
       this.store.db.prepare("SELECT * FROM knowledge_candidates WHERE id = $id").get({ $id: insertedId }),
     ));
@@ -344,19 +407,46 @@ export class KnowledgeService {
       this.recordDecision(input, "reject_candidate", "rejected", { requestFingerprint: fingerprint, candidateId: candidate.id, reason: "cross_business" });
       throw error;
     }
-    if (candidate.status !== "pending") {
-      this.recordDecision(input, "reject_candidate", "rejected", {
-        requestFingerprint: fingerprint, candidateId: candidate.id, reason: "not_pending", status: candidate.status,
+    // State check and mutation run atomically: a concurrent confirm/reject
+    // either serializes first (then this sees the terminal state) or loses
+    // the lock (honest busy), never double-applies.
+    try {
+      this.transact(() => {
+        const current = this.getCandidate(candidate.id);
+        if (current.status !== "pending") {
+          throw new KnowledgeError("stale", `candidate ${candidate.id} is ${current.status}, not pending`);
+        }
+        const updated = this.store.db.prepare(
+          "UPDATE knowledge_candidates SET status = 'rejected' WHERE id = $id AND status = 'pending'",
+        ).run({ $id: candidate.id });
+        if (updated.changes !== 1) {
+          throw new KnowledgeError("stale", `candidate ${candidate.id} left pending while rejecting`);
+        }
+        this.recordDecision(input, "reject_candidate", "applied", {
+          requestFingerprint: fingerprint,
+          candidateId: candidate.id,
+          reason: input.reason ?? null,
+        });
       });
-      throw new KnowledgeError("stale", `candidate ${candidate.id} is ${candidate.status}, not pending`);
+    } catch (error) {
+      if (error instanceof KnowledgeError && error.code === "stale") {
+        const status = this.safeCandidateStatus(candidate.id);
+        this.recordDecision(input, "reject_candidate", "rejected", {
+          requestFingerprint: fingerprint, candidateId: candidate.id, reason: "not_pending", status,
+        });
+      }
+      throw error;
     }
-    this.store.db.prepare("UPDATE knowledge_candidates SET status = 'rejected' WHERE id = $id").run({ $id: candidate.id });
-    this.recordDecision(input, "reject_candidate", "applied", {
-      requestFingerprint: fingerprint,
-      candidateId: candidate.id,
-      reason: input.reason ?? null,
-    });
     return this.getCandidate(candidate.id);
+  }
+
+  /** Best-effort status read for post-rollback audit detail (never throws). */
+  private safeCandidateStatus(id: string): string {
+    try {
+      return this.getCandidate(id).status;
+    } catch {
+      return "unknown";
+    }
   }
 
   // ---------- owner-confirmed side ----------
@@ -374,60 +464,74 @@ export class KnowledgeService {
       this.recordDecision(input, "confirm", "rejected", { requestFingerprint: fingerprint, candidateId: candidate.id, reason: "cross_business" });
       throw error;
     }
-    if (candidate.status === "confirmed") {
-      const revision = this.activeRevisionFor(candidate.businessId, candidate.key, candidate.subjectId, "global");
-      if (!revision || !candidate.confirmedFactId) {
-        throw new KnowledgeError("not_found", `confirmed candidate ${candidate.id} has no live revision row`);
-      }
-      const fact = this.getFact(candidate.confirmedFactId);
-      const result: ConfirmResult = { fact, revision, alreadyConfirmed: true, duplicate: false };
-      return result;
-    }
-    if (candidate.status !== "pending") {
-      this.recordDecision(input, "confirm", "rejected", {
-        requestFingerprint: fingerprint, candidateId: candidate.id, reason: "not_pending", status: candidate.status,
-      });
-      throw new KnowledgeError("stale", `candidate ${candidate.id} is ${candidate.status}, not pending`);
-    }
 
+    // Every state read below re-runs inside the write transaction: a
+    // concurrent confirm/correct either commits first (then this path
+    // observes the terminal state and answers idempotently) or loses the
+    // lock (honest busy). The conditional status update is the second
+    // fence; the partial unique index on active revisions is the last.
     const approvedAt = now();
-    this.store.db.exec("BEGIN IMMEDIATE");
     try {
-      const fact = this.store.addBusinessFact({
-        businessId: candidate.businessId,
-        key: candidate.key,
-        value: candidate.value,
-        confidence: "verified",
-        sourceReferences: candidate.sourceReferences,
-        observedAt: candidate.observedAt,
+      return this.transact(() => {
+        const current = this.getCandidate(candidate.id);
+        if (current.status === "confirmed") {
+          const revision = this.activeRevisionFor(current.businessId, current.key, current.subjectId, "global");
+          if (!revision || !current.confirmedFactId) {
+            throw new KnowledgeError("not_found", `confirmed candidate ${current.id} has no live revision row`);
+          }
+          const fact = this.getFact(current.confirmedFactId);
+          return { fact, revision, alreadyConfirmed: true, duplicate: false };
+        }
+        if (current.status !== "pending") {
+          throw new KnowledgeError("stale", `candidate ${current.id} is ${current.status}, not pending`);
+        }
+        const fact = this.store.addBusinessFact({
+          businessId: current.businessId,
+          key: current.key,
+          value: current.value,
+          confidence: "verified",
+          sourceReferences: current.sourceReferences,
+          observedAt: current.observedAt,
+        });
+        const revision = this.insertRevision({
+          factId: fact.id,
+          businessId: current.businessId,
+          key: current.key,
+          subjectId: current.subjectId,
+          value: current.value,
+          scope: "global",
+          approvedBy: input.actor.id,
+          approvedAt,
+          candidateId: current.id,
+          sourceReferences: current.sourceReferences,
+        });
+        const claimed = this.store.db.prepare(
+          "UPDATE knowledge_candidates SET status = 'confirmed', confirmed_fact_id = $factId WHERE id = $id AND status = 'pending'",
+        ).run({ $factId: fact.id, $id: current.id });
+        if (claimed.changes !== 1) {
+          throw new KnowledgeError("stale", `candidate ${current.id} left pending while confirming`);
+        }
+        const result: ConfirmResult = { fact, revision, alreadyConfirmed: false, duplicate: false };
+        this.recordDecision(input, "confirm", "applied", {
+          requestFingerprint: fingerprint,
+          candidateId: current.id,
+          factId: fact.id,
+          revisionId: revision.id,
+          result,
+        });
+        return result;
       });
-      const revision = this.insertRevision({
-        factId: fact.id,
-        businessId: candidate.businessId,
-        key: candidate.key,
-        subjectId: candidate.subjectId,
-        value: candidate.value,
-        scope: "global",
-        approvedBy: input.actor.id,
-        approvedAt,
-        candidateId: candidate.id,
-        sourceReferences: candidate.sourceReferences,
-      });
-      this.store.db.prepare(
-        "UPDATE knowledge_candidates SET status = 'confirmed', confirmed_fact_id = $factId WHERE id = $id",
-      ).run({ $factId: fact.id, $id: candidate.id });
-      const result: ConfirmResult = { fact, revision, alreadyConfirmed: false, duplicate: false };
-      this.recordDecision(input, "confirm", "applied", {
-        requestFingerprint: fingerprint,
-        candidateId: candidate.id,
-        factId: fact.id,
-        revisionId: revision.id,
-        result,
-      });
-      this.store.db.exec("COMMIT");
-      return result;
     } catch (error) {
-      this.store.db.exec("ROLLBACK");
+      if (error instanceof KnowledgeError && (error.code === "stale" || error.code === "not_found")) {
+        // Rejection evidence is recorded outside the rolled-back
+        // transaction so the audit survives the failure it describes.
+        this.recordDecision(input, "confirm", "rejected", {
+          requestFingerprint: fingerprint,
+          candidateId: candidate.id,
+          reason: error.code === "stale" ? "not_pending" : "not_found",
+          status: this.safeCandidateStatus(candidate.id),
+        });
+      }
       throw error;
     }
   }
@@ -457,72 +561,107 @@ export class KnowledgeService {
       this.recordDecision(input, "correct", "rejected", { requestFingerprint: fingerprint, reason: "invalid", key: input.key, subjectId });
       throw new KnowledgeError("invalid", "corrected value must be an object");
     }
-    const current = this.activeRevisionFor(input.businessId, input.key, subjectId, "global");
-    if (!current) {
-      this.recordDecision(input, "correct", "rejected", { requestFingerprint: fingerprint, reason: "not_found", key: input.key, subjectId });
-      throw new KnowledgeError("not_found", `no active confirmed fact ${input.key}/${subjectId} for ${input.businessId}`);
-    }
-    if (current.revision !== input.expectedRevision) {
-      this.recordDecision(input, "correct", "rejected", {
-        requestFingerprint: fingerprint,
-        reason: "stale_version",
-        key: input.key,
-        subjectId,
-        expectedRevision: input.expectedRevision,
-        currentRevision: current.revision,
-      });
-      throw new KnowledgeError(
-        "stale_version",
-        `stale correction: expected revision ${input.expectedRevision}, active revision is ${current.revision}`,
-      );
-    }
-    const sources = input.sourceReferences ?? current.sourceReferences;
+    // The live revision is re-read inside the write transaction: a
+    // concurrent correction either commits first (then this sees the new
+    // version and reports stale) or loses the lock (honest busy). The
+    // conditional supersede is the second fence; the partial unique index
+    // on active revisions is the last.
     const approvedAt = now();
-    this.store.db.exec("BEGIN IMMEDIATE");
     try {
-      const fact = this.store.addBusinessFact({
-        businessId: input.businessId,
-        key: input.key,
-        value: input.value,
-        confidence: "verified",
-        sourceReferences: sources,
+      return this.transact(() => {
+        const current = this.activeRevisionFor(input.businessId, input.key, subjectId, "global");
+        if (!current) {
+          throw new KnowledgeError("not_found", `no active confirmed fact ${input.key}/${subjectId} for ${input.businessId}`);
+        }
+        if (current.revision !== input.expectedRevision) {
+          throw new KnowledgeError(
+            "stale_version",
+            `stale correction: expected revision ${input.expectedRevision}, active revision is ${current.revision}`,
+          );
+        }
+        const sources = input.sourceReferences ?? current.sourceReferences;
+        const fact = this.store.addBusinessFact({
+          businessId: input.businessId,
+          key: input.key,
+          value: input.value,
+          confidence: "verified",
+          sourceReferences: sources,
+        });
+        const superseded = this.store.db.prepare(
+          "UPDATE knowledge_revisions SET status = 'superseded' WHERE id = $id AND status = 'active'",
+        ).run({ $id: current.id });
+        if (superseded.changes !== 1) {
+          throw new KnowledgeError(
+            "stale_version",
+            `stale correction: revision ${current.revision} was superseded while correcting`,
+          );
+        }
+        const revision = this.insertRevision({
+          factId: fact.id,
+          businessId: input.businessId,
+          key: input.key,
+          subjectId,
+          revision: current.revision + 1,
+          value: input.value,
+          scope: "global",
+          approvedBy: input.actor.id,
+          approvedAt,
+          sourceReferences: sources,
+        });
+        const result: ConfirmResult = { fact, revision, alreadyConfirmed: false, duplicate: false };
+        this.recordDecision(input, "correct", "applied", {
+          requestFingerprint: fingerprint,
+          supersedesRevisionId: current.id,
+          factId: fact.id,
+          revisionId: revision.id,
+          result,
+        });
+        return result;
       });
-      this.store.db.prepare("UPDATE knowledge_revisions SET status = 'superseded' WHERE id = $id").run({ $id: current.id });
-      const revision = this.insertRevision({
-        factId: fact.id,
-        businessId: input.businessId,
-        key: input.key,
-        subjectId,
-        revision: current.revision + 1,
-        value: input.value,
-        scope: "global",
-        approvedBy: input.actor.id,
-        approvedAt,
-        sourceReferences: sources,
-      });
-      const result: ConfirmResult = { fact, revision, alreadyConfirmed: false, duplicate: false };
-      this.recordDecision(input, "correct", "applied", {
-        requestFingerprint: fingerprint,
-        supersedesRevisionId: current.id,
-        factId: fact.id,
-        revisionId: revision.id,
-        result,
-      });
-      this.store.db.exec("COMMIT");
-      return result;
     } catch (error) {
-      this.store.db.exec("ROLLBACK");
+      if (error instanceof KnowledgeError && (error.code === "not_found" || error.code === "stale_version")) {
+        // Rejection evidence is recorded outside the rolled-back
+        // transaction so the audit survives the failure it describes.
+        const detail: Record<string, unknown> = { requestFingerprint: fingerprint, key: input.key, subjectId };
+        if (error.code === "not_found") {
+          detail.reason = "not_found";
+        } else {
+          const live = this.activeRevisionFor(input.businessId, input.key, subjectId, "global");
+          detail.reason = "stale_version";
+          detail.expectedRevision = input.expectedRevision;
+          detail.currentRevision = live?.revision;
+        }
+        this.recordDecision(input, "correct", "rejected", detail);
+      }
       throw error;
     }
   }
 
+  /**
+   * Owner-approved scoped exception with a canonical value shaped exactly
+   * for the accepted offers adapter: { exceptionId (server-minted),
+   * policyId, scope: { bookingId } | { customerId }, effect, approvedBy
+   * (always the commanding owner id — client-supplied authority is
+   * rejected, never normalized) }. The revision row keeps the same scope
+   * for uniqueness; the snapshot therefore feeds adaptBusinessFacts records
+   * it can actually consume, instead of revision-shaped values the adapter
+   * must report unparseable.
+   */
   addScopedException(input: DecisionCommand & {
+    policyId: string;
+    effect: "allow" | "require_owner_decision";
     scope: Exclude<FactScope, "global">;
     scopeId: string;
     subjectId?: string;
     value: Record<string, unknown>;
   }): ConfirmResult {
-    const subjectPreview = { scope: input.scope, scopeId: input.scopeId, value: isRecord(input.value) ? input.value : null };
+    const subjectPreview = {
+      policyId: typeof input.policyId === "string" ? input.policyId : null,
+      effect: input.effect,
+      scope: input.scope,
+      scopeId: input.scopeId,
+      value: isRecord(input.value) ? input.value : null,
+    };
     const fingerprint = this.requestFingerprint("exception", input, subjectPreview);
     const replay = this.replayDecision(input, "exception", fingerprint);
     if (replay) return replay as ConfirmResult;
@@ -535,6 +674,12 @@ export class KnowledgeService {
       });
       throw new KnowledgeError("invalid", reason);
     };
+    if (!isNonEmptyString(input.policyId)) {
+      rejectInvalid("scoped exceptions require an explicit policyId identifying the relaxed policy");
+    }
+    if (input.effect !== "allow" && input.effect !== "require_owner_decision") {
+      rejectInvalid("scoped exceptions require an explicit effect of allow or require_owner_decision");
+    }
     if (input.scope !== "booking" && input.scope !== "customer") {
       rejectInvalid("scoped exceptions must target a booking or customer scope");
     }
@@ -542,54 +687,92 @@ export class KnowledgeService {
       rejectInvalid("scoped exceptions require a scopeId; they can never silently globalize");
     }
     if (!isRecord(input.value)) rejectInvalid("exception value must be an object");
-    // The scope embedded in the value can only ever agree with the command —
-    // a contradiction is rejected rather than normalized away.
+    // Canonical fields are server-derived or explicitly commanded: a value
+    // carrying contradictory authority is rejected rather than normalized.
+    const canonicalScope = input.scope === "booking" ? { bookingId: input.scopeId } : { customerId: input.scopeId };
     for (const [field, expected, actual] of [
-      ["scope", input.scope, input.value.scope],
-      ["scopeId", input.scopeId, input.value.scopeId],
+      ["policyId", input.policyId, input.value.policyId],
+      ["effect", input.effect, input.value.effect],
+      ["approvedBy", input.actor.id, input.value.approvedBy],
+      ["exceptionId", undefined, input.value.exceptionId],
     ] as const) {
+      if (field === "exceptionId") {
+        if (actual !== undefined) {
+          rejectInvalid("value.exceptionId is server-minted; callers must not supply it");
+        }
+        continue;
+      }
       if (actual !== undefined && actual !== expected) {
-        rejectInvalid(`value.${field} contradicts the command scope`);
+        rejectInvalid(`value.${field} contradicts the approved exception; refusing to normalize authority`);
       }
     }
-    const value = { ...input.value, scope: input.scope, scopeId: input.scopeId };
+    if (isRecord(input.value.scope)) {
+      const embedded = input.value.scope as Record<string, unknown>;
+      const expectedKey = input.scope === "booking" ? "bookingId" : "customerId";
+      if (embedded[expectedKey] !== undefined && embedded[expectedKey] !== input.scopeId) {
+        rejectInvalid("value.scope contradicts the command scope");
+      }
+      for (const key of Object.keys(embedded)) {
+        if (key !== expectedKey && key !== "inquiryId") {
+          rejectInvalid(`value.scope carries an unexpected key "${key}" for a ${input.scope}-scoped exception`);
+        }
+      }
+    } else if (input.value.scope !== undefined) {
+      rejectInvalid("value.scope must be an object when present");
+    }
+    const value = {
+      ...input.value,
+      exceptionId: `ex_${randomUUID()}`,
+      policyId: input.policyId,
+      scope: { ...(!isRecord(input.value.scope) ? {} : (input.value.scope as Record<string, unknown>)), ...canonicalScope },
+      effect: input.effect,
+      approvedBy: input.actor.id,
+    };
     const subjectId = input.subjectId ?? input.scopeId;
     const sources: SourceReference[] = [
       { kind: "manual", locator: `gather://knowledge-exception/${input.scope}/${input.scopeId}`, label: "Owner-entered scoped exception" },
     ];
     const approvedAt = now();
-    this.store.db.exec("BEGIN IMMEDIATE");
     try {
-      const fact = this.store.addBusinessFact({
-        businessId: input.businessId,
-        key: "scoped_exception",
-        value,
-        confidence: "verified",
-        sourceReferences: sources,
+      return this.transact(() => {
+        const fact = this.store.addBusinessFact({
+          businessId: input.businessId,
+          key: "scoped_exception",
+          value,
+          confidence: "verified",
+          sourceReferences: sources,
+        });
+        const revision = this.insertRevision({
+          factId: fact.id,
+          businessId: input.businessId,
+          key: "scoped_exception",
+          subjectId,
+          value,
+          scope: input.scope,
+          scopeId: input.scopeId,
+          approvedBy: input.actor.id,
+          approvedAt,
+          sourceReferences: sources,
+        });
+        const result: ConfirmResult = { fact, revision, alreadyConfirmed: false, duplicate: false };
+        this.recordDecision(input, "exception", "applied", {
+          requestFingerprint: fingerprint,
+          factId: fact.id,
+          revisionId: revision.id,
+          result,
+        });
+        return result;
       });
-      const revision = this.insertRevision({
-        factId: fact.id,
-        businessId: input.businessId,
-        key: "scoped_exception",
-        subjectId,
-        value,
-        scope: input.scope,
-        scopeId: input.scopeId,
-        approvedBy: input.actor.id,
-        approvedAt,
-        sourceReferences: sources,
-      });
-      const result: ConfirmResult = { fact, revision, alreadyConfirmed: false, duplicate: false };
-      this.recordDecision(input, "exception", "applied", {
-        requestFingerprint: fingerprint,
-        factId: fact.id,
-        revisionId: revision.id,
-        result,
-      });
-      this.store.db.exec("COMMIT");
-      return result;
     } catch (error) {
-      this.store.db.exec("ROLLBACK");
+      // Lock contention already retries inside transact; a unique-index
+      // conflict here means an identical scoped exception already holds the
+      // scope — surface it as a conflict, never silently swallow it.
+      if (error instanceof Error && /UNIQUE constraint failed|unique/i.test(error.message)) {
+        this.recordDecision(input, "exception", "rejected", {
+          requestFingerprint: fingerprint, reason: "conflict", scope: String(input.scope), scopeId: String(input.scopeId),
+        });
+        throw new KnowledgeError("conflict", `a scoped exception already holds ${input.scope}/${input.scopeId} for this subject`);
+      }
       throw error;
     }
   }

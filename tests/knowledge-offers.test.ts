@@ -208,7 +208,7 @@ test("D5 every rejected decision is audited without raw sensitive content", () =
     );
     // Invalid exception is audited.
     assert.throws(
-      () => service.addScopedException({ businessId, scope: "booking", scopeId: "", value: { note: secret }, actor: OWNER }),
+      () => service.addScopedException({ businessId, scope: "booking", scopeId: "", policyId: "p1", effect: "allow", value: { note: secret }, actor: OWNER }),
       /scopeId/,
     );
     // Empty owner id is denied and audited.
@@ -246,7 +246,8 @@ test("snapshot facts satisfy the offers adapter acceptance contract", () => {
     service.confirmCandidate({ businessId, candidateId: price.id, actor: OWNER });
     service.addScopedException({
       businessId, scope: "booking", scopeId: "booking-7",
-      value: { exceptionId: "ex-1" }, actor: OWNER,
+      policyId: "late-checkout", effect: "allow",
+      value: { note: "owner approved late checkout" }, actor: OWNER,
     });
 
     const snapshot = service.snapshotForOffers(businessId);
@@ -264,6 +265,52 @@ test("snapshot facts satisfy the offers adapter acceptance contract", () => {
     }
     assert.ok(snapshot.facts.some((f) => f.key === "business"));
     assert.equal(snapshot.scopedFactCount, 1);
+  } finally {
+    cleanup();
+  }
+});
+
+test("snapshot exceptions carry the adapter-consumable canonical shape", () => {
+  const { service, businessId, cleanup } = fixture();
+  try {
+    const created = service.addScopedException({
+      businessId, scope: "booking", scopeId: "booking-7",
+      policyId: "late-checkout", effect: "allow",
+      value: { note: "owner approved late checkout" }, actor: OWNER,
+    });
+    // Canonical value: server-minted id, explicit policy/effect, owner-derived
+    // authority, adapter-shaped scope — matching the accepted offers adapter.
+    const value = created.fact.value as Record<string, unknown>;
+    assert.ok(typeof value.exceptionId === "string" && (value.exceptionId as string).length > 0);
+    assert.equal(value.policyId, "late-checkout");
+    assert.equal(value.effect, "allow");
+    assert.equal(value.approvedBy, OWNER.id);
+    assert.deepEqual(value.scope, { bookingId: "booking-7" });
+    const snapshot = service.snapshotForOffers(businessId);
+    const facts = snapshot.facts.filter((f) => f.key === "scoped_exception");
+    assert.equal(facts.length, 1);
+    assert.deepEqual((facts[0]?.value as Record<string, unknown>).scope, { bookingId: "booking-7" });
+    // Unauthorized minting is denied and audited, never applied.
+    assert.throws(
+      () => service.addScopedException({
+        businessId, scope: "booking", scopeId: "booking-8",
+        policyId: "late-checkout", effect: "allow",
+        value: {}, actor: { kind: "content", id: "doc-1" },
+      }),
+      /no approval authority/,
+    );
+    // A second live exception for the same scope+subject versions forward:
+    // history is preserved, exactly one stays active.
+    const revised = service.addScopedException({
+      businessId, scope: "booking", scopeId: "booking-7",
+      policyId: "late-checkout", effect: "allow",
+      value: {}, actor: OWNER,
+    });
+    assert.equal(revised.revision.revision, 2);
+    const live = service.snapshotForOffers(businessId).facts.filter((f) => f.key === "scoped_exception");
+    assert.equal(live.length, 1);
+    const denied = decisionsOf(service, businessId).filter((d) => d.outcome === "rejected");
+    assert.ok(denied.some((d) => d.kind === "exception"));
   } finally {
     cleanup();
   }
