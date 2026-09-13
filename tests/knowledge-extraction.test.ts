@@ -558,3 +558,202 @@ test("simulated origin survives on real sources through confirmation", async () 
     assert.match(stored?.note ?? "", /simulated/);
   } finally { fx.cleanup(); }
 });
+
+function pinFor(businessId: string, accountId: string, locator = "fixture://fictional/gmail/thread-9") {
+  return {
+    businessId,
+    accountId,
+    kind: "email" as const,
+    locator,
+    label: "Fictional owner email",
+    fictional: true as const,
+    sourceRevision: "thread-r1",
+  };
+}
+
+const POLICY_TEXT = "Pets are not allowed in the garden room.";
+const policyCandidate = () => ({
+  key: "policy", subjectId: "pets", value: { allowed: false }, confidence: "probable",
+  evidence: ["Pets are not allowed in the garden room."],
+});
+
+async function ledgerModule() {
+  return import("../src/knowledge/extraction/ledger.ts");
+}
+
+test("same locator and content across accounts mints separate rows with separate lineage", async () => {
+  const fx = fixture();
+  try {
+    const { createExtractionLedger, getExtractionRun, listExtractionRunCandidates } = await ledgerModule();
+    const ledger = createExtractionLedger(fx.store.db);
+    const backend = () => new FakeBackend(() => ok([policyCandidate()]));
+    const outA = await extractSourceCandidates(fx.service, backend(), { source: pinFor(fx.businessId, "acct-A"), text: POLICY_TEXT, idempotencyKey: "op-xa" }, ledger);
+    const outB = await extractSourceCandidates(fx.service, backend(), { source: pinFor(fx.businessId, "acct-B"), text: POLICY_TEXT, idempotencyKey: "op-xb" }, ledger);
+    assert.equal(outA.status, "accepted");
+    assert.equal(outB.status, "accepted");
+    assert.notEqual(outA.accepted[0]?.candidateId, outB.accepted[0]?.candidateId);
+    assert.equal(fx.service.listCandidates(fx.businessId).length, 2);
+    // Neither account's confirm disturbs the other's line.
+    const confA = fx.service.confirmCandidate({ businessId: fx.businessId, actor: OWNER, candidateId: outA.accepted[0]!.candidateId });
+    const confB = fx.service.confirmCandidate({ businessId: fx.businessId, actor: OWNER, candidateId: outB.accepted[0]!.candidateId });
+    assert.notEqual(confA.fact.id, confB.fact.id);
+    assert.equal(confA.revision.accountId, "acct-A");
+    assert.equal(confB.revision.accountId, "acct-B");
+    assert.equal(confA.revision.revision, 1);
+    assert.equal(confB.revision.revision, 1);
+    // Per-run lineage stays scoped: each run row names its own account.
+    assert.equal(getExtractionRun(ledger, "op-xa")?.accountId, "acct-A");
+    assert.equal(getExtractionRun(ledger, "op-xb")?.accountId, "acct-B");
+    assert.equal(listExtractionRunCandidates(ledger, "op-xa")[0]?.candidateId, outA.accepted[0]?.candidateId);
+    assert.equal(listExtractionRunCandidates(ledger, "op-xb")[0]?.candidateId, outB.accepted[0]?.candidateId);
+  } finally { fx.cleanup(); }
+});
+
+test("same caller key across businesses fails closed without skewing run identity", async () => {
+  const fx = fixture();
+  try {
+    const { createExtractionLedger, getExtractionRun, listExtractionRunCandidates } = await ledgerModule();
+    const ledger = createExtractionLedger(fx.store.db);
+    const otherBusiness = fx.store.createBusiness({ name: "Other", timezone: "UTC" });
+    const backend = () => new FakeBackend(() => ok([policyCandidate()]));
+    const first = await extractSourceCandidates(fx.service, backend(), { source: pinFor(fx.businessId, "acct-A"), text: POLICY_TEXT, idempotencyKey: "op-shared" }, ledger);
+    assert.equal(first.status, "accepted");
+    const second = await extractSourceCandidates(fx.service, backend(), { source: pinFor(otherBusiness.id, "acct-A"), text: POLICY_TEXT, idempotencyKey: "op-shared" }, ledger);
+    assert.equal(second.status, "invalid");
+    assert.match(second.reason ?? "", /across scopes refused/);
+    assert.equal(second.accepted.length, 0);
+    // First scope intact: its row, run identity, and candidates unchanged.
+    assert.equal(fx.service.listCandidates(fx.businessId).length, 1);
+    assert.equal(fx.service.listCandidates(otherBusiness.id).length, 0);
+    assert.equal(getExtractionRun(ledger, "op-shared")?.businessId, fx.businessId);
+    assert.equal(listExtractionRunCandidates(ledger, "op-shared").length, 1);
+  } finally { fx.cleanup(); }
+});
+
+test("lineage write failure rolls back the candidate with an explicit reason", async () => {
+  const fx = fixture();
+  try {
+    const { createExtractionLedger } = await ledgerModule();
+    const ledger = createExtractionLedger(fx.store.db);
+    // Break the candidate lineage table: the atomic hook fails inside the
+    // intake transaction, so nothing is stored anywhere.
+    fx.store.db.exec("DROP TABLE extraction_run_candidates");
+    const backend = new FakeBackend(() => ok([policyCandidate()]));
+    const out = await extractSourceCandidates(fx.service, backend, { source: pinFor(fx.businessId, "acct-A"), text: POLICY_TEXT, idempotencyKey: "op-rollback" }, ledger);
+    assert.equal(out.status, "invalid");
+    assert.match(out.rejected[0]?.reason ?? "", /lineage write failed/);
+    assert.equal(fx.service.listCandidates(fx.businessId).length, 0);
+    assert.equal(fx.service.listFacts(fx.businessId).length, 0);
+  } finally { fx.cleanup(); }
+});
+
+test("dead ledger handle fails typed before any candidate mutation", async () => {
+  const fx = fixture();
+  try {
+    const { createExtractionLedger } = await ledgerModule();
+    const ledger = createExtractionLedger(fx.store.db);
+    // Break the run table: the run-first lineage write fails before intake
+    // runs, so nothing is stored and nothing escapes as a raw error.
+    fx.store.db.exec("DROP TABLE extraction_runs");
+    const backend = new FakeBackend(() => ok([policyCandidate()]));
+    const out = await extractSourceCandidates(fx.service, backend, { source: pinFor(fx.businessId, "acct-A"), text: POLICY_TEXT, idempotencyKey: "op-deadled" }, ledger);
+    assert.equal(out.status, "invalid");
+    assert.match(out.reason ?? "", /lineage ledger unavailable before intake/);
+    assert.equal(out.accepted.length, 0);
+    assert.equal(fx.service.listCandidates(fx.businessId).length, 0);
+    assert.equal(fx.service.listFacts(fx.businessId).length, 0);
+  } finally { fx.cleanup(); }
+});
+
+test("split-brain ledger handle is refused before any backend call", async () => {
+  const fx = fixture();
+  try {
+    const { createExtractionLedger } = await ledgerModule();
+    const otherDir = mkdtempSync(join(tmpdir(), "gather-extract-other-"));
+    try {
+      const otherStore = new GatherStore(join(otherDir, "other.sqlite"));
+      try {
+        const foreign = createExtractionLedger(otherStore.db);
+        const backend = new FakeBackend(() => ok([policyCandidate()]));
+        const out = await extractSourceCandidates(fx.service, backend, { source: pinFor(fx.businessId, "acct-A"), text: POLICY_TEXT, idempotencyKey: "op-split" }, foreign);
+        assert.equal(out.status, "invalid");
+        assert.match(out.reason ?? "", /same.*database connection|split-brain/);
+        assert.equal(backend.submits.length, 0);
+        assert.equal(fx.service.listCandidates(fx.businessId).length, 0);
+      } finally {
+        otherStore.close();
+      }
+    } finally {
+      rmSync(otherDir, { recursive: true, force: true });
+    }
+  } finally { fx.cleanup(); }
+});
+
+test("lineage survives restart and replays stay stable", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "gather-extract-"));
+  const path = join(dir, "gather.sqlite");
+  const store = new GatherStore(path);
+  try {
+    const business = store.createBusiness({ name: "Fictional Cedar Hall", timezone: "America/New_York" });
+    const service = new KnowledgeService(store);
+    const { createExtractionLedger, getExtractionRun, listExtractionRunCandidates } = await ledgerModule();
+    const ledger = createExtractionLedger(store.db);
+    const backend = () => new FakeBackend(() => ok([policyCandidate()]));
+    const first = await extractSourceCandidates(service, backend(), { source: pinFor(business.id, "acct-A"), text: POLICY_TEXT, idempotencyKey: "op-restart" }, ledger);
+    assert.equal(first.status, "accepted");
+    store.close();
+    const reopened = new GatherStore(path);
+    try {
+      const service2 = new KnowledgeService(reopened);
+      const ledger2 = createExtractionLedger(reopened.db);
+      assert.equal(getExtractionRun(ledger2, "op-restart")?.status, "accepted");
+      assert.equal(listExtractionRunCandidates(ledger2, "op-restart").length, 1);
+      assert.equal(service2.listCandidates(business.id).length, 1);
+      const replay = await extractSourceCandidates(service2, backend(), { source: pinFor(business.id, "acct-A"), text: POLICY_TEXT, idempotencyKey: "op-restart" }, ledger2);
+      assert.equal(replay.status, "accepted");
+      assert.equal(replay.accepted[0]?.candidateId, first.accepted[0]?.candidateId);
+    } finally {
+      reopened.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("legacy unscoped rows never alias scoped intake", async () => {
+  const fx = fixture();
+  try {
+    const direct = fx.service.intakeCandidate({
+      businessId: fx.businessId, key: "policy", subjectId: "pets",
+      value: { allowed: false }, confidence: "probable",
+      sourceReferences: [{ kind: "email", locator: "fixture://fictional/gmail/thread-9", fictional: true }],
+    });
+    assert.equal(direct.accountId, "");
+    const backend = new FakeBackend(() => ok([policyCandidate()]));
+    const out = await extractSourceCandidates(fx.service, backend, { source: pinFor(fx.businessId, "acct-A"), text: POLICY_TEXT, idempotencyKey: "op-acct" });
+    assert.equal(out.status, "accepted");
+    assert.notEqual(out.accepted[0]?.candidateId, direct.id);
+    assert.equal(fx.service.listCandidates(fx.businessId).length, 2);
+  } finally { fx.cleanup(); }
+});
+
+test("correctFact is scoped to the account revision line", async () => {
+  const fx = fixture();
+  try {
+    const backend = () => new FakeBackend(() => ok([policyCandidate()]));
+    const outA = await extractSourceCandidates(fx.service, backend(), { source: pinFor(fx.businessId, "acct-A"), text: POLICY_TEXT, idempotencyKey: "op-ca" });
+    const outB = await extractSourceCandidates(fx.service, backend(), { source: pinFor(fx.businessId, "acct-B"), text: POLICY_TEXT, idempotencyKey: "op-cb" });
+    fx.service.confirmCandidate({ businessId: fx.businessId, actor: OWNER, candidateId: outA.accepted[0]!.candidateId });
+    fx.service.confirmCandidate({ businessId: fx.businessId, actor: OWNER, candidateId: outB.accepted[0]!.candidateId });
+    // Unscoped correction finds no line (default ""), leaving both intact.
+    assert.throws(
+      () => fx.service.correctFact({ businessId: fx.businessId, actor: OWNER, key: "policy", subjectId: "pets", expectedRevision: 1, value: { allowed: true } }),
+      /no active confirmed fact/,
+    );
+    const fixed = fx.service.correctFact({ businessId: fx.businessId, actor: OWNER, key: "policy", subjectId: "pets", accountId: "acct-A", expectedRevision: 1, value: { allowed: true } });
+    assert.equal(fixed.revision.revision, 2);
+    assert.equal(fixed.revision.accountId, "acct-A");
+    const facts = fx.service.listFacts(fx.businessId);
+    assert.deepEqual(facts.map((fact) => [fact.accountId, fact.revision]).sort(), [["acct-A", 2], ["acct-B", 1]]);
+  } finally { fx.cleanup(); }
+});

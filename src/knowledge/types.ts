@@ -45,6 +45,12 @@ export interface KnowledgeActor {
 export interface KnowledgeCandidate {
   id: string;
   businessId: string;
+  /**
+   * Server-fixed account identity of the observation (host-pinned, never
+   * model-asserted). Dedupe, supersede detection, conflicts, and revision
+   * lineage are all scoped by it; legacy rows read back as "".
+   */
+  accountId: string;
   key: string;
   /**
    * Stable identity of the thing the fact is about (e.g. a spaceId or
@@ -68,6 +74,8 @@ export interface KnowledgeRevision {
   id: string;
   factId: string;
   businessId: string;
+  /** Account line this revision belongs to; active uniqueness is per account. */
+  accountId: string;
   key: string;
   subjectId: string;
   revision: number;
@@ -86,6 +94,8 @@ export interface KnowledgeRevision {
 /** A confirmed fact enriched with its versioning/scope metadata. */
 export interface ConfirmedFact extends BusinessFact {
   revision: number;
+  /** Account line this fact was confirmed on (mirrors the revision row). */
+  accountId: string;
   /** Stable identity of the thing the fact is about (mirrors the revision row). */
   subjectId: string;
   scope: FactScope;

@@ -9,6 +9,17 @@ export {
   type SubmittedExtraction,
 } from "./backend.ts";
 export {
+  ExtractionScopeConflictError,
+  createExtractionLedger,
+  getExtractionRun,
+  listExtractionRunCandidates,
+  recordExtractionCandidate,
+  recordExtractionRun,
+  type ExtractionLedger,
+  type ExtractionRunCandidate,
+  type ExtractionRunRecord,
+} from "./ledger.ts";
+export {
   DEFAULT_AWAIT_TIMEOUT_MS,
   MAX_CANDIDATES,
   MAX_EVIDENCE_SPANS,
@@ -29,13 +40,3 @@ export {
   type ExtractSourceInput,
   type RejectedExtraction,
 } from "./extract.ts";
-export {
-  createExtractionLedger,
-  getExtractionRun,
-  listExtractionRunCandidates,
-  recordExtractionCandidate,
-  recordExtractionRun,
-  type ExtractionLedger,
-  type ExtractionRunCandidate,
-  type ExtractionRunRecord,
-} from "./ledger.ts";

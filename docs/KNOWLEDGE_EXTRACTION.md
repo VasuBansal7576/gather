@@ -70,14 +70,17 @@ extractSourceCandidates(
 Outcome semantics: `accepted` (all fed, pending only), `no_relevant_facts`
 (empty array, zero rows), `needs_review` (valid subset fed as pending with
 explicit per-candidate reasons for the rest), `invalid` (nothing fed —
-malformed payload, bound/digest violations, zero survivors), and
-`backend_unavailable` (submit/await failure, echo mismatch, or non-`ok`
-terminal status, nothing fed). Runtime wiring must persist `idempotencyKey`
-per (business, source, bytes) pair — cross-business or cross-account reuse
-of one key collides — and reuse it on retry; replays dedupe via derived
-intake ids. The submission idempotency echo and task id are validated
-before anything downstream may name the run; every await failure maps to
-`backend_unavailable`, never a raw throw.
+malformed payload, bound/digest violations, scope conflicts, dead lineage
+ledger, zero survivors), and `backend_unavailable` (submit/await failure,
+echo mismatch, or non-`ok` terminal status, nothing fed). Runtime wiring
+must persist `idempotencyKey` per (business, account, source, bytes) —
+reuse across scopes fails closed instead of skewing lineage — and reuse it
+on retry; replays dedupe via derived intake ids. The submission
+idempotency echo and task id are validated before anything downstream may
+name the run; every await failure maps to `backend_unavailable`, never a
+raw throw. The lineage ledger must wrap the same database connection the
+service runs on (`ledger.db === service.database`); a foreign handle is
+refused before any backend call.
 
 ## Canonical intake identity and lineage ledger
 
@@ -88,22 +91,31 @@ intake's content match); an altered replay under the same command hits the
 identity row with different content and is rejected deterministically
 instead of leaking a raw `UNIQUE` error.
 
+Account identity is server-fixed and persisted: `knowledge_candidates`
+and `knowledge_revisions` carry `account_id`, content dedupe, supersede
+detection, conflicts, and the active-revision uniqueness are all scoped by
+it, and confirm/correct move one account's line without touching another's
+(`correctFact` takes `accountId`, defaulting to the legacy `""` line).
+Two accounts sharing one locator and value therefore mint separate rows,
+facts, and revision lines — the previous cross-account aliasing is closed.
+
 `createExtractionLedger(db)` opens two extraction-owned tables on the same
 SQLite handle (never a second database): `extraction_runs` (one row per
 idempotency key: business, account, locator, revision, digest, backend,
 task, simulated flag, terminal status) and `extraction_run_candidates`
 (index, candidate/intake ids, key, subject, confidence, original evidence
-quotes). Every post-submit terminal outcome records its run row; candidate
-rows record first-write-wins. Simulated origin therefore survives owner
-confirmation and snapshots: the ledger still names the fake backend run,
-and each candidate row carries an extraction note — owner confirmation is
-never evidence of an actual model run.
-
-Account isolation note: intake content-dedupe is business-scoped, so two
-accounts sharing one locator and value still resolve to one candidate row;
-callers must scope locators and idempotency keys per account, and the
-ledger (which records the true account per run) is the tiebreaker for
-audit.
+quotes). The run row is written first with status `started`, so a caller
+key reused across business/account/locator/digest fails closed before any
+candidate mutation, and a dead ledger fails typed with zero rows fed.
+Candidate intake and its lineage row commit atomically inside the intake
+transaction on the same connection (via the intake `atomically` hook) or
+roll back together — a lineage failure reports `lineage write failed`
+with no surviving candidate row. Every post-submit terminal outcome
+records its run row; candidate slots colliding with different content
+throw instead of silently overwriting. Simulated origin therefore
+survives owner confirmation and snapshots: the ledger still names the
+fake backend run, and each candidate row carries an extraction note —
+owner confirmation is never evidence of an actual model run.
 
 ## Bounds
 
