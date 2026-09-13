@@ -97,7 +97,9 @@ Keep the handoff tied to the accepted booking version and update it when authori
 
 Provide a useful Today briefing, booking conversations and requirements, proposal and source inspection, approvals, business knowledge correction, connection health, and contextual chat.
 Support desktop, mobile, keyboard, and accessible interaction with loading, empty, error, uncertain, partial, and recovery states.
-The current interface is an increment subject to rendered review, not the accepted final product design.
+The owner designated [Gather Linear UI](design/Gather-Linear-UI.png) as the authoritative visual reference.
+Match its dark four-column hospitality workspace, compact triage, central offer review, booking details, and approval action while preserving the complete product behavior.
+The implemented interface requires rendered comparison against that reference before visual acceptance.
 
 ## 15. Reuse OpenClaw with clear responsibilities
 
@@ -148,7 +150,8 @@ The primary interface is an owner's hospitality workspace with a useful Today br
 Approvals show concrete consequences and their evidence.
 Business knowledge can be corrected, connection failures can be understood, and contextual chat retains the booking context.
 Loading, empty, error, uncertain, partial, and recovery states are part of the deliverable.
-The existing UI is an increment subject to rendered review, not an accepted final design.
+The owner-selected [Gather Linear UI](design/Gather-Linear-UI.png) governs the visual design.
+A matching screenshot alone does not establish that the required interactions work.
 Simulation must be labeled where the owner encounters it, including fixture connections and action receipts.
 
 ## Delivery boundaries
