@@ -68,7 +68,29 @@ export function ConditionList({ decision }: { decision: ReadinessDecision }): Re
   );
 }
 
+function provenanceLabel(provenance: StepReceipt["provenance"]): string {
+  switch (provenance) {
+    case "live":
+      return "Live receipt";
+    case "simulated":
+      return "Simulated receipt";
+    default:
+      return "Provider receipt unverified";
+  }
+}
+
+function stepLabel(receipt: StepReceipt): string {
+  if (receipt.step === "hold") return "Provisional hold";
+  if (receipt.step === "email") return "Offer email";
+  return "Unsupported step";
+}
+
 export function ReceiptList({ receipts }: { receipts: StepReceipt[] }): React.JSX.Element {
+  // Only rows scoped to the exact current proposal with a known step count
+  // as proof. Everything else renders in a clearly labeled history section
+  // (superseded proposals) or as an unsupported step — never as proof.
+  const proof = receipts.filter((receipt) => receipt.current && receipt.step !== "unknown");
+  const history = receipts.filter((receipt) => !(receipt.current && receipt.step !== "unknown"));
   if (receipts.length === 0) {
     return (
       <section className="delivery-panel" aria-label="Action receipts">
@@ -80,23 +102,51 @@ export function ReceiptList({ receipts }: { receipts: StepReceipt[] }): React.JS
   return (
     <section className="delivery-panel" aria-label="Action receipts">
       <h2>Action receipts</h2>
-      <ul className="delivery-conditions">
-        {receipts.map((receipt) => (
-          <li key={receipt.id} className="delivery-condition">
-            <div className="delivery-condition-top">
-              <strong>{receipt.step === "hold" ? "Provisional hold" : "Offer email"}</strong>
-              <StatusPill tone={receipt.status === "succeeded" ? "ok" : receipt.status === "failed" ? "attention" : "muted"}>
-                {receipt.status}
-              </StatusPill>
-            </div>
-            <p className="delivery-muted">
-              Started {formatWhen(receipt.startedAt)}
-              {receipt.completedAt ? ` · finished ${formatWhen(receipt.completedAt)}` : ""}
-            </p>
-            {receipt.error ? <p className="delivery-error-text">{receipt.error}</p> : null}
-          </li>
-        ))}
-      </ul>
+      {proof.length === 0 ? (
+        <p className="delivery-muted">No hold or email steps have completed for the current proposal yet.</p>
+      ) : (
+        <ul className="delivery-conditions">
+          {proof.map((receipt) => (
+            <li key={receipt.id} className="delivery-condition">
+              <div className="delivery-condition-top">
+                <strong>{stepLabel(receipt)}</strong>
+                <StatusPill tone={receipt.status === "succeeded" ? "ok" : receipt.status === "failed" ? "attention" : "muted"}>
+                  {receipt.status}
+                </StatusPill>
+              </div>
+              <p className="delivery-muted">
+                Started {formatWhen(receipt.startedAt)}
+                {receipt.completedAt ? ` · finished ${formatWhen(receipt.completedAt)}` : ""}
+                {` · ${provenanceLabel(receipt.provenance)}`}
+              </p>
+              {receipt.error ? <p className="delivery-error-text">{receipt.error}</p> : null}
+            </li>
+          ))}
+        </ul>
+      )}
+      {history.length > 0 ? (
+        <>
+          <h3>Earlier or unrecognized records — not current proof</h3>
+          <ul className="delivery-conditions">
+            {history.map((receipt) => (
+              <li key={receipt.id} className="delivery-condition">
+                <div className="delivery-condition-top">
+                  <strong>{stepLabel(receipt)}</strong>
+                  <StatusPill tone="muted">
+                    {receipt.step === "unknown" ? "Unsupported" : "Earlier proposal"}
+                  </StatusPill>
+                </div>
+                <p className="delivery-muted">
+                  {receipt.step === "unknown"
+                    ? "This record names no known hold or email step, so it cannot count as proof."
+                    : "This record belongs to a superseded proposal, so it cannot count as current proof."}{" "}
+                  {provenanceLabel(receipt.provenance)} · {receipt.status}.
+                </p>
+              </li>
+            ))}
+          </ul>
+        </>
+      ) : null}
     </section>
   );
 }

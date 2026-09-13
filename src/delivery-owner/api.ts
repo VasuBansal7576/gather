@@ -3,6 +3,8 @@ import {
   parseConfirmResponse,
   parseHandoffResponse,
   parseReadinessResponse,
+  receiptProvenanceForExecution,
+  receiptStepForKey,
   type ApiError,
   type ConfirmResponse,
   type HandoffResponse,
@@ -127,14 +129,12 @@ export function createDeliveryApi(fetchImpl: DeliveryFetch): DeliveryApi {
         const booking = record.booking as Record<string, unknown> | undefined;
         if (!booking || booking.id !== bookingId) continue;
         const proposals = Array.isArray(record.proposals) ? record.proposals : [];
-        // Authoritative current-proposal selection (K 4402f67): the host
-        // exposes the durable pointer as `currentProposedActionId`. Select
-        // exactly that action id — never proposals.at(-1), never max
-        // version. A pointer naming no listed proposal fails closed to no
-        // identity (never a wrong proposal). Absent pointers are pre-pointer
-        // payloads from servers predating the integration: legacy
-        // last-position fallback applies only then.
-        const hasPointerField = Object.hasOwn(record, "currentProposedActionId");
+        // Authoritative current-proposal selection: the host exposes the
+        // durable pointer as `currentProposedActionId`. Select exactly that
+        // action id — never proposals.at(-1), never max version. A missing,
+        // malformed, or dangling pointer is honestly no authority
+        // (identity undefined, every receipt non-current): the UI shows no
+        // current proposal instead of confirming or proving the wrong one.
         const pointer = typeof record.currentProposedActionId === "string" && record.currentProposedActionId.length > 0
           ? record.currentProposedActionId
           : undefined;
@@ -145,33 +145,40 @@ export function createDeliveryApi(fetchImpl: DeliveryFetch): DeliveryApi {
             const candidate = (entry as Record<string, unknown>).action as Record<string, unknown> | undefined;
             return typeof candidate?.id === "string" && candidate.id === pointer;
           });
-        } else if (hasPointerField) {
-          // Pointer field present but malformed (wrong type/empty): fail
-          // closed rather than guessing at(-1) or max version.
-          selected = undefined;
         } else {
-          selected = proposals.length > 0 ? proposals[proposals.length - 1] : undefined;
+          selected = undefined;
         }
         const action = (selected as Record<string, unknown> | undefined)?.action as Record<string, unknown> | undefined;
         let identity: ProposalIdentity | undefined;
         if (action && typeof action.id === "string" && typeof action.proposalVersion === "number" && typeof action.proposalFingerprint === "string" && typeof action.kind === "string") {
           identity = { proposedActionId: action.id, proposalVersion: action.proposalVersion, proposalFingerprint: action.proposalFingerprint, kind: action.kind };
         }
+        // Every execution row is labeled, never filtered: rows scoped to the
+        // exact current proposal (action + version) are current proof;
+        // superseded-version, foreign-action, and scope-less rows are
+        // history. Step identity validates the known operations only —
+        // unknown keys read `"unknown"`, never a guessed hold/email — and
+        // provenance carries the stored live/simulated/unknown distinction.
         const executions = Array.isArray(record.executions) ? record.executions : [];
         const receipts: StepReceipt[] = [];
         for (const item of executions) {
           if (typeof item !== "object" || item === null || Array.isArray(item)) continue;
           const execution = item as Record<string, unknown>;
           const key = typeof execution.idempotencyKey === "string" ? execution.idempotencyKey : "";
-          const step = key.includes(":send:") ? "email" as const : "hold" as const;
           if (typeof execution.id !== "string" || typeof execution.status !== "string" || typeof execution.startedAt !== "string") continue;
+          const rowActionId = typeof execution.proposedActionId === "string" ? execution.proposedActionId : "";
+          const rowVersion = typeof execution.proposalVersion === "number" ? execution.proposalVersion : NaN;
           receipts.push({
             id: execution.id,
-            step,
+            step: receiptStepForKey(key),
             status: execution.status,
             startedAt: execution.startedAt,
             ...(typeof execution.completedAt === "string" ? { completedAt: execution.completedAt } : {}),
             ...(typeof execution.error === "string" ? { error: execution.error } : {}),
+            proposedActionId: rowActionId,
+            proposalVersion: rowVersion,
+            current: identity !== undefined && rowActionId === identity.proposedActionId && rowVersion === identity.proposalVersion,
+            provenance: receiptProvenanceForExecution(execution),
           });
         }
         return {

@@ -117,6 +117,31 @@ test("unmount: pending success/error/finally commit nothing", () => {
   assert.equal(page.isConfirmCurrent("booking-fixture-1", op), true);
 });
 
+test("unmount/remount probe: a remount starts clean; the old instance cannot revive its generations", () => {
+  // The page builds its lifecycle per mount (useRef initializer), so a
+  // remount gets a fresh instance. Model that sequence: an in-flight
+  // confirm on the unmounted instance, then a fresh instance for the same
+  // booking. The old generation must satisfy neither instance's checks,
+  // and the fresh instance must not inherit busy/result generations.
+  const before = new DeliveryPageLifecycle();
+  const op = before.beginConfirm("booking-fixture-1");
+  before.unmount();
+  const after = new DeliveryPageLifecycle();
+  const freshLoad = after.beginLoad("booking-fixture-1");
+  assert.equal(before.isConfirmCurrent("booking-fixture-1", op), false);
+  assert.equal(after.isConfirmCurrent("booking-fixture-1", op), false);
+  assert.equal(after.isLoadCurrent("booking-fixture-1", freshLoad), true);
+  // Same-instance StrictMode-style remount (unmount then mount with no
+  // intervening booking change) re-arms: only the latest generation wins.
+  const same = new DeliveryPageLifecycle();
+  const stale = same.beginConfirm("booking-fixture-1");
+  same.unmount();
+  same.mount();
+  const live = same.beginConfirm("booking-fixture-1");
+  assert.equal(same.isConfirmCurrent("booking-fixture-1", stale), false);
+  assert.equal(same.isConfirmCurrent("booking-fixture-1", live), true);
+});
+
 test("proposal identity: result stays useful only for the same booking and exact proposal", () => {
   const current = { proposedActionId: "action-1", proposalVersion: 1, proposalFingerprint: "fp-1", kind: "create_provisional_hold" };
   assert.equal(proposalKey(undefined), "");
