@@ -18,7 +18,13 @@ contract below.
   the granted scopes cover (`gmail` / `google_calendar` / `google_drive` /
   `other`) and flips them to `revoked` on disconnect.
 - `connection_auth_sessions`: single-use OAuth sessions — hashed state,
-  PKCE verifier reference, expiry (10 min), business scope.
+  PKCE verifier reference, expiry (10 min), business scope, and owner
+  binding. Sessions resolve only under their exact owner: pending counts,
+  callback reads, and the consume transaction all filter by owner, and
+  legacy rows without an owner default to `local-owner` so they are never
+  adopted under an arbitrary new owner. Consume and the callback binding
+  snapshot commit in one transaction, closing the gap where a disconnect
+  could land between them.
 - `connection_accounts`: one row per verified provider identity
   (`UNIQUE(provider, account_key)`), linking the capability rows. A
   monotonic `revision` fences every binding change — disconnect, revoke,
@@ -59,7 +65,9 @@ database, no credential form, no assumed hardcoded account.
   references only.
 - **State/PKCE/replay guards**: state is stored SHA-256 hashed, sessions
   expire after 10 minutes, and consumption is a conditional update inside
-  `BEGIN IMMEDIATE` — a replayed or unknown state is `REPLAY`.
+  `BEGIN IMMEDIATE` — a replayed or unknown state is `REPLAY`. Staging and
+  the commit `BEGIN` sit inside the same cleanup boundary, so a busy store
+  deletes only newly staged refs and surfaces a typed, redacted error.
 - **Loopback-only redirects**: the configured `redirectUri` must be an
   `http://localhost|127.0.0.1|[::1]` URL ending exactly in
   `/api/connections/google/callback` with no userinfo, query, or
