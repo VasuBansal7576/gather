@@ -23,6 +23,7 @@ import {
   getWorkspace,
   holdOperationKey,
   isLiveStepProof,
+  isSimulatedStepProof,
   reconcileExecution,
   retryFailedSteps,
   stepReceiptDetail,
@@ -725,6 +726,106 @@ test("a proof-absent succeeded receipt reads unverified — never claims simulat
     for (const receipt of receipts.filter((r) => r.status === "succeeded")) {
       assert.match(receipt.detail ?? "", /unverified/);
     }
+  } finally {
+    w.cleanup();
+  }
+});
+
+// ---------- Three-state proof wording: live / simulated / unverified ----------
+
+const FIXTURE_REF = { kind: "fixture", locator: "fixture://demo/x", fictional: true };
+
+test("isSimulatedStepProof requires positive simulation evidence", () => {
+  // Positive simulated/fixture proof.
+  assert.equal(isSimulatedStepProof({ proof: { mode: "demo", simulated: true, provenance: [] } }), true);
+  assert.equal(isSimulatedStepProof({ proof: { mode: "demo", simulated: false, provenance: [] } }), true);
+  assert.equal(isSimulatedStepProof({ proof: { mode: "live", simulated: true, provenance: LIVE_SRC } }), true);
+  assert.equal(isSimulatedStepProof({ proof: { mode: "live", simulated: false, provenance: [FIXTURE_REF] } }), true);
+  assert.equal(isSimulatedStepProof({ proof: { mode: "unknown", simulated: false, provenance: [FIXTURE_REF] } }), true);
+  // Everything else is NOT simulation evidence.
+  assert.equal(isSimulatedStepProof(undefined), false);
+  assert.equal(isSimulatedStepProof(null), false);
+  assert.equal(isSimulatedStepProof({}), false);
+  assert.equal(isSimulatedStepProof({ proof: null }), false);
+  assert.equal(isSimulatedStepProof({ proof: {} }), false, "an empty proof object proves nothing");
+  assert.equal(isSimulatedStepProof({ proof: { mode: "live", simulated: false, provenance: [] } }), false);
+  assert.equal(isSimulatedStepProof({ proof: { mode: "unknown", simulated: false, provenance: [] } }), false);
+  assert.equal(
+    isSimulatedStepProof({ proof: { mode: "live", simulated: false, provenance: [...LIVE_SRC, FIXTURE_REF] } }),
+    false,
+    "mixed envelopes are unknown, never simulated",
+  );
+  assert.equal(
+    isSimulatedStepProof({ proof: { mode: "live", simulated: false, provenance: [{ kind: "calendar", locator: "" }] } }),
+    false,
+  );
+  // Live proof is never simulated proof.
+  assert.equal(isSimulatedStepProof({ proof: { mode: "live", simulated: false, provenance: LIVE_SRC } }), false);
+});
+
+function succeededExecution(result: unknown) {
+  return { id: "exec-1", status: "succeeded", result } as never;
+}
+
+test("stepReceiptDetail reads live, simulated, and unverified honestly", () => {
+  const live = { proof: { mode: "live", simulated: false, provenance: LIVE_SRC } };
+  const demo = { proof: { mode: "demo", simulated: true, provenance: [] } };
+  assert.equal(stepReceiptDetail(succeededExecution(live)), "Done — provider receipt recorded");
+  assert.equal(stepReceiptDetail(succeededExecution(demo)), "Done — simulated provider receipt");
+  assert.equal(stepReceiptDetail(succeededExecution(undefined)), "Done — provider receipt unverified");
+  assert.equal(stepReceiptDetail(succeededExecution({ proof: {} })), "Done — provider receipt unverified");
+  assert.equal(
+    stepReceiptDetail(succeededExecution({ proof: { mode: "live", simulated: false, provenance: [] } })),
+    "Done — provider receipt unverified",
+  );
+  assert.equal(
+    stepReceiptDetail(succeededExecution({ proof: { mode: "mystery", simulated: false, provenance: [] } })),
+    "Done — provider receipt unverified",
+  );
+  assert.equal(
+    stepReceiptDetail(succeededExecution({ proof: { mode: "live", simulated: false, provenance: [...LIVE_SRC, FIXTURE_REF] } })),
+    "Done — provider receipt unverified",
+  );
+  assert.equal(
+    stepReceiptDetail({ id: "exec-2", status: "failed", error: "slot taken", result: demo } as never),
+    "slot taken",
+  );
+});
+
+test("adapter receipt wording matches the service three-state rule on real rows", async () => {
+  const w = world();
+  try {
+    const deps = demoDeps(w.store);
+    const { booking, action } = seedBooking(w.store, w.businessId, "b-wording", "a-wording");
+    await approveAndExecute(deps, approveIdentity(w.store, action.id, booking.id));
+    const executions = w.store.listActionExecutions(action.id);
+    assert.ok(executions.length > 0);
+    const rewrite = (proof: unknown) => {
+      for (const execution of executions) {
+        const result = { ...(execution.result as Record<string, unknown>), proof };
+        w.store.db.prepare("UPDATE action_executions SET result_json = $json WHERE id = $id").run({ $json: JSON.stringify(result), $id: execution.id });
+      }
+    };
+    const wording = () => {
+      const workspace = getWorkspace(w.store, { ownerId: OWNER });
+      const adapted = adaptWorkspace(workspace as unknown as Parameters<typeof adaptWorkspace>[0]);
+      const detail = adapted.bookings.find((item) => item.id === booking.id)?.detail;
+      return (detail?.receipts ?? []).filter((r) => r.status === "succeeded").map((r) => r.detail ?? "");
+    };
+    // Genuine demo proofs stay simulated.
+    assert.ok(wording().every((detail) => detail.includes("simulated")));
+    // Malformed and unknown proofs read unverified — never simulated.
+    rewrite({});
+    assert.ok(wording().every((detail) => detail.includes("unverified")), JSON.stringify(wording()));
+    rewrite({ mode: "live", simulated: false, provenance: [] });
+    assert.ok(wording().every((detail) => detail.includes("unverified")));
+    rewrite({ mode: "mystery", simulated: false, provenance: [] });
+    assert.ok(wording().every((detail) => detail.includes("unverified")));
+    rewrite({ mode: "live", simulated: false, provenance: [...LIVE_SRC, FIXTURE_REF] });
+    assert.ok(wording().every((detail) => detail.includes("unverified")));
+    // Positive fixture proof still reads simulated.
+    rewrite({ mode: "demo", simulated: true, provenance: [] });
+    assert.ok(wording().every((detail) => detail.includes("simulated")));
   } finally {
     w.cleanup();
   }
