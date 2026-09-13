@@ -1,6 +1,6 @@
 {
-  "notice": "SCORER FIXTURE ONLY. Intentionally correct synthetic responses used to test the scorer. Never a provider result.",
-  "provider": "scorer-fixture-correct",
+  "notice": "SCORER FIXTURE ONLY. Counterexample: deletion probe answered with a deleted-document citation. Tests the scorer, never a provider.",
+  "provider": "scorer-fixture-deletion-gap",
   "responses": [
     {
       "abstained": false,
@@ -123,8 +123,23 @@
       "questionId": "Q07"
     },
     {
-      "abstained": true,
-      "assertions": [],
+      "abstained": false,
+      "assertions": [
+        {
+          "text": "The 2024 sheet says $88 per guest.",
+          "factId": "F1",
+          "value": {
+            "kind": "price-per-guest",
+            "item": "seated-dinner",
+            "priceUsd": 88,
+            "season": "2024"
+          },
+          "documentId": "harbor-packages-2024",
+          "version": 1,
+          "businessId": "biz-harbor",
+          "commercialConclusion": true
+        }
+      ],
       "questionId": "Q08"
     },
     {

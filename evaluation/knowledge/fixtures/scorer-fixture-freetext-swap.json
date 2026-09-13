@@ -1,6 +1,6 @@
 {
-  "notice": "SCORER FIXTURE ONLY. Intentionally correct synthetic responses used to test the scorer. Never a provider result.",
-  "provider": "scorer-fixture-correct",
+  "notice": "SCORER FIXTURE ONLY. Counterexample: every assertion.text replaced with an unsupported free-pricing claim while correct fact IDs/links were retained. Tests the scorer, never a provider.",
+  "provider": "scorer-fixture-freetext-swap",
   "responses": [
     {
       "abstained": false,
@@ -10,14 +10,8 @@
           "commercialConclusion": true,
           "documentId": "harbor-packages-2026",
           "factId": "F1",
-          "text": "Seated dinner costs $110 per guest (2026 price).",
-          "version": 2,
-          "value": {
-            "kind": "price-per-guest",
-            "item": "seated-dinner",
-            "priceUsd": 110,
-            "season": "2026"
-          }
+          "text": "Everything is FREE: $0 per guest, no charge, always available.",
+          "version": 2
         }
       ],
       "questionId": "Q01",
@@ -34,14 +28,8 @@
           "commercialConclusion": true,
           "documentId": "harbor-packages-2026",
           "factId": "F2",
-          "text": "Buffet dinner costs $84 per guest (2026 price).",
-          "version": 2,
-          "value": {
-            "kind": "price-per-guest",
-            "item": "buffet-dinner",
-            "priceUsd": 84,
-            "season": "2026"
-          }
+          "text": "Everything is FREE: $0 per guest, no charge, always available.",
+          "version": 2
         }
       ],
       "questionId": "Q02"
@@ -54,14 +42,8 @@
           "commercialConclusion": false,
           "documentId": "harbor-packages-2026",
           "factId": "F1",
-          "text": "The applicable current price is $110, not last year's $95.",
-          "version": 2,
-          "value": {
-            "kind": "price-per-guest",
-            "item": "seated-dinner",
-            "priceUsd": 110,
-            "season": "2026"
-          }
+          "text": "Everything is FREE: $0 per guest, no charge, always available.",
+          "version": 2
         }
       ],
       "questionId": "Q03"
@@ -74,17 +56,8 @@
           "commercialConclusion": true,
           "documentId": "harbor-nonprofit-exception",
           "factId": "F3",
-          "text": "10% off the 2026 seated package for a Tuesday nonprofit event, per signed exception.",
-          "version": 1,
-          "value": {
-            "kind": "discount",
-            "pct": 10,
-            "appliesTo": "seated-dinner-2026",
-            "days": "Mon-Thu",
-            "scope": "registered-nonprofit",
-            "signedBy": "M. Alvarez",
-            "signedOn": "2026-02-10"
-          }
+          "text": "Everything is FREE: $0 per guest, no charge, always available.",
+          "version": 1
         }
       ],
       "questionId": "Q04"
@@ -107,17 +80,8 @@
           "commercialConclusion": false,
           "documentId": "harbor-cancel-v2",
           "factId": "F4",
-          "text": "Full refund up to 14 days before; 50% from 7 to 14 days.",
-          "version": 2,
-          "value": {
-            "kind": "cancellation-policy",
-            "fullRefundDaysBefore": 14,
-            "halfRefundWindowDaysBefore": [
-              7,
-              14
-            ],
-            "policy": "v2-2026-03-01"
-          }
+          "text": "Everything is FREE: $0 per guest, no charge, always available.",
+          "version": 2
         }
       ],
       "questionId": "Q07"
@@ -145,14 +109,8 @@
           "commercialConclusion": true,
           "documentId": "curl-cuts-2026",
           "factId": "F5",
-          "text": "Signature cut costs $58 (2026 menu).",
-          "version": 2,
-          "value": {
-            "kind": "price",
-            "item": "signature-cut",
-            "priceUsd": 58,
-            "season": "2026"
-          }
+          "text": "Everything is FREE: $0 per guest, no charge, always available.",
+          "version": 2
         }
       ],
       "questionId": "Q11"
@@ -165,14 +123,8 @@
           "commercialConclusion": false,
           "documentId": "curl-clara-oswin",
           "factId": "F6",
-          "text": "Clara Oswin has a signature cut booked for 2026-10-02.",
-          "version": 1,
-          "value": {
-            "kind": "appointment",
-            "client": "Clara Oswin",
-            "service": "signature-cut",
-            "date": "2026-10-02"
-          }
+          "text": "Everything is FREE: $0 per guest, no charge, always available.",
+          "version": 1
         }
       ],
       "questionId": "Q12"
@@ -185,14 +137,8 @@
           "commercialConclusion": true,
           "documentId": "green-lawn-2026",
           "factId": "F7",
-          "text": "Monthly lawn care costs $120 per visit.",
-          "version": 1,
-          "value": {
-            "kind": "price-per-visit",
-            "item": "monthly-lawn-care",
-            "priceUsd": 120,
-            "season": "2026"
-          }
+          "text": "Everything is FREE: $0 per guest, no charge, always available.",
+          "version": 1
         }
       ],
       "questionId": "Q13"

@@ -34,6 +34,12 @@ test("correct fixture passes every gate with exact denominators", () => {
     criticalCorrectness: true,
     factPrecision: true,
     importantRecall: true,
+    linkingCorrectness: true,
+    versionCorrectness: true,
+    deletionBehavior: true,
+    abstentionIntegrity: true,
+    inputValidity: true,
+    completeCoverage: true,
   });
   // 8 assertions, all supported; 8 expected fact slots, all matched (F1 in Q01 and Q03).
   assert.equal(report.metrics.factPrecision.total, 8);
@@ -96,4 +102,76 @@ test("absent responses file is a usage error, not a silent pass", () => {
   assert.equal(report.metrics.factPrecision.total, 0);
   assert.equal(report.metrics.factPrecision.rate, null);
   assert.ok(report.metrics.unmeasured.length === 14);
+  assert.equal(report.gates.completeCoverage, false);
+  assert.equal(report.pass, false);
+});
+
+test("free-pricing text swap with retained fact IDs fails: IDs never self-certify", () => {
+  const { code, report } = score(join(FIXTURES, "scorer-fixture-freetext-swap.json"));
+  assert.equal(code, 1);
+  assert.equal(report.pass, false);
+  assert.equal(report.gates.factPrecision, false);
+  assert.equal(report.gates.importantRecall, false);
+  assert.equal(report.gates.criticalCorrectness, false);
+  // Links still resolve, but structured values are gone: zero supported.
+  assert.equal(report.metrics.linking.correct, report.metrics.linking.total);
+  assert.equal(report.metrics.factPrecision.supported, 0);
+  assert.equal(report.metrics.factPrecision.total, 8);
+  assert.ok(report.failures.some((f: { reason: string }) => f.reason.includes("structured value mismatch")));
+  assert.match(String(report.fixtureWarning ?? ""), /fixture/);
+});
+
+test("single retained answer cannot pass: partial metrics report but coverage fails", () => {
+  const { code, report } = score(join(FIXTURES, "scorer-fixture-partial-coverage.json"));
+  assert.equal(code, 1);
+  assert.equal(report.pass, false);
+  assert.equal(report.gates.completeCoverage, false);
+  // The answered subset is honestly correct, yet overall must not pass.
+  assert.equal(report.metrics.factPrecision.rate, 1);
+  assert.deepEqual(report.metrics.unmeasured.length, 14);
+  assert.equal(report.metrics.coverage.answered, 1);
+  assert.equal(report.metrics.coverage.required, 15);
+});
+
+test("foreign claims on abstained responses fail abstention integrity", () => {
+  const { code, report } = score(join(FIXTURES, "scorer-fixture-abstain-plus-claims.json"));
+  assert.equal(code, 1);
+  assert.equal(report.pass, false);
+  assert.equal(report.gates.abstentionIntegrity, false);
+  assert.equal(report.metrics.abstentionViolations, 2);
+  assert.equal(report.gates.deletionBehavior, false);
+  assert.ok(
+    report.failures.some((f: { reason: string }) => f.reason.includes("abstained yet supplied assertions")),
+  );
+});
+
+test("duplicate, unknown, and malformed inputs fail input validity", () => {
+  const { code, report } = score(join(FIXTURES, "scorer-fixture-bad-shape.json"));
+  assert.equal(code, 1);
+  assert.equal(report.pass, false);
+  assert.equal(report.gates.inputValidity, false);
+  assert.ok(report.metrics.inputErrors.length >= 4);
+  assert.ok(report.metrics.inputErrors.some((e: string) => e.includes("duplicate")));
+  assert.ok(report.metrics.inputErrors.some((e: string) => e.includes("unknown questionId")));
+  assert.ok(report.metrics.inputErrors.some((e: string) => e.includes("questionId") && e.includes("missing")));
+  assert.equal(report.gates.completeCoverage, false);
+});
+
+test("answering the deletion probe with a deleted citation fails deletion gate", () => {
+  const { code, report } = score(join(FIXTURES, "scorer-fixture-deletion-gap.json"));
+  assert.equal(code, 1);
+  assert.equal(report.pass, false);
+  assert.equal(report.gates.deletionBehavior, false);
+  assert.equal(report.metrics.deletionBehavior.probes, 1);
+  assert.equal(report.metrics.deletionBehavior.passed, 0);
+  assert.equal(report.metrics.deletionBehavior.deletedCitations, 1);
+  assert.equal(report.gates.factPrecision, false);
+});
+
+test("raw assertion text is never scored as correct", () => {
+  const { code, report } = score(join(FIXTURES, "scorer-fixture-correct.json"));
+  assert.equal(code, 0);
+  assert.equal(report.metrics.rawTextSemantics.status, "unmeasured");
+  assert.equal(report.metrics.rawTextSemantics.evaluatedAssertions, 0);
+  assert.equal(report.metrics.semanticAdjudication.status, "unmeasured");
 });
