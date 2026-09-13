@@ -4,7 +4,8 @@
 
 The local Gather application is runnable on Node 26 with the owner workspace, deterministic demo connectors, and a durable booking approval API integrated on `main`.
 The reviewed service was integrated as `ef5e7c9` from `b0058ba`.
-The owner workspace is still awaiting its verified API wiring.
+Reviewed Google Calendar and Gmail adapter boundaries were integrated as `72c82b7` from `363bef7`.
+The owner workspace is still awaiting its verified API wiring and comparison with the owner-selected [Gather Linear UI](design/Gather-Linear-UI.png).
 
 The demo connectors and fixture workspace remain explicitly simulated and are not live Gmail, Drive, Calendar, or OpenClaw integrations.
 
@@ -23,7 +24,7 @@ This count describes the local application milestone only, not completion of the
 - [x] Connector fixtures cover provenance, unavailable dates, idempotency, and timeout reconciliation.
 - [x] Local launcher and doctor scripts are present and do not install packages or touch external runtimes.
 - [x] `npm ci` completes without credentials or network provider setup.
-- [x] `npm test` passes: 55 tests across storage, connectors, approval, recovery, concurrency, and hold-expiry suites.
+- [x] `npm test` passes: 84 tests across storage, connectors, approval, recovery, concurrency, and hold-expiry suites.
 - [x] `npm run typecheck` passes.
 - [x] `npm run build` passes.
 - [x] Doctor passes with Node 26.8.2, installed dependencies, supported scripts, and a project-local writable `.runtime` directory.
@@ -50,7 +51,7 @@ Independent review covered exact proposal identity, stale approval rejection, fr
 Additional counterexamples exposed expired holds blocking in the same process and durable intents surviving known receipts.
 Both original counterexamples pass after the fixes, alongside end-to-end simulated hold creation, clock advancement, rebooking, and restart tests.
 The service review gate is accepted for this local simulated component only.
-Actual HTTP approval and restart acceptance is running separately.
+Independent actual HTTP acceptance on `b0058ba` passed against a temporary SQLite database: empty workspace, explicit demo initialization, exact approval, stable repeated receipts, stale approval rejection (409), cross-origin rejection (403), and restart preserving the same receipts without extra simulated writes.
 No live provider receipt or booking confirmation is established by these tests.
 
 ## Next integrated milestone
@@ -59,7 +60,9 @@ The service is integrated; owner approval and recovery interactions remain under
 Parallel workers are implementing and correcting the isolated runtime adapter, Google provider adapters, business-aware offers, and persistent proactive booking work.
 Runtime worker evidence includes an actual isolated Gateway boot, protocol handshake, control-plane RPCs, and observed shutdown without model or Google calls.
 Runtime acceptance remains open while isolation and lifecycle changes receive independent review.
-Google adapters have only simulated transport evidence and remain disconnected pending approved test-account assets.
+Google adapters passed independent review on `363bef7`, including scripted provider responses and a real loopback transport timeout.
+The combined suite on `72c82b7` passes 84 tests and type checking.
+These adapter component checks establish no live Google outcome; the adapters remain disconnected pending approved test-account assets.
 Offer and proactive-work modules require independent verification and integration before owner-facing acceptance.
 The next demonstrable owner journey is explicit demo initialization, exact proposal review and approval, individually persisted hold and email receipts, and restart recovery through the workspace.
 
