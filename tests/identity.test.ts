@@ -6,6 +6,9 @@ import test from "node:test";
 import { GatherStore } from "../src/server/sqlite-store.ts";
 import {
   buildSourceKey,
+  ensureBookingIdentityTables,
+  getIdentityLink,
+  getOpenIdentityDecision,
   IdentityError,
   listIdentityAudit,
   listIdentityDecisions,
@@ -29,6 +32,14 @@ function fixtureStore(): Fixture {
   const dir = mkdtempSync(join(tmpdir(), "gather-identity-"));
   const store = new GatherStore(join(dir, "gather.sqlite"));
   const business = store.createBusiness({ name: "Fictional Cedar Hall", timezone: "America/New_York" });
+  // The source key's account must be known: bindings deny unknown accounts.
+  store.upsertConnectedAccount({
+    id: "acc-owner-inbox",
+    businessId: business.id,
+    provider: "gmail",
+    displayName: "Fictional owner inbox",
+    status: "connected",
+  });
   return {
     store,
     dir,
@@ -39,6 +50,8 @@ function fixtureStore(): Fixture {
     },
   };
 }
+
+const OWNER = { kind: "owner" as const, id: "local-owner" };
 
 function comps(fixture: Fixture, overrides: Partial<IdentityComponents> = {}): IdentityComponents {
   return {
@@ -312,7 +325,7 @@ test("stale owner decision is rejected; current version resolves", () => {
         recordOwnerIdentityDecision(fx.store, {
           sourceKey: key,
           chosenBookingId: bookingA,
-          decidedBy: "local-owner",
+          actor: OWNER,
           candidateVersion: v1 ? v1.candidateVersion : -1,
           candidateFingerprint: v1 ? v1.candidateFingerprint : "stale",
         }),
@@ -324,7 +337,7 @@ test("stale owner decision is rejected; current version resolves", () => {
         recordOwnerIdentityDecision(fx.store, {
           sourceKey: key,
           chosenBookingId: bookingB,
-          decidedBy: "  ",
+          actor: { kind: "owner" as const, id: "  " },
           candidateVersion: v2 ? v2.candidateVersion : -1,
           candidateFingerprint: v2 ? v2.candidateFingerprint : "",
         }),
@@ -333,7 +346,7 @@ test("stale owner decision is rejected; current version resolves", () => {
     const bound = recordOwnerIdentityDecision(fx.store, {
       sourceKey: key,
       chosenBookingId: bookingB,
-      decidedBy: "local-owner",
+      actor: OWNER,
       candidateVersion: v2 ? v2.candidateVersion : -1,
       candidateFingerprint: v2 ? v2.candidateFingerprint : "",
     });
@@ -391,7 +404,7 @@ test("cross-business and cross-account bindings are rejected on both paths", () 
           recordOwnerIdentityDecision(fx.store, {
             sourceKey: foreignKey.sourceKey,
             chosenBookingId: local,
-            decidedBy: "local-owner",
+            actor: OWNER,
             candidateVersion: foreignKey.decision.candidateVersion,
             candidateFingerprint: foreignKey.decision.candidateFingerprint,
           }),
@@ -417,7 +430,7 @@ test("unlink and correction keep audit history without destroying the old record
     });
     const unlinked = unlinkIdentityLink(fx.store, {
       sourceKey: key,
-      actor: "local-owner",
+      actor: OWNER,
       reason: "Wrong event: message was about the winter market",
     });
     assert.equal(unlinked.status, "unlinked");
@@ -430,7 +443,7 @@ test("unlink and correction keep audit history without destroying the old record
       const corrected = recordOwnerIdentityDecision(fx.store, {
         sourceKey: key,
         chosenBookingId: bookingB,
-        decidedBy: "local-owner",
+        actor: OWNER,
         candidateVersion: afterUnlink.decision.candidateVersion,
         candidateFingerprint: afterUnlink.decision.candidateFingerprint,
       });
@@ -495,6 +508,289 @@ test("known link is durable across proposal, hold, and resource revisions", () =
     assert.equal(resolved.outcome, "linked");
     assert.equal(resolved.outcome === "linked" && resolved.bookingId, bookingId);
     assert.equal(resolved.outcome === "linked" && resolved.provenanceMode, "live");
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test("audit failure rolls back the link — no un-audited binding persists", () => {
+  const fx = fixtureStore();
+  try {
+    const bookingId = makeBooking(fx, { eventName: "Fictional Audit Test" });
+    ensureBookingIdentityTables(fx.store);
+    fx.store.db.exec(
+      "CREATE TRIGGER fail_identity_audit BEFORE INSERT ON booking_identity_audit BEGIN SELECT RAISE(ABORT, 'audit unavailable'); END",
+    );
+    const key = buildSourceKey(comps(fx));
+    assert.throws(
+      () =>
+        recordVerifiedIdentityLink(fx.store, {
+          components: comps(fx),
+          bookingId,
+          receipt: { operationKey: "gather:email:send:audit-fail", mode: "demo" },
+        }),
+      /audit unavailable/,
+    );
+    // The link insert must NOT survive the aborted audit write.
+    assert.equal(getIdentityLink(fx.store, key), undefined, "link must roll back with its audit row");
+    // The same applies to a decision open: decision row and its audit are one write.
+    assert.throws(() => proposeBookingIdentity(fx.store, { components: comps(fx, { externalId: "msg-002" }) }), /audit unavailable/);
+    assert.equal(getOpenIdentityDecision(fx.store, buildSourceKey(comps(fx, { externalId: "msg-002" }))), undefined);
+    fx.store.db.exec("DROP TRIGGER fail_identity_audit");
+    // Recovery works once the audit path is healthy again.
+    recordVerifiedIdentityLink(fx.store, {
+      components: comps(fx),
+      bookingId,
+      receipt: { operationKey: "gather:email:send:audit-ok", mode: "demo" },
+    });
+    assert.equal(getIdentityLink(fx.store, key)?.bookingId, bookingId);
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test("a replayed receipt with a different operation key or mode is a mismatched identity", () => {
+  const fx = fixtureStore();
+  try {
+    const bookingId = makeBooking(fx, { eventName: "Fictional Replay Gala" });
+    recordVerifiedIdentityLink(fx.store, {
+      components: comps(fx),
+      bookingId,
+      receipt: { operationKey: "gather:email:send:opA", mode: "live" },
+    });
+    // Identical receipt: still idempotent.
+    const again = recordVerifiedIdentityLink(fx.store, {
+      components: comps(fx),
+      bookingId,
+      receipt: { operationKey: "gather:email:send:opA", mode: "live" },
+    });
+    assert.equal(again.receiptOperationKey, "gather:email:send:opA");
+    // Same booking but a DIFFERENT operation key is not a duplicate.
+    assertIdentityError(
+      () =>
+        recordVerifiedIdentityLink(fx.store, {
+          components: comps(fx),
+          bookingId,
+          receipt: { operationKey: "gather:email:send:opB", mode: "live" },
+        }),
+      "CONFLICT",
+    );
+    // Same operation key under a different provenance mode is not a duplicate either.
+    assertIdentityError(
+      () =>
+        recordVerifiedIdentityLink(fx.store, {
+          components: comps(fx),
+          bookingId,
+          receipt: { operationKey: "gather:email:send:opA", mode: "demo" },
+        }),
+      "CONFLICT",
+    );
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test("owner correction clears the obsolete provider receipt and asserts owner provenance", () => {
+  const fx = fixtureStore();
+  try {
+    const bookingA = makeBooking(fx, { eventName: "Fictional Spring Fete" });
+    const bookingB = makeBooking(fx, { eventName: "Fictional Autumn Fete" });
+    const key = buildSourceKey(comps(fx));
+    // Live receipt binds A.
+    recordVerifiedIdentityLink(fx.store, {
+      components: comps(fx),
+      bookingId: bookingA,
+      receipt: { operationKey: "gather:calendar:hold:opA", mode: "live" },
+    });
+    // Replacement without the reviewed target is refused outright.
+    assertIdentityError(
+      () =>
+        unlinkIdentityLink(fx.store, {
+          sourceKey: key,
+          actor: OWNER,
+          reason: "wrong event",
+          replacementBookingId: bookingB,
+        }),
+      "INVALID_REQUEST",
+    );
+    // A stale expected target is refused.
+    assertIdentityError(
+      () =>
+        unlinkIdentityLink(fx.store, {
+          sourceKey: key,
+          actor: OWNER,
+          reason: "wrong event",
+          expectedBookingId: bookingB,
+          replacementBookingId: bookingB,
+        }),
+      "STALE_DECISION",
+    );
+    // Reviewed correction: receipt opA proved A, not B — it is cleared.
+    const corrected = unlinkIdentityLink(fx.store, {
+      sourceKey: key,
+      actor: OWNER,
+      reason: "wrong event",
+      expectedBookingId: bookingA,
+      replacementBookingId: bookingB,
+    });
+    assert.equal(corrected.bookingId, bookingB);
+    assert.equal(corrected.origin, "owner_resolution");
+    assert.equal(corrected.provenanceMode, "owner", "owner assertion is not provider proof and not necessarily demo");
+    assert.equal(corrected.receiptOperationKey, undefined, "receipt opA must not appear to prove booking B");
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test("concurrent opens hold exactly one open decision; a resolved decision rejects replays", () => {
+  const fx = fixtureStore();
+  try {
+    const bookingA = makeBooking(fx, { eventName: "Fictional Alpha Gala" });
+    const bookingB = makeBooking(fx, { eventName: "Fictional Beta Gala" });
+    const key = buildSourceKey(comps(fx));
+    const first = proposeBookingIdentity(fx.store, { components: comps(fx), hints: { eventName: "Alpha" } });
+    assert.equal(first.outcome, "needs_decision");
+    // A second open with a different candidate set supersedes atomically.
+    const path = join(fx.dir, "gather.sqlite");
+    const second = new GatherStore(path);
+    try {
+      const other = proposeBookingIdentity(second, { components: comps(fx), hints: { eventName: "Beta" } });
+      assert.equal(other.outcome, "needs_decision");
+      const opens = listIdentityDecisions(second, key).filter((d) => d.status === "open");
+      assert.equal(opens.length, 1, "partial unique index: at most one open decision per source key");
+      // The database rejects a second open row outright.
+      assert.throws(
+        () =>
+          second.db.prepare(
+            `INSERT INTO booking_identity_decisions
+              (id, source_key, candidate_version, candidate_fingerprint, candidate_ids_json, status, created_at)
+             VALUES ('x', $k, 99, 'fp', '[]', 'open', 'now')`,
+          ).run({ $k: key }),
+        /UNIQUE constraint/,
+      );
+      // Resolving with the superseded v1 version fails on the fresh connection too.
+      if (first.outcome === "needs_decision" && other.outcome === "needs_decision") {
+        assertIdentityError(
+          () =>
+            recordOwnerIdentityDecision(second, {
+              sourceKey: key,
+              chosenBookingId: bookingA,
+              actor: OWNER,
+              candidateVersion: first.decision.candidateVersion,
+              candidateFingerprint: first.decision.candidateFingerprint,
+            }),
+          "STALE_DECISION",
+        );
+        // Resolve v2 once; a replay of the same version is now stale too.
+        recordOwnerIdentityDecision(second, {
+          sourceKey: key,
+          chosenBookingId: bookingB,
+          actor: OWNER,
+          candidateVersion: other.decision.candidateVersion,
+          candidateFingerprint: other.decision.candidateFingerprint,
+        });
+        assertIdentityError(
+          () =>
+            recordOwnerIdentityDecision(second, {
+              sourceKey: key,
+              chosenBookingId: bookingB,
+              actor: OWNER,
+              candidateVersion: other.decision.candidateVersion,
+              candidateFingerprint: other.decision.candidateFingerprint,
+            }),
+          "STALE_DECISION",
+        );
+      }
+    } finally {
+      second.close();
+    }
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test("unknown accounts are denied unless a trusted host registry port vouches", () => {
+  const fx = fixtureStore();
+  try {
+    const bookingId = makeBooking(fx, { eventName: "Fictional Registry Dinner" });
+    const ghost = comps(fx, { accountId: "acc-ghost" });
+    // Unknown to the store and no registry: denied, not silently bound.
+    assertIdentityError(
+      () =>
+        recordVerifiedIdentityLink(fx.store, {
+          components: ghost,
+          bookingId,
+          receipt: { operationKey: "gather:email:send:ghost", mode: "demo" },
+        }),
+      "CROSS_ACCOUNT",
+    );
+    // A registry asserting a FOREIGN business is denied too.
+    const foreignRegistry = { getAccount: () => ({ businessId: "biz-other", provider: "gmail" }) };
+    assertIdentityError(
+      () =>
+        recordVerifiedIdentityLink(fx.store, {
+          components: ghost,
+          bookingId,
+          receipt: { operationKey: "gather:email:send:ghost", mode: "demo" },
+          accounts: foreignRegistry,
+        }),
+      "CROSS_ACCOUNT",
+    );
+    // A trusted registry entry for the same business + provider vouches.
+    const registry = { getAccount: (id: string) => (id === "acc-ghost" ? { businessId: fx.businessId, provider: "gmail" } : undefined) };
+    const linked = recordVerifiedIdentityLink(fx.store, {
+      components: ghost,
+      bookingId,
+      receipt: { operationKey: "gather:email:send:ghost", mode: "demo" },
+      accounts: registry,
+    });
+    assert.equal(linked.bookingId, bookingId);
+    // The same scope check guards the linked path: without the registry the
+    // stored binding cannot resolve — its source account is unreadable.
+    assertIdentityError(() => proposeBookingIdentity(fx.store, { components: ghost }), "CROSS_ACCOUNT");
+    const resolved = proposeBookingIdentity(fx.store, { components: ghost, accounts: registry });
+    assert.equal(resolved.outcome === "linked" && resolved.bookingId, bookingId);
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test("owner decisions reject non-owner and non-actor identities", () => {
+  const fx = fixtureStore();
+  try {
+    const bookingId = makeBooking(fx, { eventName: "Fictional Claimed Supper" });
+    const result = proposeBookingIdentity(fx.store, {
+      components: comps(fx),
+      hints: { eventName: "Claimed Supper" },
+    });
+    assert.equal(result.outcome, "needs_decision");
+    if (result.outcome === "needs_decision") {
+      const decision = result.decision;
+      // A bare string (e.g. lifted from message text) is not an owner actor.
+      assertIdentityError(
+        () =>
+          recordOwnerIdentityDecision(fx.store, {
+            sourceKey: result.sourceKey,
+            chosenBookingId: bookingId,
+            actor: "the owner (signed, definitely the venue)" as never,
+            candidateVersion: decision.candidateVersion,
+            candidateFingerprint: decision.candidateFingerprint,
+          }),
+        "INVALID_REQUEST",
+      );
+      // A non-owner kind can never decide.
+      assertIdentityError(
+        () =>
+          recordOwnerIdentityDecision(fx.store, {
+            sourceKey: result.sourceKey,
+            chosenBookingId: bookingId,
+            actor: { kind: "content", id: "message-author" } as never,
+            candidateVersion: decision.candidateVersion,
+            candidateFingerprint: decision.candidateFingerprint,
+          }),
+        "INVALID_REQUEST",
+      );
+    }
   } finally {
     fx.cleanup();
   }

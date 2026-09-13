@@ -6,8 +6,8 @@ import {
   getActiveIdentityLink,
   getIdentityLink,
   getOpenIdentityDecision,
-  markDecisionResolved,
   openOrReuseIdentityDecision,
+  resolveDecisionIfOpen,
   type IdentityLinkRow,
   type ProvenanceMode,
 } from "./store.ts";
@@ -43,6 +43,27 @@ export interface IdentityCandidate {
   reasons: string[];
   /** Candidates are never authoritative; only verified receipts / owner decisions bind. */
   authoritative: false;
+}
+
+/**
+ * Trusted host-side account registry. When the store holds no
+ * connected_accounts row for a source key's account id, this port is the
+ * ONLY alternative source of truth: an account unknown to both is denied,
+ * never silently bound.
+ */
+export interface IdentityAccountRegistry {
+  getAccount(accountId: string): { businessId: string; provider: string } | undefined;
+}
+
+/**
+ * The owner actor for identity decisions. `kind: "owner"` marks a
+ * host-server-derived identity (e.g. the configured GATHER_OWNER_ID
+ * principal); a bare string lifted from message text cannot satisfy this —
+ * raw message owner ids grant no authority.
+ */
+export interface IdentityOwnerActor {
+  kind: "owner";
+  id: string;
 }
 
 export type ProposeIdentityResult =
@@ -82,7 +103,28 @@ export interface VerifiedReceipt {
   /** Stable provider operation key correlating the observed record (e.g. hold/email operation key). */
   operationKey: string;
   /** Demo receipts are simulated fixtures; live receipts are real provider state. Never conflated. */
-  mode: ProvenanceMode;
+  mode: Exclude<ProvenanceMode, "owner">;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function requireNonEmptyString(name: string, value: unknown): string {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new IdentityError("INVALID_REQUEST", `${name} requires a non-empty string`);
+  }
+  return value;
+}
+
+function requireOwnerActor(value: unknown): IdentityOwnerActor {
+  if (!isRecord(value) || value.kind !== "owner" || typeof value.id !== "string" || value.id.trim().length === 0) {
+    throw new IdentityError(
+      "INVALID_REQUEST",
+      "Owner decisions require a host-server owner actor ({ kind: 'owner', id }); message-claimed identities grant no authority",
+    );
+  }
+  return { kind: "owner", id: value.id.trim() };
 }
 
 function bookingBusinessId(store: GatherStore, bookingId: string): string {
@@ -93,26 +135,36 @@ function bookingBusinessId(store: GatherStore, bookingId: string): string {
   }
 }
 
-function connectedAccountBusiness(store: GatherStore, accountId: string): { businessId: string; provider: string } | undefined {
+/**
+ * Resolve the account id to its scope: the store's connected_accounts table
+ * is primary; a trusted host registry port is the only fallback. Unknown or
+ * unreadable accounts return undefined — callers MUST deny, not assume.
+ */
+function connectedAccountBusiness(
+  store: GatherStore,
+  accountId: string,
+  registry?: IdentityAccountRegistry,
+): { businessId: string; provider: string } | undefined {
   try {
     const account = store.getConnectedAccount(accountId);
     return { businessId: account.businessId, provider: account.provider };
   } catch {
-    // Unknown accounts are allowed: the link still records the caller's
-    // account id, and owner resolution stays scoped to the source key.
-    return undefined;
+    return registry?.getAccount(accountId);
   }
 }
 
 /**
- * Enforce business/account scope shared by both binding paths. A source key
- * from one business or account can never bind a booking from another.
+ * Enforce business/account scope shared by every binding path. A source key
+ * from one business or account can never bind a booking from another, and an
+ * account neither the store nor the trusted registry can read is denied —
+ * unknown identity is never assumed safe.
  */
 function requireScope(
   store: GatherStore,
   key: IdentityComponents,
   bookingId: string,
   bookingBusiness: string,
+  registry?: IdentityAccountRegistry,
 ): void {
   if (bookingBusiness !== key.businessId) {
     throw new IdentityError(
@@ -120,14 +172,20 @@ function requireScope(
       `Cross-business link denied: source key belongs to business ${key.businessId} but booking ${bookingId} belongs to ${bookingBusiness}`,
     );
   }
-  const account = connectedAccountBusiness(store, key.accountId);
-  if (account && account.businessId !== key.businessId) {
+  const account = connectedAccountBusiness(store, key.accountId, registry);
+  if (!account) {
+    throw new IdentityError(
+      "CROSS_ACCOUNT",
+      `Unknown or unreadable account ${key.accountId}: bindings require a connected account or an explicit trusted host account registry entry`,
+    );
+  }
+  if (account.businessId !== key.businessId) {
     throw new IdentityError(
       "CROSS_ACCOUNT",
       `Cross-account link denied: account ${key.accountId} belongs to business ${account.businessId}, not ${key.businessId}`,
     );
   }
-  if (account && account.provider !== "other" && account.provider !== key.provider) {
+  if (account.provider !== "other" && account.provider !== key.provider) {
     throw new IdentityError(
       "INVALID_REQUEST",
       `Provider mismatch: account ${key.accountId} is a "${account.provider}" account, not "${key.provider}"`,
@@ -203,7 +261,9 @@ export function findCandidates(
 /**
  * Resolve one provider-side record to its booking.
  *
- * - A durable ACTIVE link for the exact source key resolves immediately.
+ * - A durable ACTIVE link for the exact source key resolves immediately —
+ *   after the same scope check as every binding path, so a link whose
+ *   account became unknown or foreign cannot resolve.
  * - Anything else returns `needs_decision` with deterministic candidates and
  *   an open owner decision (versioned + fingerprinted). Weak hints and
  *   untrusted message claims NEVER auto-merge: even a single weak candidate
@@ -211,12 +271,15 @@ export function findCandidates(
  */
 export function proposeBookingIdentity(
   store: GatherStore,
-  input: { components: IdentityComponents; hints?: IdentityHints },
+  input: { components: IdentityComponents; hints?: IdentityHints; accounts?: IdentityAccountRegistry },
 ): ProposeIdentityResult {
   ensureBookingIdentityTables(store);
   const sourceKey = buildSourceKey(input.components);
+  const key = decodeSourceKey(sourceKey);
   const active = getActiveIdentityLink(store, sourceKey);
   if (active) {
+    const business = bookingBusinessId(store, active.bookingId);
+    requireScope(store, key, active.bookingId, business, input.accounts);
     return {
       outcome: "linked",
       sourceKey,
@@ -256,73 +319,113 @@ function isConcurrencyConflict(error: unknown): boolean {
  * for it. First writer wins; any conflicting binding throws CONFLICT and
  * never silently merges or overwrites — including rows left by unlink
  * history, which require owner resolution to revisit.
+ *
+ * The link row and its audit row commit in ONE transaction under BEGIN
+ * IMMEDIATE: the current link state is re-read under the write lock, and a
+ * failed audit insert rolls the link back instead of leaving an
+ * un-audited binding behind.
  */
 export function recordVerifiedIdentityLink(
   store: GatherStore,
-  input: { components: IdentityComponents; bookingId: string; receipt: VerifiedReceipt; actor?: string },
+  input: {
+    components: IdentityComponents;
+    bookingId: string;
+    receipt: VerifiedReceipt;
+    actor?: string;
+    accounts?: IdentityAccountRegistry;
+  },
 ): IdentityLinkRow {
   ensureBookingIdentityTables(store);
   const key = decodeSourceKey(buildSourceKey(input.components));
   const sourceKey = buildSourceKey(key);
-  if (!input.receipt?.operationKey?.trim()) {
-    throw new IdentityError("INVALID_REQUEST", "Verified receipt requires a non-empty provider operation key");
+  const bookingId = requireNonEmptyString("bookingId", input.bookingId);
+  if (!isRecord(input.receipt)) {
+    throw new IdentityError("INVALID_REQUEST", "Verified receipt requires an explicit receipt object");
   }
+  const operationKey = requireNonEmptyString("receipt.operationKey", input.receipt.operationKey);
   if (input.receipt.mode !== "demo" && input.receipt.mode !== "live") {
     throw new IdentityError("INVALID_REQUEST", "Verified receipt requires an explicit provenance mode ('demo' or 'live')");
   }
-  const business = bookingBusinessId(store, input.bookingId);
-  requireScope(store, key, input.bookingId, business);
-  const existing = getIdentityLink(store, sourceKey);
-  if (existing && existing.bookingId === input.bookingId && existing.status === "active") return existing; // duplicate receipt: idempotent
-  if (existing) {
-    throw new IdentityError(
-      "CONFLICT",
-      `Source key is already bound to booking ${existing.bookingId} (status ${existing.status}); conflicting verified binding for ${input.bookingId} refused — resolve via owner decision`,
-    );
-  }
+  const business = bookingBusinessId(store, bookingId);
+  requireScope(store, key, bookingId, business, input.accounts);
   const timestamp = new Date().toISOString();
+  store.db.exec("BEGIN IMMEDIATE");
   try {
-    store.db.prepare(
-      `INSERT INTO booking_identity_links
-        (source_key, booking_id, business_id, account_id, provider, origin, provenance_mode, receipt_operation_key, status, created_at, updated_at)
-       VALUES ($key, $booking, $business, $account, $provider, 'verified_receipt', $mode, $receipt, 'active', $at, $at)
-       ON CONFLICT(source_key) DO NOTHING`,
-    ).run({
-      $key: sourceKey,
-      $booking: input.bookingId,
-      $business: key.businessId,
-      $account: key.accountId,
-      $provider: key.provider,
-      $mode: input.receipt.mode,
-      $receipt: input.receipt.operationKey,
-      $at: timestamp,
-    });
-  } catch (error) {
-    if (isConcurrencyConflict(error)) {
+    // Re-read under the write lock: another writer may have bound the key
+    // between the earlier validation and now.
+    const existing = getIdentityLink(store, sourceKey);
+    if (existing && existing.status === "active") {
+      // Idempotent ONLY for a byte-identical receipt: same booking, same
+      // provider operation key, same provenance mode. A different receipt
+      // replaying the same booking is a mismatched identity, not a duplicate.
+      if (
+        existing.bookingId === bookingId &&
+        existing.receiptOperationKey === operationKey &&
+        existing.provenanceMode === input.receipt.mode
+      ) {
+        store.db.exec("COMMIT");
+        return existing;
+      }
       throw new IdentityError(
         "CONFLICT",
-        `Concurrent link conflict for this source key: another writer bound it first; refusing binding for ${input.bookingId}`,
+        existing.bookingId === bookingId
+          ? `Mismatched receipt identity: source key already bound to booking ${bookingId} via operation ${existing.receiptOperationKey ?? "none"} (${existing.provenanceMode}); refusing replay of ${operationKey} (${input.receipt.mode})`
+          : `Source key is already bound to booking ${existing.bookingId} (status ${existing.status}); conflicting verified binding for ${bookingId} refused — resolve via owner decision`,
       );
+    }
+    if (existing) {
+      throw new IdentityError(
+        "CONFLICT",
+        `Source key is already bound to booking ${existing.bookingId} (status ${existing.status}); conflicting verified binding for ${bookingId} refused — resolve via owner decision`,
+      );
+    }
+    try {
+      store.db.prepare(
+        `INSERT INTO booking_identity_links
+          (source_key, booking_id, business_id, account_id, provider, origin, provenance_mode, receipt_operation_key, status, created_at, updated_at)
+         VALUES ($key, $booking, $business, $account, $provider, 'verified_receipt', $mode, $receipt, 'active', $at, $at)`,
+      ).run({
+        $key: sourceKey,
+        $booking: bookingId,
+        $business: key.businessId,
+        $account: key.accountId,
+        $provider: key.provider,
+        $mode: input.receipt.mode,
+        $receipt: operationKey,
+        $at: timestamp,
+      });
+    } catch (error) {
+      if (isConcurrencyConflict(error)) {
+        throw new IdentityError(
+          "CONFLICT",
+          `Concurrent link conflict for this source key: another writer bound it first; refusing binding for ${bookingId}`,
+        );
+      }
+      throw error;
+    }
+    appendIdentityAudit(store, {
+      sourceKey,
+      action: "verified_link",
+      bookingId,
+      actor: input.actor ?? "host-verified-receipt",
+      reason: `Bound via ${input.receipt.mode} provider-correlated receipt ${operationKey}`,
+    });
+    store.db.exec("COMMIT");
+  } catch (error) {
+    try {
+      store.db.exec("ROLLBACK");
+    } catch {
+      // Already rolled back; surface the original failure.
     }
     throw error;
   }
   const winner = getIdentityLink(store, sourceKey);
-  if (!winner) {
-    throw new IdentityError("CONFLICT", "Concurrent link conflict for this source key: another writer bound it first");
-  }
-  if (winner.bookingId !== input.bookingId) {
+  if (!winner || winner.bookingId !== bookingId) {
     throw new IdentityError(
       "CONFLICT",
-      `Concurrent link conflict: source key was bound to ${winner.bookingId} by another writer; refusing ${input.bookingId}`,
+      `Concurrent link conflict: source key was bound by another writer; refusing ${bookingId}`,
     );
   }
-  appendIdentityAudit(store, {
-    sourceKey,
-    action: "verified_link",
-    bookingId: input.bookingId,
-    actor: input.actor ?? "host-verified-receipt",
-    reason: `Bound via ${input.receipt.mode} provider-correlated receipt ${input.receipt.operationKey}`,
-  });
   return winner;
 }
 
@@ -330,101 +433,121 @@ export function recordVerifiedIdentityLink(
  * Bind (or correct) a source key from an explicit, trusted OWNER resolution.
  * The caller presents the open decision's exact candidate version +
  * fingerprint; stale, cross-business, or cross-account resolutions are
- * rejected. Unlike the verified path, this path MAY correct an existing
- * active binding — the change is preserved in audit history, never by
- * deleting the old record.
+ * rejected — all validated atomically inside BEGIN IMMEDIATE so a decision
+ * superseded between review and write cannot slip through. Unlike the
+ * verified path, this path MAY correct an existing active binding; the
+ * change is preserved in audit history, never by deleting the old record.
+ * A correction to a different booking clears the obsolete provider receipt:
+ * a receipt that proved booking A must not appear to prove booking B, and
+ * the owner's assertion is recorded with 'owner' provenance — authoritative
+ * but not provider-verified.
  *
- * `decidedBy` must be server-derived (e.g. GATHER_OWNER_ID); request-supplied
- * identities and message-claimed authorizers are not accepted here.
+ * `actor` must be a host-server owner actor ({ kind: 'owner', id }) such as
+ * the configured owner principal; request- or message-supplied identities
+ * are not accepted here.
  */
 export function recordOwnerIdentityDecision(
   store: GatherStore,
   input: {
     sourceKey: string;
     chosenBookingId: string;
-    decidedBy: string;
+    actor: IdentityOwnerActor;
     candidateVersion: number;
     candidateFingerprint: string;
+    accounts?: IdentityAccountRegistry;
   },
 ): IdentityLinkRow {
   ensureBookingIdentityTables(store);
   let key: IdentityComponents;
   try {
-    key = decodeSourceKey(input.sourceKey);
+    key = decodeSourceKey(requireNonEmptyString("sourceKey", input.sourceKey));
   } catch {
     throw new IdentityError("INVALID_REQUEST", "Owner decision requires a well-formed source key");
   }
-  if (!input.decidedBy?.trim()) {
-    throw new IdentityError("INVALID_REQUEST", "Owner decision requires a server-derived owner identity (decidedBy)");
+  const actor = requireOwnerActor(input.actor);
+  const chosenBookingId = requireNonEmptyString("chosenBookingId", input.chosenBookingId);
+  if (typeof input.candidateVersion !== "number" || !Number.isInteger(input.candidateVersion) || input.candidateVersion < 1) {
+    throw new IdentityError("INVALID_REQUEST", "Owner decision requires the reviewed candidateVersion (positive integer)");
   }
-  const open = getOpenIdentityDecision(store, input.sourceKey);
-  if (
-    !open ||
-    open.candidateVersion !== input.candidateVersion ||
-    open.candidateFingerprint !== input.candidateFingerprint
-  ) {
-    throw new IdentityError(
-      "STALE_DECISION",
-      "Owner decision is stale: the candidate set changed since this resolution was reviewed; re-propose and review the current candidates",
-    );
-  }
-  const business = bookingBusinessId(store, input.chosenBookingId);
-  requireScope(store, key, input.chosenBookingId, business);
-  const allowed: string[] = JSON.parse(open.candidateIdsJson) as string[];
-  if (allowed.length > 0 && !allowed.includes(input.chosenBookingId)) {
-    throw new IdentityError(
-      "INVALID_REQUEST",
-      `Chosen booking ${input.chosenBookingId} is not among the resolved v${open.candidateVersion} candidates`,
-    );
-  }
+  requireNonEmptyString("candidateFingerprint", input.candidateFingerprint);
   const timestamp = new Date().toISOString();
   store.db.exec("BEGIN IMMEDIATE");
   try {
+    // Re-read the open decision under the write lock: the version and
+    // fingerprint the owner reviewed must still be current.
+    const open = getOpenIdentityDecision(store, input.sourceKey);
+    if (
+      !open ||
+      open.candidateVersion !== input.candidateVersion ||
+      open.candidateFingerprint !== input.candidateFingerprint
+    ) {
+      throw new IdentityError(
+        "STALE_DECISION",
+        "Owner decision is stale: the candidate set changed since this resolution was reviewed; re-propose and review the current candidates",
+      );
+    }
+    const business = bookingBusinessId(store, chosenBookingId);
+    requireScope(store, key, chosenBookingId, business, input.accounts);
+    const allowed: string[] = JSON.parse(open.candidateIdsJson) as string[];
+    if (allowed.length > 0 && !allowed.includes(chosenBookingId)) {
+      throw new IdentityError(
+        "INVALID_REQUEST",
+        `Chosen booking ${chosenBookingId} is not among the resolved v${open.candidateVersion} candidates`,
+      );
+    }
     const existing = getIdentityLink(store, input.sourceKey);
-    if (existing && existing.status === "active" && existing.bookingId === input.chosenBookingId) {
-      markDecisionResolved(store, open.id, input.chosenBookingId, input.decidedBy);
-      store.db.exec("COMMIT");
+    if (existing && existing.status === "active" && existing.bookingId === chosenBookingId) {
+      if (!resolveDecisionIfOpen(store, open.id, chosenBookingId, actor.id)) {
+        throw new IdentityError("STALE_DECISION", "Owner decision was already resolved by a concurrent writer");
+      }
       appendIdentityAudit(store, {
         sourceKey: input.sourceKey,
         action: "decision_resolved",
-        bookingId: input.chosenBookingId,
-        actor: input.decidedBy,
+        bookingId: chosenBookingId,
+        actor: actor.id,
         reason: `Owner confirmed existing v${open.candidateVersion}/${open.candidateFingerprint.slice(0, 12)} binding`,
       });
+      store.db.exec("COMMIT");
       const current = getIdentityLink(store, input.sourceKey);
       if (!current) throw new IdentityError("NOT_FOUND", "Identity link vanished during owner confirmation");
       return current;
     }
     if (existing) {
+      const correctsBooking = existing.bookingId !== chosenBookingId;
       store.db.prepare(
         `UPDATE booking_identity_links SET booking_id = $booking, business_id = $business, account_id = $account,
-          provider = $provider, origin = 'owner_resolution', status = 'active', updated_at = $at WHERE source_key = $key`,
+          provider = $provider, origin = 'owner_resolution', status = 'active',
+          provenance_mode = $mode, receipt_operation_key = $receipt, updated_at = $at WHERE source_key = $key`,
       ).run({
-        $booking: input.chosenBookingId,
+        $booking: chosenBookingId,
         $business: key.businessId,
         $account: key.accountId,
         $provider: key.provider,
+        // A different booking voids the prior provider receipt's proof: the
+        // receipt stays attributable to the old record in audit, never to B.
+        $mode: correctsBooking ? "owner" : existing.provenanceMode,
+        $receipt: correctsBooking ? null : existing.receiptOperationKey ?? null,
         $at: timestamp,
         $key: input.sourceKey,
       });
       appendIdentityAudit(store, {
         sourceKey: input.sourceKey,
         action: existing.status === "active" ? "correction" : "owner_link",
-        bookingId: input.chosenBookingId,
-        actor: input.decidedBy,
+        bookingId: chosenBookingId,
+        actor: actor.id,
         reason:
           existing.status === "active"
-            ? `Owner corrected binding ${existing.bookingId} -> ${input.chosenBookingId} at v${open.candidateVersion}/${open.candidateFingerprint.slice(0, 12)} (prior record preserved in audit)`
+            ? `Owner corrected binding ${existing.bookingId} -> ${chosenBookingId} at v${open.candidateVersion}/${open.candidateFingerprint.slice(0, 12)} (prior record preserved in audit${correctsBooking ? "; provider receipt cleared as obsolete" : ""})`
             : `Owner bound after unlink at v${open.candidateVersion}/${open.candidateFingerprint.slice(0, 12)} (prior record preserved in audit)`,
       });
     } else {
       store.db.prepare(
         `INSERT INTO booking_identity_links
           (source_key, booking_id, business_id, account_id, provider, origin, provenance_mode, receipt_operation_key, status, created_at, updated_at)
-         VALUES ($key, $booking, $business, $account, $provider, 'owner_resolution', 'demo', NULL, 'active', $at, $at)`,
+         VALUES ($key, $booking, $business, $account, $provider, 'owner_resolution', 'owner', NULL, 'active', $at, $at)`,
       ).run({
         $key: input.sourceKey,
-        $booking: input.chosenBookingId,
+        $booking: chosenBookingId,
         $business: key.businessId,
         $account: key.accountId,
         $provider: key.provider,
@@ -433,12 +556,14 @@ export function recordOwnerIdentityDecision(
       appendIdentityAudit(store, {
         sourceKey: input.sourceKey,
         action: "owner_link",
-        bookingId: input.chosenBookingId,
-        actor: input.decidedBy,
+        bookingId: chosenBookingId,
+        actor: actor.id,
         reason: `Owner bound at v${open.candidateVersion}/${open.candidateFingerprint.slice(0, 12)}`,
       });
     }
-    markDecisionResolved(store, open.id, input.chosenBookingId, input.decidedBy);
+    if (!resolveDecisionIfOpen(store, open.id, chosenBookingId, actor.id)) {
+      throw new IdentityError("STALE_DECISION", "Owner decision was already resolved by a concurrent writer");
+    }
     store.db.exec("COMMIT");
   } catch (error) {
     try {
@@ -456,49 +581,93 @@ export function recordOwnerIdentityDecision(
 /**
  * Remove (or correct) an active binding without destroying history: the row
  * flips to `unlinked` (or moves to the replacement booking) and every
- * transition stays in the audit log. A replacement must stay in scope.
+ * transition stays in the audit log.
+ *
+ * `expectedBookingId` is the reviewed-target guard: when present it must
+ * equal the currently bound booking, and it is REQUIRED whenever a
+ * `replacementBookingId` is given — an unrestricted replacement would
+ * bypass the reviewed link entirely. A correction to a different booking
+ * clears the obsolete provider receipt and records 'owner' provenance; the
+ * receipt that proved booking A never appears to prove booking B.
  */
 export function unlinkIdentityLink(
   store: GatherStore,
-  input: { sourceKey: string; actor: string; reason: string; replacementBookingId?: string },
+  input: {
+    sourceKey: string;
+    actor: IdentityOwnerActor;
+    reason: string;
+    expectedBookingId?: string;
+    replacementBookingId?: string;
+    accounts?: IdentityAccountRegistry;
+  },
 ): IdentityLinkRow {
   ensureBookingIdentityTables(store);
   let key: IdentityComponents;
   try {
-    key = decodeSourceKey(input.sourceKey);
+    key = decodeSourceKey(requireNonEmptyString("sourceKey", input.sourceKey));
   } catch {
     throw new IdentityError("INVALID_REQUEST", "Unlink requires a well-formed source key");
   }
-  if (!input.actor?.trim()) throw new IdentityError("INVALID_REQUEST", "Unlink requires an actor");
-  if (!input.reason?.trim()) throw new IdentityError("INVALID_REQUEST", "Unlink requires a reason");
-  const active = getActiveIdentityLink(store, input.sourceKey);
-  if (!active) throw new IdentityError("NOT_FOUND", "No active identity link for this source key");
-  const timestamp = new Date().toISOString();
+  const actor = requireOwnerActor(input.actor);
+  requireNonEmptyString("reason", input.reason);
+  if (input.expectedBookingId !== undefined) {
+    requireNonEmptyString("expectedBookingId", input.expectedBookingId);
+  }
   if (input.replacementBookingId !== undefined) {
-    const business = bookingBusinessId(store, input.replacementBookingId);
-    requireScope(store, key, input.replacementBookingId, business);
-    store.db.prepare(
-      `UPDATE booking_identity_links SET booking_id = $booking, origin = 'owner_resolution', updated_at = $at WHERE source_key = $key`,
-    ).run({ $booking: input.replacementBookingId, $at: timestamp, $key: input.sourceKey });
-    appendIdentityAudit(store, {
-      sourceKey: input.sourceKey,
-      action: "correction",
-      bookingId: input.replacementBookingId,
-      actor: input.actor,
-      reason: `${input.reason} (corrected ${active.bookingId} -> ${input.replacementBookingId}; prior binding preserved in audit)`,
-    });
-  } else {
-    store.db.prepare("UPDATE booking_identity_links SET status = 'unlinked', updated_at = $at WHERE source_key = $key").run({
-      $at: timestamp,
-      $key: input.sourceKey,
-    });
-    appendIdentityAudit(store, {
-      sourceKey: input.sourceKey,
-      action: "unlink",
-      bookingId: active.bookingId,
-      actor: input.actor,
-      reason: input.reason,
-    });
+    requireNonEmptyString("replacementBookingId", input.replacementBookingId);
+    if (input.expectedBookingId === undefined) {
+      throw new IdentityError(
+        "INVALID_REQUEST",
+        "A link correction must name the reviewed target: expectedBookingId is required with replacementBookingId",
+      );
+    }
+  }
+  const timestamp = new Date().toISOString();
+  store.db.exec("BEGIN IMMEDIATE");
+  try {
+    const active = getActiveIdentityLink(store, input.sourceKey);
+    if (!active) throw new IdentityError("NOT_FOUND", "No active identity link for this source key");
+    if (input.expectedBookingId !== undefined && input.expectedBookingId !== active.bookingId) {
+      throw new IdentityError(
+        "STALE_DECISION",
+        `Reviewed link is stale: expected target ${input.expectedBookingId} but the active binding is ${active.bookingId}; re-read and review the current link`,
+      );
+    }
+    if (input.replacementBookingId !== undefined) {
+      const business = bookingBusinessId(store, input.replacementBookingId);
+      requireScope(store, key, input.replacementBookingId, business, input.accounts);
+      store.db.prepare(
+        `UPDATE booking_identity_links SET booking_id = $booking, origin = 'owner_resolution',
+          provenance_mode = 'owner', receipt_operation_key = NULL, updated_at = $at WHERE source_key = $key`,
+      ).run({ $booking: input.replacementBookingId, $at: timestamp, $key: input.sourceKey });
+      appendIdentityAudit(store, {
+        sourceKey: input.sourceKey,
+        action: "correction",
+        bookingId: input.replacementBookingId,
+        actor: actor.id,
+        reason: `${input.reason} (corrected ${active.bookingId} -> ${input.replacementBookingId}; provider receipt cleared as obsolete, prior binding preserved in audit)`,
+      });
+    } else {
+      store.db.prepare("UPDATE booking_identity_links SET status = 'unlinked', updated_at = $at WHERE source_key = $key").run({
+        $at: timestamp,
+        $key: input.sourceKey,
+      });
+      appendIdentityAudit(store, {
+        sourceKey: input.sourceKey,
+        action: "unlink",
+        bookingId: active.bookingId,
+        actor: actor.id,
+        reason: input.reason,
+      });
+    }
+    store.db.exec("COMMIT");
+  } catch (error) {
+    try {
+      store.db.exec("ROLLBACK");
+    } catch {
+      // Already rolled back; surface the original failure.
+    }
+    throw error;
   }
   const current = getIdentityLink(store, input.sourceKey);
   if (!current) throw new IdentityError("NOT_FOUND", "Identity link vanished during unlink");

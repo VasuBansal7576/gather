@@ -7,7 +7,9 @@
  *
  * Trust summary: weak hints and untrusted message claims only ever produce
  * `needs_decision` candidates; only a host-verified provider-correlated
- * receipt or an explicit trusted owner decision can bind.
+ * receipt or an explicit host-server owner decision can bind. Every
+ * mutation commits link/decision/audit state in one transaction, and
+ * unknown accounts are denied unless a trusted host registry port vouches.
  */
 export {
   findCandidates,
@@ -19,10 +21,12 @@ export {
   buildSourceKey,
   decodeSourceKey,
   fingerprintCandidates,
+  type IdentityAccountRegistry,
   type IdentityCandidate,
   type IdentityComponents,
   type IdentityErrorCode,
   type IdentityHints,
+  type IdentityOwnerActor,
   type ProposeIdentityResult,
   type ProvenanceMode,
   type VerifiedReceipt,
@@ -36,6 +40,9 @@ export {
   getOpenIdentityDecision,
   listIdentityAudit,
   listIdentityDecisions,
+  markDecisionResolved,
+  openOrReuseIdentityDecision,
+  resolveDecisionIfOpen,
   type IdentityAuditRow,
   type IdentityDecisionRow,
   type IdentityLinkOrigin,
