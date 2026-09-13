@@ -112,6 +112,11 @@ export class GatherOpenClawRuntime {
     return this.mcpRef?.url ?? null;
   }
 
+  /** The boundary bearer token (this process's own secret; never logged). */
+  get mcpAuthToken(): string | null {
+    return this.mcpToken;
+  }
+
   /**
    * Ready-for-model gate for the live-model runner: reports whether an
    * explicit supported model selection is configured. Absent model fails

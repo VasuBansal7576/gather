@@ -5,12 +5,16 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { GatherStore } from "../sqlite-store.ts";
 import type { GatherRuntimeTasks } from "../../runtime/tasks.ts";
-import { GatherOpenClawRuntime } from "../../runtime/openclaw-runtime.ts";
+import {
+  GatherOpenClawRuntime,
+  type GatherOpenClawRuntimeOptions,
+  type GatherRuntimeDeps,
+} from "../../runtime/openclaw-runtime.ts";
 import type { GatherModelSelection } from "../../runtime/config.ts";
 import { ModelConfigError } from "../../runtime/config.ts";
 import type { ProviderConnectors } from "../provider-runtime/index.ts";
 import { GatherMcpBoundary } from "../../runtime/mcp.ts";
-import { createLiveMcpTools, type LiveMcpAuditEntry } from "./mcp-tools.ts";
+import { createLiveMcpTools, type LiveMcpAuditEntry, type LiveMcpScope } from "./mcp-tools.ts";
 import type {
   LiveRunInput,
   LiveRunRecord,
@@ -51,18 +55,30 @@ export interface LiveExecutionOptions {
   providers: ProviderConnectors;
   /** Explicit N-model selection (ids only, never credentials); absent means MODEL_UNCONFIGURED. */
   model?: GatherModelSelection;
-  /** Injected tasks channel (scripted in verification; live channel later). */
+  /** Injected tasks channel (scripted in verification; live uses the started runtime's own channel). */
   tasks?: GatherRuntimeTasks;
   recipient?: string;
   runTimeoutMs?: number;
   mcpPort?: number;
   now?: () => string;
+  /** Live-path runtime root (defaults to a task-scoped tmp dir). */
+  runtimeRootDir?: string;
+  /** Live-path gateway loopback port (0 = caller must supply a free one). */
+  gatewayPort?: number;
+  /** Lifecycle seams for scripted verification of the live path. */
+  runtimeDeps?: GatherRuntimeDeps;
+  /** Runtime construction seam (scripted verification captures the instance). */
+  runtimeFactory?: (
+    options: GatherOpenClawRuntimeOptions,
+    deps: GatherRuntimeDeps,
+  ) => GatherOpenClawRuntime;
 }
 
 export interface ScopedExecution {
   runtime: GatherOpenClawRuntime;
   runtimeStarted: boolean;
-  boundary: GatherMcpBoundary;
+  /** Standalone boundary — present only on the scripted path (live runs own the boundary inside the started runtime). */
+  boundary: GatherMcpBoundary | null;
   boundaryUrl: string;
   authToken: string;
   model: string;
@@ -129,27 +145,45 @@ function readPriorRun(store: GatherStore, businessId: string, idempotencyKey: st
 }
 
 /**
- * Start the executable host: gate the explicit model selection through N's
- * contract, construct (not spawn) the owned GatherOpenClawRuntime with the
- * run's MCP tools registered, and listen on loopback. The host owns close:
- * a started runtime is always reaped there — the runner never quits while
- * an owned runtime is unreaped.
+ * Start the executable host for a run.
+ *
+ * live=true: the owned GatherOpenClawRuntime is REALLY started — it
+ * provisions the isolated layout, listens the run's MCP tools on loopback,
+ * boots the gateway child, and connects with hello-ok; the model then
+ * drives the tools through the gateway's own MCP client. `runtimeStarted`
+ * is true and close() always reaps the started runtime.
+ *
+ * live=false (scripted verification): only a standalone loopback boundary
+ * is listened — no gateway child, no model — and a scripted planner drives
+ * the tools through a real MCP client.
  */
 export async function startScopedExecutionHost(input: {
   model?: GatherModelSelection;
   tools: ReturnType<typeof createLiveMcpTools>;
   mcpPort?: number;
   rootDir?: string;
+  gatewayPort?: number;
+  runtimeDeps?: GatherRuntimeDeps;
+  live?: boolean;
+  runtimeFactory?: (
+    options: GatherOpenClawRuntimeOptions,
+    deps: GatherRuntimeDeps,
+  ) => GatherOpenClawRuntime;
 }): Promise<ScopedExecution> {
-  const runtime = new GatherOpenClawRuntime({
-    rootDir: input.rootDir ?? join(tmpdir(), "gather-live-model-idle"),
-    // Construction only resolves layout (no bind/spawn until start); the
-    // port below is never bound on this path.
-    gatewayPort: 19411,
-    ...(input.model === undefined ? {} : { model: input.model }),
-    mcpTools: input.tools,
-    ...(input.mcpPort === undefined ? {} : { mcpPort: input.mcpPort }),
-  });
+  const live = input.live === true;
+  const construct = input.runtimeFactory ?? ((options, runtimeDeps) => new GatherOpenClawRuntime(options, runtimeDeps));
+  const runtime = construct(
+    {
+      rootDir: input.rootDir ?? join(tmpdir(), `gather-live-model-${live ? "run" : "idle"}-${randomUUID()}`),
+      // A live run needs a caller-assigned loopback port; the scripted path
+      // never binds the gateway port at all.
+      gatewayPort: input.gatewayPort ?? 19411,
+      ...(input.model === undefined ? {} : { model: input.model }),
+      mcpTools: input.tools,
+      ...(input.mcpPort === undefined ? {} : { mcpPort: input.mcpPort }),
+    },
+    input.runtimeDeps ?? {},
+  );
   let model: string;
   try {
     model = runtime.requireModelSelection().model;
@@ -159,20 +193,32 @@ export async function startScopedExecutionHost(input: {
     }
     throw error;
   }
+  if (live) {
+    await runtime.start();
+    return {
+      runtime,
+      runtimeStarted: true,
+      boundary: null,
+      boundaryUrl: runtime.mcpUrl ?? "",
+      authToken: runtime.mcpAuthToken ?? "",
+      model,
+      close: async () => {
+        await runtime.stop().catch(() => undefined);
+      },
+    };
+  }
   const authToken = randomBytes(24).toString("hex");
   const boundary = new GatherMcpBoundary({ tools: input.tools, authToken });
   const { url } = await boundary.listen({ port: input.mcpPort ?? 0 });
-  const runtimeStarted = false;
   return {
     runtime,
-    runtimeStarted,
+    runtimeStarted: false,
     boundary,
     boundaryUrl: url,
     authToken,
     model,
     close: async () => {
       await boundary.close().catch(() => undefined);
-      if (runtimeStarted) await runtime.stop().catch(() => undefined);
     },
   };
 }
@@ -228,6 +274,14 @@ function claimRun(
       throw new LiveModelError("INVALID_REQUEST", "idempotency key was already used for different designated inputs; a key names one exact journey");
     }
     if (prior.status === "continuing") {
+      // A continuing LIVE run may still be executing remotely under its
+      // gateway run id — resubmitting could start a duplicate remote run.
+      // Honest pending: hand back the persisted record untouched; scripted
+      // runs have no remote identity and resume in place.
+      if (prior.mode === "live") {
+        store.db.exec("ROLLBACK");
+        return { action: "return", record: prior };
+      }
       const resumed: LiveRunRecord = { ...prior, runId, status: "running", steps: [], startedAt, finishedAt: startedAt };
       writeLiveRun(store, resumed, key);
       store.db.exec("COMMIT");
@@ -245,11 +299,39 @@ function claimRun(
   }
 }
 
+/** Tool names as they appear in the durable audit -> LiveRunStep names. */
+const AUDIT_TO_STEP: Record<string, LiveRunStep["tool"]> = {
+  "gather.read_inquiry": "readInquiry",
+  "gather.read_venue_policy": "readVenuePolicy",
+  "gather.check_availability": "checkAvailability",
+  "gather.prepare_proposal": "prepareProposal",
+};
+
 /**
- * Execute one designated journey with the model (or its scripted planner
- * stand-in) calling the registered MCP tools over loopback HTTP. Source
- * identity stays server-side; the run record + tool-call audit persist
- * durably; timeouts preserve the continuing run id without duplicates.
+ * The instruction submitted to the isolated agent run. It names the exact
+ * tool order and hard boundaries — identity, sources, recipient, and price
+ * are all bound server-side inside the tool handlers, so the model can
+ * never forge them.
+ */
+const LIVE_RUN_INSTRUCTION = [
+  "You are preparing a booking proposal inside Gather for one venue inquiry.",
+  "Call the Gather tools in exactly this order:",
+  "1. gather.read_inquiry — read the designated inquiry thread (no arguments).",
+  "2. gather.read_venue_policy — read the designated venue-policy file (no arguments).",
+  "3. gather.check_availability — check the exact slot the inquiry requests (startAt/endAt ISO timestamps from the inquiry).",
+  "4. gather.prepare_proposal — prepare the proposal with the attested slot, the guest count from the inquiry, and brief notes.",
+  "Rules: use ONLY these four tools; never invent sources, prices, or recipients — they are bound server-side. You have no approval, send, or receipt authority — never claim any. If a tool returns an error, stop and report it instead of retrying with changed arguments.",
+].join("\n");
+
+/**
+ * Execute one designated journey. LIVE runs start the owned
+ * GatherOpenClawRuntime (gateway child + run-scoped MCP boundary + hello-ok
+ * connection), submit the instruction through runtime.tasks, and wait on
+ * the real run id — the model itself calls the tools through the gateway.
+ * Scripted verification keeps the injected-planner loop over a standalone
+ * loopback boundary. Source identity stays server-side either way; the run
+ * record + tool-call audit persist durably; timeouts preserve the
+ * continuing run id without duplicates.
  */
 export async function runLiveExecution(
   input: LiveRunInput & { runTimeoutMs?: number; gatewayIdempotencyKey?: string },
@@ -263,14 +345,13 @@ export async function runLiveExecution(
   const startedAt = nowIso(deps);
   const claimed = claimRun(deps.store, input, runId, startedAt);
   if (claimed.action === "return") return claimed.record;
-  if (!deps.planner) {
+  const execution = deps.execution ?? (input.mode === "scripted" ? "simulated" : "live");
+  if (execution === "simulated" && !deps.planner) {
     throw new LiveModelError(
       "MODEL_UNCONFIGURED",
-      "no tool-calling driver is wired: live model driving arrives with the authorized path (I, pending); scripted verification injects a planner explicitly",
+      "scripted verification requires an explicit planner; live runs are driven by the model through runtime.tasks",
     );
   }
-  const planner = deps.planner;
-  const execution = deps.execution ?? (input.mode === "scripted" ? "simulated" : "live");
   const steps: LiveRunStep[] = [];
   let accountId = "";
   const persistAudit = (entry: LiveMcpAuditEntry): void => {
@@ -278,11 +359,13 @@ export async function runLiveExecution(
       .prepare("INSERT INTO live_model_tool_calls (run_id, tool, at, ok, error) VALUES ($r, $t, $at, $ok, $e)")
       .run({ $r: runId, $t: entry.tool, $at: entry.at, $ok: entry.ok ? 1 : 0, $e: entry.error ?? null });
   };
+  let gatewayRunId: string | undefined;
   const finish = (status: LiveRunRecord["status"], proposal?: PreparedProposal, error?: string): LiveRunRecord => {
     const record: LiveRunRecord = {
       runId,
       businessId: input.businessId,
       accountId,
+      ...(gatewayRunId === undefined ? {} : { gatewayRunId }),
       designation: designationOf(input),
       mode: input.mode,
       simulated: execution === "simulated",
@@ -328,6 +411,7 @@ export async function runLiveExecution(
     const recipient = deps.recipient ?? CONTROLLED_TEST_RECIPIENT;
     if (!recipient.trim()) throw new LiveModelError("INVALID_REQUEST", "a server-side controlled recipient is required");
 
+    const runState: LiveMcpScope["state"] = {};
     const tools = createLiveMcpTools({
       store: deps.store,
       businessId: input.businessId,
@@ -343,8 +427,74 @@ export async function runLiveExecution(
       execution,
       ...(deps.now === undefined ? {} : { now: deps.now }),
       audit: persistAudit,
-      state: {},
+      state: runState,
     });
+
+    if (execution === "live") {
+      // REAL path: the runtime boots the isolated gateway, listens the
+      // run's tools on its own MCP boundary, and connects via hello-ok; the
+      // instruction goes through runtime.tasks and the MODEL calls the
+      // tools — this runner never plans or calls a tool itself.
+      scoped = await startScopedExecutionHost({
+        model: deps.model,
+        tools,
+        live: true,
+        ...(deps.runtimeRootDir === undefined ? {} : { rootDir: deps.runtimeRootDir }),
+        ...(deps.gatewayPort === undefined ? {} : { gatewayPort: deps.gatewayPort }),
+        ...(deps.mcpPort === undefined ? {} : { mcpPort: deps.mcpPort }),
+        ...(deps.runtimeDeps === undefined ? {} : { runtimeDeps: deps.runtimeDeps }),
+        ...(deps.runtimeFactory === undefined ? {} : { runtimeFactory: deps.runtimeFactory }),
+      });
+      const tasks = deps.tasks ?? scoped.runtime.tasks;
+      const submitted = await tasks.submitTask({
+        bookingId: `live-model:${input.businessId}:${runId}`,
+        message: LIVE_RUN_INSTRUCTION,
+        idempotencyKey: input.gatewayIdempotencyKey ?? input.idempotencyKey ?? `live-model:${runId}`,
+        label: `gather:live-model:${input.businessId}`,
+        ...(input.runTimeoutMs === undefined ? {} : { runTimeoutMs: input.runTimeoutMs }),
+      });
+      gatewayRunId = submitted.runId;
+      const deadline = input.runTimeoutMs !== undefined || deps.runTimeoutMs !== undefined
+        ? Date.now() + (input.runTimeoutMs ?? deps.runTimeoutMs ?? 0)
+        : undefined;
+      // Wait on the real run identity until terminal or the budget expires.
+      // A wait timeout is wait-only: the remote run may continue, so the
+      // record stays "continuing" under its run id, never re-submitted.
+      for (;;) {
+        const remaining = deadline === undefined ? 30000 : deadline - Date.now();
+        if (remaining <= 0) {
+          return finish(
+            "continuing",
+            runState.proposal,
+            `run wait budget expired; gateway run ${submitted.runId} may still be executing — resume under the same idempotency key`,
+          );
+        }
+        const wait = await tasks.waitForRun({ runId: submitted.runId, timeoutMs: Math.min(remaining, 30000) });
+        if (wait.status === "error") {
+          return finish("error", runState.proposal, `gateway run ${submitted.runId} failed: ${wait.error ?? wait.stopReason ?? "unknown"}`);
+        }
+        if (wait.status === "ok") break;
+        if (deadline === undefined) {
+          return finish("continuing", runState.proposal, `gateway wait ${wait.status}; run continues under ${runId} (gateway run ${submitted.runId})`);
+        }
+      }
+      // Read back SERVER-SIDE results only: the durable tool audit and the
+      // proposal the tool handler persisted — never the model's narration.
+      for (const entry of listToolCalls(deps.store, runId)) {
+        steps.push({
+          tool: AUDIT_TO_STEP[entry.tool] ?? (entry.tool as LiveRunStep["tool"]),
+          ok: entry.ok,
+          at: entry.at,
+          ...(entry.error === undefined ? {} : { error: entry.error }),
+        });
+      }
+      if (!runState.proposal) {
+        throw new LiveModelError("TOOL_FAILURE", `model run ${submitted.runId} finished without preparing a proposal`);
+      }
+      return finish("ok", runState.proposal);
+    }
+
+    const planner = deps.planner!;
     scoped = await startScopedExecutionHost({ model: deps.model, tools });
 
     const transport = new StreamableHTTPClientTransport(new URL(scoped.boundaryUrl), {
@@ -361,7 +511,6 @@ export async function runLiveExecution(
     // Run lifecycle on the tasks channel when injected: announce the run
     // session, then wait it out at the end. Gateway idempotency is stable
     // per caller key, so retries never duplicate the provider run.
-    let gatewayRunId: string | undefined;
     if (deps.tasks) {
       const submitted = await deps.tasks.submitTask({
         bookingId: `live-model:${input.businessId}:${runId}`,
@@ -462,6 +611,7 @@ export async function runLiveExecution(
       runId,
       businessId: input.businessId,
       accountId,
+      ...(gatewayRunId === undefined ? {} : { gatewayRunId }),
       designation: designationOf(input),
       mode: input.mode,
       simulated: execution === "simulated",
