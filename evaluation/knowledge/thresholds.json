@@ -36,7 +36,7 @@
     },
     "abstentionIntegrity": {
       "threshold": 0,
-      "rule": "zero responses with abstained:true that still supply assertions"
+      "rule": "zero responses with abstained:true that still supply assertions, and zero mustAbstain questions answered instead of abstained (even with zero assertions)"
     },
     "inputValidity": {
       "threshold": 0,
@@ -47,5 +47,5 @@
     }
   },
   "status": "provisional local evaluation thresholds, not a production guarantee. Set before any provider scoring run.",
-  "amended": "2026-09-14: added structured-value, coverage, abstention, deletion, version, linking, and input gates; predeclared 2026-09-14 thresholds unchanged"
+  "amended": "2026-09-14: added structured-value, coverage, abstention, deletion, version, linking, and input gates; predeclared 2026-09-14 thresholds unchanged. 2026-09-14 fix: required-abstention violations count into abstentionIntegrity (threshold still 0) and missing abstained/assertions fields are input errors; no numeric threshold changed"
 }
