@@ -94,6 +94,8 @@ function receiptOf(execution: ExecutionDTO, timezone: string | undefined): Actio
     id: execution.id,
     actionId: execution.proposedActionId,
     executionId: execution.id,
+    proposalVersion: execution.proposalVersion,
+    step,
     label: STEP_LABEL[step],
     status: execution.status as ActionReceipt["status"],
     timestamp: formatTimestamp(execution.completedAt ?? execution.reconciledAt ?? execution.startedAt, timezone),

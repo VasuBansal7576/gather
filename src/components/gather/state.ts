@@ -32,6 +32,26 @@ export function isApprovalInFlight(
 }
 
 /**
+ * Whether the exact displayed proposal version has fully executed — every
+ * receipt scoped to this action id + version succeeded. Only then does the
+ * approve control show a completed state; a newer proposal (new action id or
+ * version) has no scoped receipts and stays approvable, while failed,
+ * partial, or uncertain receipts keep their recovery paths instead of
+ * reading as "approved".
+ */
+export function proposalApprovalComplete(
+  proposal: Pick<Proposal, 'id' | 'version'>,
+  receipts: readonly ActionReceipt[] | undefined,
+): boolean {
+  const scoped = (receipts ?? []).filter(
+    (receipt) =>
+      receipt.actionId === proposal.id &&
+      (receipt.proposalVersion === undefined || receipt.proposalVersion === proposal.version),
+  );
+  return scoped.length > 0 && scoped.every((receipt) => receipt.status === 'succeeded');
+}
+
+/**
  * Recovery routing for a receipt. `uncertain` always reconciles first — an
  * explicit `recovery: 'retry'` declaration cannot skip verifying whether the
  * execution already applied. For other statuses an explicit declaration wins;
