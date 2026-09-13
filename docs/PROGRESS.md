@@ -169,6 +169,12 @@ Subsequent screenshot and browser commands timed out or lost their connection, s
 The task-owned browser tab and server were closed and its disposable database removed.
 No actual OAuth exchange or connected-account outcome is claimed.
 
+Astra subsequently completed a rendered retry on the production build at `f3b7894`: explicit demo setup reached the workspace, Today opened a booking, and approval produced separate simulated hold and email receipts while keeping the booking provisional.
+The initial retry lost its HTTP server; restarting the task-owned server in a persistent terminal allowed the journey to complete.
+At 390×844, the page width remained 390 pixels and the approval control stayed inside the viewport; desktop verification used 1586×992.
+This accepts the combined rendered simulated setup-to-approval journey, while a new screenshot comparison and actual provider outcomes remain unverified.
+The task-owned browser tab and server were closed and the disposable database was removed.
+
 Consistent local backup and restore-to-new-database were integrated at `bf73f3e` from `03cafd4` after independent review, 13 focused tests and type checking passed.
 Regression checks cover concurrent destination creation, competing publishers, foreign staging files, invalid database markers, and committed SQLite WAL rows surviving restore.
 Publication refuses an existing destination atomically; restore creates a new database and does not replace the current one.
