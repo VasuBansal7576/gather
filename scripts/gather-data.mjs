@@ -8,24 +8,27 @@
  * Source defaults to GATHER_DATABASE_PATH (else data/gather.sqlite, relative
  * to the repo root). Backup takes a consistent snapshot of a live database
  * with VACUUM INTO from a read-only connection (captures committed WAL
- * content without touching the source), verifies integrity, and publishes
- * atomically to an exclusive new destination. Restore validates a snapshot
- * and copies it to an exclusive new destination only: it never deletes,
- * replaces, or live-patches the original or current database. Selecting the
- * restored file (GATHER_DATABASE_PATH) is an explicit owner step performed
- * with the launcher stopped. No row contents are ever printed.
+ * content without touching the source), verifies integrity and the Gather
+ * marker, and publishes atomically to an exclusive new destination via a
+ * same-directory hard link (link-then-unlink-own-stage: a concurrent file
+ * can never be overwritten). Restore validates a snapshot, re-snapshots it
+ * consistently through VACUUM INTO (so uncheckpointed WAL rows are
+ * preserved, never silently dropped), and publishes the same atomic way to
+ * an exclusive new destination only: it never deletes, replaces, or
+ * live-patches the original or current database. Selecting the restored
+ * file (GATHER_DATABASE_PATH) is an explicit owner step performed with the
+ * launcher stopped. No row contents are ever printed.
  */
 import {
   chmodSync,
-  copyFileSync,
   existsSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   openSync,
   closeSync,
-  readFileSync,
+  readSync,
   realpathSync,
-  renameSync,
   unlinkSync,
 } from "node:fs";
 import { createHash } from "node:crypto";
@@ -100,7 +103,20 @@ function requireSameFile(a, b, what) {
 }
 
 function sha256File(path) {
-  return createHash("sha256").update(readFileSync(path)).digest("hex");
+  // Bounded-memory digest: fixed 1 MiB window, never the whole file at once.
+  const hash = createHash("sha256");
+  const fd = openSync(path, "r");
+  try {
+    const window = Buffer.alloc(1024 * 1024);
+    for (;;) {
+      const n = readSync(fd, window, 0, window.length, null);
+      if (n === 0) break;
+      hash.update(window.subarray(0, n));
+    }
+  } finally {
+    closeSync(fd);
+  }
+  return hash.digest("hex");
 }
 
 function openReadOnly(path, what) {
@@ -133,12 +149,66 @@ function tableCount(db, table) {
   return db.prepare(`SELECT COUNT(*) AS n FROM "${table.replace(/"/g, '""')}"`).get().n;
 }
 
-/** Remove our own temp file; never anything else. Originals stay intact. */
-function discardTemp(path) {
+/**
+ * Honest Gather marker on both paths: a real SQLite file is not enough —
+ * the stable root table `businesses` must exist. This is a sanity marker,
+ * not a version gate (see docs/DATA_RECOVERY.md for compatibility limits).
+ */
+function requireGatherMarker(db, what) {
+  if (!tableNames(db).includes("businesses")) {
+    abort(`${what} is a valid SQLite file but not a Gather database (no businesses table)`);
+  }
+}
+
+/**
+ * Consistent snapshot into an exclusively created staging file: reads the
+ * source read-only (committed WAL content included), writes every table
+ * with no enumeration or schema assumptions, and never locks the source
+ * for writing. The staging file is created mode 0600 BEFORE any data
+ * lands (VACUUM INTO fills the pre-created file in place).
+ */
+function vacuumIntoStage(srcPath, tmp, what) {
+  const src = openReadOnly(srcPath, what);
+  try {
+    src.exec(`VACUUM INTO '${tmp.replace(/'/g, "''")}'`);
+  } finally {
+    src.close();
+  }
+}
+
+/**
+ * Remove a staging file ONLY when this run created it exclusively.
+ * Pre-existing files (including another process's stage) are never
+ * removed: callers pass staged=true solely after their own `wx` open.
+ */
+function discardOwnedTemp(staged, path) {
+  if (!staged) return;
   try {
     unlinkSync(path);
   } catch {
-    // Already gone or never created; nothing else may be removed.
+    // Already gone; nothing else may be removed.
+  }
+}
+
+/**
+ * Genuinely atomic, exclusive publication. The staging file lives in the
+ * destination directory (same filesystem by construction) and is linked to
+ * the final name: link(2) either creates the destination atomically or
+ * fails with EEXIST when another process won the race — it can never
+ * silently overwrite. Only our own staging name is unlinked afterwards.
+ */
+function publishStage(tmp, absDest, what) {
+  try {
+    linkSync(tmp, absDest);
+  } catch (error) {
+    if (error.code === "EEXIST") abort(`${what} already exists (refusing to overwrite): ${absDest}`);
+    abort(`cannot publish ${what} ${absDest}: ${error.message}`);
+  }
+  try {
+    unlinkSync(tmp);
+  } catch {
+    // Destination holds the data; a leftover staging name is reported by
+    // leaving it in place rather than touching anything else.
   }
 }
 
@@ -161,29 +231,33 @@ function doBackup(dbPath, destPath) {
   requireAbsent(tmp, "backup staging file");
   const stage = openSync(tmp, "wx", RESTRICTED_MODE);
   closeSync(stage);
+  const staged = true;
   try {
-    // Read-only hot snapshot: consistent committed contents including WAL,
-    // every table (no table enumeration, no schema assumptions), source
-    // untouched and never locked for writing.
-    const src = openReadOnly(absSrc, "backup source");
+    // Marker first on the live source: refuse non-Gather databases before
+    // doing any staging work.
+    const probe = openReadOnly(absSrc, "backup source");
     try {
-      src.exec(`VACUUM INTO '${tmp.replace(/'/g, "''")}'`);
+      integrityOk(probe, "backup source");
+      requireGatherMarker(probe, "backup source");
     } finally {
-      src.close();
+      probe.close();
     }
+    vacuumIntoStage(absSrc, tmp, "backup source");
     const check = openReadOnly(tmp, "backup staging copy");
+    let tablesLine;
     try {
       integrityOk(check, "backup staging copy");
+      requireGatherMarker(check, "backup staging copy");
       const tables = tableNames(check);
-      const counts = tables.map((t) => `${t}=${tableCount(check, t)}`).join(" ");
+      tablesLine = `tables=${tables.length} ${tables.map((t) => `${t}=${tableCount(check, t)}`).join(" ")}`;
       chmodSync(tmp, RESTRICTED_MODE);
-      renameSync(tmp, absDest);
-      process.stdout.write(`backup ok dest=${absDest} sha256=${sha256File(absDest)} tables=${tables.length} ${counts}\n`);
     } finally {
       check.close();
     }
+    publishStage(tmp, absDest, "backup destination");
+    process.stdout.write(`backup ok dest=${absDest} sha256=${sha256File(absDest)} ${tablesLine}\n`);
   } catch (error) {
-    discardTemp(tmp);
+    discardOwnedTemp(staged, tmp);
     if (error instanceof DataError) fail(`backup failed (source left intact): ${error.message}`);
     throw error;
   }
@@ -207,33 +281,36 @@ function doRestore(snapshotPath, destPath) {
 
   const tmp = `${absDest}.partial-${process.pid}`;
   requireAbsent(tmp, "restore staging file");
+  const stage = openSync(tmp, "wx", RESTRICTED_MODE);
+  closeSync(stage);
+  const staged = true;
   try {
-    // Validate before copying: real SQLite, integrity ok, Gather marker.
+    // Validate before snapshotting: real SQLite, integrity ok, Gather marker.
     // The marker is the stable root table `businesses`, not a version gate:
     // see docs/DATA_RECOVERY.md for compatibility limits.
-    const snap = openReadOnly(absSnap, "restore snapshot");
+    const probe = openReadOnly(absSnap, "restore snapshot");
     try {
-      integrityOk(snap, "restore snapshot");
-      if (!tableNames(snap).includes("businesses")) {
-        abort("restore snapshot is a valid SQLite file but not a Gather database (no businesses table)");
-      }
+      integrityOk(probe, "restore snapshot");
+      requireGatherMarker(probe, "restore snapshot");
     } finally {
-      snap.close();
+      probe.close();
     }
-    const stage = openSync(tmp, "wx", RESTRICTED_MODE);
-    closeSync(stage);
-    copyFileSync(absSnap, tmp);
+    // Consistent snapshot for restore too: VACUUM INTO reads committed
+    // contents including WAL sidecars, so a snapshot with uncheckpointed
+    // WAL can never silently restore older main-file-only content.
+    vacuumIntoStage(absSnap, tmp, "restore snapshot");
     chmodSync(tmp, RESTRICTED_MODE);
     const check = openReadOnly(tmp, "restore staging copy");
     try {
       integrityOk(check, "restore staging copy");
-      renameSync(tmp, absDest);
-      process.stdout.write(`restore ok dest=${absDest} sha256=${sha256File(absDest)}\n`);
+      requireGatherMarker(check, "restore staging copy");
     } finally {
       check.close();
     }
+    publishStage(tmp, absDest, "restore destination");
+    process.stdout.write(`restore ok dest=${absDest} sha256=${sha256File(absDest)}\n`);
   } catch (error) {
-    discardTemp(tmp);
+    discardOwnedTemp(staged, tmp);
     if (error instanceof DataError) fail(`restore failed (originals left intact): ${error.message}`);
     throw error;
   }
