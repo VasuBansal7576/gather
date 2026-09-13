@@ -55,7 +55,17 @@ try {
     parentPort?.postMessage({ ok: false, error: `unknown op ${op}` });
   }
 } catch (error) {
-  parentPort?.postMessage({ ok: false, error: error instanceof Error ? `${error.name}:${error.message}`.slice(0, 200) : String(error).slice(0, 200) });
+  // Propagate the machine-readable code alongside the message so tests can
+  // assert exact typed outcomes (e.g. stale_version) instead of matching
+  // message substrings — a raw lock leak surfaces here as an absent code.
+  const code = typeof (error as { code?: unknown }).code === "string"
+    ? (error as { code: string }).code
+    : undefined;
+  parentPort?.postMessage({
+    ok: false,
+    ...(code === undefined ? {} : { code }),
+    error: error instanceof Error ? `${error.name}:${error.message}`.slice(0, 200) : String(error).slice(0, 200),
+  });
 } finally {
   store.close();
 }

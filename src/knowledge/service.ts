@@ -108,6 +108,36 @@ function backoffSleep(attempt: number): void {
 }
 
 /**
+ * Bounded lock-busy retry for single idempotent writes that execute OUTSIDE
+ * `transact` — notably the post-rollback `recordDecision` audit inserts on
+ * rejection paths. Those inserts race the winner's still-open write
+ * transaction under true cross-connection concurrency; without a retry the
+ * raw SQLITE_BUSY ("database is locked") escapes and masquerades as the
+ * operation outcome (observed: stale losers reporting `Error:database is
+ * locked` from `recordDecision` instead of `stale_version`). Only lock
+ * contention is retried; anything else propagates immediately. When retries
+ * are exhausted a KnowledgeError("busy") names the honest outcome: retry the
+ * whole command. Callers must pass idempotent operations only (INSERT OR
+ * IGNORE, idempotent DDL) — never external effects.
+ */
+export function runWithBusyRetry<T>(operation: () => T, maxAttempts: number = MAX_TXN_ATTEMPTS): T {
+  let attempt = 0;
+  for (;;) {
+    try {
+      return operation();
+    } catch (error) {
+      if (isBusyError(error) && attempt < maxAttempts) {
+        attempt += 1;
+        backoffSleep(attempt);
+        continue;
+      }
+      if (isBusyError(error)) throw new KnowledgeError("busy", "knowledge store is busy; retry the command");
+      throw error;
+    }
+  }
+}
+
+/**
  * Rebuild the typed rejection a recorded decision row describes. Rejected
  * replays throw this instead of casting the audit detail into a successful
  * result with absent fact/revision rows. Rows written by older versions
@@ -271,13 +301,19 @@ export class KnowledgeService {
     // the account-blind active-revision uniqueness with the account-scoped
     // one (the old index would otherwise forbid two accounts holding the
     // same key). Legacy rows read back as account ''.
-    this.ensureColumn("knowledge_candidates", "account_id", "TEXT NOT NULL DEFAULT ''");
-    this.ensureColumn("knowledge_revisions", "account_id", "TEXT NOT NULL DEFAULT ''");
-    this.store.db.exec("DROP INDEX IF EXISTS idx_knowledge_active_revision");
-    this.store.db.exec(`
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_active_revision_account
-        ON knowledge_revisions(business_id, account_id, key, subject_id, scope, COALESCE(scope_id, ''))
-        WHERE status = 'active'`);
+    // Runs inside transact (bounded busy retries): concurrent first-start
+    // constructors otherwise race this DDL outside any retry and surface
+    // raw "database is locked" from migration instead of from test logic.
+    // Every statement here is idempotent, so full retries are safe.
+    this.transact(() => {
+      this.ensureColumn("knowledge_candidates", "account_id", "TEXT NOT NULL DEFAULT ''");
+      this.ensureColumn("knowledge_revisions", "account_id", "TEXT NOT NULL DEFAULT ''");
+      this.store.db.exec("DROP INDEX IF EXISTS idx_knowledge_active_revision");
+      this.store.db.exec(`
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_active_revision_account
+          ON knowledge_revisions(business_id, account_id, key, subject_id, scope, COALESCE(scope_id, ''))
+          WHERE status = 'active'`);
+    });
   }
 
   /**
@@ -1492,14 +1528,20 @@ export class KnowledgeService {
     detail: Record<string, unknown>,
   ): void {
     const commandId = input.commandId ?? `kd_${createHash("sha256").update(canonical({ kind, ...detail, at: randomUUID() })).digest("hex").slice(0, 24)}`;
-    this.store.db.prepare(
-      `INSERT OR IGNORE INTO knowledge_decisions
-        (command_id, kind, business_id, actor_kind, actor_id, outcome, detail_json, created_at)
-       VALUES ($id, $kind, $businessId, $actorKind, $actorId, $outcome, $detail, $createdAt)`,
-    ).run({
-      $id: commandId, $kind: kind, $businessId: input.businessId,
-      $actorKind: input.actor.kind, $actorId: input.actor.id,
-      $outcome: outcome, $detail: JSON.stringify(detail), $createdAt: now(),
+    // INSERT OR IGNORE is idempotent, so bounded busy retries are safe here.
+    // This insert runs both inside transact (applied paths) and outside it
+    // (post-rollback rejection audits); the latter race a concurrent
+    // winner's write transaction and must not leak raw SQLITE_BUSY.
+    runWithBusyRetry(() => {
+      this.store.db.prepare(
+        `INSERT OR IGNORE INTO knowledge_decisions
+          (command_id, kind, business_id, actor_kind, actor_id, outcome, detail_json, created_at)
+         VALUES ($id, $kind, $businessId, $actorKind, $actorId, $outcome, $detail, $createdAt)`,
+      ).run({
+        $id: commandId, $kind: kind, $businessId: input.businessId,
+        $actorKind: input.actor.kind, $actorId: input.actor.id,
+        $outcome: outcome, $detail: JSON.stringify(detail), $createdAt: now(),
+      });
     });
   }
 

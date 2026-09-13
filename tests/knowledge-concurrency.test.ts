@@ -28,6 +28,8 @@ interface WorkerOutcome {
   revision?: number;
   alreadyConfirmed?: boolean;
   duplicate?: boolean;
+  /** Machine-readable error code (absent when a raw lock error leaks). */
+  code?: string;
   error?: string;
 }
 
@@ -134,9 +136,54 @@ test("concurrent correction with one expected version applies once; losers go st
     assert.equal(applied.length, 1, `expected exactly one applied correction, got ${JSON.stringify(outcomes)}`);
     for (const loser of outcomes.filter((o) => !o.ok)) {
       assert.match(loser.error ?? "", /stale correction|stale_version|stale/, `loser must be stale-version, got ${loser.error}`);
+      // Exact typed code: a raw "database is locked" leaking from the
+      // rejection audit carries no code, so this pins the audit boundary.
+      assert.equal(loser.code, "stale_version", `loser must carry the typed stale_version code, got code=${loser.code} error=${loser.error}`);
     }
     const rejected = new KnowledgeService(verify).listDecisions(businessId).filter((d) => d.outcome === "rejected");
     assert.ok(rejected.some((d) => JSON.stringify(d.detail).includes("stale_version")), "stale losers must be audited");
+  } finally {
+    verify.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("concurrent all-stale corrections audit every loser without lock leakage", async () => {
+  // Every worker expects a revision that can never be live, so ALL of them
+  // take the post-rollback rejection-audit path at once — the exact boundary
+  // that leaked `Error:database is locked` (service.ts recordDecision,
+  // reached from the correctFact stale_version handler). Assertions are
+  // exact and deterministic: typed codes plus durable audit rows, no sleeps.
+  const directory = mkdtempSync(join(tmpdir(), "gather-kb-conc-"));
+  const path = join(directory, "k.sqlite");
+  const setup = new GatherStore(path);
+  const service = new KnowledgeService(setup);
+  const businessId = setup.createBusiness({ name: "Fictional Hall", timezone: "UTC" }).id;
+  const candidate = service.intakeCandidate({
+    businessId, key: "space", subjectId: "room-race", value: spaceValue("R"),
+    confidence: "probable", sourceReferences: [DOC],
+  });
+  service.confirmCandidate({ businessId, actor: OWNER, candidateId: candidate.id });
+  setup.close();
+  const payload = {
+    businessId, actor: OWNER, key: "space", subjectId: "room-race", expectedRevision: 999,
+    value: spaceValue("R2"), sourceReferences: [DOC],
+  };
+  const outcomes = await fanOut(path, Array.from({ length: 6 }, () => ({ op: "correct", payload })));
+  const verify = new GatherStore(path);
+  try {
+    assert.equal(outcomes.filter((o) => o.ok).length, 0, `no impossible revision may apply, got ${JSON.stringify(outcomes)}`);
+    for (const loser of outcomes) {
+      assert.equal(loser.code, "stale_version", `every loser must carry stale_version, got code=${loser.code} error=${loser.error}`);
+    }
+    const rejected = new KnowledgeService(verify).listDecisions(businessId).filter((d) => d.outcome === "rejected");
+    assert.equal(rejected.length, 6, `every loser must be audited, got ${rejected.length}: ${JSON.stringify(outcomes)}`);
+    for (const decision of rejected) {
+      assert.equal((decision.detail as { reason?: string }).reason, "stale_version");
+    }
+    const active = verify.db.prepare("SELECT revision FROM knowledge_revisions WHERE status = 'active'").all() as { revision: number }[];
+    assert.equal(active.length, 1);
+    assert.equal(active[0]?.revision, 1, "failed corrections must not advance the revision");
   } finally {
     verify.close();
     rmSync(directory, { recursive: true, force: true });
