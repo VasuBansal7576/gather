@@ -14,8 +14,8 @@ The demo connectors and fixture workspace remain explicitly simulated and are no
 
 This checklist has a fixed total of 17 gates.
 
-Fourteen gates were accepted on the combined 343-test run and production build at `cb913a9`.
-The newer setup integration at `8b35a2d` passes its production build but only 380 of 381 combined tests, so its aggregate test gate remains open.
+Fourteen gates are accepted on the combined 425-test run and production build at `fd6c76b`.
+The preceding setup integration at `8b35a2d` passed its production build but only 380 of 381 combined tests; that failed run remains recorded below.
 The recurring isolated Gateway startup timeout remains an open reliability issue despite the passing rerun.
 This count describes the local application milestone only, not completion of the product requirements in [PRD.md](PRD.md).
 
@@ -27,7 +27,7 @@ This count describes the local application milestone only, not completion of the
 - [x] Connector fixtures cover provenance, unavailable dates, idempotency, and timeout reconciliation.
 - [x] Local launcher and doctor scripts are present and do not install packages or touch external runtimes.
 - [x] `npm ci` completes without credentials or network provider setup.
-- [x] Storage, connector, approval, recovery, offers, runtime, Google scope, and owner-state checks pass together in the 343-test run on `cb913a9`.
+- [x] Storage, connector, approval, recovery, offers, runtime, Google scope, owner-state, setup, backup and inquiry-capture checks pass together in the 425-test run on `fd6c76b`.
   The preceding `dc07d55` run passed 330/331 with the isolated Gateway handshake timeout described below; this failure remains recorded.
 - [x] `npm run typecheck` passes.
 - [x] `npm run build` passes.
@@ -111,12 +111,13 @@ No credentials, personal OpenClaw configuration or data, provider actions, custo
 
 ## Workspace cleanup and dependency findings
 
-Eighteen completed review, failed-launch, runtime, dependency-maintenance, knowledge, delivery-evaluator, owner-workspace, setup, connection-service, and inherited milestone worktrees were removed after checking clean tracked state and active worker ownership.
+Nineteen completed review, failed-launch, runtime, dependency-maintenance, knowledge, delivery-evaluator, owner-workspace, setup, connection-service, backup, and inherited milestone worktrees were removed after checking clean tracked state and active worker ownership.
 Original foundation, interface, connector-contract, and packaging commits remain preserved by local branch references; integrated review commits remain reachable on remote main.
 The completed knowledge commit is additionally preserved at `archive/gather-business-knowledge-640f57b`; its successor worker uses a separate business-operator worktree.
 The completed delivery evaluator is preserved at `archive/gather-delivery-readiness-e626000`; its successor uses a separate booking-delivery worktree.
 The completed owner workspace is preserved at `archive/gather-owner-host-fbafe11`; its worker now independently reviews the confirmation service.
 The setup UI, setup integration review, and connection service are preserved at `archive/gather-setup-ui-57e2518`, `archive/gather-setup-integration-9d65478`, and `archive/gather-connections-db6815f`.
+The completed backup implementation is preserved at `archive/gather-data-recovery-03cafd4`.
 Active execution worktrees and unrelated work were preserved.
 
 Dependency remediation `64bb96e` was integrated as `1fbbb754` after compatibility review.
@@ -160,7 +161,10 @@ The connection service passed 23 focused tests and type checking independently, 
 The setup component passed an independent production browser and route review with 95 focused checks on its review branch.
 The combined production build passes; its 380/381 test result repeats the actual isolated Gateway `hello-ok` timeout within the unchanged 30-second limit.
 The child was stopped after timeout, and no port collision has been demonstrated as the cause.
-A separate production browser review of the combined setup-to-booking journey is in progress.
+A separate production HTTP review of the combined setup-to-booking journey passed, including exact approvals, repeated and concurrent requests, foreign/stale refusals, reconciliation and restart persistence.
+Astra additionally exercised rendered setup creation, required-field error recovery, explicit unavailable Google state and disabled continuation at 390-pixel width without horizontal overflow.
+Subsequent screenshot and browser commands timed out or lost their connection, so this attempt does not establish the full combined rendered journey or a new screenshot comparison.
+The task-owned browser tab and server were closed and its disposable database removed.
 No actual OAuth exchange or connected-account outcome is claimed.
 
 Consistent local backup and restore-to-new-database were integrated at `bf73f3e` from `03cafd4` after independent review, 13 focused tests and type checking passed.
@@ -168,3 +172,13 @@ Regression checks cover concurrent destination creation, competing publishers, f
 Publication refuses an existing destination atomically; restore creates a new database and does not replace the current one.
 The database marker is a sanity check, not a schema-version compatibility guarantee.
 No private or live business database was used for this verification.
+
+## Durable inquiry capture integration
+
+The inquiry capture and due-work bridge was integrated at `fd6c76b` from `f8341b2` after an independent 31-test review and Astra's separate focused tests and type checking.
+The combined integration then passed all 425 tests and the production build with no skipped tests.
+Capture checkpoints advance independently of parked processing, bounded failures become visible dead letters, and owner recovery preserves attempts and history without rewinding unrelated cursors.
+Waiting visibility and recovery are scoped to the bound business and account; model-facing tools do not grant retry authority.
+Capture preserves the first observed message identity and does not provide a complete revision or deletion mirror.
+Production scheduling, provider-account composition and host registration remain separate implementation work in progress.
+Passing the actual isolated doctor in this run does not resolve the previously recurring startup timeout or establish model execution or connected-account behavior.
