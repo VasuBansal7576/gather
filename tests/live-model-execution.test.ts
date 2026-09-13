@@ -610,3 +610,201 @@ test("live path: replaying a continuing run returns pending without a duplicate 
     cleanupFx(fx);
   }
 });
+
+// --- Proposal-contract composition regression -----------------------------
+// The generated proposal must compose with the REAL approval pipeline:
+// create_provisional_hold kind, explicit calendarId/expiresAt, then
+// previewConsequences -> approveAndExecute -> scripted hold + email receipts.
+
+import { approveAndExecute, previewConsequences } from "../src/server/booking-service.ts";
+import type { BookingServiceDeps } from "../src/server/booking-service.ts";
+import type {
+  CalendarConnector,
+  CheckAvailabilityRequest,
+  CreateProvisionalHoldRequest,
+  EmailSender,
+  ProvisionalHold,
+  SendEmailRequest,
+  SentEmail,
+} from "../src/connectors/contracts.ts";
+import type { SourceReference } from "../src/domain/contracts.ts";
+import { DEMO_MODE } from "../src/connectors/contracts.ts";
+
+const SCRIPTED_META = (operationKey: string) => ({ operationKey, sourceReferences: [SCRIPTED_SOURCE], mode: DEMO_MODE, simulated: true as const });
+
+const SCRIPTED_SOURCE: SourceReference = { kind: "calendar", locator: "scripted://approval-connectors", label: "Scripted approval connectors", fictional: true };
+
+class ScriptedApprovalCalendar implements CalendarConnector {
+  holds: ProvisionalHold[] = [];
+  async checkAvailability(req: CheckAvailabilityRequest) {
+    return {
+      status: "succeeded" as const,
+      metadata: SCRIPTED_META(req.operationKey),
+      data: {
+        slots: [{ slotId: "s-free", calendarId: req.calendarId, startAt: req.startAt, endAt: req.endAt, available: true, sourceReferences: [SCRIPTED_SOURCE] }],
+        provenance: [SCRIPTED_SOURCE],
+      },
+    };
+  }
+  async createProvisionalHold(req: CreateProvisionalHoldRequest) {
+    const hold: ProvisionalHold = {
+      holdId: `hold-${this.holds.length + 1}`,
+      operationKey: req.operationKey,
+      bookingId: req.bookingId,
+      calendarId: req.calendarId,
+      startAt: req.startAt,
+      endAt: req.endAt,
+      expiresAt: req.expiresAt,
+      status: "provisional_hold",
+      createdAt: "2026-09-14T00:00:00.000Z",
+      sourceReferences: [SCRIPTED_SOURCE],
+    };
+    this.holds.push(hold);
+    return { status: "succeeded" as const, metadata: SCRIPTED_META(req.operationKey), data: { hold, provenance: [SCRIPTED_SOURCE] } };
+  }
+  async reconcileProvisionalHold(req: { operationKey: string }) {
+    const hold = this.holds.find((entry) => entry.operationKey === req.operationKey);
+    if (!hold) return { status: "failed" as const, metadata: SCRIPTED_META(req.operationKey), error: { kind: "not_found" as const, message: "no such hold", retryable: false } };
+    return { status: "succeeded" as const, metadata: SCRIPTED_META(req.operationKey), data: { hold, provenance: [SCRIPTED_SOURCE] } };
+  }
+}
+
+class ScriptedApprovalEmail implements EmailSender {
+  sent: SentEmail[] = [];
+  async sendEmail(req: SendEmailRequest) {
+    const sentEmail: SentEmail = {
+      messageId: `sent-${this.sent.length + 1}`,
+      operationKey: req.operationKey,
+      to: req.to,
+      cc: req.cc ?? [],
+      subject: req.subject,
+      body: req.body,
+      sentAt: "2026-09-14T00:00:00.000Z",
+      sourceReferences: [SCRIPTED_SOURCE],
+    };
+    this.sent.push(sentEmail);
+    return { status: "succeeded" as const, metadata: SCRIPTED_META(req.operationKey), data: { sentEmail, provenance: [SCRIPTED_SOURCE] } };
+  }
+  async reconcileSentEmail(req: { operationKey: string }) {
+    const sentEmail = this.sent.find((entry) => entry.operationKey === req.operationKey);
+    if (!sentEmail) return { status: "failed" as const, metadata: SCRIPTED_META(req.operationKey), error: { kind: "not_found" as const, message: "no such email", retryable: false } };
+    return { status: "succeeded" as const, metadata: SCRIPTED_META(req.operationKey), data: { sentEmail, provenance: [SCRIPTED_SOURCE] } };
+  }
+}
+
+test("generated proposal composes through the real approval pipeline to hold + email receipts", async () => {
+  const fx = await fixture();
+  try {
+    const record = await runLiveExecution(baseInput(fx, { idempotencyKey: "exec-compose" }), baseDeps(fx));
+    assert.equal(record.status, "ok");
+    const proposal = record.proposal!;
+    const action = fx.store.getProposedAction(proposal.proposedActionId);
+    assert.equal(action.kind, "create_provisional_hold", "proposal kind matches the only executable plan");
+    const payload = action.payload as Record<string, unknown>;
+    assert.equal(payload.calendarId, CALENDAR_ID, "server-bound calendar, never a model argument");
+    const expiresAt = String(payload.expiresAt);
+    assert.ok(Date.parse(expiresAt) > Date.parse("2026-09-14T00:00:00.000Z"), "hold expiry is in the future");
+    assert.ok(Date.parse(expiresAt) < Date.parse(SLOT.startAt), "hold expiry precedes the event start");
+
+    // GET preview: same resolver the owner review screen uses.
+    const preview = previewConsequences(payload, { nowMs: Date.parse("2026-09-14T00:00:00.000Z") });
+    assert.ok(preview.consequences, `preview resolves: ${preview.consequencesError ?? ""}`);
+    assert.deepEqual(preview.consequences!.emailTo, [CONTROLLED_TEST_RECIPIENT]);
+    assert.equal(preview.consequences!.expiresAt, expiresAt);
+
+    // An altered (tampered fingerprint) approval is refused before any write.
+    const calendar = new ScriptedApprovalCalendar();
+    const email = new ScriptedApprovalEmail();
+    const bookingDeps: BookingServiceDeps = {
+      store: fx.store,
+      calendar,
+      email,
+      ownerId: "local-owner",
+      now: () => "2026-09-14T00:00:00.000Z",
+    };
+    await assert.rejects(
+      () => approveAndExecute(bookingDeps, {
+        bookingId: proposal.bookingId,
+        proposedActionId: action.id,
+        proposalVersion: action.proposalVersion,
+        proposalFingerprint: "0".repeat(64),
+      }),
+      /Stale proposal/,
+    );
+    assert.equal(calendar.holds.length, 0, "refused approval writes nothing");
+    assert.equal(email.sent.length, 0);
+
+    // Exact approval executes the real plan: fresh availability, durable
+    // hold on the bound calendar, then the rendered offer email.
+    const approved = await approveAndExecute(bookingDeps, {
+      bookingId: proposal.bookingId,
+      proposedActionId: action.id,
+      proposalVersion: action.proposalVersion,
+      proposalFingerprint: action.proposalFingerprint,
+    });
+    assert.equal(approved.hold?.execution.status, "succeeded");
+    assert.equal(approved.email?.execution.status, "succeeded");
+    assert.equal(approved.booking.status, "provisional_hold");
+    assert.equal(approved.confirmedBooking, false, "a hold is never a confirmed booking");
+    assert.equal(calendar.holds.length, 1);
+    assert.equal(calendar.holds[0]!.calendarId, CALENDAR_ID);
+    assert.equal(calendar.holds[0]!.expiresAt, expiresAt);
+    assert.equal(email.sent.length, 1);
+    const sent = email.sent[0]!;
+    assert.deepEqual(sent.to, [CONTROLLED_TEST_RECIPIENT]);
+    assert.ok(sent.body.includes("Guests: 12"), "exact guest count in the rendered offer");
+    assert.ok(sent.body.includes("GBP 600"), "exact total in the rendered offer");
+    assert.ok(sent.body.includes("Europe/London"), "venue timezone in the rendered offer");
+    // Times render in the business timezone: 18:00 local, never raw UTC ISO.
+    assert.ok(sent.body.includes("18:00"), "event start rendered as 18:00 local");
+    assert.ok(!sent.body.includes("17:00"), "UTC rendering would wrongly show 17:00");
+    assert.ok(!sent.body.includes(SLOT.startAt), "raw ISO timestamp is not the displayed time");
+    assert.ok(sent.body.includes("provisional"), "provisional terms in the rendered offer");
+    assert.ok(sent.body.includes("customer accepts the exact date, time, guest count and price"), "customer acceptance of exact terms required");
+    assert.ok(sent.body.includes("reservation is verified"), "verified reservation required before confirmation");
+    assert.ok(sent.body.includes("Venue approval alone does not confirm a booking"), "venue approval alone never confirms");
+    // No automatic-release promise: no provider release is wired.
+    assert.ok(!/releas/i.test(sent.body), "no automatic release claim in the sent offer");
+    assert.ok(!sent.body.includes("Nothing sent"), "the sent body is the offer, not a placeholder");
+    assert.ok(!sent.body.includes("\u2014"), "no em dash in sent copy");
+  } finally {
+    cleanupFx(fx);
+  }
+});
+
+test("the old send_offer shape fails the real pipeline", async () => {
+  const fx = await fixture();
+  try {
+    const booking = fx.store.createBooking({ businessId: fx.businessId, eventName: "legacy", status: "inquiry" });
+    const action = fx.store.createProposedAction({
+      bookingId: booking.id,
+      kind: "send_offer",
+      payload: {
+        startAt: SLOT.startAt,
+        endAt: SLOT.endAt,
+        emailTo: [CONTROLLED_TEST_RECIPIENT],
+        emailSubject: "legacy",
+        emailBody: "legacy body",
+      },
+      sourceReferences: [],
+    });
+    const deps: BookingServiceDeps = {
+      store: fx.store,
+      calendar: new ScriptedApprovalCalendar(),
+      email: new ScriptedApprovalEmail(),
+      ownerId: "local-owner",
+      now: () => "2026-09-14T00:00:00.000Z",
+    };
+    await assert.rejects(
+      () => approveAndExecute(deps, {
+        bookingId: booking.id,
+        proposedActionId: action.id,
+        proposalVersion: action.proposalVersion,
+        proposalFingerprint: action.proposalFingerprint,
+      }),
+      /Unsupported proposal kind "send_offer"/,
+    );
+  } finally {
+    cleanupFx(fx);
+  }
+});

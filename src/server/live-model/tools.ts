@@ -48,6 +48,44 @@ function fail(tool: string, message: string): never {
   throw new LiveModelError("TOOL_FAILURE", `${tool} failed: ${message}`);
 }
 
+/**
+ * Reviewable hold window: a GATHER TEST offer holds the slot for at most 24
+ * hours and always releases at least one hour before the event starts —
+ * never past the event itself.
+ */
+const HOLD_VALIDITY_MS = 24 * 60 * 60 * 1000;
+const HOLD_RELEASE_BUFFER_MS = 60 * 60 * 1000;
+
+/** Human-readable local time in the business timezone (never raw UTC ISO). */
+function formatLocal(iso: string, timezone: string): string {
+  return new Intl.DateTimeFormat("en-GB", {
+    dateStyle: "medium",
+    timeStyle: "short",
+    timeZone: timezone,
+  }).format(new Date(iso));
+}
+
+/**
+ * The exact body the approval pipeline sends on owner approval: a real
+ * offer, not a placeholder: the exact window rendered in the business
+ * timezone, guest count, exact GBP terms, the offer validity, and explicit
+ * provisional terms. It promises no automatic slot release (none is wired)
+ * and never implies venue approval alone confirms a booking.
+ */
+function renderOfferBody(terms: ProposalTerms, policy: { perPersonGbp: number; currency: string }, timezone: string, expiresAt: string): string {
+  return [
+    "GATHER TEST: provisional event offer",
+    "",
+    `Event window: ${formatLocal(terms.startAt, timezone)} to ${formatLocal(terms.endAt, timezone)} (${timezone})`,
+    `Guests: ${terms.guestCount}`,
+    `Total: ${policy.currency} ${terms.totalGbp} (${policy.currency} ${policy.perPersonGbp} per person)`,
+    `Offer validity: this provisional offer is valid until ${formatLocal(expiresAt, timezone)} (${timezone}).`,
+    `Notes: ${terms.notes}`,
+    "",
+    "This is a provisional offer only. It becomes a confirmed booking only after all of the following: the customer accepts the exact date, time, guest count and price above; the venue approves; and the reservation is verified in the provider system of record. Venue approval alone does not confirm a booking.",
+  ].join("\n");
+}
+
 export interface LiveTools {
   readInquiry(input: { threadId: string }): Promise<InquiryTerms>;
   readVenuePolicy(input: { fileId: string }): Promise<VenuePolicy>;
@@ -167,6 +205,18 @@ export function createLiveTools(ports: LiveToolPorts): LiveTools {
         throw new LiveModelError("POLICY_VIOLATION", "availability attestation names a different calendar");
       }
       const evidence = [input.inquiry.provenance.source, input.policy.provenance.source, input.availability.provenance.source];
+      // Hold validity is server-computed, never a model term: the provisional
+      // hold expires at the earlier of 24h from now or one hour before the
+      // event starts — always in the future, always before the event, and
+      // explicit in the fingerprinted payload so the owner reviews it.
+      const nowMs = Date.parse(ports.now ? ports.now() : new Date().toISOString());
+      const expiresMs = Math.min(nowMs + HOLD_VALIDITY_MS, Date.parse(terms.startAt) - HOLD_RELEASE_BUFFER_MS);
+      if (!Number.isFinite(expiresMs) || expiresMs <= nowMs) {
+        throw new LiveModelError("POLICY_VIOLATION", "the attested slot starts too soon to hold provisionally; no proposal prepared");
+      }
+      const expiresAt = new Date(expiresMs).toISOString();
+      const business = ports.store.getBusiness(ports.businessId);
+      const emailBody = renderOfferBody(terms, input.policy, business.timezone, expiresAt);
       const booking = ports.store.createBooking({
         businessId: ports.businessId,
         eventName: `GATHER TEST proposal: ${terms.guestCount} guests ${terms.startAt}`,
@@ -177,19 +227,24 @@ export function createLiveTools(ports: LiveToolPorts): LiveTools {
         notes: `GATHER TEST. ${terms.notes}`,
         sourceReferences: evidence,
       });
+      // The approval pipeline executes exactly one plan: provisional hold +
+      // offer email (kind "create_provisional_hold"). Every executable field
+      // is explicit in the fingerprinted payload — no derived defaults.
       const action = ports.store.createProposedAction({
         bookingId: booking.id,
-        kind: "send_offer",
+        kind: "create_provisional_hold",
         payload: {
           startAt: terms.startAt,
           endAt: terms.endAt,
+          expiresAt,
+          calendarId: ports.calendarId,
           guestCount: terms.guestCount,
           perPersonGbp: terms.perPersonGbp,
           totalGbp: terms.totalGbp,
           currency: input.policy.currency,
           emailTo: [ports.recipient],
-          emailSubject: `GATHER TEST proposal: ${terms.guestCount} guests ${terms.startAt}`,
-          emailBody: `GATHER TEST offer (GBP ${terms.totalGbp} total) to the controlled test recipient. Nothing sent: owner approval required.`,
+          emailSubject: `GATHER TEST provisional offer: ${terms.guestCount} guests ${terms.startAt}`,
+          emailBody,
           controlledRecipient: ports.recipient,
           evidence: evidence.map((source) => ({ kind: source.kind, locator: source.locator, label: source.label })),
         },
