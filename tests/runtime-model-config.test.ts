@@ -5,7 +5,7 @@
  * Verifies the exact installed-schema emission (`agents.defaults.model` as
  * a bare provider/model string, top-level `auth.profiles`/`auth.order`
  * metadata), the owner-authorized allowlist, subscription-only rejection
- * of key auth, the absent-model ready gate, and secret-freedom of the
+ * of key auth, the absent-model configured gate, and secret-freedom of the
  * materialized config.
  */
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
@@ -15,6 +15,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   buildGatewayConfig,
+  defineGatherTool,
   resolveGatherOpenClawLayout,
   ensureLayoutDirectories,
   writeGatewayConfig,
@@ -30,7 +31,7 @@ const PROFILE = "openai:bansalv8198@gmail.com";
 function selection(overrides: Record<string, unknown> = {}): GatherModelSelection {
   return {
     model: MODEL,
-    auth: { profileId: PROFILE, provider: "openai", mode: "oauth", email: "bansalv8198@gmail.com" },
+    auth: { profileId: PROFILE, provider: "openai", mode: "oauth", email: "owner@example.test" },
     ...overrides,
   } as GatherModelSelection;
 }
@@ -56,7 +57,7 @@ test("emits the exact model string with subscription profile selection/order", (
     assert.equal(JSON.stringify(config).includes("fallbacks"), false, "no alternate-model fallback may be configured");
     assert.deepEqual(config.auth, {
       profiles: {
-        [PROFILE]: { provider: "openai", mode: "oauth", email: "bansalv8198@gmail.com" },
+        [PROFILE]: { provider: "openai", mode: "oauth", email: "owner@example.test" },
       },
       order: { "openai": [PROFILE] },
     });
@@ -96,7 +97,7 @@ test("unsupported, malformed, mismatched, and key-based selections fail closed",
   }
 });
 
-test("absent model emits no model/auth keys and fails ready-for-model clearly", () => {
+test("absent model emits no model/auth keys and reports configured/unverified clearly", () => {
   const { layout: lay, cleanup } = layout();
   try {
     const config = buildGatewayConfig(lay, {});
@@ -105,7 +106,8 @@ test("absent model emits no model/auth keys and fails ready-for-model clearly", 
     assert.equal("auth" in config, false, "control-plane/demo configs carry no auth section");
     const runtime = new GatherOpenClawRuntime({ rootDir: lay.rootDir, gatewayPort: lay.port });
     const status = runtime.modelStatus();
-    assert.equal(status.ready, false);
+    assert.equal(status.configured, false);
+    assert.equal(status.verified, false, "configuration alone never reports verified readiness");
     assert.match(status.reason ?? "", /MODEL_NOT_CONFIGURED/);
     assert.throws(
       () => runtime.requireModelSelection(),
@@ -122,17 +124,19 @@ test("runtime provision passes the model through and gates readiness", () => {
     ensureLayoutDirectories(lay);
     const runtime = new GatherOpenClawRuntime({ rootDir: lay.rootDir, gatewayPort: lay.port, model: selection() });
     const status = runtime.modelStatus();
-    assert.equal(status.ready, true);
+    assert.equal(status.configured, true);
+    assert.equal(status.verified, false, "even a valid selection is configured/unverified until the live auth root proves it");
     assert.equal(status.model, MODEL);
     assert.deepEqual(runtime.requireModelSelection(), selection());
     const { configPath } = runtime.provision();
     const config = JSON.parse(readFileSync(configPath, "utf8"));
     assert.equal(config.agents.defaults.model, MODEL);
     assert.equal(config.auth.order["openai"][0], PROFILE);
-    // Invalid selections report not-ready through the gate instead of throwing.
+    // Invalid selections report unconfigured through the gate instead of throwing.
     const bad = new GatherOpenClawRuntime({ rootDir: lay.rootDir, gatewayPort: lay.port, model: selection({ model: "other/model" }) });
     const badStatus = bad.modelStatus();
-    assert.equal(badStatus.ready, false);
+    assert.equal(badStatus.configured, false);
+    assert.equal(badStatus.verified, false);
     assert.match(badStatus.reason ?? "", /UNSUPPORTED_MODEL/);
   } finally {
     cleanup();
@@ -157,5 +161,53 @@ test("materialized model config carries no credential material", () => {
     );
   } finally {
     cleanup();
+  }
+});
+
+test("failed-start rollback rewrite preserves the model selection", async () => {
+  // Every config rewrite path (provision, MCP re-write, rollback) must
+  // carry the explicit model/auth selection: a failed start that tears
+  // down the MCP boundary rewrites the config without the stale MCP ref
+  // but must never drop the model selection with it.
+  const directory = mkdtempSync(join(tmpdir(), "gather-model-rollback-"));
+  try {
+    const runtime = new GatherOpenClawRuntime(
+      {
+        rootDir: join(directory, "openclaw"),
+        gatewayPort: 34000 + ((process.pid + (layoutCounter++)) % 20000),
+        mcpTools: [defineGatherTool({
+          name: "probe",
+          description: "rollback probe tool",
+          inputSchema: {},
+          execution: "simulated",
+          handler: async () => ({ content: [{ type: "text", text: "ok" }] }),
+        })],
+        model: selection(),
+      },
+      {
+        processFactory: () => ({
+          gatewayToken: "test-token",
+          pid: null,
+          currentState: "stopped" as const,
+          start: async () => { throw new Error("spawn denied"); },
+          stop: async () => {},
+        }),
+        connectionFactory: () => {
+          throw new Error("connection factory must not run after a failed spawn");
+        },
+        mcpBoundaryFactory: () => ({
+          toolNames: ["probe"],
+          listen: async () => ({ url: "http://127.0.0.1:9/mcp", port: 9 }),
+          close: async () => {},
+        }),
+      },
+    );
+    await assert.rejects(runtime.start(), /spawn denied/);
+    const config = JSON.parse(readFileSync(runtime.layout.configPath, "utf8"));
+    assert.equal(config.mcp, undefined, "torn-down MCP ref must be gone after rollback");
+    assert.equal(config.agents.defaults.model, MODEL, "rollback rewrite must preserve the model");
+    assert.deepEqual(config.auth.order, { openai: [PROFILE] }, "rollback rewrite must preserve auth selection");
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
   }
 });
