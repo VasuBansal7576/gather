@@ -168,6 +168,20 @@ it — the boundary never claims cost completeness on its own.
 Every mutating call accepts an optional `commandId`; a repeat returns the
 recorded outcome (`duplicate: true`) with no additional effect.
 
+## Owner conflict resolution UI
+
+`GET /api/knowledge/conflicts?businessId=` lists business-wide
+cross-account revision groups (exact revision ids, account lines, current
+values, resolved/conflicted status); `POST /api/knowledge/conflicts`
+resolves one group to an exact `winningRevisionId` with the reviewed
+`consideredRevisionIds` sent verbatim. Owner identity and business scope
+are host-derived; stale sets reject with 409 and force fresh review
+without auto-retry. The review UI (`KnowledgeBrowser` account-conflicts
+section + `ConflictCard`) shows confirmed conflicts distinctly from
+pending candidate cards, asks one focused question per group, and sends
+only the reviewed set. Losing lines stay withheld from offers; no profit
+or currency is ever invented.
+
 ## Verification
 
 - `npx tsc --noEmit` — clean.

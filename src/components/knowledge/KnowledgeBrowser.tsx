@@ -19,9 +19,14 @@ import type {
   KnowledgeCandidate,
   KnowledgeConfirmedFact,
   KnowledgeSnapshot,
+  KnowledgeSourceReference,
   WithheldFact,
 } from "../../knowledge-owner/types.ts";
+import type { BusinessConflict } from "../../knowledge-owner/conflicts.ts";
+import { createConflictApi } from "../../knowledge-owner/conflicts.ts";
 import { CandidateCard, type CandidateDecision } from "./CandidateCard.tsx";
+import { ConflictCard, type ConflictResolutionInput } from "./ConflictCard.tsx";
+import "./conflict.css";
 import { ConfirmedFacts, type CorrectSubmission } from "./ConfirmedFacts.tsx";
 
 type LoadState =
@@ -52,6 +57,7 @@ function errorMessage(error: unknown, fallback: string): { message: string; retr
  */
 export function KnowledgeBrowser(): React.JSX.Element {
   const api = useMemo(() => createKnowledgeOwnerApi((input, init) => fetch(input, init)), []);
+  const conflictApi = useMemo(() => createConflictApi((input, init) => fetch(input, init)), []);
   const inFlight = useRef(new Set<string>());
   // Independent generations for the venue list and the venue data: a late
   // response from a superseded selection is dropped before it can commit
@@ -71,6 +77,7 @@ export function KnowledgeBrowser(): React.JSX.Element {
   const [dataState, setDataState] = useState<LoadState>({ kind: "idle" });
   const [candidates, setCandidates] = useState<KnowledgeCandidate[]>([]);
   const [facts, setFacts] = useState<KnowledgeConfirmedFact[]>([]);
+  const [conflicts, setConflicts] = useState<BusinessConflict[]>([]);
   const [snapshot, setSnapshot] = useState<KnowledgeSnapshot | undefined>();
   const [withheld, setWithheld] = useState<WithheldFact[]>([]);
   const [busyKey, setBusyKey] = useState<string | null>(null);
@@ -110,23 +117,25 @@ export function KnowledgeBrowser(): React.JSX.Element {
     setDataState({ kind: "loading" });
     setMutation({ errors: {} });
     try {
-      const [candidateRes, snapshotRes, factsRes] = await Promise.all([
+      const [candidateRes, snapshotRes, factsRes, conflictList] = await Promise.all([
         api.listCandidates(id),
         api.getSnapshot(id),
         api.listFacts(id),
+        conflictApi.listConflicts(id),
       ]);
       if (!dataGen.current.isCurrent(generation)) return;
       setCandidates(candidateRes.candidates);
       setSnapshot(snapshotRes.snapshot);
       setWithheld(snapshotRes.snapshot.withheld);
       setFacts(factsRes.facts);
+      setConflicts(conflictList);
       setDataState({ kind: "ready" });
     } catch (error) {
       if (!dataGen.current.isCurrent(generation)) return;
       const { message, retryable } = errorMessage(error, "Gather could not load business understanding.");
       setDataState({ kind: "error", message, retryable });
     }
-  }, [api]);
+  }, [api, conflictApi]);
 
   useEffect(() => {
     void loadBusinesses();
@@ -135,9 +144,11 @@ export function KnowledgeBrowser(): React.JSX.Element {
   useEffect(() => {
     if (!businessId) return;
     // Clear the previous venue's data before loading: stale candidates,
-    // facts, and messages must never present as the newly selected venue.
+    // facts, conflicts, and messages must never present as the newly
+    // selected venue.
     setCandidates([]);
     setFacts([]);
+    setConflicts([]);
     setSnapshot(undefined);
     setWithheld([]);
     setMutation({ errors: {} });
@@ -235,6 +246,31 @@ export function KnowledgeBrowser(): React.JSX.Element {
     void runDecision("exception:new", "Scoped exception", () => api.addException(businessId, input));
   }, [api, businessId, runDecision]);
 
+  const handleResolve = useCallback((conflict: BusinessConflict, input: ConflictResolutionInput) => {
+    if (!businessId) return;
+    // The exact reviewed set travels verbatim; a 409 STALE_PROPOSAL from
+    // the service surfaces its re-review message and refreshes — approval
+    // is never retried against the new set automatically.
+    void runDecision(`resolve:${conflict.key}:${conflict.subjectId}`, "Conflict resolution", () =>
+      conflictApi.resolveConflict({
+        businessId,
+        key: conflict.key,
+        ...(conflict.subjectId === "" ? {} : { subjectId: conflict.subjectId }),
+        ...(conflict.scope === "booking" || conflict.scope === "customer"
+          ? { scope: conflict.scope, ...(conflict.scopeId === undefined ? {} : { scopeId: conflict.scopeId }) }
+          : {}),
+        winningRevisionId: input.winningRevisionId,
+        consideredRevisionIds: input.consideredRevisionIds,
+        commandId: input.commandId,
+      }));
+  }, [conflictApi, businessId, runDecision]);
+
+  const factSources = useMemo(() => {
+    const map = new Map<string, KnowledgeSourceReference[]>();
+    for (const fact of facts) map.set(fact.id, fact.sourceReferences);
+    return map;
+  }, [facts]);
+
   const ordered = useMemo(() => sortCandidatesForReview(candidates), [candidates]);
   const needsReview = useMemo(() => ordered.filter((candidate) => groupOf(candidate) === "needs-review"), [ordered]);
   const stale = useMemo(() => ordered.filter((candidate) => groupOf(candidate) === "stale"), [ordered]);
@@ -330,6 +366,30 @@ export function KnowledgeBrowser(): React.JSX.Element {
           </div>
         ) : (
           <div className="knowledge-grid">
+            {conflicts.length > 0 ? (
+              <section className="knowledge-section" aria-labelledby="knowledge-conflicts-heading">
+                <div className="knowledge-section-heading">
+                  <h2 id="knowledge-conflicts-heading">
+                    Account conflicts<span className="knowledge-count">{conflicts.filter((c) => c.status === "conflicted").length}</span>
+                  </h2>
+                  <p>
+                    Already-confirmed values that disagree across account lines — distinct from
+                    pending observations below. Pick exactly one revision per conflict; losers
+                    stay out of offers, nothing merges.
+                  </p>
+                </div>
+                {conflicts.map((conflict) => (
+                  <ConflictCard
+                    key={`${conflict.key}:${conflict.subjectId}:${conflict.scope}:${conflict.scopeId ?? ""}`}
+                    conflict={conflict}
+                    factSources={factSources}
+                    busy={busyKey === `resolve:${conflict.key}:${conflict.subjectId}`}
+                    mutationError={mutation.errors[`resolve:${conflict.key}:${conflict.subjectId}`]}
+                    onResolve={(input) => handleResolve(conflict, input)}
+                  />
+                ))}
+              </section>
+            ) : null}
             <section className="knowledge-section" aria-labelledby="knowledge-review-heading">
               <div className="knowledge-section-heading">
                 <h2 id="knowledge-review-heading">Review queue<span className="knowledge-count">{needsCount}</span></h2>

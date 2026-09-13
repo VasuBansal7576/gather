@@ -1,0 +1,51 @@
+/* Account-conflict cards: scoped additions only. Base card, pill, notice,
+   button, and value styles are reused read-only from knowledge.css. */
+
+.knowledge-card.is-account-conflict {
+  border-left: 3px solid #ffb020;
+}
+
+.knowledge-card.is-account-conflict.is-resolved {
+  border-left-color: #3ddc84;
+}
+
+.conflict-options {
+  border: 1px solid #26262e;
+  border-radius: 10px;
+  padding: 14px 16px;
+  margin: 12px 0;
+  display: grid;
+  gap: 8px;
+}
+
+.conflict-options legend {
+  font-weight: 600;
+  padding: 0 8px;
+}
+
+.conflict-option {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  padding: 10px 12px;
+  border: 1px solid #26262e;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.conflict-option input[type="radio"] {
+  margin-top: 4px;
+  accent-color: #a495fd;
+  width: 16px;
+  height: 16px;
+}
+
+.conflict-option-body {
+  display: grid;
+  gap: 4px;
+}
+
+.conflict-option input:focus-visible {
+  outline: 2px solid #a495fd;
+  outline-offset: 2px;
+}
