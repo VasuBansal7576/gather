@@ -378,13 +378,21 @@ export class DeliveryStore {
       if (existing.status !== "in_progress") return { kind: "replay", command: existing };
       const leaseExpires = Date.parse(existing.updatedAt) + input.leaseMs;
       if (leaseExpires > input.nowMs) return { kind: "in_progress", command: existing };
-      // Expired in-progress command: reclaim only within the same transaction
-      // below by updating it to a fresh in-progress row for this caller.
-      this.db.prepare(`UPDATE delivery_confirm_commands SET updated_at = $timestamp
+      // Expired in-progress command: reclaim only if this caller's conditional
+      // update actually landed. A competing reclaimer that committed first
+      // changes updated_at, so this update matches zero rows — that caller must
+      // not report ownership; re-read and classify the winner's row instead.
+      const reclaimed = this.db.prepare(`UPDATE delivery_confirm_commands SET updated_at = $timestamp
         WHERE confirm_key = $key AND status = 'in_progress' AND updated_at = $stale`).run({
         $timestamp: now(), $key: input.confirmKey, $stale: existing.updatedAt,
       });
-      return { kind: "owned", command: this.getConfirmCommand(input.confirmKey) as ConfirmCommand };
+      const current = this.getConfirmCommand(input.confirmKey);
+      if (!current) throw new Error("Confirm command vanished during lease reclaim");
+      if (reclaimed.changes === 0) {
+        if (current.requestHash !== input.requestHash) return { kind: "conflict", command: current };
+        return current.status === "in_progress" ? { kind: "in_progress", command: current } : { kind: "replay", command: current };
+      }
+      return { kind: "owned", command: current };
     }
     const timestamp = now();
     const inserted = this.db.prepare(`INSERT INTO delivery_confirm_commands
