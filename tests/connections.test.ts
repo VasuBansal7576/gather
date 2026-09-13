@@ -241,6 +241,61 @@ test("missing granted scopes fail the callback and connect nothing", async () =>
   }
 });
 
+test("canonical identity alias/granted swap is accepted: userinfo.email satisfies email", async () => {
+  const fx = fixture();
+  try {
+    const svc = service(fx);
+    // Live shape: Google returns the userinfo URL form where "email" was requested.
+    fx.transport.tokenResponse = {
+      accessToken: "a", refreshToken: "r", expiresInSec: 60,
+      scope: "openid https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/calendar",
+    };
+    const start = svc.startAuthorization({ businessId: fx.businessId, provider: "google" });
+    const done = await svc.completeAuthorization({ code: "c1", state: stateOf(start.authorizationUrl) });
+    assert.equal(done.businessId, fx.businessId);
+    assert.equal(svc.getConnections(fx.businessId).providers[0]?.accounts.length, 1);
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test("missing each data scope is rejected by name; aliases never mask data scopes", async () => {
+  const required = [
+    "openid",
+    "email",
+    "https://www.googleapis.com/auth/gmail.send",
+    "https://www.googleapis.com/auth/calendar",
+    "https://www.googleapis.com/auth/drive.readonly",
+  ];
+  const dataScopes = required.filter((scope) => scope !== "openid" && scope !== "email");
+  for (const dropped of dataScopes) {
+    const fx = fixture();
+    try {
+      const svc = new ConnectionService({
+        store: fx.store, secrets: fx.secrets, transport: fx.transport,
+        googleApp: { ...APP, requiredScopes: required }, ownerId: "local-owner", nowMs: () => fx.nowMs,
+      });
+      fx.transport.tokenResponse = {
+        accessToken: "a", refreshToken: "r", expiresInSec: 60,
+        // Identity alias present, but exactly one data scope withheld.
+        scope: ["openid", "https://www.googleapis.com/auth/userinfo.email", ...required.filter((s) => s !== "openid" && s !== "email" && s !== dropped)].join(" "),
+      };
+      const start = svc.startAuthorization({ businessId: fx.businessId, provider: "google" });
+      await assert.rejects(
+        svc.completeAuthorization({ code: "c1", state: stateOf(start.authorizationUrl) }),
+        (e: unknown) => {
+          assert.ok(e instanceof ConnectionError && e.code === "MISSING_SCOPE");
+          assert.ok(e.message.includes(dropped), `message must name the missing scope ${dropped}`);
+          return true;
+        },
+      );
+      assert.equal(svc.getConnections(fx.businessId).providers[0]?.accounts.length, 0);
+    } finally {
+      fx.cleanup();
+    }
+  }
+});
+
 test("access token refresh is singleflight; revocation marks the connection revoked", async () => {
   const fx = fixture();
   try {
