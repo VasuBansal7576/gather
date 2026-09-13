@@ -23,7 +23,10 @@ the runner carries an explicit `GatherModelSelection` through
   listing check, planner-driven tool calls over a real MCP client,
   submit/wait/history on the injected tasks channel, durable run
   record + per-call tool audit, timeout → `continuing` run id without
-  duplicates, idempotent caller keys (gateway key stable per key).
+  duplicates. Idempotency keys name one exact designated journey:
+  same key + same inputs replays or resumes (gateway key stable per
+  key, no duplicate provider run), same key + changed inputs rejects,
+  concurrent duplicates collapse onto the winner's claimed run.
 - `tools.ts` — policy enforcement reused by the handlers (exact
   arithmetic, capacity, same-run attested free slot; violations reject
   pre-write). Proposal payloads name the controlled test recipient
@@ -65,7 +68,10 @@ GBP 600 total from them.
 ## Remaining before any live outcome (no overall completion claimed)
 
 1. **Astra start handoff + consent**: no live Google/model requests
-   until then (`GATHER_LIVE_CONSENT` + `allowLive` gate).
+   until then (`GATHER_LIVE_CONSENT` + `allowLive` gate). Model
+   selection consumed exactly from N (verified actual
+   `openai/gpt-5.6-luna`, `openai:bansalv8198@gmail.com`); OAuth root
+   at `main/.runtime/openclaw-live` left untouched pending handoff.
 2. **I — authorized Codex OAuth** under `main/.runtime/openclaw-live`
    and the exact Luna auth profile (root/config untouched meanwhile);
    model-driven (non-scripted) tool calling wires up with that path.
