@@ -84,11 +84,18 @@ payment/confirmation step.
   release the claim. Pending intents are never purged by lease or clock: an
   intent records a provider effect of unknown outcome and stays fail-closed
   until evidence (a durable receipt, an explicit release after definitive
-  failure, or reconciliation). Receipts whose hold has expired no longer deny
-  their window — expiry is observed against the injected service clock — but
-  receipt rows are preserved as history. The availability read consults the
-  same durable conflict set (excluding the caller's own operation key), so
-  availability and create agree in-process and across restarts.
+  failure, or reconciliation) — except that an intent whose key already has a
+  durable receipt defers to that receipt, so a crash between receipt write
+  and intent release cannot block forever. Receipts whose hold has expired no
+  longer deny their window — expiry is observed against the injected service
+  clock — but receipt rows are preserved as history. The availability read
+  consults the same durable conflict set (excluding the caller's own
+  operation key), so availability and create agree in-process and across
+  restarts. The demo adapter mirrors these rules in-memory: its hold conflict
+  check ignores expired holds, create-time slot reads are scoped to the
+  requested calendar exactly like availability, and all three layers (demo
+  world, durable wrappers, service clock) share one injected clock source in
+  the server runtime.
 - Failed steps reopen under the **same** idempotency key, so a real provider
   dedupes them.
 

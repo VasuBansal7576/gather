@@ -30,13 +30,17 @@ export function ownerId(): string {
 
 export function getRuntime(): ServerRuntime {
   if (cached) return cached;
+  // One shared wall-clock source for the demo store, the durable wrappers,
+  // and the service clock, so simulated expiry agrees everywhere.
+  const clockMs = (): number => Date.now();
   const store = new GatherStore(databasePath());
-  const connectors = createDemoConnectors({ calendarSlots: demoFixtureSlots() });
+  const connectors = createDemoConnectors({ calendarSlots: demoFixtureSlots(), nowMs: clockMs });
   const deps: BookingServiceDeps = {
     store,
-    calendar: new DurableDemoCalendar(store, connectors.calendar),
+    calendar: new DurableDemoCalendar(store, connectors.calendar, clockMs),
     email: new DurableDemoEmail(store, connectors.email),
     ownerId: ownerId(),
+    now: () => new Date(clockMs()).toISOString(),
   };
   cached = { store, connectors, deps };
   return cached;

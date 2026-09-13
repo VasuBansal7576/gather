@@ -46,6 +46,12 @@ export interface DemoConnectorSeed {
   calendarSlots?: readonly CalendarSlot[];
   now?: string;
   /**
+   * Mutable clock (epoch millis) shared with the service and durable
+   * wrappers so simulated expiry advances consistently in-process and
+   * across restarts. When absent, the fixed `now` seed time is used.
+   */
+  nowMs?: () => number;
+  /**
    * These keys complete their write in memory, then report an uncertain
    * timeout once. Reconciliation discovers the completed write.
    */
@@ -137,7 +143,8 @@ export class InMemoryDemoConnectorStore {
   private readonly provisionalHolds = new Map<string, ProvisionalHold>();
   private readonly timeoutAfterSuccess: Set<string>;
   private readonly consumedTimeouts = new Set<string>();
-  private readonly currentTime: string;
+  private readonly fixedTime: string;
+  private readonly clockMs?: () => number;
 
   public constructor(seed: DemoConnectorSeed = {}) {
     const emailThreads = seed.emailThreads ?? [];
@@ -157,12 +164,13 @@ export class InMemoryDemoConnectorStore {
       this.calendarSlots.set(slot.slotId, copySlot(slot));
     }
 
-    this.currentTime = seed.now ?? "2026-01-01T00:00:00.000Z";
+    this.fixedTime = seed.now ?? "2026-01-01T00:00:00.000Z";
+    this.clockMs = seed.nowMs;
     this.timeoutAfterSuccess = new Set(seed.timeoutAfterSuccessOperationKeys ?? []);
   }
 
   public now(): string {
-    return this.currentTime;
+    return this.clockMs === undefined ? this.fixedTime : new Date(this.clockMs()).toISOString();
   }
 
   public getEmailThread(threadId: string): InquiryThread | undefined {
@@ -523,6 +531,7 @@ export class DemoCalendarConnector implements CalendarAvailabilityReader, Provis
     const unavailableSlot = slots.find(
       (slot) =>
         !slot.available &&
+        slot.calendarId === request.calendarId &&
         overlaps(slot.startAt, slot.endAt, request.startAt, request.endAt),
     );
     if (unavailableSlot !== undefined) {
@@ -537,6 +546,7 @@ export class DemoCalendarConnector implements CalendarAvailabilityReader, Provis
     const coveringSlot = slots.find(
       (slot) =>
         slot.available &&
+        slot.calendarId === request.calendarId &&
         covers(slot.startAt, slot.endAt, request.startAt, request.endAt),
     );
     if (coveringSlot === undefined) {
@@ -548,10 +558,14 @@ export class DemoCalendarConnector implements CalendarAvailabilityReader, Provis
       );
     }
 
+    // Expired holds no longer deny their window, mirroring the durable
+    // receipt rule; holds without a readable expiry stay fail-closed.
+    const nowMs = Date.parse(this.store.now());
     const conflictingHold = this.store.listProvisionalHolds().find(
       (hold) =>
         hold.calendarId === request.calendarId &&
-        overlaps(hold.startAt, hold.endAt, request.startAt, request.endAt),
+        overlaps(hold.startAt, hold.endAt, request.startAt, request.endAt) &&
+        (!Number.isFinite(Date.parse(hold.expiresAt)) || Date.parse(hold.expiresAt) > nowMs),
     );
     if (conflictingHold !== undefined) {
       return failure(

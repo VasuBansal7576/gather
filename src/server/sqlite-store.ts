@@ -790,17 +790,26 @@ export class GatherStore {
   ): string | undefined {
     const startMs = Date.parse(startAt);
     const endMs = Date.parse(endAt);
+    const receiptsByKey = new Map<string, Record<string, unknown>>();
+    const receipts = this.db.prepare("SELECT operation_key, receipt_json, start_at, end_at FROM provider_receipts WHERE kind = 'hold' AND (calendar_id = $calendar OR calendar_id IS NULL)").all({ $calendar: calendarId });
+    for (const item of receipts) {
+      receiptsByKey.set(String(row(item).operation_key), item as Record<string, unknown>);
+    }
     const intents = this.db.prepare("SELECT operation_key, start_at, end_at FROM provider_hold_intents WHERE calendar_id = $calendar").all({ $calendar: calendarId });
     for (const item of intents) {
       const candidate = row(item);
       if (excludeOperationKey !== undefined && String(candidate.operation_key) === excludeOperationKey) continue;
+      // An intent with a durable receipt is no longer unknown: the receipt
+      // below governs (including its expiry). Only receipt-less intents —
+      // effects whose outcome is genuinely unproven — stay fail-closed.
+      // This also heals a crash between receipt write and intent release.
+      if (receiptsByKey.has(String(candidate.operation_key))) continue;
       if (Date.parse(String(candidate.start_at)) < endMs && Date.parse(String(candidate.end_at)) > startMs) {
         return String(candidate.operation_key);
       }
     }
-    const receipts = this.db.prepare("SELECT operation_key, receipt_json, start_at, end_at FROM provider_receipts WHERE kind = 'hold' AND (calendar_id = $calendar OR calendar_id IS NULL)").all({ $calendar: calendarId });
-    for (const item of receipts) {
-      const candidate = row(item);
+    for (const item of receiptsByKey.values()) {
+      const candidate = item;
       if (excludeOperationKey !== undefined && String(candidate.operation_key) === excludeOperationKey) continue;
       const hold = ((parseJson(candidate.receipt_json, {}) as Record<string, unknown>).hold ?? {}) as Record<string, unknown>;
       const receiptCalendar = typeof hold.calendarId === "string" ? hold.calendarId : undefined;
