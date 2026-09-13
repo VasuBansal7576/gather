@@ -156,6 +156,57 @@ Simulation must be labeled where the owner encounters it, including fixture conn
 
 ## Delivery boundaries
 
+## Component reuse and integration contract — 2026-09-14
+
+This section records the owner's reuse-first direction. These are requirements and candidate choices, not implementation or production-readiness claims. The complete booking scope above remains unchanged.
+
+### Customer experience and deployment
+
+- Owners connect business apps and delegate outcomes; they must not install or configure memory platforms, queues, databases, agents, or workflow infrastructure.
+- The local distribution packages required dependencies behind the documented launch path. Hosted delivery operates infrastructure on the provider side. Software must run somewhere: an API/MCP connection avoids local installation but does not remove hosting, credentials, cost, or operational responsibilities.
+- Do not install every shortlisted repository. Use one primary implementation per responsibility, reuse existing adequate capabilities, and leave optional integrations disabled unless configured.
+- A hosted service, remote data transfer, or paid plan is not authorized solely by this architecture. Preserve existing test-data, spending, and credential boundaries.
+
+### Component decisions
+
+| Responsibility | Direction | Adoption gate |
+| --- | --- | --- |
+| Agent runtime | Reuse the isolated OpenClaw adapter. | Actual model/tool execution and restart behavior. |
+| Business context | Evaluate Supermemory first; Cognee is a comparison/fallback, not a second simultaneous memory system. | Verify exact edition/license, available connector and self-hosted features, per-business isolation, retrieval quality, update/deletion behavior, latency and usage. No automatic migration. |
+| Parsing | Use the selected context provider's adequate existing processing; evaluate Docling only for demonstrated format failures. | Representative menus, contracts, tables and attachments. |
+| Durable work | Keep proven current persistence; consider pg-boss if PostgreSQL is selected, or Temporal if workflow complexity justifies it. | Demonstrated recovery improvement and explicit scheduling ownership; never competing schedulers. |
+| Process lifecycle | Evaluate Execa only against reproduced native launcher issues; container init such as Tini applies only to containers. | Startup, cancellation, child shutdown and state preservation. |
+| Verification | Reuse Playwright for browser journeys, Promptfoo where useful for model evaluation, and Gitleaks for secret scanning. | Real assertions and reproducible reports, not presence of a dependency. |
+| Hosted operations | Prefer existing deployment secrets; evaluate OpenFGA, SigNoz and Restic only where requirements justify them. | Permission enforcement, useful alerts, consistent backups and actual restore. These services are not mandatory local startup dependencies. |
+
+### Integration boundary
+
+The logical path is: owner UI -> Gather backend -> isolated claw -> controlled Gather tools -> context provider or business apps. Background jobs also use the same permission and execution boundaries.
+
+- A thin server-side context adapter supplies operations such as ingest, search, update and delete. These are Gather interface concepts, not assertions about any vendor's API names.
+- A provider may be accessed through its supported HTTPS API, SDK or remote MCP interface. An SDK is client code, not the entire provider installation. Local stdio MCP requires a local server; remote MCP requires a running remote service.
+- Server-side identity fixes business scope before every request; never let model-supplied tenant IDs or metadata tags alone enforce access control.
+- Retrieved context is evidence, not authority. Keep credentials server-side and minimize provider payloads. Do not send private business data until authorized.
+- Gather's durable records retain exact approvals, accepted offers, pending work and action receipts. Connected calendar/payment systems prove reservations/payments. A memory summary cannot replace those authoritative records.
+- Use provider health, timeouts, bounded retries and visible degraded states. Missing critical context blocks the affected commitment, not unrelated work. Do not silently change memory providers or pretend stale context is fresh.
+
+### Knowledge acceptance and customer setup
+
+- Evaluate a realistic noisy dataset with old/new prices, signed exceptions, duplicates, unrelated content, similar customer names, deletions and changed policies. Include multiple isolated fictional businesses.
+- Measure fact precision, important-evidence recall, linking accuracy, applicable-version selection and unsupported conclusions. Establish explicit acceptance thresholds before accepting the evaluation; do not invent calibrated confidence from model labels.
+- Initial imports must expose progress and incomplete coverage. Ask owners focused consequential questions, not require approval of every extracted snippet. Unsupported apps and missing capabilities must be visible.
+- Test replay, pagination, missed-update reconciliation, deletion and revocation. A connected account does not establish complete or current ingestion.
+
+### Hackathon and hosted acceptance boundaries
+
+For the hackathon: prove one isolated business's real three-or-more-app journey, attributable context, exact approvals, verified external actions, duplicate prevention and restart recovery. If required deposit/resource evidence is absent, label the outcome provisional rather than confirmed. Preserve the broader product requirements as outstanding, not removed.
+
+Before hosted production: specify and verify employee roles and tenant isolation, retention/export/deletion including derived memory, usage limits and backpressure, operational latency/recovery targets, alert ownership, consistent backup restore, migrations and rollback. Infrastructure libraries supply mechanisms, not these product policies.
+
+Record every component decision with its version/edition, license, tested interface, evidence, limitations, and rollback path. Keep implemented, locally tested and live-verified statuses separate in PROGRESS.md.
+
+## Delivery constraints
+
 Keep personal OpenClaw data and configuration untouched.
 Do not publish credentials, private customer information, local runtime state, or raw authentication receipts.
 Use authorized subscription access without enabling overages, purchasing services, or moving work to cloud execution.
