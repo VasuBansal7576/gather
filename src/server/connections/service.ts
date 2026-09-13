@@ -243,6 +243,26 @@ export class ConnectionService {
     return { businessId, providers: [this.providerSummary(businessId, "google")] };
   }
 
+  /** Global provider readiness — independent of any business. */
+  providerReadiness(): { provider: ConnectionProvider; status: "available" | "unavailable"; unavailableReason?: string }[] {
+    return [
+      this.googleApp
+        ? { provider: "google", status: "available" }
+        : {
+            provider: "google",
+            status: "unavailable",
+            unavailableReason:
+              "Google provider app is not configured (missing client id/metadata); set GATHER_GOOGLE_CLIENT_ID to enable real authorization",
+          },
+    ];
+  }
+
+  /** Business context for a callback redirect target; undefined for unknown states. */
+  peekSessionBusinessId(state: string): string | undefined {
+    if (typeof state !== "string" || state.length === 0) return undefined;
+    return this.sessionByState(state)?.businessId;
+  }
+
   // ------------------------------------------------------------ oauth start
 
   startAuthorization(input: { businessId: string; provider: ConnectionProvider; displayName?: string }): AuthorizationStartDTO {

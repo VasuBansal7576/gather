@@ -79,14 +79,27 @@ can only touch entries it created) or `EnvSecretStore` when
 
 ## Routes
 
+- `GET  /api/setup` → `{ ownerId, businesses: [{id,name,timezone}], providers: [{provider,status,unavailableReason?}] }`
+  — owner-scoped business list + global provider readiness; ownerId is
+  server-derived.
+- `POST /api/setup/business` `{name, timezone}` →
+  `{ business: {id,name,timezone}, created, ownerId }` — same-origin
+  guarded; IANA timezone validation; same-name+timezone retries return the
+  existing business under `BEGIN IMMEDIATE` (no duplicates); creates only
+  the business row, never fictional seed data.
 - `GET  /api/connections?businessId` → `ConnectionsSummaryDTO`
 - `POST /api/connections/google/authorize` `{businessId, displayName?}` →
   `{authorizationUrl, expiresAt}` or 503 `UNAVAILABLE` (same-origin guarded)
 - `GET  /api/connections/google/callback?code&state` → 302 to
-  `/?connected=google` or `/?connectionError=CODE` (`?format=json` returns
-  the result body for scripted flows)
+  `/setup?businessId=<session business>&connected=google` or
+  `/setup?businessId=...&connectionError=CODE` — the redirect target is
+  server-owned (`/setup`) and preserves the session's business context;
+  `?format=json` returns the result body for scripted flows.
 - `POST /api/connections/google/disconnect` `{accountId}` →
   `{disconnected:true}` (same-origin guarded)
+
+Error bodies everywhere are `{ code, message, retryable }` with codes from
+`ConnectionError` plus `CROSS_ORIGIN_DENIED`/`INVALID_REQUEST`.
 
 ## Explicitly out of scope
 
