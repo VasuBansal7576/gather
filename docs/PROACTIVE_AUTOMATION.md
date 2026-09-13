@@ -12,14 +12,20 @@ Each timer tick runs exactly one guarded cycle for its account: the
 injected sweep body only (normally intake sweep + due-work drain via
 `startProactiveAccount`). Overlap protection is a shared per-account
 latch held in a registry independent of binding records: overlapping ticks
-skip and count instead of running concurrently, a refresh — or a remove
-plus re-register — during an in-flight sweep keeps the latch (the fresh
-binding waits, then sweeps normally — it can never wedge and never
-overlaps), and a prior sweep's completion releases the shared latch
-without writing stale counters onto the new record. A body that never
-settles is declared explicitly stuck (degraded with the reason kept, timer
-stopped, ownership and tombstone retained — no forced new body);
-re-register to resume. Repeated sweep failures degrade the binding
+skip and count instead of running concurrently, and a prior sweep's
+completion releases the shared latch without writing stale counters onto
+the new record. A refresh — or a remove plus re-register — during an
+in-flight sweep registers the fresh binding HELD: it reports `degraded`
+with a "prior sweep still in flight" reason (never falsely `running`),
+cannot tick while the latch is owned, and promotes to `running` only on
+the observed settle — a permanently stuck body keeps the fresh binding
+honestly held, never wedged-silent. The retained cell also carries the
+owning business: `remove()` is not proof prior work ended, so a
+cross-business re-register while the old body is unsettled is rejected
+until it settles; an idle remove releases the cell immediately. A body
+that never settles is declared explicitly stuck (degraded with the reason
+kept, timer stopped, ownership and tombstone retained — no forced new
+body). Repeated sweep failures degrade the binding
 explicitly — timer stopped, status `degraded` with the last error —
 instead of retrying silently forever; re-register to resume. `stop` clears
 the timer and awaits the in-flight sweep on a real elapsed-time deadline

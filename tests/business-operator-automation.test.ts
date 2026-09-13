@@ -228,13 +228,17 @@ test("refresh during an in-flight sweep keeps overlap protection, then sweeps ag
       intervalMs: 60_000,
     });
     assert.equal(refreshed.inFlight, true, "reports the shared in-flight latch honestly");
+    assert.equal(refreshed.status, "degraded", "held behind the prior sweep — never false running");
+    assert.match(refreshed.lastError ?? "", /prior sweep still in flight/);
     const skipped = await tickBinding(ACCOUNT);
-    assert.equal(skipped.skippedOverlap, true, "old sweep still holds the latch");
+    assert.equal(skipped.ok, false, "held binding cannot tick while the latch is owned");
+    assert.equal(skipped.error, "no running binding");
     slow.release();
     await first;
     await new Promise((resolve) => setTimeout(resolve, 10));
-    // Old sweep's completion cleared the SHARED latch and wrote nothing to
-    // the new record — the refreshed binding sweeps normally.
+    // Old sweep's completion cleared the SHARED latch, promoted the held
+    // binding, and wrote nothing to the new record — it sweeps normally.
+    assert.equal(getProactiveBinding(ACCOUNT)?.status, "running", "promoted on observed settle");
     const next = await tickBinding(ACCOUNT);
     assert.equal(next.skippedOverlap, false);
     assert.equal(next.ok, true);
@@ -386,13 +390,17 @@ test("remove plus re-register never runs bodies concurrently", async () => {
       runSweep: async () => { newCalls += 1; },
       intervalMs: 60_000,
     });
-    // The removed lifecycle's body is still unsettled: the fresh binding
-    // must skip, not overlap it.
+    // The removed lifecycle's body is still unsettled: the fresh binding is
+    // HELD degraded behind it — never running, never overlapping.
+    const held = getProactiveBinding(ACCOUNT);
+    assert.equal(held?.status, "degraded");
     const skipped = await tickBinding(ACCOUNT);
-    assert.equal(skipped.skippedOverlap, true);
+    assert.equal(skipped.ok, false);
     assert.equal(newCalls, 0, "no concurrent body while the old one runs");
     slow.release();
     await oldSweep;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(getProactiveBinding(ACCOUNT)?.status, "running", "promoted on the observed settle");
     const next = await tickBinding(ACCOUNT);
     assert.equal(next.skippedOverlap, false);
     assert.equal(newCalls, 1, "fresh body runs once the old one settles");
@@ -464,5 +472,113 @@ test("health scopes waiting and paused aggregates to the calling business", asyn
     assert.deepEqual(health.pausedBookings, [], "foreign paused bookings must not leak");
   } finally {
     fx.cleanup();
+  }
+});
+
+// ---------- stuck-latch hold + cross-business tombstone regressions ----------
+
+test("re-register behind a still-in-flight sweep is HELD degraded, promoted on observed settle", async () => {
+  const slow = deferred();
+  try {
+    registerProactiveBinding({ accountId: ACCOUNT, businessId: BUSINESS, runSweep: slow.run, intervalMs: 60_000 });
+    const first = tickBinding(ACCOUNT);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    // Public sequence: re-register while the prior body still owns the latch.
+    let newRuns = 0;
+    const held = registerProactiveBinding({
+      accountId: ACCOUNT, businessId: BUSINESS,
+      runSweep: async () => { newRuns += 1; },
+      intervalMs: 60_000,
+    });
+    assert.equal(held.status, "degraded", "never labels held work as running");
+    assert.equal(held.inFlight, true);
+    assert.match(held.lastError ?? "", /prior sweep still in flight/);
+    const ticked = await tickBinding(ACCOUNT);
+    assert.equal(ticked.ok, false, "held binding cannot tick while the latch is owned");
+    // Observed settle releases the latch AND promotes the held binding.
+    slow.release();
+    await first;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const promoted = getProactiveBinding(ACCOUNT);
+    assert.equal(promoted?.status, "running", "promoted only after observed settle");
+    assert.equal(promoted?.lastError, undefined);
+    const next = await tickBinding(ACCOUNT);
+    assert.equal(next.ok, true);
+    assert.equal(newRuns, 1, "the fresh body runs exactly once, after settle");
+  } finally {
+    slow.release();
+    resetProactiveAutomation();
+  }
+});
+
+test("re-register after the stuck watchdog keeps holding until the hung body settles", async () => {
+  const hung = deferred();
+  try {
+    registerProactiveBinding({
+      accountId: ACCOUNT, businessId: BUSINESS,
+      runSweep: hung.run, intervalMs: 60_000, maxSweepMs: 80,
+    });
+    const stuckTick = tickBinding(ACCOUNT);
+    await new Promise((resolve) => setTimeout(resolve, 150)); // watchdog degrades
+    assert.equal(getProactiveBinding(ACCOUNT)?.status, "degraded");
+    // The documented recovery — re-register — must NOT label stuck as running.
+    const held = registerProactiveBinding({
+      accountId: ACCOUNT, businessId: BUSINESS,
+      runSweep: async () => "ok", intervalMs: 60_000,
+    });
+    assert.equal(held.status, "degraded", "held behind the still-unsettled body");
+    const ticked = await tickBinding(ACCOUNT);
+    assert.equal(ticked.ok, false);
+    // Only the observed settle promotes the fresh binding.
+    hung.release();
+    await stuckTick;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(getProactiveBinding(ACCOUNT)?.status, "running");
+    const next = await tickBinding(ACCOUNT);
+    assert.equal(next.ok, true);
+    assert.equal(next.state?.totalRuns, 1);
+  } finally {
+    hung.release();
+    resetProactiveAutomation();
+  }
+});
+
+test("remove during an unsettled sweep keeps business ownership: cross-business rebind rejected until settle", async () => {
+  const slow = deferred();
+  try {
+    registerProactiveBinding({ accountId: ACCOUNT, businessId: "biz-A", runSweep: slow.run, intervalMs: 60_000 });
+    const first = tickBinding(ACCOUNT);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    // remove() drops the record but is NOT proof A's work ended.
+    assert.equal(removeProactiveBinding(ACCOUNT), true);
+    assert.throws(
+      () => registerProactiveBinding({ accountId: ACCOUNT, businessId: "biz-B", runSweep: async () => {}, intervalMs: 60_000 }),
+      /still has unsettled work owned by business biz-A/,
+      "business B cannot attach while A's body is live",
+    );
+    // After the observed settle the tombstone is released and B is allowed.
+    slow.release();
+    await first;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const rebound = registerProactiveBinding({ accountId: ACCOUNT, businessId: "biz-B", runSweep: async () => {}, intervalMs: 60_000 });
+    assert.equal(rebound.status, "running");
+    assert.equal(rebound.businessId, "biz-B");
+  } finally {
+    slow.release();
+    resetProactiveAutomation();
+  }
+});
+
+test("idle remove releases the latch cell so same-account rebinding is immediate", async () => {
+  try {
+    registerProactiveBinding({ accountId: ACCOUNT, businessId: "biz-A", runSweep: async () => {}, intervalMs: 60_000 });
+    assert.equal(removeProactiveBinding(ACCOUNT), true);
+    // Nothing in flight: the cell is released, so a different business may
+    // bind immediately — no stale tombstone.
+    const rebound = registerProactiveBinding({ accountId: ACCOUNT, businessId: "biz-B", runSweep: async () => {}, intervalMs: 60_000 });
+    assert.equal(rebound.businessId, "biz-B");
+    assert.equal(rebound.status, "running");
+  } finally {
+    resetProactiveAutomation();
   }
 });
