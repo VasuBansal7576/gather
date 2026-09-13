@@ -60,6 +60,8 @@ interface ConnectionAccountRow {
   displayName: string;
   scopesJson: string;
   status: "connected" | "revoked" | "error";
+  /** Durable fence: bumped on every binding change so in-flight work can't resurrect stale state. */
+  revision: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -83,7 +85,7 @@ function secretKey(...parts: string[]): string {
   return `conn:${parts.join(":")}`;
 }
 
-/** Fixed loopback redirect allowlist: http + loopback host + the exact callback path. */
+/** Fixed loopback redirect allowlist: http + loopback host + the exact callback path, no ambiguity. */
 export function assertLoopbackRedirectUri(redirectUri: string): string {
   let url: URL;
   try {
@@ -92,10 +94,11 @@ export function assertLoopbackRedirectUri(redirectUri: string): string {
     throw new ConnectionError("UNAVAILABLE", `Provider redirect URI is not a valid URL: ${redirectUri}`);
   }
   const loopbackHost = url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]";
-  if (url.protocol !== "http:" || !loopbackHost || url.pathname !== GOOGLE_CALLBACK_PATH) {
+  const ambiguous = url.username !== "" || url.password !== "" || url.search !== "" || url.hash !== "";
+  if (url.protocol !== "http:" || !loopbackHost || url.pathname !== GOOGLE_CALLBACK_PATH || ambiguous) {
     throw new ConnectionError(
       "UNAVAILABLE",
-      `Provider redirect URI must be an http loopback URL ending in ${GOOGLE_CALLBACK_PATH} (got ${redirectUri})`,
+      `Provider redirect URI must be a plain http loopback URL ending in ${GOOGLE_CALLBACK_PATH} with no userinfo, query, or fragment`,
     );
   }
   return redirectUri;
@@ -173,6 +176,7 @@ export class ConnectionService {
         display_name TEXT NOT NULL,
         scopes_json TEXT NOT NULL,
         status TEXT NOT NULL CHECK (status IN ('connected', 'revoked', 'error')),
+        revision INTEGER NOT NULL DEFAULT 1,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         UNIQUE(provider, account_key)
@@ -187,6 +191,10 @@ export class ConnectionService {
         updated_at TEXT NOT NULL
       );
     `);
+    const cols = this.db.prepare("PRAGMA table_info(connection_accounts)").all() as Array<{ name: string }>;
+    if (!cols.some((col) => col.name === "revision")) {
+      this.db.exec("ALTER TABLE connection_accounts ADD COLUMN revision INTEGER NOT NULL DEFAULT 1");
+    }
   }
 
   // ---------------------------------------------------------------- reads
@@ -221,7 +229,7 @@ export class ConnectionService {
         provider,
         status: "unavailable",
         unavailableReason:
-          "Google provider app is not configured (missing client id/metadata); set GATHER_GOOGLE_CLIENT_ID to enable real authorization",
+          "Google connection is unavailable in this installation",
         accounts: linked,
       };
     }
@@ -252,7 +260,7 @@ export class ConnectionService {
             provider: "google",
             status: "unavailable",
             unavailableReason:
-              "Google provider app is not configured (missing client id/metadata); set GATHER_GOOGLE_CLIENT_ID to enable real authorization",
+              "Google connection is unavailable in this installation",
           },
     ];
   }
@@ -274,7 +282,7 @@ export class ConnectionService {
     if (!app || !app.clientId.trim()) {
       throw new ConnectionError(
         "UNAVAILABLE",
-        "Google connection is unavailable: provider app is not configured (missing client id)",
+        "Google connection is unavailable in this installation",
       );
     }
     const redirectUri = assertLoopbackRedirectUri(app.redirectUri);
@@ -350,7 +358,7 @@ export class ConnectionService {
    */
   async completeAuthorization(input: { code: string; state: string }): Promise<AuthorizationCompleteDTO> {
     const app = this.googleApp;
-    if (!app) throw new ConnectionError("UNAVAILABLE", "Google provider app is not configured");
+    if (!app) throw new ConnectionError("UNAVAILABLE", "Google connection is unavailable in this installation");
     if (typeof input.code !== "string" || input.code.trim().length === 0) {
       throw new ConnectionError("INVALID_REQUEST", "Authorization callback requires a code");
     }
@@ -438,8 +446,18 @@ export class ConnectionService {
       );
     }
     const grantedScopes = [...granted].sort();
-    const accessRef = secretKey("google", identity.accountKey, "access");
-    const refreshRef = secretKey("google", identity.accountKey, "refresh");
+    // Staged publish: new secrets are written under fresh versioned refs and
+    // only become the binding's refs when the DB commit succeeds — a failure
+    // anywhere before commit leaves the prior valid binding and its secrets
+    // untouched, and superseded refs are deleted only after commit.
+    const generation = randomUUID().slice(0, 12);
+    const stagedAccessRef = secretKey("google", identity.accountKey, "access", generation);
+    const stagedRefreshRef = token.refreshToken
+      ? secretKey("google", identity.accountKey, "refresh", generation)
+      : undefined;
+    this.secrets.set(stagedAccessRef, token.accessToken);
+    if (stagedRefreshRef) this.secrets.set(stagedRefreshRef, token.refreshToken!);
+    const priorMeta = existing ? this.tokenMeta(existing.id) : undefined;
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const timestamp = nowIso();
@@ -472,10 +490,10 @@ export class ConnectionService {
       }
       this.db.prepare(
         `INSERT INTO connection_accounts
-          (id, connected_account_ids_json, business_id, provider, account_key, display_name, scopes_json, status, created_at, updated_at)
-         VALUES ($id, $cids, $b, 'google', $ak, $dn, $sj, 'connected', $at, $at)
+          (id, connected_account_ids_json, business_id, provider, account_key, display_name, scopes_json, status, revision, created_at, updated_at)
+         VALUES ($id, $cids, $b, 'google', $ak, $dn, $sj, 'connected', 1, $at, $at)
          ON CONFLICT(id) DO UPDATE SET connected_account_ids_json = $cids, scopes_json = $sj, status = 'connected',
-           display_name = $dn, updated_at = $at`,
+           display_name = $dn, revision = connection_accounts.revision + 1, updated_at = $at`,
       ).run({
         $id: connectionId,
         $cids: JSON.stringify(connectedIds),
@@ -485,19 +503,20 @@ export class ConnectionService {
         $sj: JSON.stringify(grantedScopes),
         $at: timestamp,
       });
+      // A provider that omits a new refresh token on reauthorization keeps
+      // the previously granted one — never null it out.
+      const refreshRef = stagedRefreshRef ?? priorMeta?.refreshRef ?? null;
       this.db.prepare(
         `INSERT INTO connection_token_meta (connection_id, access_ref, access_expires_at_ms, refresh_ref, updated_at)
          VALUES ($id, $ar, $ax, $rr, $at)
          ON CONFLICT(connection_id) DO UPDATE SET access_ref = $ar, access_expires_at_ms = $ax, refresh_ref = $rr, updated_at = $at`,
       ).run({
         $id: connectionId,
-        $ar: accessRef,
+        $ar: stagedAccessRef,
         $ax: token.expiresInSec ? this.nowMs() + token.expiresInSec * 1000 : null,
-        $rr: token.refreshToken ? refreshRef : null,
+        $rr: refreshRef,
         $at: timestamp,
       });
-      this.secrets.set(accessRef, token.accessToken);
-      if (token.refreshToken) this.secrets.set(refreshRef, token.refreshToken);
       this.db.exec("COMMIT");
     } catch (error) {
       try {
@@ -505,9 +524,15 @@ export class ConnectionService {
       } catch {
         // Already rolled back.
       }
-      this.secrets.delete(accessRef);
-      this.secrets.delete(refreshRef);
+      this.secrets.delete(stagedAccessRef);
+      if (stagedRefreshRef) this.secrets.delete(stagedRefreshRef);
       throw error;
+    }
+    // Compensating cleanup: only the now-superseded refs are removed, and
+    // only after the new binding is durable.
+    if (priorMeta?.accessRef && priorMeta.accessRef !== stagedAccessRef) this.secrets.delete(priorMeta.accessRef);
+    if (stagedRefreshRef && priorMeta?.refreshRef && priorMeta.refreshRef !== stagedRefreshRef) {
+      this.secrets.delete(priorMeta.refreshRef);
     }
     return {
       provider: "google",
@@ -543,6 +568,7 @@ export class ConnectionService {
       displayName: String(row.display_name),
       scopesJson: String(row.scopes_json),
       status: row.status as ConnectionAccountRow["status"],
+      revision: Number(row.revision ?? 1),
       createdAt: String(row.created_at),
       updatedAt: String(row.updated_at),
     };
@@ -565,74 +591,144 @@ export class ConnectionService {
   }
 
   /**
-   * Return a usable access token for a connected account, refreshing when it
-   * is expired or near expiry. Concurrent refreshes for one connection share
-   * a single in-flight exchange (singleflight); a revoked refresh token
-   * marks the connection revoked instead of looping.
+   * Canonical public→internal resolution: accepts either the internal
+   * connection id or a public connected_accounts id (the ids callers see in
+   * getConnections DTOs) and returns the owning connection row. Business
+   * scope is enforced by callers after resolution.
    */
-  async accessToken(connectionId: string): Promise<string> {
-    const connection = this.connectionById(connectionId);
-    if (!connection || connection.status !== "connected") {
-      throw new ConnectionError("NOT_FOUND", `No connected account ${connectionId}`);
+  private resolveConnection(id: string): ConnectionAccountRow | undefined {
+    const direct = this.connectionById(id);
+    if (direct) return direct;
+    const rows = this.db.prepare("SELECT * FROM connection_accounts").all() as SqlRow[];
+    for (const row of rows) {
+      const candidate = this.toConnectionRow(row);
+      if ((JSON.parse(candidate.connectedAccountIdsJson) as string[]).includes(id)) return candidate;
     }
-    const meta = this.tokenMeta(connectionId);
+    return undefined;
+  }
+
+  /**
+   * Return a usable access token for a connected account, refreshing when it
+   * is expired or near expiry. `accountId` may be the connection id or a
+   * public connected_accounts id; `businessId` scopes the lookup explicitly.
+   * Concurrent refreshes for one connection share a single in-flight
+   * exchange (singleflight); a revoked refresh token marks the connection
+   * revoked instead of looping.
+   */
+  async accessToken(input: { accountId: string; businessId: string }): Promise<string> {
+    const connection = this.resolveConnection(input.accountId);
+    if (!connection || connection.businessId !== input.businessId || connection.status !== "connected") {
+      throw new ConnectionError("NOT_FOUND", `No connected account ${input.accountId} for this business`);
+    }
+    const meta = this.tokenMeta(connection.id);
     const cached = meta?.accessRef ? this.secrets.get(meta.accessRef) : undefined;
     if (cached && meta?.accessExpiresAtMs && meta.accessExpiresAtMs - this.nowMs() > ACCESS_EXPIRY_SKEW_MS) {
       return cached;
     }
-    const inFlight = this.refreshes.get(connectionId);
+    const inFlight = this.refreshes.get(connection.id);
     if (inFlight) return inFlight;
-    const attempt = this.refreshConnection(connection, meta).finally(() => this.refreshes.delete(connectionId));
-    this.refreshes.set(connectionId, attempt);
+    const attempt = this.refreshConnection(connection, meta).finally(() => this.refreshes.delete(connection.id));
+    this.refreshes.set(connection.id, attempt);
     return attempt;
   }
 
+  /**
+   * Refresh under a durable revision fence: the connection's revision is
+   * captured before the provider exchange, staged secrets are published only
+   * if the connection is still the same connected binding inside BEGIN
+   * IMMEDIATE, and the revision bumps on commit. A disconnect or reconnect
+   * that lands mid-exchange makes the late refresh fail STALE — it can
+   * never resurrect deleted secrets or hand back a usable token for a
+   * binding that no longer exists. Cross-process refreshes serialize the
+   * same way: the loser's revision check fails closed.
+   */
   private async refreshConnection(connection: ConnectionAccountRow, meta: TokenMetaRow | undefined): Promise<string> {
     const app = this.googleApp;
-    if (!app) throw new ConnectionError("UNAVAILABLE", "Google provider app is not configured");
+    if (!app) throw new ConnectionError("UNAVAILABLE", "Google connection is unavailable in this installation");
     const refreshToken = meta?.refreshRef ? this.secrets.get(meta.refreshRef) : undefined;
     if (!refreshToken) {
       this.markRevoked(connection);
       throw new ConnectionError("ACCESS_REVOKED", `Connection ${connection.id} has no usable refresh token`);
     }
+    let token;
     try {
-      const token = await this.transport.refresh({
+      token = await this.transport.refresh({
         tokenEndpoint: app.tokenEndpoint,
         clientId: app.clientId,
         clientSecret: app.clientSecret,
         refreshToken,
       });
+    } catch (error) {
+      // Structural classification only — provider description text never
+      // surfaces (it may carry sensitive material). invalid_grant and
+      // unauthorized_client are terminal; anything else stays retryable.
+      if (
+        error instanceof ConnectionError &&
+        (error.providerError === "invalid_grant" || error.providerError === "unauthorized_client")
+      ) {
+        this.markRevoked(connection);
+        throw new ConnectionError("ACCESS_REVOKED", `Connection ${connection.id} was revoked at the provider`);
+      }
+      if (error instanceof ConnectionError) throw error;
+      throw new ConnectionError("EXCHANGE_FAILED", "Token refresh failed at the provider", { retryable: true });
+    }
+    // Staged publish under the revision fence.
+    const generation = randomUUID().slice(0, 12);
+    const stagedAccessRef = secretKey("google", connection.accountKey, "access", generation);
+    const stagedRefreshRef = token.refreshToken
+      ? secretKey("google", connection.accountKey, "refresh", generation)
+      : undefined;
+    this.secrets.set(stagedAccessRef, token.accessToken);
+    if (stagedRefreshRef) this.secrets.set(stagedRefreshRef, token.refreshToken!);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const current = this.connectionById(connection.id);
+      if (!current || current.status !== "connected" || current.revision !== connection.revision) {
+        throw new ConnectionError(
+          "STALE",
+          "The connection changed while refreshing; the refreshed token was discarded",
+        );
+      }
       const timestamp = nowIso();
-      const accessRef = meta?.accessRef ?? secretKey("google", connection.accountKey, "access");
-      const refreshRef = meta?.refreshRef ?? secretKey("google", connection.accountKey, "refresh");
-      this.secrets.set(accessRef, token.accessToken);
-      if (token.refreshToken) this.secrets.set(refreshRef, token.refreshToken);
+      const refreshRef = stagedRefreshRef ?? meta?.refreshRef ?? null;
       this.db.prepare(
         `INSERT INTO connection_token_meta (connection_id, access_ref, access_expires_at_ms, refresh_ref, updated_at)
          VALUES ($id, $ar, $ax, $rr, $at)
          ON CONFLICT(connection_id) DO UPDATE SET access_ref = $ar, access_expires_at_ms = $ax, refresh_ref = $rr, updated_at = $at`,
       ).run({
         $id: connection.id,
-        $ar: accessRef,
+        $ar: stagedAccessRef,
         $ax: token.expiresInSec ? this.nowMs() + token.expiresInSec * 1000 : null,
         $rr: refreshRef,
         $at: timestamp,
       });
+      this.db.prepare("UPDATE connection_accounts SET revision = revision + 1, updated_at = $at WHERE id = $id").run({
+        $at: timestamp,
+        $id: connection.id,
+      });
+      this.db.exec("COMMIT");
+      if (meta?.accessRef && meta.accessRef !== stagedAccessRef) this.secrets.delete(meta.accessRef);
+      if (stagedRefreshRef && meta?.refreshRef && meta.refreshRef !== stagedRefreshRef) {
+        this.secrets.delete(meta.refreshRef);
+      }
       return token.accessToken;
     } catch (error) {
-      if (error instanceof ConnectionError) throw error;
-      const message = error instanceof Error ? error.message : "provider error";
-      if (/invalid_grant|revoked|unauthorized/i.test(message)) {
-        this.markRevoked(connection);
-        throw new ConnectionError("ACCESS_REVOKED", `Connection ${connection.id} was revoked at the provider`);
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        // Already rolled back.
       }
-      throw new ConnectionError("EXCHANGE_FAILED", `Token refresh failed: ${message}`);
+      this.secrets.delete(stagedAccessRef);
+      if (stagedRefreshRef) this.secrets.delete(stagedRefreshRef);
+      throw error;
     }
   }
 
   private markRevoked(connection: ConnectionAccountRow): void {
     const timestamp = nowIso();
-    this.db.prepare("UPDATE connection_accounts SET status = 'revoked', updated_at = $at WHERE id = $id").run({
+    this.db.prepare(
+      "UPDATE connection_accounts SET status = 'revoked', revision = revision + 1, updated_at = $at WHERE id = $id",
+    ).run({
       $at: timestamp,
       $id: connection.id,
     });
@@ -650,25 +746,20 @@ export class ConnectionService {
   /**
    * Remove ONE selected Gather binding: the linked connected_accounts rows
    * flip to revoked, this module's secrets for the connection are deleted,
-   * and a best-effort remote revocation is attempted. Nothing else the owner
-   * has — other connections, other secrets, any provider-side data — is
-   * touched.
+   * and a best-effort remote revocation is attempted. `accountId` may be the
+   * connection id or a public connected_accounts id; `businessId` scopes it
+   * explicitly. The revocation commits before secrets are removed, so a
+   * refresh in flight at that moment hits the revision fence and discards
+   * its staged secrets instead of resurrecting the binding. Nothing else
+   * the owner has — other connections, other secrets, any provider-side
+   * data — is touched.
    */
-  async disconnect(connectionId: string): Promise<{ disconnected: true }> {
-    let connection = this.connectionById(connectionId);
-    if (!connection) {
-      // Also accept a connected_accounts id: resolve to its owning connection.
-      const rows = this.db.prepare("SELECT * FROM connection_accounts").all() as SqlRow[];
-      for (const row of rows) {
-        const candidate = this.toConnectionRow(row);
-        if ((JSON.parse(candidate.connectedAccountIdsJson) as string[]).includes(connectionId)) {
-          connection = candidate;
-          break;
-        }
-      }
+  async disconnect(input: { accountId: string; businessId: string }): Promise<{ disconnected: true }> {
+    const connection = this.resolveConnection(input.accountId);
+    if (!connection || connection.businessId !== input.businessId) {
+      throw new ConnectionError("NOT_FOUND", `No connected account ${input.accountId} for this business`);
     }
-    if (!connection) throw new ConnectionError("NOT_FOUND", `No connected account ${connectionId}`);
-    const meta = this.tokenMeta(connectionId);
+    const meta = this.tokenMeta(connection.id);
     const app = this.googleApp;
     if (app?.revokeEndpoint && this.transport.revokeToken) {
       const token =
@@ -682,22 +773,34 @@ export class ConnectionService {
         }
       }
     }
-    for (const ref of [meta?.accessRef, meta?.refreshRef]) {
-      if (ref) this.secrets.delete(ref);
-    }
-    const timestamp = nowIso();
-    this.db.prepare("UPDATE connection_accounts SET status = 'revoked', updated_at = $at WHERE id = $id").run({
-      $at: timestamp,
-      $id: connection.id,
-    });
-    for (const id of JSON.parse(connection.connectedAccountIdsJson) as string[]) {
-      try {
-        this.store.setConnectedAccountStatus(id, "revoked");
-      } catch {
-        // Row already gone; keep going.
+    const refs: string[] = [];
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const timestamp = nowIso();
+      this.db.prepare(
+        "UPDATE connection_accounts SET status = 'revoked', revision = revision + 1, updated_at = $at WHERE id = $id",
+      ).run({ $at: timestamp, $id: connection.id });
+      const current = this.tokenMeta(connection.id);
+      if (current?.accessRef) refs.push(current.accessRef);
+      if (current?.refreshRef) refs.push(current.refreshRef);
+      this.db.prepare("DELETE FROM connection_token_meta WHERE connection_id = $id").run({ $id: connection.id });
+      for (const id of JSON.parse(connection.connectedAccountIdsJson) as string[]) {
+        try {
+          this.store.setConnectedAccountStatus(id, "revoked");
+        } catch {
+          // Row already gone; keep going.
+        }
       }
+      this.db.exec("COMMIT");
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        // Already rolled back.
+      }
+      throw error;
     }
-    this.db.prepare("DELETE FROM connection_token_meta WHERE connection_id = $id").run({ $id: connection.id });
+    for (const ref of refs) this.secrets.delete(ref);
     return { disconnected: true };
   }
 }
