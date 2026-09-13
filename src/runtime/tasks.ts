@@ -15,26 +15,53 @@ import type { GatherGatewayConnection } from "./client.ts";
  * /concepts/agent-loop: an agent.wait timeout is wait-only — it does NOT stop
  * the underlying run. Terminal "error" may represent cancellation;
  * stopReason "superseded" means a newer session writer replaced the run.
+ * Unrecognized statuses are treated as non-terminal: they never imply the
+ * remote run finished.
  */
 
 export const DEFAULT_AGENT_ID = "main";
 
 const UNSAFE_SESSION_CHARS = /[^a-zA-Z0-9._-]+/g;
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function requireString(value: unknown, field: string, method: string): string {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error(`malformed ${method} response: ${field} is not a non-empty string`);
+  }
+  return value;
+}
+
+function requireNumber(value: unknown, field: string, method: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new Error(`malformed ${method} response: ${field} is not a finite number`);
+  }
+  return value;
+}
+
 /**
  * Deterministic per-booking session key in the supported
  * `agent:<agentId>:<rest>` form (non-empty rest segments).
- * Every message for one booking shares one session, so conversational state
- * and deduping are stable across process restarts.
+ *
+ * Collision-resistant: the readable slug is sanitized for humans only, while
+ * a sha256 digest of the exact bookingId + agentId identity makes distinct
+ * bookings distinct — sanitization can never alias "a/b" and "a-b".
  */
 export function bookingSessionKey(
   bookingId: string,
   agentId: string = DEFAULT_AGENT_ID,
 ): string {
-  const safeBooking = bookingId.trim().replace(UNSAFE_SESSION_CHARS, "-");
+  const trimmed = bookingId.trim();
+  if (!trimmed) throw new Error("bookingId must contain a usable character");
+  const safeBooking = trimmed.replace(UNSAFE_SESSION_CHARS, "-").slice(0, 48) || "booking";
   const safeAgent = agentId.trim().replace(UNSAFE_SESSION_CHARS, "-") || DEFAULT_AGENT_ID;
-  if (!safeBooking) throw new Error("bookingId must contain a usable character");
-  return `agent:${safeAgent}:gather:booking:${safeBooking}`;
+  const digest = createHash("sha256")
+    .update(`gather-booking:${safeAgent}:${trimmed}`)
+    .digest("hex")
+    .slice(0, 12);
+  return `agent:${safeAgent}:gather:booking:${safeBooking}-${digest}`;
 }
 
 /**
@@ -87,15 +114,19 @@ export interface SubmittedTask {
   idempotencyKey: string;
 }
 
-export type RunWaitStatus = "ok" | "error" | "timeout" | "pending";
+export type RunWaitStatus = "ok" | "error" | "timeout" | "pending" | "unknown";
+
+const KNOWN_WAIT_STATUSES = new Set(["ok", "error", "timeout", "pending"]);
 
 export interface RunWaitResult {
   status: RunWaitStatus;
+  /** The raw status string reported by the gateway, if any. */
+  rawStatus?: string;
   runId: string;
   /**
-   * True when status is "timeout" or "pending": the wait expired but the
-   * remote run may still be executing. A timeout is never proof the run
-   * stopped — reconcile before retrying or declaring failure.
+   * True unless the run verifiably reached a terminal state ("ok" or
+   * "error"). A wait timeout is wait-only — it does not stop the run — and
+   * an unrecognized status can never prove the run finished.
    */
   executionMayContinue: boolean;
   stopReason?: string;
@@ -130,13 +161,13 @@ export class GatherRuntimeTasks {
     if (request.extraSystemPrompt) params.extraSystemPrompt = request.extraSystemPrompt;
     if (request.runTimeoutMs) params.timeout = request.runTimeoutMs;
 
-    const response = await this.connection.request<{ runId: string; acceptedAt: number }>(
-      "agent",
-      params,
-    );
+    const response = await this.connection.request<unknown>("agent", params);
+    if (!isRecord(response)) {
+      throw new Error("malformed agent response: not an object");
+    }
     return {
-      runId: response.runId,
-      acceptedAt: response.acceptedAt,
+      runId: requireString(response.runId, "runId", "agent"),
+      acceptedAt: requireNumber(response.acceptedAt, "acceptedAt", "agent"),
       sessionKey,
       idempotencyKey: request.idempotencyKey,
     };
@@ -145,23 +176,33 @@ export class GatherRuntimeTasks {
   /**
    * Waits for a run's terminal snapshot. A "timeout" result means ONLY that
    * the wait expired — the run may still be executing remotely; it does not
-   * stop or cancel the run.
+   * stop or cancel the run. An unrecognized status is reported as "unknown"
+   * and can never imply the run finished.
    */
   async waitForRun(input: {
     runId: string;
     timeoutMs?: number;
   }): Promise<RunWaitResult> {
     const timeoutMs = input.timeoutMs ?? 30000;
-    const response = await this.connection.request<Record<string, unknown>>(
+    const response = await this.connection.request<unknown>(
       "agent.wait",
       { runId: input.runId, timeoutMs },
       { timeoutMs: timeoutMs + 15000 },
     );
-    const status = (response.status as RunWaitStatus | undefined) ?? "timeout";
+    if (!isRecord(response)) {
+      throw new Error("malformed agent.wait response: not an object");
+    }
+    const rawStatus = typeof response.status === "string" ? response.status : undefined;
+    const status: RunWaitStatus =
+      rawStatus && KNOWN_WAIT_STATUSES.has(rawStatus)
+        ? (rawStatus as RunWaitStatus)
+        : "unknown";
+    const terminal = status === "ok" || status === "error";
     return {
       status,
+      rawStatus,
       runId: input.runId,
-      executionMayContinue: status === "timeout" || status === "pending",
+      executionMayContinue: !terminal,
       stopReason: typeof response.stopReason === "string" ? response.stopReason : undefined,
       error: typeof response.error === "string" ? response.error : undefined,
       startedAt: typeof response.startedAt === "number" ? response.startedAt : undefined,
@@ -175,11 +216,18 @@ export class GatherRuntimeTasks {
     sessionKey: string;
     limit?: number;
   }): Promise<SessionHistoryEntry[]> {
-    const response = await this.connection.request<{ messages?: unknown[] }>(
+    const response = await this.connection.request<unknown>(
       "chat.history",
       { sessionKey: input.sessionKey, limit: input.limit ?? 50 },
     );
-    return (response.messages ?? []).map((raw) => ({ raw }));
+    if (!isRecord(response)) {
+      throw new Error("malformed chat.history response: not an object");
+    }
+    const messages = response.messages ?? [];
+    if (!Array.isArray(messages)) {
+      throw new Error("malformed chat.history response: messages is not an array");
+    }
+    return messages.map((raw) => ({ raw }));
   }
 
   /** Durable session index rows (sessions.list). */
@@ -190,5 +238,10 @@ export class GatherRuntimeTasks {
   /** Gateway status summary (status). */
   async gatewayStatus(): Promise<unknown> {
     return this.connection.request("status", {});
+  }
+
+  /** Redacted config snapshot (config.get) — config is never returned raw. */
+  async configSnapshot(): Promise<unknown> {
+    return this.connection.request("config.get", {});
   }
 }

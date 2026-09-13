@@ -1,7 +1,8 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { chmodSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { accessSync, chmodSync, constants, existsSync, statSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { GatherOpenClawLayout } from "./layout.ts";
 
 /**
@@ -23,28 +24,146 @@ import type { GatherOpenClawLayout } from "./layout.ts";
  * personal OPENCLAW_* variables or provider keys cannot leak in, and
  * OPENCLAW_HOME + HOME both point at the Gather-owned home dir so no
  * personal-home config fallback is possible. No login-shell env import is
- * enabled (OPENCLAW_LOAD_SHELL_ENV is never set).
+ * enabled (OPENCLAW_LOAD_SHELL_ENV is never set), and caller-supplied env is
+ * restricted to an explicit diagnostic allowlist.
  */
 
 export const OPENCLAW_EX_CONFIG_EXIT_CODE = 78;
 
 export interface OpenClawExecutable {
-  /** Executable to spawn, e.g. "openclaw" or an absolute node binary. */
+  /**
+   * Absolute path to the executable, e.g. "/opt/homebrew/bin/openclaw" or an
+   * absolute node binary when args[0] is an .mjs package entry. Bare command
+   * names are rejected: the adapter never selects a runtime via PATH lookup.
+   */
   command: string;
   /**
-   * Arguments prepended before "gateway". Use ["/path/to/openclaw.mjs"] with
-   * command=process.execPath when spawning the package entry directly.
+   * Arguments prepended before the subcommand, e.g.
+   * ["/path/to/openclaw.mjs"] when command is a node binary.
    */
   args?: string[];
 }
 
+export type ExecutableSource = "explicit" | "package";
+
+export interface ResolvedExecutable {
+  executable: OpenClawExecutable;
+  source: ExecutableSource;
+}
+
+function assertReadableFile(path: string, what: string): void {
+  if (!existsSync(path)) throw new Error(`${what} does not exist: ${path}`);
+  if (!statSync(path).isFile()) throw new Error(`${what} is not a regular file: ${path}`);
+}
+
+function assertExecutableFile(path: string, what: string): void {
+  assertReadableFile(path, what);
+  if (process.platform !== "win32") {
+    try {
+      accessSync(path, constants.X_OK);
+    } catch {
+      throw new Error(`${what} is not executable: ${path}`);
+    }
+  }
+}
+
+/**
+ * Resolves the openclaw package entry via import.meta (supported embedding
+ * pattern: package main entry's sibling `openclaw.mjs`). Returns null when
+ * the package is not installed in this project.
+ */
+export function resolveInstalledPackageEntry(): string | null {
+  try {
+    const packageEntry = fileURLToPath(import.meta.resolve("openclaw"));
+    const entry = resolve(dirname(packageEntry), "..", "openclaw.mjs");
+    return existsSync(entry) ? entry : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Resolves a verified executable. Explicit executables are validated (must be
+ * an absolute existing executable file; args[0] must exist when given). With
+ * no explicit executable, the installed `openclaw` package entry is used when
+ * resolvable; otherwise this throws rather than falling back to a PATH lookup
+ * that could pick an arbitrary runtime.
+ */
+export function resolveOpenClawExecutable(input: {
+  executable?: OpenClawExecutable;
+}): ResolvedExecutable {
+  if (input.executable) {
+    const exe = input.executable;
+    if (!exe.command.startsWith("/") && !/^[A-Za-z]:[\\/]/.test(exe.command)) {
+      throw new Error(
+        `openclaw executable must be an absolute validated path, got bare command "${exe.command}"`,
+      );
+    }
+    assertExecutableFile(exe.command, "openclaw executable");
+    if (exe.args && exe.args.length > 0) {
+      assertReadableFile(exe.args[0]!, "openclaw package entry");
+    }
+    return { executable: exe, source: "explicit" };
+  }
+  const entry = resolveInstalledPackageEntry();
+  if (entry) {
+    return {
+      executable: { command: process.execPath, args: [entry] },
+      source: "package",
+    };
+  }
+  throw new Error(
+    "no verified openclaw executable: the openclaw package is not resolvable from this project; " +
+      "pass an explicit absolute OpenClawExecutable",
+  );
+}
+
+/**
+ * Verifies the resolved executable actually reports an OpenClaw version.
+ * Runs `<exe> --version` with a minimal env and requires an `OpenClaw x.y.z`
+ * banner. Returns the reported version string.
+ */
+export function verifyOpenClawExecutable(
+  resolved: ResolvedExecutable,
+  env: Record<string, string>,
+): string {
+  const result = spawnSync(
+    resolved.executable.command,
+    [...(resolved.executable.args ?? []), "--version"],
+    { env: env as NodeJS.ProcessEnv, encoding: "utf8", timeout: 15000 },
+  );
+  const output = `${result.stdout ?? ""}${result.stderr ?? ""}`.trim();
+  const match = output.match(/OpenClaw\s+(\d+\.\d+\.\d+(?:-\S+)?)/i);
+  if (result.error || result.status !== 0 || !match) {
+    throw new Error(
+      `openclaw executable failed --version verification ` +
+        `(status=${result.status}, error=${result.error?.message ?? "none"}): ${output.slice(0, 300)}`,
+    );
+  }
+  return match[1]!;
+}
+
 export interface GatewayProcessOptions {
   layout: GatherOpenClawLayout;
-  /** Defaults to { command: "openclaw" } resolved via PATH. */
+  /**
+   * Verified executable; when omitted the installed openclaw package entry is
+   * resolved. Bare PATH commands are never used.
+   */
   executable?: OpenClawExecutable;
   /** Pre-generated token; generated and persisted when omitted. */
   gatewayToken?: string;
-  /** Extra OPENCLAW_*-safe env additions. Must not override isolation keys. */
+  /**
+   * Narrow shared secret for the Gather MCP boundary; passed to the child as
+   * GATHER_MCP_TOKEN for config header substitution. Adapter-internal, never
+   * overridable by extraEnv.
+   */
+  mcpToken?: string;
+  /**
+   * Diagnostics-only additions; restricted to EXTRA_ENV_ALLOWLIST. Overrides
+   * of isolation keys or runtime toggles (e.g. OPENCLAW_NO_RESPAWN,
+   * OPENCLAW_SKIP_CHANNELS, OPENCLAW_LOAD_SHELL_ENV, NODE_OPTIONS) are
+   * rejected — no personal imports or policy weakening.
+   */
   extraEnv?: Record<string, string>;
   log?: (line: string) => void;
 }
@@ -56,19 +175,47 @@ const ISOLATION_ENV_KEYS = new Set([
   "OPENCLAW_WORKSPACE_DIR",
   "OPENCLAW_GATEWAY_PORT",
   "OPENCLAW_GATEWAY_TOKEN",
+  "GATHER_MCP_TOKEN",
   "HOME",
   "TMPDIR",
+]);
+
+/**
+ * Only these caller-supplied variables may reach the child. Diagnostics
+ * surface only — never auth, lifecycle, policy, or loader knobs.
+ */
+export const EXTRA_ENV_ALLOWLIST = new Set([
+  "OPENCLAW_LOG_LEVEL",
+  "OPENCLAW_DIAGNOSTICS",
+  "OPENCLAW_DIAGNOSTICS_TIMELINE_PATH",
+  "OPENCLAW_DEBUG_SSE",
+  "OPENCLAW_DEBUG_MODEL_TRANSPORT",
 ]);
 
 export function tokenFilePath(layout: GatherOpenClawLayout): string {
   return join(layout.secretsDir, "gateway-token");
 }
 
-/** Generates and persists a Gather-only gateway token (mode 0600). */
+export function mcpTokenFilePath(layout: GatherOpenClawLayout): string {
+  return join(layout.secretsDir, "mcp-token");
+}
+
+function writeSecret(path: string, value: string): void {
+  writeFileSync(path, `${value}\n`, { mode: 0o600 });
+  chmodSync(path, 0o600);
+}
+
+/** Generates and persists a Gather-only shared secret (mode 0600). */
 export function ensureGatewayToken(layout: GatherOpenClawLayout): string {
   const token = `gather-gw-${randomBytes(24).toString("base64url")}`;
-  writeFileSync(tokenFilePath(layout), `${token}\n`, { mode: 0o600 });
-  chmodSync(tokenFilePath(layout), 0o600);
+  writeSecret(tokenFilePath(layout), token);
+  return token;
+}
+
+/** Generates and persists the MCP boundary bearer token (mode 0600). */
+export function ensureMcpToken(layout: GatherOpenClawLayout): string {
+  const token = `gather-mcp-${randomBytes(24).toString("base64url")}`;
+  writeSecret(mcpTokenFilePath(layout), token);
   return token;
 }
 
@@ -80,13 +227,17 @@ export function buildGatewayChildEnv(
   layout: GatherOpenClawLayout,
   gatewayToken: string,
   extraEnv: Record<string, string> = {},
+  internal: { mcpToken?: string } = {},
 ): Record<string, string> {
   for (const key of Object.keys(extraEnv)) {
     if (ISOLATION_ENV_KEYS.has(key)) {
       throw new Error(`extraEnv may not override isolation variable ${key}`);
     }
+    if (!EXTRA_ENV_ALLOWLIST.has(key)) {
+      throw new Error(`extraEnv key ${key} is not in the diagnostic allowlist`);
+    }
   }
-  return {
+  const env: Record<string, string> = {
     PATH: process.env.PATH ?? "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin",
     HOME: layout.homeDir,
     TMPDIR: layout.tmpDir,
@@ -104,6 +255,8 @@ export function buildGatewayChildEnv(
     OPENCLAW_EXEC_SHELL_SNAPSHOT: "0",
     ...extraEnv,
   };
+  if (internal.mcpToken) env.GATHER_MCP_TOKEN = internal.mcpToken;
+  return env;
 }
 
 export interface SpawnLike {
@@ -122,27 +275,44 @@ export type GatewayProcessState =
   | "stopping"
   | "failed";
 
+interface ChildExit {
+  code: number | null;
+  signal: string | null;
+}
+
 export class OpenClawGatewayProcess {
   readonly layout: GatherOpenClawLayout;
   readonly gatewayToken: string;
-  private readonly executable: OpenClawExecutable;
+  readonly resolvedExecutable: ResolvedExecutable;
+  /** Reported by `--version` verification during start(); null until then. */
+  openclawVersion: string | null = null;
   private readonly extraEnv: Record<string, string>;
+  private readonly mcpToken?: string;
   private readonly log: (line: string) => void;
   private readonly spawnFn: SpawnLike;
+  private readonly verify: boolean;
   private child: ChildProcess | null = null;
+  private exitPromise: Promise<ChildExit> | null = null;
+  private spawnErrorPromise: Promise<Error> | null = null;
   private state: GatewayProcessState = "stopped";
-  private exitCode: number | null = null;
-  private exitSignal: string | null = null;
+  private lastExit: ChildExit | null = null;
   private stderrTail: string[] = [];
   private repairAttempted = false;
 
-  constructor(options: GatewayProcessOptions, deps: { spawnFn?: SpawnLike } = {}) {
+  constructor(
+    options: GatewayProcessOptions,
+    deps: { spawnFn?: SpawnLike; skipExecutableVerification?: boolean } = {},
+  ) {
     this.layout = options.layout;
     this.gatewayToken = options.gatewayToken ?? ensureGatewayToken(options.layout);
-    this.executable = options.executable ?? { command: "openclaw" };
+    this.resolvedExecutable = resolveOpenClawExecutable({
+      executable: options.executable,
+    });
     this.extraEnv = options.extraEnv ?? {};
+    this.mcpToken = options.mcpToken;
     this.log = options.log ?? (() => {});
     this.spawnFn = deps.spawnFn ?? (spawn as unknown as SpawnLike);
+    this.verify = deps.skipExecutableVerification !== true;
   }
 
   get currentState(): GatewayProcessState {
@@ -158,15 +328,24 @@ export class OpenClawGatewayProcess {
   }
 
   get env(): Record<string, string> {
-    return buildGatewayChildEnv(this.layout, this.gatewayToken, this.extraEnv);
+    return buildGatewayChildEnv(this.layout, this.gatewayToken, this.extraEnv, {
+      mcpToken: this.mcpToken,
+    });
   }
 
   private spawnGateway(): ChildProcess {
     const child = this.spawnFn(
-      this.executable.command,
-      [...(this.executable.args ?? []), "gateway"],
+      this.resolvedExecutable.executable.command,
+      [...(this.resolvedExecutable.executable.args ?? []), "gateway"],
       { env: this.env, stdio: ["ignore", "pipe", "pipe"] },
     );
+    this.exitPromise = new Promise<ChildExit>((resolvePromise) => {
+      child.once("exit", (code, signal) => resolvePromise({ code, signal }));
+    });
+    this.spawnErrorPromise = new Promise<Error>((resolvePromise) => {
+      child.once("error", (error) => resolvePromise(error));
+    });
+    this.lastExit = null;
     child.stderr?.on("data", (chunk: Buffer) => {
       const text = chunk.toString("utf8");
       for (const line of text.split("\n")) {
@@ -182,46 +361,55 @@ export class OpenClawGatewayProcess {
       }
     });
     child.on("exit", (code, signal) => {
-      this.exitCode = code;
-      this.exitSignal = signal;
+      this.lastExit = { code, signal };
       if (this.state !== "stopping" && this.state !== "failed") {
         this.state = "stopped";
       }
       this.child = null;
     });
     child.on("error", () => {
-      this.state = "failed";
+      if (this.state !== "stopping") this.state = "failed";
     });
     return child;
   }
 
   /**
-   * Starts the gateway process. Resolves once the process is spawned; callers
-   * wait for protocol readiness (hello-ok) via the client, per the embedding
-   * contract — never for a log substring.
+   * Verifies the executable (one `--version` probe under the minimal env),
+   * then starts the gateway. Resolves once the process survives the early
+   * window; callers wait for protocol readiness (hello-ok) via the client —
+   * never for a log substring.
    *
-   * If the child exits 78 (EX_CONFIG) the supervisor runs
-   * `openclaw doctor --fix --yes --non-interactive` once under the same env,
-   * retries startup once, then rejects with the diagnostics tail.
+   * A spawn-level error (missing/permission-denied executable) rejects
+   * immediately instead of being mistaken for a running child. A child that
+   * exits 78 (EX_CONFIG) triggers one `doctor --fix` repair and one retry.
    */
   async start(): Promise<void> {
     if (this.state === "running" || this.state === "starting") {
       throw new Error(`gateway process already ${this.state}`);
     }
     this.state = "starting";
-    this.exitCode = null;
-    this.exitSignal = null;
+
+    if (this.verify) {
+      this.openclawVersion = verifyOpenClawExecutable(this.resolvedExecutable, this.env);
+      this.log(`[adapter] verified openclaw ${this.openclawVersion} (${this.resolvedExecutable.source})`);
+    }
 
     this.child = this.spawnGateway();
-    const firstExit = await this.waitForEarlyExit(1500);
-    if (firstExit === null) {
+    const first = await this.waitForEarlyExitOrError(1500);
+    if (first === null) {
       this.state = "running";
       return;
     }
-    if (firstExit !== OPENCLAW_EX_CONFIG_EXIT_CODE) {
+    if (first.kind === "error") {
       this.state = "failed";
       throw new Error(
-        `openclaw gateway exited early with code ${firstExit}: ${this.stderrTail.join("\n")}`,
+        `openclaw gateway failed to spawn: ${first.error.message}`,
+      );
+    }
+    if (first.code !== OPENCLAW_EX_CONFIG_EXIT_CODE) {
+      this.state = "failed";
+      throw new Error(
+        `openclaw gateway exited early with code ${first.code}: ${this.stderrTail.join("\n")}`,
       );
     }
 
@@ -236,43 +424,47 @@ export class OpenClawGatewayProcess {
     await this.runDoctorRepair();
     this.state = "starting";
     this.child = this.spawnGateway();
-    const secondExit = await this.waitForEarlyExit(1500);
-    if (secondExit === null) {
+    const second = await this.waitForEarlyExitOrError(1500);
+    if (second === null) {
       this.state = "running";
       return;
     }
     this.state = "failed";
     throw new Error(
-      `openclaw gateway exited with code ${secondExit} after repair retry: ${this.stderrTail.join("\n")}`,
+      second.kind === "error"
+        ? `openclaw gateway failed to spawn after repair: ${second.error.message}`
+        : `openclaw gateway exited with code ${second.code} after repair retry: ${this.stderrTail.join("\n")}`,
     );
   }
 
   /**
-   * Returns the exit code if the child exits within graceMs, else null.
-   * A still-running child after the grace window counts as "started"; real
-   * readiness is proven by the protocol handshake, not process survival.
+   * Resolves {kind:"exit"} / {kind:"error"} if the child exits or errors
+   * within graceMs, else null (still running).
    */
-  private waitForEarlyExit(graceMs: number): Promise<number | null> {
-    const child = this.child;
-    if (!child) return Promise.resolve(this.exitCode);
-    if (this.exitCode !== null) return Promise.resolve(this.exitCode);
-    return new Promise((resolvePromise) => {
-      const timer = setTimeout(() => {
-        child.off("exit", onExit);
-        resolvePromise(null);
-      }, graceMs);
-      const onExit = (code: number | null) => {
-        clearTimeout(timer);
-        resolvePromise(code ?? 1);
-      };
-      child.once("exit", onExit);
-    });
+  private waitForEarlyExitOrError(
+    graceMs: number,
+  ): Promise<{ kind: "exit"; code: number | null } | { kind: "error"; error: Error } | null> {
+    if (!this.child || !this.exitPromise || !this.spawnErrorPromise) {
+      return Promise.resolve({ kind: "exit", code: this.lastExit?.code ?? null });
+    }
+    const exit = this.exitPromise.then(({ code }) => ({ kind: "exit" as const, code }));
+    const error = this.spawnErrorPromise.then((err) => ({ kind: "error" as const, error: err }));
+    const alive = new Promise<null>((resolvePromise) =>
+      setTimeout(() => resolvePromise(null), graceMs),
+    );
+    return Promise.race([exit, error, alive]);
   }
 
   private runDoctorRepair(): Promise<void> {
-    const args = [...(this.executable.args ?? []), "doctor", "--fix", "--yes", "--non-interactive"];
+    const args = [
+      ...(this.resolvedExecutable.executable.args ?? []),
+      "doctor",
+      "--fix",
+      "--yes",
+      "--non-interactive",
+    ];
     return new Promise((resolvePromise, rejectPromise) => {
-      const doctor = this.spawnFn(this.executable.command, args, {
+      const doctor = this.spawnFn(this.resolvedExecutable.executable.command, args, {
         env: this.env,
         stdio: ["ignore", "pipe", "pipe"],
       });
@@ -294,39 +486,48 @@ export class OpenClawGatewayProcess {
   }
 
   /**
-   * SIGTERM, wait exitTimeoutMs, then SIGKILL. Resolves when the child is
-   * gone. Shutdown of the WS client is the caller's job and happens first;
-   * per the embedding contract the gateway broadcasts a `shutdown` event
-   * before an orderly close.
+   * SIGTERM, wait exitTimeoutMs for the OBSERVED child exit, then SIGKILL and
+   * wait again. The process is never reported stopped and its resources are
+   * never released without an observed exit event: if no exit is observed
+   * even after SIGKILL the state becomes "failed" and stop() rejects.
    */
-  async stop(exitTimeoutMs = 10000): Promise<void> {
+  async stop(exitTimeoutMs = 10000, killGraceMs = 5000): Promise<void> {
     const child = this.child;
+    const exitPromise = this.exitPromise;
     this.state = "stopping";
-    if (!child) {
-      this.state = this.exitCode === null ? "stopped" : "failed";
+    if (!child || !exitPromise) {
+      // Either never started or the exit was already observed by the
+      // exit handler — in both cases the child is verifiably gone.
+      this.state = "stopped";
       return;
     }
-    const exited = new Promise<number | null>((resolvePromise) => {
-      if (this.exitCode !== null) {
-        resolvePromise(this.exitCode);
-        return;
-      }
-      child.once("exit", (code) => resolvePromise(code));
-    });
+
     child.kill("SIGTERM");
-    const result = await Promise.race([
-      exited,
+    const first = await Promise.race([
+      exitPromise.then(() => "exited" as const),
       new Promise<"timeout">((resolvePromise) =>
         setTimeout(() => resolvePromise("timeout"), exitTimeoutMs),
       ),
     ]);
-    if (result === "timeout" && this.child) {
-      this.child.kill("SIGKILL");
-      await new Promise<void>((resolvePromise) => {
-        this.child?.once("exit", () => resolvePromise());
-        setTimeout(resolvePromise, 5000);
-      });
+
+    if (first === "timeout") {
+      child.kill("SIGKILL");
+      const second = await Promise.race([
+        exitPromise.then(() => "exited" as const),
+        new Promise<"timeout">((resolvePromise) =>
+          setTimeout(() => resolvePromise("timeout"), killGraceMs),
+        ),
+      ]);
+      if (second === "timeout") {
+        // No observed exit even after SIGKILL: do not claim stopped, do not
+        // release the child reference.
+        this.state = "failed";
+        throw new Error(
+          `openclaw gateway (pid ${child.pid}) did not exit after SIGKILL within ${killGraceMs}ms`,
+        );
+      }
     }
+
     this.child = null;
     this.state = "stopped";
   }

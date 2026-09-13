@@ -6,6 +6,7 @@ export {
 export {
   buildGatewayConfig,
   writeGatewayConfig,
+  GATHER_TOOL_DENY,
   type GatherGatewayConfigOptions,
   type GatherMcpServerRef,
 } from "./config.ts";
@@ -13,11 +14,19 @@ export {
   OpenClawGatewayProcess,
   buildGatewayChildEnv,
   ensureGatewayToken,
+  ensureMcpToken,
   tokenFilePath,
+  mcpTokenFilePath,
+  resolveOpenClawExecutable,
+  resolveInstalledPackageEntry,
+  verifyOpenClawExecutable,
+  EXTRA_ENV_ALLOWLIST,
   OPENCLAW_EX_CONFIG_EXIT_CODE,
   type GatewayProcessOptions,
   type GatewayProcessState,
   type OpenClawExecutable,
+  type ResolvedExecutable,
+  type ExecutableSource,
   type SpawnLike,
 } from "./process.ts";
 export {
@@ -41,16 +50,16 @@ export {
 } from "./tasks.ts";
 export {
   GatherMcpBoundary,
+  defineGatherTool,
+  type GatherTool,
   type GatherToolContext,
   type GatherToolDefinition,
   type GatherToolExecution,
   type GatherToolHandler,
   type GatherToolResult,
-  type AnyGatherToolDefinition,
   type GatherMcpBoundaryOptions,
 } from "./mcp.ts";
 export {
   GatherOpenClawRuntime,
   type GatherOpenClawRuntimeOptions,
-  type GatherRuntimeState,
 } from "./openclaw-runtime.ts";
