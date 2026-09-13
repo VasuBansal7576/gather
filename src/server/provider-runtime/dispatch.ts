@@ -80,6 +80,56 @@ function isNonEmpty(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
 
+function isConnectorError(error: unknown): error is ConnectorError {
+  if (!error || typeof error !== "object") return false;
+  const err = error as { kind?: unknown; message?: unknown; retryable?: unknown };
+  return (
+    typeof err.kind === "string" &&
+    typeof err.message === "string" &&
+    typeof err.retryable === "boolean" &&
+    [
+      "invalid_request",
+      "not_found",
+      "slot_unavailable",
+      "conflict",
+      "timeout_after_success",
+      "authorization_denied",
+      "access_revoked",
+      "rate_limited",
+      "transport_error",
+      "unsupported",
+    ].includes(err.kind)
+  );
+}
+
+/** Bounded attempts for the binding write lock across SQLite handles. */
+const MAX_BIND_ATTEMPTS = 10;
+
+function bindBackoff(attempt: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.min(5 + attempt * 5, 50));
+}
+
+function sqliteCode(error: unknown): string {
+  if (!error || typeof error !== "object") return "";
+  const err = error as { errcode?: unknown; code?: unknown; message?: unknown };
+  // node:sqlite numeric codes: 5 = SQLITE_BUSY, 19 = SQLITE_CONSTRAINT.
+  if (err.errcode === 5) return "busy";
+  if (err.errcode === 19) return "unique";
+  const code = typeof err.code === "string" ? err.code : "";
+  const message = typeof err.message === "string" ? err.message : "";
+  if (/UNIQUE constraint failed/i.test(`${code} ${message}`)) return "unique";
+  if (/database is locked|database table is locked/i.test(message)) return "busy";
+  return "";
+}
+
+function isBusyError(error: unknown): boolean {
+  return sqliteCode(error) === "busy";
+}
+
+function isUniqueViolation(error: unknown): boolean {
+  return sqliteCode(error) === "unique";
+}
+
 export interface ProviderDispatchContext {
   store: GatherStore;
   ownerId: string;
@@ -124,11 +174,73 @@ export class ProviderResolver {
         business_id TEXT NOT NULL,
         owner_id TEXT NOT NULL,
         connection_account_id TEXT NOT NULL,
+        generation INTEGER NOT NULL DEFAULT 1,
+        status TEXT NOT NULL DEFAULT 'bound',
         created_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_provider_calendar_bindings_business
         ON provider_calendar_bindings(business_id);
     `);
+    // Migrate pre-generation databases in place: history rows keep their
+    // original proof (created_at) and read back as generation 1 / bound.
+    this.ensureBindingColumn("generation", "INTEGER NOT NULL DEFAULT 1");
+    this.ensureBindingColumn("status", "TEXT NOT NULL DEFAULT 'bound'");
+  }
+
+  private ensureBindingColumn(column: string, type: string): void {
+    const info = this.store.db.prepare("PRAGMA table_info(provider_calendar_bindings)").all() as Array<{ name: unknown }>;
+    if (!info.some((entry) => String(entry.name) === column)) {
+      this.store.db.exec(`ALTER TABLE provider_calendar_bindings ADD COLUMN ${column} ${type}`);
+    }
+  }
+
+  /**
+   * One immediately-committed write transaction with bounded lock-busy
+   * retries across SQLite handles. UNIQUE violations (a concurrent handle
+   * won the same calendar id) surface as typed conflicts, never raw
+   * driver errors; exhausted contention surfaces as retryable
+   * transport_error, never a silent partial write.
+   */
+  private transactBinding<T>(fn: () => T): T {
+    let attempt = 0;
+    for (;;) {
+      try {
+        this.store.db.exec("BEGIN IMMEDIATE");
+      } catch (error) {
+        if (isBusyError(error) && attempt < MAX_BIND_ATTEMPTS) {
+          attempt += 1;
+          bindBackoff(attempt);
+          continue;
+        }
+        if (isBusyError(error)) {
+          throw { kind: "transport_error", message: "calendar binding store is busy; retry the host action", retryable: true } as ConnectorError;
+        }
+        throw error;
+      }
+      try {
+        const out = fn();
+        this.store.db.exec("COMMIT");
+        return out;
+      } catch (error) {
+        try {
+          this.store.db.exec("ROLLBACK");
+        } catch {
+          // Nothing to roll back; surface the original failure.
+        }
+        if (isBusyError(error) && attempt < MAX_BIND_ATTEMPTS) {
+          attempt += 1;
+          bindBackoff(attempt);
+          continue;
+        }
+        if (isBusyError(error)) {
+          throw { kind: "transport_error", message: "calendar binding store is busy; retry the host action", retryable: true } as ConnectorError;
+        }
+        if (isUniqueViolation(error)) {
+          throw { kind: "conflict", message: "calendar binding changed concurrently; re-read and retry the host action", retryable: false } as ConnectorError;
+        }
+        throw error;
+      }
+    }
   }
 
   /** The durable execution row binds every operation key to its exact action. */
@@ -193,23 +305,45 @@ export class ProviderResolver {
    * verified calendar-capability account owns a calendar id, and no other
    * business may claim it. Tenant scope for calendar work comes from THIS
    * record — never inferred from proposals, payloads, or model output.
+   * Unbind keeps the row as an `unbound` tombstone (original proof
+   * preserved); only `bound` rows authorize work, and every fresh bind
+   * bumps `generation` so previously resolved ports go stale.
    */
-  private bindingFor(calendarId: string):
-    | { calendarId: string; businessId: string; accountId: string }
-    | undefined {
+  /** Owner-scoped binding row read for the port guard (public for BoundCalendarPort). */
+  bindingRow(calendarId: string): {
+    calendarId: string;
+    businessId: string;
+    accountId: string;
+    generation: number;
+    status: string;
+  } | undefined {
     const row = this.store.db
       .prepare(
-        "SELECT calendar_id, business_id, connection_account_id FROM provider_calendar_bindings WHERE calendar_id = $c AND owner_id = $o",
+        "SELECT calendar_id, business_id, connection_account_id, generation, status FROM provider_calendar_bindings WHERE calendar_id = $c AND owner_id = $o",
       )
       .get({ $c: calendarId, $o: this.ownerId }) as
-      | { calendar_id: string; business_id: string; connection_account_id: string }
+      | { calendar_id: unknown; business_id: unknown; connection_account_id: unknown; generation: unknown; status: unknown }
       | undefined;
     if (!row) return undefined;
-    return { calendarId: String(row.calendar_id), businessId: String(row.business_id), accountId: String(row.connection_account_id) };
+    return {
+      calendarId: String(row.calendar_id),
+      businessId: String(row.business_id),
+      accountId: String(row.connection_account_id),
+      generation: Number(row.generation ?? 1),
+      status: String(row.status ?? "bound"),
+    };
   }
 
-  /** The DTO for a binding's pinned account, resolved owner-scoped. */
-  private boundAccountFor(businessId: string, accountId: string): ConnectedAccountDTO | undefined {
+  private bindingFor(calendarId: string):
+    | { calendarId: string; businessId: string; accountId: string; generation: number }
+    | undefined {
+    const row = this.bindingRow(calendarId);
+    if (!row || row.status !== "bound") return undefined;
+    return { calendarId: row.calendarId, businessId: row.businessId, accountId: row.accountId, generation: row.generation };
+  }
+
+  /** The DTO for a binding's pinned account, resolved owner-scoped (public for BoundCalendarPort). */
+  boundAccountFor(businessId: string, accountId: string): ConnectedAccountDTO | undefined {
     let accounts: ConnectedAccountDTO[];
     try {
       const google = this.connectionService.getConnections(businessId).providers.find((p) => p.provider === "google");
@@ -226,53 +360,95 @@ export class ProviderResolver {
    * Host action: durably bind a calendar id to this business's verified
    * calendar account. `accountId` may pin a specific connected account;
    * absent, the business must have exactly one connected calendar account.
-   * A calendar already bound to another business conflicts — a foreign
-   * scope can never claim it.
+   * A calendar bound to another business conflicts — a foreign scope can
+   * never claim it. Check and write run atomically: a concurrent handle
+   * that wins the calendar id surfaces as a typed conflict, never a raw
+   * driver error. Every fresh bind (including same-account rebind after
+   * unbind) bumps generation, invalidating previously resolved ports.
    */
   bindCalendar(input: { businessId: string; calendarId: string; accountId?: string }): { ok: true } | { ok: false; error: ConnectorError } {
-    const existing = this.bindingFor(input.calendarId);
-    if (existing && (existing.businessId !== input.businessId || existing.accountId !== (input.accountId ?? existing.accountId))) {
-      return { ok: false, error: { kind: "conflict", message: `Calendar ${input.calendarId} is already bound to another business or account`, retryable: false } };
+    try {
+      return this.transactBinding(() => {
+        const existing = this.bindingRow(input.calendarId);
+        if (existing && existing.status === "bound") {
+          if (existing.businessId !== input.businessId || existing.accountId !== (input.accountId ?? existing.accountId)) {
+            return { ok: false as const, error: { kind: "conflict", message: `Calendar ${input.calendarId} is already bound to another business or account`, retryable: false } as ConnectorError };
+          }
+          return { ok: true as const };
+        }
+        let accountId = input.accountId;
+        if (accountId !== undefined) {
+          const account = this.boundAccountFor(input.businessId, accountId);
+          if (!account || account.status !== "connected") {
+            return { ok: false as const, error: { kind: "access_revoked", message: `Account ${accountId} is not a connected calendar account for business ${input.businessId}`, retryable: false } as ConnectorError };
+          }
+        } else {
+          const target = this.resolveCapabilityAccount(input.businessId, "google_calendar");
+          if (target.kind !== "live") {
+            return { ok: false as const, error: target.kind === "fail" ? target.error : { kind: "not_found", message: "No verified calendar account to bind", retryable: false } as ConnectorError };
+          }
+          accountId = target.account.id;
+        }
+        if (existing) {
+          // Released scope rebinding: history row kept, generation bumped.
+          this.store.db
+            .prepare(
+              "UPDATE provider_calendar_bindings SET business_id = $b, connection_account_id = $a, generation = generation + 1, status = 'bound' WHERE calendar_id = $c AND owner_id = $o",
+            )
+            .run({ $b: input.businessId, $a: accountId, $c: input.calendarId, $o: this.ownerId });
+        } else {
+          this.store.db
+            .prepare(
+              "INSERT INTO provider_calendar_bindings (calendar_id, business_id, owner_id, connection_account_id, generation, status, created_at) VALUES ($c, $b, $o, $a, 1, 'bound', $t)",
+            )
+            .run({ $c: input.calendarId, $b: input.businessId, $o: this.ownerId, $a: accountId, $t: new Date().toISOString() });
+        }
+        return { ok: true as const };
+      });
+    } catch (error) {
+      if (isConnectorError(error)) return { ok: false, error };
+      throw error;
     }
-    if (existing) return { ok: true };
-    let accountId = input.accountId;
-    if (accountId !== undefined) {
-      const account = this.boundAccountFor(input.businessId, accountId);
-      if (!account || account.status !== "connected") {
-        return { ok: false, error: { kind: "access_revoked", message: `Account ${accountId} is not a connected calendar account for business ${input.businessId}`, retryable: false } };
-      }
-    } else {
-      const target = this.resolveCapabilityAccount(input.businessId, "google_calendar");
-      if (target.kind !== "live") {
-        return { ok: false, error: target.kind === "fail" ? target.error : { kind: "not_found", message: "No verified calendar account to bind", retryable: false } };
-      }
-      accountId = target.account.id;
-    }
-    this.store.db
-      .prepare(
-        "INSERT INTO provider_calendar_bindings (calendar_id, business_id, owner_id, connection_account_id, created_at) VALUES ($c, $b, $o, $a, $t)",
-      )
-      .run({ $c: input.calendarId, $b: input.businessId, $o: this.ownerId, $a: accountId, $t: new Date().toISOString() });
-    return { ok: true };
   }
 
-  /** Host action: remove one of this business's calendar bindings. */
-  unbindCalendar(input: { businessId: string; calendarId: string }): { ok: true } | { ok: false; error: ConnectorError } {
-    const existing = this.bindingFor(input.calendarId);
-    if (!existing || existing.businessId !== input.businessId) {
-      return { ok: false, error: { kind: "not_found", message: `Calendar ${input.calendarId} is not bound to business ${input.businessId}`, retryable: false } };
+  /**
+   * Host action: release one of this business's calendar bindings. The row
+   * is kept as an `unbound` tombstone (original proof preserved) and the
+   * delete compares exact owner + business (+ account when pinned), so a
+   * foreign scope can neither remove nor adopt the binding. Runs atomically;
+   * concurrent races surface as typed conflicts.
+   */
+  unbindCalendar(input: { businessId: string; calendarId: string; accountId?: string }): { ok: true } | { ok: false; error: ConnectorError } {
+    try {
+      return this.transactBinding(() => {
+        const existing = this.bindingRow(input.calendarId);
+        if (!existing || existing.status !== "bound" || existing.businessId !== input.businessId) {
+          return { ok: false as const, error: { kind: "not_found", message: `Calendar ${input.calendarId} is not bound to business ${input.businessId}`, retryable: false } as ConnectorError };
+        }
+        if (input.accountId !== undefined && existing.accountId !== input.accountId) {
+          return { ok: false as const, error: { kind: "conflict", message: `Calendar ${input.calendarId} is bound to a different account; refusing to release another account's binding`, retryable: false } as ConnectorError };
+        }
+        const released = this.store.db
+          .prepare(
+            "UPDATE provider_calendar_bindings SET status = 'unbound' WHERE calendar_id = $c AND owner_id = $o AND business_id = $b AND status = 'bound'",
+          )
+          .run({ $c: input.calendarId, $o: this.ownerId, $b: input.businessId });
+        if (released.changes !== 1) {
+          return { ok: false as const, error: { kind: "conflict", message: `Calendar ${input.calendarId} changed concurrently; re-read and retry the host action`, retryable: false } as ConnectorError };
+        }
+        return { ok: true as const };
+      });
+    } catch (error) {
+      if (isConnectorError(error)) return { ok: false, error };
+      throw error;
     }
-    this.store.db
-      .prepare("DELETE FROM provider_calendar_bindings WHERE calendar_id = $c AND owner_id = $o")
-      .run({ $c: input.calendarId, $o: this.ownerId });
-    return { ok: true };
   }
 
-  /** Owner-scoped listing for setup/diagnostics. */
+  /** Owner-scoped listing of live bindings for setup/diagnostics (tombstones excluded). */
   listCalendarBindings(businessId: string): { calendarId: string; accountId: string }[] {
     const rows = this.store.db
       .prepare(
-        "SELECT calendar_id, connection_account_id FROM provider_calendar_bindings WHERE business_id = $b AND owner_id = $o ORDER BY calendar_id",
+        "SELECT calendar_id, connection_account_id FROM provider_calendar_bindings WHERE business_id = $b AND owner_id = $o AND status = 'bound' ORDER BY calendar_id",
       )
       .all({ $b: businessId, $o: this.ownerId }) as Array<{ calendar_id: string; connection_account_id: string }>;
     return rows.map((row) => ({ calendarId: String(row.calendar_id), accountId: String(row.connection_account_id) }));
@@ -335,7 +511,13 @@ export class ProviderResolver {
   /**
    * The host-facing calendar port for offer/intake composition: resolves
    * one explicitly bound calendar (host-validated business + durable
-   * binding + verified pinned account) into the live calendar connector.
+   * binding + verified pinned account) into a GUARDED live calendar
+   * connector. The returned port re-validates the exact binding
+   * (business + account + generation) and the account's connected status
+   * on EVERY operation: unbind, rebind (even same-account, via the
+   * generation bump), account change, or revocation all fail retained
+   * ports closed. A resolved port is a capability snapshot, never an
+   * irrevocable handle — callers must re-resolve after any host change.
    * Unbound, foreign, or fixture calendars fail closed.
    */
   resolveCalendarPorts(input: { businessId: string; calendarId: string }): { ok: true; ports: { account: ConnectedAccountDTO; calendar: CalendarConnector } } | { ok: false; error: ConnectorError } {
@@ -349,7 +531,22 @@ export class ProviderResolver {
     if (target.businessId !== input.businessId) {
       return { ok: false, error: { kind: "conflict", message: `Calendar ${input.calendarId} is bound to a different business`, retryable: false } };
     }
-    return { ok: true, ports: { account: target.account, calendar: this.googleFor(target.account, input.calendarId).calendar } };
+    const binding = this.bindingFor(input.calendarId);
+    if (!binding || binding.businessId !== input.businessId || binding.accountId !== target.account.id) {
+      return { ok: false, error: { kind: "conflict", message: `Calendar ${input.calendarId} changed during resolution; re-resolve before use`, retryable: false } };
+    }
+    return {
+      ok: true,
+      ports: {
+        account: target.account,
+        calendar: new BoundCalendarPort(this, {
+          businessId: input.businessId,
+          calendarId: input.calendarId,
+          accountId: target.account.id,
+          generation: binding.generation,
+        }),
+      },
+    };
   }
 
   /**
@@ -402,6 +599,98 @@ export class ProviderResolver {
       return undefined;
     }
     return { to: payload.emailTo, subject: payload.emailSubject, body: payload.emailBody };
+  }
+}
+
+/**
+ * A resolved calendar port that guards the exact binding it was resolved
+ * from. Every operation re-reads the durable binding row and the pinned
+ * account's live status before delegating: a binding that was unbound,
+ * rebound (generation bumped even for same-account rebinds), moved to
+ * another account, or revoked since resolution fails closed with a typed
+ * error instead of acting on stale authority. Tokens still resolve lazily
+ * per authorized call against the pinned account, so a revocation landing
+ * between the guard and the token fetch fails at the fetch — never
+ * silently, never with another account's credentials.
+ */
+export class BoundCalendarPort implements CalendarConnector {
+  private readonly resolver: ProviderResolver;
+  private readonly scope: { businessId: string; calendarId: string; accountId: string; generation: number };
+
+  constructor(
+    resolver: ProviderResolver,
+    scope: { businessId: string; calendarId: string; accountId: string; generation: number },
+  ) {
+    this.resolver = resolver;
+    this.scope = scope;
+  }
+
+  private guard(operationKey: string): { ok: true; calendar: CalendarConnector } | { ok: false; result: ConnectorResult<never> } {
+    const current = this.resolver.bindingRow(this.scope.calendarId);
+    if (!current || current.status !== "bound") {
+      return {
+        ok: false,
+        result: failure(operationKey, {
+          kind: "not_found",
+          message: `Calendar ${this.scope.calendarId} is no longer bound — re-resolve ports after the host change`,
+          retryable: false,
+        }),
+      };
+    }
+    if (
+      current.businessId !== this.scope.businessId ||
+      current.accountId !== this.scope.accountId ||
+      current.generation !== this.scope.generation
+    ) {
+      return {
+        ok: false,
+        result: failure(operationKey, {
+          kind: "conflict",
+          message: `Calendar ${this.scope.calendarId} binding changed since this port was resolved — re-resolve before use`,
+          retryable: false,
+        }),
+      };
+    }
+    const account = this.resolver.boundAccountFor(current.businessId, current.accountId);
+    if (!account) {
+      return {
+        ok: false,
+        result: failure(operationKey, {
+          kind: "not_found",
+          message: `The account bound to calendar ${this.scope.calendarId} no longer exists`,
+          retryable: false,
+        }),
+      };
+    }
+    if (account.status !== "connected") {
+      return {
+        ok: false,
+        result: failure(operationKey, {
+          kind: "access_revoked",
+          message: `The account bound to calendar ${this.scope.calendarId} is ${account.status}, not connected`,
+          retryable: false,
+        }),
+      };
+    }
+    return { ok: true, calendar: this.resolver.googleFor(account, this.scope.calendarId).calendar };
+  }
+
+  async checkAvailability(request: CheckAvailabilityRequest): Promise<ConnectorResult<CheckAvailabilityResponse>> {
+    const guarded = this.guard(request.operationKey);
+    if (!guarded.ok) return guarded.result;
+    return guarded.calendar.checkAvailability(request);
+  }
+
+  async createProvisionalHold(request: CreateProvisionalHoldRequest): Promise<ConnectorResult<CreateProvisionalHoldResponse>> {
+    const guarded = this.guard(request.operationKey);
+    if (!guarded.ok) return guarded.result;
+    return guarded.calendar.createProvisionalHold(request);
+  }
+
+  async reconcileProvisionalHold(request: OperationRequest): Promise<ConnectorResult<CreateProvisionalHoldResponse>> {
+    const guarded = this.guard(request.operationKey);
+    if (!guarded.ok) return guarded.result;
+    return guarded.calendar.reconcileProvisionalHold(request);
   }
 }
 
@@ -526,7 +815,7 @@ export interface ProviderConnectors {
   resolveCalendarPorts(input: { businessId: string; calendarId: string }): { ok: true; ports: { account: ConnectedAccountDTO; calendar: CalendarConnector } } | { ok: false; error: ConnectorError };
   /** Host actions over the durable calendar-binding boundary. */
   bindCalendar(input: { businessId: string; calendarId: string; accountId?: string }): { ok: true } | { ok: false; error: ConnectorError };
-  unbindCalendar(input: { businessId: string; calendarId: string }): { ok: true } | { ok: false; error: ConnectorError };
+  unbindCalendar(input: { businessId: string; calendarId: string; accountId?: string }): { ok: true } | { ok: false; error: ConnectorError };
   listCalendarBindings(businessId: string): { calendarId: string; accountId: string }[];
 }
 

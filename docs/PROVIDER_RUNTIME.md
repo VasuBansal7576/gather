@@ -33,13 +33,25 @@ provider-runtime -> connections leaves, index -> runtime stays one-way.
   always resolve to demo.
 - **Calendar scope is a durable, host-validated binding** — never inferred
   from proposals or payloads. `provider_calendar_bindings` records
-  `calendar_id -> business_id + pinned connection_account_id`; the host
-  writes it via `providers.bindCalendar({businessId, calendarId, accountId?})`
+  `calendar_id -> business_id + pinned connection_account_id + generation`
+  (`bound`/`unbound` status); the host writes it via
+  `providers.bindCalendar({businessId, calendarId, accountId?})`
   (verifies a bound, connected `google_calendar` account; one calendar
-  claims one owner — a foreign business's claim conflicts). A request's
-  `calendarId` on a real booking must be bound to that booking's business:
-  unbound -> `not_found`, foreign -> `conflict`, bound-account revoked ->
-  `access_revoked`.
+  claims one owner — a foreign business's claim conflicts) and releases it
+  via `providers.unbindCalendar({businessId, calendarId, accountId?})`,
+  which keeps an `unbound` tombstone (original proof preserved) after
+  comparing exact owner + business (+ account when pinned). Every fresh
+  bind — including same-account rebind after unbind — bumps `generation`.
+  A request's `calendarId` on a real booking must be bound to that booking's
+  business: unbound -> `not_found`, foreign -> `conflict`, bound-account
+  revoked -> `access_revoked`.
+- **Resolved calendar ports are guarded snapshots, not raw connectors.**
+  `resolveCalendarPorts` returns a port that re-validates the exact binding
+  (business + account + generation) and the account's connected status on
+  every operation, so a retained port goes stale on unbind, rebind,
+  account change, or revocation instead of acting on revoked authority.
+  Callers re-resolve after any host change. Bind/unbind run atomically, so
+  concurrent handles surface typed `conflict`, never raw constraint errors.
 - **Email sends** resolve through the durable execution row
   (`idempotency_key` -> action -> booking) to the business's unique
   connected `gmail` account.
