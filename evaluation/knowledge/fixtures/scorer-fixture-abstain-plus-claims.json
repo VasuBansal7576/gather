@@ -1,6 +1,6 @@
 {
-  "notice": "SCORER FIXTURE ONLY. Intentionally correct synthetic responses used to test the scorer. Never a provider result.",
-  "provider": "scorer-fixture-correct",
+  "notice": "SCORER FIXTURE ONLY. Counterexample: foreign claims appended to abstained responses. Tests the scorer, never a provider.",
+  "provider": "scorer-fixture-abstain-plus-claims",
   "responses": [
     {
       "abstained": false,
@@ -124,12 +124,41 @@
     },
     {
       "abstained": true,
-      "assertions": [],
+      "assertions": [
+        {
+          "text": "The withdrawn 2024 sheet says seated dinner was $88 per guest.",
+          "factId": "F1",
+          "value": {
+            "kind": "price-per-guest",
+            "item": "seated-dinner",
+            "priceUsd": 88,
+            "season": "2024"
+          },
+          "documentId": "harbor-packages-2024",
+          "version": 1,
+          "businessId": "biz-harbor",
+          "commercialConclusion": false
+        }
+      ],
       "questionId": "Q08"
     },
     {
       "abstained": true,
-      "assertions": [],
+      "assertions": [
+        {
+          "text": "Custom lighting has a flat $500 price.",
+          "factId": "F9",
+          "value": {
+            "kind": "price",
+            "item": "custom-lighting",
+            "priceUsd": 500
+          },
+          "documentId": "harbor-lighting",
+          "version": 1,
+          "businessId": "biz-harbor",
+          "commercialConclusion": false
+        }
+      ],
       "questionId": "Q09"
     },
     {

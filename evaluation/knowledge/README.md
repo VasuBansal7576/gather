@@ -15,13 +15,17 @@ production guarantee.
   policies, a withdrawn (deleted) sheet, and unknown-cost items. Status
   `active` means citable; `superseded` is history only; `deleted` must never
   be cited.
-- `ground-truth.json` — questions with exact expected facts (source
-  document, version, business), critical flags, and `mustAbstain` questions
-  where any authoritative commercial conclusion is a gate failure.
+- `ground-truth.json` — questions with exact expected facts (structured
+  `value`, source document, version, business), critical flags,
+  `mustAbstain` questions where any authoritative commercial conclusion is
+  a gate failure, and `deletionProbe` flags where the only honest outcome
+  is abstention because the source is withdrawn.
 - `thresholds.json` — acceptance thresholds established 2026-09-14 before
   any provider scoring: zero cross-business leakage, zero unsupported
   authoritative conclusions, 100% critical price/version/exception-scope
-  correctness, >=95% fact precision, >=90% important-evidence recall.
+  correctness, >=95% fact precision, >=90% important-evidence recall,
+  plus required 100% linking/version/deletion correctness, zero
+  abstention or input violations, and complete required-case coverage.
 - `fixtures/` — synthetic scorer fixtures. They test the scorer only and
   are never provider results.
 
@@ -35,7 +39,16 @@ production guarantee.
    timestamps).
 3. Score: `node scripts/evaluate-knowledge.mjs --responses <path> [--format json]`.
    Exit 0 means all gates pass, 1 means a gate failed.
-4. Unanswered questions are reported as unmeasured and excluded from every
-   denominator — never filled in, never scored as pass.
+4. Unanswered questions are reported as unmeasured and excluded from partial
+   denominators — never filled in, never scored as pass. Whole-corpus PASS
+   additionally requires every required question answered (`completeCoverage`).
 5. Latency is reported only from supplied timestamps; without them the
    report says unmeasured. No vendor figures are extrapolated.
+6. Integrity model: an assertion is supported only when its structured
+   `value` deep-equals the trusted ground-truth value with an exact source
+   link — fact IDs alone never self-certify. Raw `text` is never scored;
+   text semantics stay unmeasured unless separately adjudicated labels are
+   supplied via `--semantic-labels`, which are reported apart from the
+   structured gates. `abstained:true` with assertions, duplicate/unknown/
+   malformed inputs, and any deletion/version/linking miss each fail their
+   own gate.

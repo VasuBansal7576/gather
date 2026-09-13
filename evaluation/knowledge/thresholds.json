@@ -1,1 +1,51 @@
-{"established":"2026-09-14","gates":{"criticalCorrectness":{"rule":"every critical expected fact answered with exact text, source document, version, and business","threshold":1},"factPrecision":{"minimum":0.95,"rule":"supported assertions over total assertions across scored questions"},"importantRecall":{"minimum":0.9,"rule":"expected facts matched over total expected facts across scored questions"},"noLeakage":{"rule":"zero assertions citing another business, zero cross-scope answers","threshold":0},"noUnsupportedAuthority":{"rule":"zero authoritative commercial conclusions on mustAbstain questions or without an exact ground-truth fact","threshold":0}},"status":"provisional local evaluation thresholds, not a production guarantee. Set before any provider scoring run."}
+{
+  "established": "2026-09-14",
+  "gates": {
+    "criticalCorrectness": {
+      "rule": "every critical expected fact answered with the exact structured value, source document, version, and business (raw text never scored)",
+      "threshold": 1
+    },
+    "factPrecision": {
+      "minimum": 0.95,
+      "rule": "supported assertions over total assertions across scored questions"
+    },
+    "importantRecall": {
+      "minimum": 0.9,
+      "rule": "expected facts matched over total expected facts across scored questions"
+    },
+    "noLeakage": {
+      "rule": "zero assertions citing another business, zero cross-scope answers",
+      "threshold": 0
+    },
+    "noUnsupportedAuthority": {
+      "rule": "zero authoritative commercial conclusions on mustAbstain questions or without an exact ground-truth fact",
+      "threshold": 0
+    },
+    "linkingCorrectness": {
+      "minimum": 1,
+      "rule": "every assertion carrying a factId resolves to exactly the expected document and version; at least one linked assertion required"
+    },
+    "versionCorrectness": {
+      "minimum": 1,
+      "rule": "every version-sensitive question answered with the applicable active version"
+    },
+    "deletionBehavior": {
+      "minimum": 1,
+      "deletedCitationsThreshold": 0,
+      "rule": "every ground-truth deletionProbe honored (abstain, no assertions) and zero citations of deleted documents"
+    },
+    "abstentionIntegrity": {
+      "threshold": 0,
+      "rule": "zero responses with abstained:true that still supply assertions"
+    },
+    "inputValidity": {
+      "threshold": 0,
+      "rule": "zero duplicate, unknown-question, or malformed inputs"
+    },
+    "completeCoverage": {
+      "rule": "whole-corpus acceptance requires every required question answered; partial metrics report but cannot pass"
+    }
+  },
+  "status": "provisional local evaluation thresholds, not a production guarantee. Set before any provider scoring run.",
+  "amended": "2026-09-14: added structured-value, coverage, abstention, deletion, version, linking, and input gates; predeclared 2026-09-14 thresholds unchanged"
+}

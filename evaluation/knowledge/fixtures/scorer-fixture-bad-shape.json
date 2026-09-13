@@ -1,0 +1,76 @@
+{
+  "notice": "SCORER FIXTURE ONLY. Malformed inputs: duplicate, unknown questionId, mistyped fields. Tests the scorer, never a provider.",
+  "provider": "scorer-fixture-bad-shape",
+  "responses": [
+    {
+      "abstained": false,
+      "assertions": [
+        {
+          "businessId": "biz-harbor",
+          "commercialConclusion": true,
+          "documentId": "harbor-packages-2026",
+          "factId": "F1",
+          "text": "Seated dinner costs $110 per guest (2026 price).",
+          "version": 2,
+          "value": {
+            "kind": "price-per-guest",
+            "item": "seated-dinner",
+            "priceUsd": 110,
+            "season": "2026"
+          }
+        }
+      ],
+      "questionId": "Q01",
+      "timestampsMs": {
+        "finishedAt": 1726000000500,
+        "startedAt": 1726000000000
+      }
+    },
+    {
+      "abstained": false,
+      "assertions": [
+        {
+          "businessId": "biz-harbor",
+          "commercialConclusion": true,
+          "documentId": "harbor-packages-2026",
+          "factId": "F1",
+          "text": "Seated dinner costs $110 per guest (2026 price).",
+          "version": 2,
+          "value": {
+            "kind": "price-per-guest",
+            "item": "seated-dinner",
+            "priceUsd": 110,
+            "season": "2026"
+          }
+        }
+      ],
+      "questionId": "Q01",
+      "timestampsMs": {
+        "finishedAt": 1726000000500,
+        "startedAt": 1726000000000
+      }
+    },
+    {
+      "questionId": "Q99",
+      "abstained": false,
+      "assertions": []
+    },
+    {
+      "questionId": "Q02",
+      "abstained": "yes",
+      "assertions": [
+        {
+          "text": "x",
+          "factId": "F2",
+          "documentId": "harbor-packages-2026",
+          "version": "two",
+          "businessId": "biz-harbor"
+        }
+      ]
+    },
+    {
+      "abstained": false,
+      "assertions": []
+    }
+  ]
+}
