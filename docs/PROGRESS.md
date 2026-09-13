@@ -111,7 +111,7 @@ No credentials, personal OpenClaw configuration or data, provider actions, custo
 
 ## Workspace cleanup and dependency findings
 
-Twenty-five completed review, failed-launch, runtime, dependency-maintenance, knowledge, delivery-evaluator, owner-workspace, setup, connection-service, backup, confirmation-service, commercial, extraction-backend, conflict-resolution, and inherited milestone worktrees were removed after checking clean tracked state and active worker ownership.
+Twenty-nine completed review, failed-launch, runtime, dependency-maintenance, knowledge, delivery-evaluator, owner-workspace, setup, connection-service, backup, confirmation-service, commercial, extraction-backend, conflict-resolution, proactive-monitoring, and inherited milestone worktrees were removed after checking clean tracked state and active worker ownership.
 Original foundation, interface, connector-contract, and packaging commits remain preserved by local branch references; integrated review commits remain reachable on remote main.
 The completed knowledge commit is additionally preserved at `archive/gather-business-knowledge-640f57b`; its successor worker uses a separate business-operator worktree.
 The completed delivery evaluator is preserved at `archive/gather-delivery-readiness-e626000`; its successor uses a separate booking-delivery worktree.
@@ -232,5 +232,19 @@ The embedded browser measured 839 pixels with no horizontal overflow; the reques
 The task-owned browser, server, and disposable database were cleaned up.
 
 The owner has authorized a designated Google test account, fictional seed data, and a fresh isolated Codex subscription login for the requested Luna model.
-OAuth application setup, model authentication, model-to-tool composition, and real end-to-end execution remain pending verification.
+Fresh isolated subscription OAuth and one actual no-tools text turn with `openai/gpt-5.6-luna` were verified by the login worker.
+That turn returned the requested text through the authorized subscription profile with no API-key fallback; it does not prove Gather tool invocation.
+The Google test application and three required APIs are configured, and the live local setup host is running for owner consent.
+Model-to-tool composition and the real end-to-end booking journey remain pending verification.
 These authorizations and component checks do not increase the fixed 14-of-17 accepted local milestone count or establish a whole-product completion percentage.
+
+Proactive sweep ownership and recovery were integrated at `6e1a5dc` after independent review and Astra's 24 integration tests and type checking passed.
+The tests include actual periodic resumption after a stuck sweep settles, without overlapping ownership or resurrecting stopped work.
+Setup and connection lifecycle registration were integrated at `92c9bf2` after independent review and eight integration tests and type checking passed.
+This enables scoped durable inquiry capture; it does not establish automatic model-generated offers.
+
+Current-proposal authority and evidence presentation were integrated at `5d1bfee` after the reviewed dependency chain, 63 integration tests, and type checking passed.
+The service rechecks proposal authority after asynchronous reconciliation, and the owner workspace preserves live, simulated, and unverified evidence as distinct states.
+These checks use controlled fixtures and scripted provider responses; they do not establish real booking confirmation.
+The remote `main` was verified at `5d1bfee` after push.
+The latest production build attempt was stopped when the live development host started sharing its output directory; no production-build pass is claimed for this integration.
