@@ -1,0 +1,30 @@
+{
+  "notice": "SCORER FIXTURE ONLY. Counterexample: only the first answer retained. Tests the scorer, never a provider.",
+  "provider": "scorer-fixture-partial-coverage",
+  "responses": [
+    {
+      "abstained": false,
+      "assertions": [
+        {
+          "businessId": "biz-harbor",
+          "commercialConclusion": true,
+          "documentId": "harbor-packages-2026",
+          "factId": "F1",
+          "text": "Seated dinner costs $110 per guest (2026 price).",
+          "version": 2,
+          "value": {
+            "kind": "price-per-guest",
+            "item": "seated-dinner",
+            "priceUsd": 110,
+            "season": "2026"
+          }
+        }
+      ],
+      "questionId": "Q01",
+      "timestampsMs": {
+        "finishedAt": 1726000000500,
+        "startedAt": 1726000000000
+      }
+    }
+  ]
+}
