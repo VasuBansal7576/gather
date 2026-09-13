@@ -52,6 +52,26 @@
   margin-top: 16px;
 }
 
+/* Narrow-viewport guard (measured 43px PhaseBanner overflow at 390px):
+   grid/flex items default to min-width:auto and refuse to shrink past
+   their longest token, so every direct child may shrink and long
+   identifiers/locators may break instead of widening the page. */
+.delivery-main > *,
+.delivery-banner > *,
+.delivery-card-top > *,
+.delivery-condition-top > * {
+  min-width: 0;
+}
+
+.delivery-banner strong,
+.delivery-panel strong,
+.delivery-muted,
+.delivery-error-text,
+.delivery-notice p,
+.delivery-sources li {
+  overflow-wrap: break-word;
+}
+
 .delivery-banner {
   display: flex;
   flex-wrap: wrap;
@@ -90,7 +110,8 @@
   display: flex;
   justify-content: space-between;
   align-items: center;
-  gap: 12px;
+  flex-wrap: wrap;
+  gap: 8px 12px;
 }
 
 .delivery-card-top h2 {
