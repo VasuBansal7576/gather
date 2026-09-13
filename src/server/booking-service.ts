@@ -369,10 +369,12 @@ export function getWorkspace(store: GatherStore, deps?: Pick<BookingServiceDeps,
     };
   });
   // The workspace marker reflects what the payload actually contains: demo
-  // only when every booking is an explicit fixture; a workspace containing
+  // only when there IS at least one booking and every booking is an explicit
+  // fixture (an empty list would vacuously satisfy `.every` and falsely mark
+  // a connected-but-empty workspace as simulated); a workspace containing
   // real bookings can never claim the fictional/simulated marker, and it
   // claims live only when every succeeded step carries positive live proof.
-  const everyBookingFixture = bookings.every((item) => isFixtureBooking(item.booking));
+  const everyBookingFixture = bookings.length > 0 && bookings.every((item) => isFixtureBooking(item.booking));
   const allExecutions = bookings.flatMap((item) => item.executions);
   const workspaceMarker = everyBookingFixture
     ? { demo: true as const, mode: DEMO_MARKER }
@@ -392,9 +394,11 @@ export function getWorkspace(store: GatherStore, deps?: Pick<BookingServiceDeps,
     connections,
     notice: everyBookingFixture
       ? "DEMO ONLY: all records and receipts are local fixtures/simulated integrations, not live provider state."
-      : workspaceMarker.mode === LIVE_MARKER
-        ? "Contains real bookings with provider receipts; holds are provisional, never confirmed bookings."
-        : "Contains real bookings; provider evidence is unverified unless a receipt shows live proof.",
+      : bookings.length === 0
+        ? "No bookings yet — nothing shown is provider-verified; connected sources report in as inquiries arrive."
+        : workspaceMarker.mode === LIVE_MARKER
+          ? "Contains real bookings with provider receipts; holds are provisional, never confirmed bookings."
+          : "Contains real bookings; provider evidence is unverified unless a receipt shows live proof.",
   };
 }
 
