@@ -58,7 +58,8 @@ test("conflict values never invent currency or profit", () => {
   assert.ok(unlabeled.includes("currency not stated"), "missing currency is honest");
   assert.ok(!/[£$₹]/.test(unlabeled), "no currency symbol without source currency");
   assert.ok(!/profit/i.test(formatConflictValue({ unitCents: 9500 })));
-  assert.equal(formatConflictValue({ unitCents: 9500 }), "unitCents: 9500");
+  assert.equal(formatConflictValue({ unitCents: 9500 }), "9500 minor units (currency not stated)");
+  assert.equal(formatConflictValue({ unitCents: 9500, currency: "GBP" }), "£95.00");
 });
 
 function fixtureFetch(handler: (input: string, init?: RequestInit) => unknown) {

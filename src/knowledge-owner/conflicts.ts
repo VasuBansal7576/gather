@@ -119,8 +119,14 @@ export function parseResolution(value: unknown): ConflictResolution | undefined 
  * key/value text. Profit is never computed or claimed.
  */
 export function formatConflictValue(value: Record<string, unknown>): string {
-  const amount = value.amountCents;
-  if (typeof amount === "number" && Number.isFinite(amount)) {
+  const amount = ((): number | undefined => {
+    for (const key of ["amountCents", "unitCents"] as const) {
+      const entry = value[key];
+      if (typeof entry === "number" && Number.isFinite(entry)) return entry;
+    }
+    return undefined;
+  })();
+  if (amount !== undefined) {
     return formatMoneyPart(amount, value.currency);
   }
   const parts = Object.entries(value).map(([k, v]) => `${k}: ${typeof v === "object" ? JSON.stringify(v) : String(v)}`);

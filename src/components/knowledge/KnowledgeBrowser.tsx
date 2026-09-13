@@ -302,7 +302,7 @@ export function KnowledgeBrowser(): React.JSX.Element {
           <p>
             Review what matters — prices, policies, spaces — and confirm, correct, or dismiss it.
             Everything you skip stays exactly as it is: unreviewed observations remain pending and
-            confirmed facts stay in force. Nothing here configures workflows or infrastructure.
+            confirmed facts stay in force.
           </p>
         </header>
 
