@@ -85,6 +85,11 @@ function classifyDeposit(item: Record<string, unknown>): DepositReceipt | string
     return "deposit_ledger output without a known receipt status";
   }
   if (!isIso(item.observedAt)) return "deposit_ledger output without observedAt timestamp";
+  if (item.refundedCents !== undefined) {
+    if (typeof item.refundedCents !== "number" || !Number.isInteger(item.refundedCents) || item.refundedCents < 0 || item.refundedCents > item.amountCents) {
+      return "deposit_ledger output with invalid refundedCents";
+    }
+  }
   if (!isRefArray(item.sourceRefs)) return "deposit_ledger output without source references";
   return {
     resolver: "deposit_ledger",
@@ -93,6 +98,7 @@ function classifyDeposit(item: Record<string, unknown>): DepositReceipt | string
     amountCents: item.amountCents,
     currency: item.currency,
     status: item.status as DepositReceipt["status"],
+    refundedCents: typeof item.refundedCents === "number" ? item.refundedCents : undefined,
     observedAt: item.observedAt,
     sourceRefs: item.sourceRefs,
   };
@@ -270,13 +276,16 @@ function evaluateDeposit(ctx: EvalContext, cfg: ConditionConfig): ConditionResul
   }
   const disregarded = inCurrency.filter((receipt) => receipt.status !== "settled");
   const settled = inCurrency.filter((receipt) => receipt.status === "settled");
-  const paid = settled.reduce((sum, receipt) => sum + receipt.amountCents, 0);
+  // Net settled position after refunds: a refunded slice no longer counts.
+  const paid = settled.reduce((sum, receipt) => sum + receipt.amountCents - (receipt.refundedCents ?? 0), 0);
+  const refundedTotal = settled.reduce((sum, receipt) => sum + (receipt.refundedCents ?? 0), 0);
+  const refundNote = refundedTotal > 0 ? ` (net of ${refundedTotal} refunded)` : "";
   if (paid >= requirement.requiredAmountCents) {
-    return { ...base, status: "verified", detail: `Settled ${paid} of required ${requirement.requiredAmountCents} ${requirement.currency} across ${settled.length} receipt(s)`, evidence: settled.flatMap((receipt) => receipt.sourceRefs) };
+    return { ...base, status: "verified", detail: `Settled net ${paid} of required ${requirement.requiredAmountCents} ${requirement.currency} across ${settled.length} receipt(s)${refundNote}`, evidence: settled.flatMap((receipt) => receipt.sourceRefs) };
   }
   const pendingNote = disregarded.length > 0 ? `; ${disregarded.length} receipt(s) not settled (${[...new Set(disregarded.map((receipt) => receipt.status))].join(", ")})` : "";
   const evidence = [...settled, ...disregarded].flatMap((receipt) => receipt.sourceRefs);
-  return { ...base, status: "missing", detail: `Partial deposit: settled ${paid} of required ${requirement.requiredAmountCents} ${requirement.currency}${pendingNote}`, evidence };
+  return { ...base, status: "missing", detail: `Partial deposit: settled net ${paid} of required ${requirement.requiredAmountCents} ${requirement.currency}${refundNote}${pendingNote}`, evidence };
 }
 
 function proposalWindow(payload: Record<string, unknown>): { startAt: string; endAt: string; calendarId: string } | null {
@@ -334,6 +343,13 @@ function evaluateResources(ctx: EvalContext, cfg: ConditionConfig): ConditionRes
   if (waiver) return waivedResult(cfg.kind, cfg.required, waiver);
   const requiredIds = cfg.resources?.requiredResourceIds ?? [];
   const maxAge = cfg.maxAgeMs ?? DEFAULT_RESOURCE_MAX_AGE_MS;
+  const eventEnd = eventEndIso(ctx.input);
+  const coversEvent = (validUntil: string | undefined): boolean => {
+    if (!validUntil) return true;
+    if (Date.parse(validUntil) <= ctx.nowMs) return false;
+    if (eventEnd) return Date.parse(validUntil) >= Date.parse(eventEnd);
+    return true;
+  };
   const breakdown: ResourceResult[] = requiredIds.map((resourceId) => {
     const commits = ctx.classified.resources.filter((commit) => commit.resourceId === resourceId);
     if (commits.length === 0) return { resourceId, status: "missing" as const, detail: "No commitment evidence" };
@@ -341,7 +357,8 @@ function evaluateResources(ctx: EvalContext, cfg: ConditionConfig): ConditionRes
     if (current.length === 0) {
       return { resourceId, status: "stale" as const, detail: "Commitment evidence is older than the allowed evidence age; re-verify" };
     }
-    const committed = current.filter((commit) => commit.status === "committed" && (!commit.validUntil || Date.parse(commit.validUntil) > ctx.nowMs));
+    const committed = current.filter((commit) => commit.status === "committed" && coversEvent(commit.validUntil));
+    const shortWindow = current.filter((commit) => commit.status === "committed" && !coversEvent(commit.validUntil));
     const bad = current.filter((commit) => commit.status === "rejected" || commit.status === "revoked");
     if (committed.length > 0 && bad.length > 0) {
       return { resourceId, status: "conflicting" as const, detail: "Conflicting commitment and rejection/revocation evidence" };
@@ -352,6 +369,9 @@ function evaluateResources(ctx: EvalContext, cfg: ConditionConfig): ConditionRes
     }
     if (bad.length > 0) {
       return { resourceId, status: "conflicting" as const, detail: `Resource ${bad[0]?.status}; commitment required` };
+    }
+    if (shortWindow.length > 0) {
+      return { resourceId, status: "missing" as const, detail: `Commitment does not cover the event window (valid until ${shortWindow[0]?.validUntil})` };
     }
     if (current.some((commit) => commit.status === "expired" || (commit.validUntil && Date.parse(commit.validUntil) <= ctx.nowMs))) {
       return { resourceId, status: "stale" as const, detail: "Commitment expired; re-verify" };
@@ -373,9 +393,22 @@ function evaluateResources(ctx: EvalContext, cfg: ConditionConfig): ConditionRes
   return { ...base, status: "verified", detail: `All ${breakdown.length} required resources explicitly committed`, evidence, resources: breakdown };
 }
 
+function eventEndIso(input: EvaluateReadinessInput): string | null {
+  if (isIso(input.booking.endAt)) return input.booking.endAt;
+  const payloadEnd: unknown = input.proposal.payload.endAt;
+  if (isIso(payloadEnd)) return payloadEnd;
+  return null;
+}
+
 /**
- * Smallest maintainable booking-specific readiness evaluator. Pure: no
- * store, no status writes, no sends. Never confirms from a hold alone, a
+ * Smallest maintainable booking-specific readiness evaluator. Pure and
+ * explicitly trusted-input-only: evidence, waivers, and policy must reach
+ * it through the DeliveryVerifiers host boundary
+ * (`evaluateBookingReadiness`), which fetches proofs for the exact binding.
+ * Never pass external payloads here directly — raw input cannot choose a
+ * trusted resolver, waive a condition, or mark a receipt verified.
+ *
+ * No store, no status writes, no sends. Never confirms from a hold alone, a
  * payment link, an email claim, an unverified request, or unknown
  * availability — those inputs are either unclassifiable raw signals or
  * rejected evidence.
@@ -456,6 +489,13 @@ export function evaluateReadiness(raw: unknown): ReadinessDecision {
     ctx.citedFictional.length === 0 ? "none" : fictionalSet.size === 1 ? (fictionalSet.has(true) ? "demo" : "live") : "mixed";
 
   const blockedBy: string[] = [];
+  if (input.booking.status === "cancelled") {
+    blockedBy.push("booking_cancelled — a cancelled booking can never be confirmed ready");
+  }
+  const eventEnd = eventEndIso(input);
+  if (eventEnd && Date.parse(eventEnd) <= nowMs) {
+    blockedBy.push("event_window_passed — the event has already ended; readiness is blocked");
+  }
   for (const condition of conditions) {
     if (condition.required && condition.status !== "verified") {
       blockedBy.push(`${condition.kind}:${condition.status} — ${condition.detail}`);

@@ -7,21 +7,26 @@ connector, API, UI, and packaging files are untouched.
 ## What it is
 
 A pure, booking-specific readiness evaluator plus an operational-handoff
-builder (`src/delivery/contracts.ts`, `readiness.ts`, `handoff.ts`,
-re-exported from `index.ts`). It evaluates an immutable accepted proposal
-identity against configured business confirmation conditions using only
-typed trusted verifier outputs. It performs no store writes, changes no
-booking status, runs no scheduler, sends nothing, and approves nothing: it
-exports a module for later guarded-service wiring.
+builder (`src/delivery/contracts.ts`, `readiness.ts`, `verifiers.ts`,
+`handoff.ts`, re-exported from `index.ts`).
+
+A resolver kind string inside evidence is **not** itself trusted, so raw
+input never reaches the evaluator. The host injects `DeliveryVerifiers`
+functions that fetch and verify persisted/provider proofs for the exact
+business/booking/version binding; only those validated outputs are
+evaluated. Policy and waivers are likewise sourced from the trusted host,
+never from external payloads. Raw external claims cannot choose
+`owner_authority`, mark a receipt verified, or supply the policy.
+`evaluateReadiness` remains as the pure explicitly-trusted-input-only core
+for callers that already hold boundary-validated inputs.
 
 ```ts
-import { evaluateReadiness, buildHandoff } from "./src/delivery/index.ts";
+import { evaluateBookingReadiness, buildHandoff } from "./src/delivery/index.ts";
 
-const decision = evaluateReadiness({
-  nowIso, businessId, booking, proposal, policy,
-  evidence,      // VerifierOutput[] from the trusted resolver boundary
+const decision = await evaluateBookingReadiness({
+  nowIso, businessId, booking, proposal,
+  verifiers,     // host-injected: loadPolicy + fetch* for the exact binding
   rawSignals,    // payment links, email claims: counted, never verifying
-  waivers,       // scoped OwnerWaiver[]; payload booleans never waive
 });
 const handoff = buildHandoff({ decision, booking, proposal });
 ```
@@ -29,25 +34,28 @@ const handoff = buildHandoff({ decision, booking, proposal });
 ## Readiness rules (G12)
 
 - **Binding first:** business, booking, proposal version/fingerprint, and
-  policy business must agree or evaluation throws. Acceptance binds to the
-  exact proposal version **and** fingerprint; other versions conflict.
+  host policy business must agree or evaluation throws. Acceptance binds to
+  the exact proposal version **and** fingerprint; other versions conflict.
+- **Lifecycle blocks:** cancelled bookings and past event windows block
+  readiness regardless of evidence.
 - **Per-condition verdicts:** each condition reports `verified`, `missing`,
   `stale`, or `conflicting` with source references. Required conditions
   block; optional ones are reported only.
 - **Acceptance:** exact-version record verifies; revoked or
   other-version-only records conflict.
-- **Deposit:** settled receipts in the required currency sum to the
-  required amount (split payments supported). Pending receipts do not
-  verify; rejected/refunded/revoked receipts are excluded; wrong currency
-  conflicts; partial payment is `missing` with paid-vs-required detail.
+- **Deposit:** net settled receipts (amount minus refunds) in the required
+  currency sum to the required amount (split payments supported). Pending
+  receipts do not verify; rejected/refunded/revoked receipts are excluded;
+  wrong currency conflicts; partial payment is `missing` with net
+  paid-vs-required detail.
 - **Availability:** a current provider attestation must fully cover the
   accepted window. Unknown windows are `missing`, old proofs and expired
   holds are `stale`, unavailable slots conflict. A hold alone — without a
   current available attestation — never verifies.
 - **Resources:** every required resource needs an explicit, current
-  `committed` status. `requested` is `missing`, expired evidence is
-  `stale`, rejected/revoked evidence conflicts, and committed-plus-revoked
-  ambiguity conflicts.
+  `committed` status whose time window covers the event.
+  `requested` is `missing`, expired evidence is `stale`, rejected/revoked
+  evidence conflicts, and committed-plus-revoked ambiguity conflicts.
 - **Trusted resolver boundary:** only `acceptance_record`,
   `deposit_ledger`, `calendar_provider`, `resource_registry`, and
   `owner_authority` outputs count. Malformed shapes, unknown resolvers, and
@@ -70,10 +78,14 @@ or services are fabricated. Provenance travels with the handoff.
 
 ## Verified (module scope only)
 
-- `tests/delivery.readiness.test.ts` — 17 tests.
+- `tests/delivery.readiness.test.ts` — 17 tests (pure core).
 - `tests/delivery.handoff.test.ts` — 5 tests.
-- Full suite plus `npm run typecheck` (see commit message for counts).
-  These are module tests; they do not establish integration acceptance.
+- `tests/delivery.verifiers.test.ts` — 6 tests (host boundary: exact
+  binding queries, hostile input rejection, cancelled/past blocks, net
+  refunds, window coverage, fail-closed verifiers).
+- Full suite: 83 tests pass; `npm run typecheck` clean (see commit).
+  These are module tests with injected fakes; they do not establish live
+  provider integration acceptance.
 
 ## Integration left (not claimed)
 

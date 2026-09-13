@@ -1,6 +1,7 @@
 export { evaluateReadiness } from "./readiness.ts";
 export { buildHandoff } from "./handoff.ts";
-export { assertValidEvaluateInput, assertValidHandoffInput } from "./contracts.ts";
+export { evaluateBookingReadiness } from "./verifiers.ts";
+export { assertValidEvaluateInput, assertValidHandoffInput, assertConditionConfig } from "./contracts.ts";
 export type {
   AcceptedProposal,
   AcceptanceRecord,
@@ -30,3 +31,13 @@ export type {
   TrustedResolver,
   VerifierOutput,
 } from "./contracts.ts";
+export type {
+  AcceptanceQuery,
+  AvailabilityQuery,
+  BookingReadinessQuery,
+  DeliveryVerifiers,
+  DepositQuery,
+  PolicyQuery,
+  ResourceQuery,
+  WaiverQuery,
+} from "./verifiers.ts";
