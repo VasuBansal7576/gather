@@ -86,6 +86,19 @@ satisfy it and grants no authority.
 - `booking_identity_decisions` has at most one `open` row per source key,
   enforced by a partial `UNIQUE` index; open-version resolution is a
   conditional `UPDATE ... WHERE status='open'` inside the transaction.
+- `link_revision` is a monotonic per-link counter (also persisted on each
+  audit row): every binding change bumps it, and `unlinkIdentityLink`
+  requires `expectedLinkRevision` to equal the current value. A caller that
+  reviewed A, then watched the binding move A -> B -> A, can never apply a
+  stale correction — the booking alone is not the binding's identity.
+- Schema upgrades are failure-atomic: `migrateIdentityLinksTable` rebuilds
+  the pre-'owner' provenance table (rename -> create -> copy -> drop ->
+  index replay) inside one transaction with `PRAGMA foreign_keys` held off
+  and a `foreign_key_check` before commit, validates the exact legacy
+  column shape first, and refuses to run inside an open transaction. A
+  mid-migration failure leaves the original table intact — never a
+  partially renamed `*_legacy` table. Post-'owner' tables missing
+  `link_revision` gain it via additive `ALTER TABLE ... DEFAULT 1`.
 
 ### Account trust
 
@@ -102,9 +115,10 @@ on every binding path — including `propose` on an already-linked key.
   candidates + versioned/fingerprinted open decision).
 - `recordVerifiedIdentityLink(store, { components, bookingId, receipt, actor?, accounts? })`
 - `recordOwnerIdentityDecision(store, { sourceKey, chosenBookingId, actor, candidateVersion, candidateFingerprint, accounts? })`
-- `unlinkIdentityLink(store, { sourceKey, actor, reason, expectedBookingId?, replacementBookingId?, accounts? })`
-  — `expectedBookingId` is the reviewed-target guard; it is REQUIRED with
-  `replacementBookingId` and must equal the currently bound booking.
+- `unlinkIdentityLink(store, { sourceKey, actor, reason, expectedLinkRevision, expectedBookingId?, replacementBookingId?, accounts? })`
+  — `expectedLinkRevision` is REQUIRED on every call and must equal the
+  link's current `linkRevision`; `expectedBookingId` is additionally
+  required with `replacementBookingId` and must equal the bound booking.
 - Readers: `getIdentityLink`, `getActiveIdentityLink`, `getOpenIdentityDecision`,
   `listIdentityDecisions`, `listIdentityAudit`, `buildSourceKey`,
   `decodeSourceKey`, `fingerprintCandidates`.

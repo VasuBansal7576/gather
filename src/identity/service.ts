@@ -73,6 +73,8 @@ export type ProposeIdentityResult =
       bookingId: string;
       origin: IdentityLinkRow["origin"];
       provenanceMode: ProvenanceMode;
+      /** Current binding revision — pass to unlink/correction as the reviewed target. */
+      linkRevision: number;
     }
   | {
       outcome: "needs_decision";
@@ -286,6 +288,7 @@ export function proposeBookingIdentity(
       bookingId: active.bookingId,
       origin: active.origin,
       provenanceMode: active.provenanceMode,
+      linkRevision: active.linkRevision,
     };
   }
   const candidates = findCandidates(store, input.components.businessId, input.hints ?? {});
@@ -382,8 +385,8 @@ export function recordVerifiedIdentityLink(
     try {
       store.db.prepare(
         `INSERT INTO booking_identity_links
-          (source_key, booking_id, business_id, account_id, provider, origin, provenance_mode, receipt_operation_key, status, created_at, updated_at)
-         VALUES ($key, $booking, $business, $account, $provider, 'verified_receipt', $mode, $receipt, 'active', $at, $at)`,
+          (source_key, booking_id, business_id, account_id, provider, origin, provenance_mode, receipt_operation_key, status, link_revision, created_at, updated_at)
+         VALUES ($key, $booking, $business, $account, $provider, 'verified_receipt', $mode, $receipt, 'active', 1, $at, $at)`,
       ).run({
         $key: sourceKey,
         $booking: bookingId,
@@ -409,6 +412,7 @@ export function recordVerifiedIdentityLink(
       bookingId,
       actor: input.actor ?? "host-verified-receipt",
       reason: `Bound via ${input.receipt.mode} provider-correlated receipt ${operationKey}`,
+      linkRevision: 1,
     });
     store.db.exec("COMMIT");
   } catch (error) {
@@ -514,10 +518,11 @@ export function recordOwnerIdentityDecision(
     }
     if (existing) {
       const correctsBooking = existing.bookingId !== chosenBookingId;
+      const nextRevision = existing.linkRevision + 1;
       store.db.prepare(
         `UPDATE booking_identity_links SET booking_id = $booking, business_id = $business, account_id = $account,
           provider = $provider, origin = 'owner_resolution', status = 'active',
-          provenance_mode = $mode, receipt_operation_key = $receipt, updated_at = $at WHERE source_key = $key`,
+          provenance_mode = $mode, receipt_operation_key = $receipt, link_revision = $rev, updated_at = $at WHERE source_key = $key`,
       ).run({
         $booking: chosenBookingId,
         $business: key.businessId,
@@ -527,6 +532,7 @@ export function recordOwnerIdentityDecision(
         // receipt stays attributable to the old record in audit, never to B.
         $mode: correctsBooking ? "owner" : existing.provenanceMode,
         $receipt: correctsBooking ? null : existing.receiptOperationKey ?? null,
+        $rev: nextRevision,
         $at: timestamp,
         $key: input.sourceKey,
       });
@@ -539,12 +545,13 @@ export function recordOwnerIdentityDecision(
           existing.status === "active"
             ? `Owner corrected binding ${existing.bookingId} -> ${chosenBookingId} at v${open.candidateVersion}/${open.candidateFingerprint.slice(0, 12)} (prior record preserved in audit${correctsBooking ? "; provider receipt cleared as obsolete" : ""})`
             : `Owner bound after unlink at v${open.candidateVersion}/${open.candidateFingerprint.slice(0, 12)} (prior record preserved in audit)`,
+        linkRevision: nextRevision,
       });
     } else {
       store.db.prepare(
         `INSERT INTO booking_identity_links
-          (source_key, booking_id, business_id, account_id, provider, origin, provenance_mode, receipt_operation_key, status, created_at, updated_at)
-         VALUES ($key, $booking, $business, $account, $provider, 'owner_resolution', 'owner', NULL, 'active', $at, $at)`,
+          (source_key, booking_id, business_id, account_id, provider, origin, provenance_mode, receipt_operation_key, status, link_revision, created_at, updated_at)
+         VALUES ($key, $booking, $business, $account, $provider, 'owner_resolution', 'owner', NULL, 'active', 1, $at, $at)`,
       ).run({
         $key: input.sourceKey,
         $booking: chosenBookingId,
@@ -559,6 +566,7 @@ export function recordOwnerIdentityDecision(
         bookingId: chosenBookingId,
         actor: actor.id,
         reason: `Owner bound at v${open.candidateVersion}/${open.candidateFingerprint.slice(0, 12)}`,
+        linkRevision: 1,
       });
     }
     if (!resolveDecisionIfOpen(store, open.id, chosenBookingId, actor.id)) {
@@ -583,10 +591,13 @@ export function recordOwnerIdentityDecision(
  * flips to `unlinked` (or moves to the replacement booking) and every
  * transition stays in the audit log.
  *
- * `expectedBookingId` is the reviewed-target guard: when present it must
- * equal the currently bound booking, and it is REQUIRED whenever a
- * `replacementBookingId` is given — an unrestricted replacement would
- * bypass the reviewed link entirely. A correction to a different booking
+ * `expectedLinkRevision` is the reviewed-binding guard: it is REQUIRED and
+ * must equal the link's current monotonic `linkRevision`. Revising to a
+ * different booking bumps the revision, so a caller that reviewed A, then
+ * saw the binding move A -> B -> A, cannot apply a stale correction — the
+ * booking alone is not the binding's identity.
+ * `expectedBookingId` must equal the currently bound booking whenever a
+ * `replacementBookingId` is given. A correction to a different booking
  * clears the obsolete provider receipt and records 'owner' provenance; the
  * receipt that proved booking A never appears to prove booking B.
  */
@@ -596,6 +607,7 @@ export function unlinkIdentityLink(
     sourceKey: string;
     actor: IdentityOwnerActor;
     reason: string;
+    expectedLinkRevision: number;
     expectedBookingId?: string;
     replacementBookingId?: string;
     accounts?: IdentityAccountRegistry;
@@ -610,6 +622,16 @@ export function unlinkIdentityLink(
   }
   const actor = requireOwnerActor(input.actor);
   requireNonEmptyString("reason", input.reason);
+  if (
+    typeof input.expectedLinkRevision !== "number" ||
+    !Number.isInteger(input.expectedLinkRevision) ||
+    input.expectedLinkRevision < 1
+  ) {
+    throw new IdentityError(
+      "INVALID_REQUEST",
+      "Unlink/correction requires the reviewed expectedLinkRevision (positive integer)",
+    );
+  }
   if (input.expectedBookingId !== undefined) {
     requireNonEmptyString("expectedBookingId", input.expectedBookingId);
   }
@@ -627,28 +649,39 @@ export function unlinkIdentityLink(
   try {
     const active = getActiveIdentityLink(store, input.sourceKey);
     if (!active) throw new IdentityError("NOT_FOUND", "No active identity link for this source key");
+    if (active.linkRevision !== input.expectedLinkRevision) {
+      throw new IdentityError(
+        "STALE_DECISION",
+        `Reviewed link is stale: expected link revision ${input.expectedLinkRevision} but the binding is at revision ${active.linkRevision}; re-read and review the current link`,
+      );
+    }
     if (input.expectedBookingId !== undefined && input.expectedBookingId !== active.bookingId) {
       throw new IdentityError(
         "STALE_DECISION",
         `Reviewed link is stale: expected target ${input.expectedBookingId} but the active binding is ${active.bookingId}; re-read and review the current link`,
       );
     }
+    const nextRevision = active.linkRevision + 1;
     if (input.replacementBookingId !== undefined) {
       const business = bookingBusinessId(store, input.replacementBookingId);
       requireScope(store, key, input.replacementBookingId, business, input.accounts);
       store.db.prepare(
         `UPDATE booking_identity_links SET booking_id = $booking, origin = 'owner_resolution',
-          provenance_mode = 'owner', receipt_operation_key = NULL, updated_at = $at WHERE source_key = $key`,
-      ).run({ $booking: input.replacementBookingId, $at: timestamp, $key: input.sourceKey });
+          provenance_mode = 'owner', receipt_operation_key = NULL, link_revision = $rev, updated_at = $at WHERE source_key = $key`,
+      ).run({ $booking: input.replacementBookingId, $rev: nextRevision, $at: timestamp, $key: input.sourceKey });
       appendIdentityAudit(store, {
         sourceKey: input.sourceKey,
         action: "correction",
         bookingId: input.replacementBookingId,
         actor: actor.id,
         reason: `${input.reason} (corrected ${active.bookingId} -> ${input.replacementBookingId}; provider receipt cleared as obsolete, prior binding preserved in audit)`,
+        linkRevision: nextRevision,
       });
     } else {
-      store.db.prepare("UPDATE booking_identity_links SET status = 'unlinked', updated_at = $at WHERE source_key = $key").run({
+      store.db.prepare(
+        "UPDATE booking_identity_links SET status = 'unlinked', link_revision = $rev, updated_at = $at WHERE source_key = $key",
+      ).run({
+        $rev: nextRevision,
         $at: timestamp,
         $key: input.sourceKey,
       });
@@ -658,6 +691,7 @@ export function unlinkIdentityLink(
         bookingId: active.bookingId,
         actor: actor.id,
         reason: input.reason,
+        linkRevision: nextRevision,
       });
     }
     store.db.exec("COMMIT");

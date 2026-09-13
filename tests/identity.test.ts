@@ -1,9 +1,11 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { GatherStore } from "../src/server/sqlite-store.ts";
+import { migrateIdentityLinksTable } from "../src/identity/store.ts";
 import {
   buildSourceKey,
   ensureBookingIdentityTables,
@@ -432,6 +434,7 @@ test("unlink and correction keep audit history without destroying the old record
       sourceKey: key,
       actor: OWNER,
       reason: "Wrong event: message was about the winter market",
+      expectedLinkRevision: 1,
     });
     assert.equal(unlinked.status, "unlinked");
     // After unlink the record no longer resolves: it needs a fresh decision.
@@ -609,6 +612,7 @@ test("owner correction clears the obsolete provider receipt and asserts owner pr
           sourceKey: key,
           actor: OWNER,
           reason: "wrong event",
+          expectedLinkRevision: 1,
           replacementBookingId: bookingB,
         }),
       "INVALID_REQUEST",
@@ -620,6 +624,7 @@ test("owner correction clears the obsolete provider receipt and asserts owner pr
           sourceKey: key,
           actor: OWNER,
           reason: "wrong event",
+          expectedLinkRevision: 1,
           expectedBookingId: bookingB,
           replacementBookingId: bookingB,
         }),
@@ -630,6 +635,7 @@ test("owner correction clears the obsolete provider receipt and asserts owner pr
       sourceKey: key,
       actor: OWNER,
       reason: "wrong event",
+      expectedLinkRevision: 1,
       expectedBookingId: bookingA,
       replacementBookingId: bookingB,
     });
@@ -793,5 +799,194 @@ test("owner decisions reject non-owner and non-actor identities", () => {
     }
   } finally {
     fx.cleanup();
+  }
+});
+
+test("monotonic link revision defeats stale corrections even through A->B->A", () => {
+  const fx = fixtureStore();
+  try {
+    const bookingA = makeBooking(fx, { eventName: "Fictional River Fete" });
+    const bookingB = makeBooking(fx, { eventName: "Fictional Harbor Fete" });
+    const key = buildSourceKey(comps(fx));
+    recordVerifiedIdentityLink(fx.store, {
+      components: comps(fx),
+      bookingId: bookingA,
+      receipt: { operationKey: "gather:email:send:aba", mode: "live" },
+    });
+    assert.equal(getIdentityLink(fx.store, key)!.linkRevision, 1);
+    // A -> B (rev 2), then B -> A (rev 3): the booking is A again but the
+    // binding is not the same binding the first reviewer saw.
+    unlinkIdentityLink(fx.store, {
+      sourceKey: key, actor: OWNER, reason: "first correction",
+      expectedLinkRevision: 1, expectedBookingId: bookingA, replacementBookingId: bookingB,
+    });
+    unlinkIdentityLink(fx.store, {
+      sourceKey: key, actor: OWNER, reason: "second correction",
+      expectedLinkRevision: 2, expectedBookingId: bookingB, replacementBookingId: bookingA,
+    });
+    const current = getIdentityLink(fx.store, key)!;
+    assert.equal(current.bookingId, bookingA);
+    assert.equal(current.linkRevision, 3);
+    // A caller that reviewed rev 1 (booking A) cannot apply its stale plan.
+    assertIdentityError(
+      () =>
+        unlinkIdentityLink(fx.store, {
+          sourceKey: key, actor: OWNER, reason: "stale plan",
+          expectedLinkRevision: 1, expectedBookingId: bookingA, replacementBookingId: bookingB,
+        }),
+      "STALE_DECISION",
+    );
+    // An exact repeat of an already-applied correction is stale too.
+    assertIdentityError(
+      () =>
+        unlinkIdentityLink(fx.store, {
+          sourceKey: key, actor: OWNER, reason: "repeat",
+          expectedLinkRevision: 2, expectedBookingId: bookingB, replacementBookingId: bookingA,
+        }),
+      "STALE_DECISION",
+    );
+    // The current revision with the current target still works.
+    const ok = unlinkIdentityLink(fx.store, {
+      sourceKey: key, actor: OWNER, reason: "reviewed now",
+      expectedLinkRevision: 3, expectedBookingId: bookingA, replacementBookingId: bookingB,
+    });
+    assert.equal(ok.linkRevision, 4);
+    // The revision reached is durable in the audit trail.
+    const audits = listIdentityAudit(fx.store, key);
+    const revisions = audits.filter((row) => row.linkRevision !== undefined).map((row) => row.linkRevision);
+    assert.deepEqual(revisions, [1, 2, 3, 4]);
+  } finally {
+    fx.cleanup();
+  }
+});
+
+// ---------- schema migration ----------
+
+const LEGACY_LINKS_DDL = `
+  CREATE TABLE booking_identity_links (
+    source_key TEXT PRIMARY KEY,
+    booking_id TEXT NOT NULL,
+    business_id TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    origin TEXT NOT NULL CHECK (origin IN ('verified_receipt', 'owner_resolution')),
+    provenance_mode TEXT NOT NULL CHECK (provenance_mode IN ('demo', 'live')),
+    receipt_operation_key TEXT,
+    status TEXT NOT NULL CHECK (status IN ('active', 'unlinked')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`;
+
+function seedLegacyDb(path: string): void {
+  const db = new DatabaseSync(path);
+  try {
+    db.exec(LEGACY_LINKS_DDL);
+    db.prepare(
+      `INSERT INTO booking_identity_links
+        (source_key, booking_id, business_id, account_id, provider, origin, provenance_mode, receipt_operation_key, status, created_at, updated_at)
+       VALUES ('k1', 'b1', 'biz1', 'acc1', 'gmail', 'verified_receipt', 'live', 'op-1', 'active', 't', 't'),
+              ('k2', 'b2', 'biz1', 'acc1', 'gmail', 'owner_resolution', 'demo', NULL, 'unlinked', 't', 't')`,
+    ).run();
+    db.exec("CREATE INDEX idx_legacy_booking ON booking_identity_links(booking_id)");
+  } finally {
+    db.close();
+  }
+}
+
+test("populated legacy table migrates failure-atomically and survives reopen", () => {
+  const dir = mkdtempSync(join(tmpdir(), "gather-identity-migrate-"));
+  const path = join(dir, "legacy.sqlite");
+  try {
+    seedLegacyDb(path);
+    const db = new DatabaseSync(path);
+    try {
+      migrateIdentityLinksTable(db);
+      const rows = db.prepare("SELECT * FROM booking_identity_links ORDER BY source_key").all() as Record<string, unknown>[];
+      assert.equal(rows.length, 2, "all legacy rows preserved");
+      assert.equal(rows[0]!.link_revision, 1, "legacy rows gain revision 1");
+      assert.equal(rows[1]!.status, "unlinked");
+      // Secondary indexes are preserved on the rebuilt table.
+      const idx = db.prepare(
+        "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='booking_identity_links' AND name='idx_legacy_booking'",
+      ).get();
+      assert.ok(idx, "secondary index recreated on the new table");
+      // 'owner' provenance now inserts; the old CHECK is gone.
+      db.prepare(
+        `INSERT INTO booking_identity_links
+          (source_key, booking_id, business_id, account_id, provider, origin, provenance_mode, status, link_revision, created_at, updated_at)
+         VALUES ('k3', 'b3', 'biz1', 'acc1', 'gmail', 'owner_resolution', 'owner', 'active', 1, 't', 't')`,
+      ).run();
+    } finally {
+      db.close();
+    }
+    // Reopen: migration is idempotent and rows persist.
+    const reopened = new DatabaseSync(path);
+    try {
+      migrateIdentityLinksTable(reopened);
+      const count = reopened.prepare("SELECT COUNT(*) AS n FROM booking_identity_links").get() as Record<string, unknown>;
+      assert.equal(Number(count.n), 3);
+      const leftover = reopened.prepare(
+        "SELECT name FROM sqlite_master WHERE name = 'booking_identity_links_legacy'",
+      ).get();
+      assert.equal(leftover, undefined, "no partially renamed table remains");
+    } finally {
+      reopened.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a mid-migration failure rolls back without a partially renamed table", () => {
+  const dir = mkdtempSync(join(tmpdir(), "gather-identity-migfail-"));
+  const path = join(dir, "legacy.sqlite");
+  try {
+    seedLegacyDb(path);
+    const db = new DatabaseSync(path);
+    try {
+      assert.throws(
+        () => migrateIdentityLinksTable(db, { createSql: "CREATE TABLE booking_identity_links (broken" }),
+        /incomplete input|syntax/i,
+      );
+      // The rename is rolled back: the original table and all rows are intact.
+      const rows = db.prepare("SELECT source_key, provenance_mode FROM booking_identity_links ORDER BY source_key").all();
+      assert.equal(rows.length, 2);
+      const leftover = db.prepare(
+        "SELECT name FROM sqlite_master WHERE name = 'booking_identity_links_legacy'",
+      ).get();
+      assert.equal(leftover, undefined, "no *_legacy table left behind");
+      // Foreign keys pragma is restored to its prior state.
+      const fk = db.prepare("PRAGMA foreign_keys").get() as Record<string, unknown>;
+      assert.equal(Number(fk.foreign_keys), 1, "gather opens DBs with foreign_keys ON; it must be restored");
+    } finally {
+      db.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("post-owner shape missing link_revision gains it additively with rows intact", () => {
+  const dir = mkdtempSync(join(tmpdir(), "gather-identity-addcol-"));
+  const path = join(dir, "prev.sqlite");
+  try {
+    const db = new DatabaseSync(path);
+    try {
+      // The a7d435d shape: 'owner' in CHECK, no link_revision column.
+      db.exec(LEGACY_LINKS_DDL.replace("'demo', 'live'", "'demo', 'live', 'owner'"));
+      db.prepare(
+        `INSERT INTO booking_identity_links
+          (source_key, booking_id, business_id, account_id, provider, origin, provenance_mode, status, created_at, updated_at)
+         VALUES ('k1', 'b1', 'biz1', 'acc1', 'gmail', 'owner_resolution', 'owner', 'active', 't', 't')`,
+      ).run();
+      migrateIdentityLinksTable(db);
+      const row = db.prepare("SELECT * FROM booking_identity_links WHERE source_key = 'k1'").get() as Record<string, unknown>;
+      assert.equal(Number(row.link_revision), 1);
+      assert.equal(row.provenance_mode, "owner", "existing owner rows survive the additive column");
+    } finally {
+      db.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });
