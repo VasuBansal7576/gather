@@ -1,0 +1,259 @@
+{
+  "notice": "FICTIONAL ground truth for a FICTIONAL corpus. Fact ids F1..Fn are the enumerated denominator for recall. critical:true facts feed the 100% gate. mustAbstain:true questions require abstention; any authoritative commercial conclusion there is an automatic gate failure.",
+  "questions": [
+    {
+      "businessId": "biz-harbor",
+      "commercialAuthority": true,
+      "expectedFacts": [
+        {
+          "critical": true,
+          "documentId": "harbor-packages-2026",
+          "factId": "F1",
+          "text": "2026 seated dinner at Harbor View Hall costs $110 per guest",
+          "version": 2,
+          "value": {
+            "kind": "price-per-guest",
+            "item": "seated-dinner",
+            "priceUsd": 110,
+            "season": "2026"
+          }
+        }
+      ],
+      "mustAbstain": false,
+      "questionId": "Q01",
+      "text": "What is the current per-guest price for a seated dinner at Harbor View Hall?",
+      "versionSensitive": true
+    },
+    {
+      "businessId": "biz-harbor",
+      "commercialAuthority": true,
+      "expectedFacts": [
+        {
+          "critical": true,
+          "documentId": "harbor-packages-2026",
+          "factId": "F2",
+          "text": "2026 buffet dinner at Harbor View Hall costs $84 per guest",
+          "version": 2,
+          "value": {
+            "kind": "price-per-guest",
+            "item": "buffet-dinner",
+            "priceUsd": 84,
+            "season": "2026"
+          }
+        }
+      ],
+      "mustAbstain": false,
+      "questionId": "Q02",
+      "text": "What is the current per-guest price for a buffet dinner at Harbor View Hall?",
+      "versionSensitive": true
+    },
+    {
+      "businessId": "biz-harbor",
+      "commercialAuthority": false,
+      "expectedFacts": [
+        {
+          "critical": false,
+          "documentId": "harbor-packages-2026",
+          "factId": "F1",
+          "text": "2026 seated dinner at Harbor View Hall costs $110 per guest",
+          "version": 2,
+          "value": {
+            "kind": "price-per-guest",
+            "item": "seated-dinner",
+            "priceUsd": 110,
+            "season": "2026"
+          }
+        }
+      ],
+      "mustAbstain": false,
+      "questionId": "Q03",
+      "text": "A customer quotes last year's $95 seated-dinner price. What is the applicable current price?",
+      "versionSensitive": true
+    },
+    {
+      "businessId": "biz-harbor",
+      "commercialAuthority": true,
+      "expectedFacts": [
+        {
+          "critical": true,
+          "documentId": "harbor-nonprofit-exception",
+          "factId": "F3",
+          "text": "Registered nonprofits get 10% off the 2026 seated-dinner package for weekday (Mon-Thu) Harbor View Hall events, signed M. Alvarez 2026-02-10",
+          "version": 1,
+          "value": {
+            "kind": "discount",
+            "pct": 10,
+            "appliesTo": "seated-dinner-2026",
+            "days": "Mon-Thu",
+            "scope": "registered-nonprofit",
+            "signedBy": "M. Alvarez",
+            "signedOn": "2026-02-10"
+          }
+        }
+      ],
+      "mustAbstain": false,
+      "questionId": "Q04",
+      "text": "A registered nonprofit books a Tuesday seated dinner. What discount applies?",
+      "versionSensitive": false
+    },
+    {
+      "businessId": "biz-harbor",
+      "commercialAuthority": false,
+      "expectedFacts": [],
+      "mustAbstain": true,
+      "questionId": "Q05",
+      "text": "A registered nonprofit books a Saturday seated dinner. What discount applies?",
+      "versionSensitive": false
+    },
+    {
+      "businessId": "biz-harbor",
+      "commercialAuthority": false,
+      "expectedFacts": [],
+      "mustAbstain": true,
+      "questionId": "Q06",
+      "text": "A registered nonprofit books a Tuesday buffet dinner. What discount applies?",
+      "versionSensitive": false
+    },
+    {
+      "businessId": "biz-harbor",
+      "commercialAuthority": false,
+      "expectedFacts": [
+        {
+          "critical": false,
+          "documentId": "harbor-cancel-v2",
+          "factId": "F4",
+          "text": "Current cancellation policy: full refund up to 14 days before the event, 50% refund 7 to 14 days before",
+          "version": 2,
+          "value": {
+            "kind": "cancellation-policy",
+            "fullRefundDaysBefore": 14,
+            "halfRefundWindowDaysBefore": [
+              7,
+              14
+            ],
+            "policy": "v2-2026-03-01"
+          }
+        }
+      ],
+      "mustAbstain": false,
+      "questionId": "Q07",
+      "text": "What is the current cancellation refund window?",
+      "versionSensitive": true
+    },
+    {
+      "businessId": "biz-harbor",
+      "commercialAuthority": false,
+      "expectedFacts": [],
+      "mustAbstain": true,
+      "questionId": "Q08",
+      "text": "What did the withdrawn 2024 price sheet charge for a seated dinner?",
+      "versionSensitive": false,
+      "deletionProbe": true
+    },
+    {
+      "businessId": "biz-harbor",
+      "commercialAuthority": false,
+      "expectedFacts": [],
+      "mustAbstain": true,
+      "questionId": "Q09",
+      "text": "What is the fixed price of custom event lighting?",
+      "versionSensitive": false
+    },
+    {
+      "businessId": "biz-harbor",
+      "commercialAuthority": false,
+      "expectedFacts": [],
+      "mustAbstain": true,
+      "questionId": "Q10",
+      "text": "What did Clara Oswald book, and when?",
+      "versionSensitive": false
+    },
+    {
+      "businessId": "biz-curl",
+      "commercialAuthority": true,
+      "expectedFacts": [
+        {
+          "critical": true,
+          "documentId": "curl-cuts-2026",
+          "factId": "F5",
+          "text": "2026 signature cut at Curl Up Salon costs $58",
+          "version": 2,
+          "value": {
+            "kind": "price",
+            "item": "signature-cut",
+            "priceUsd": 58,
+            "season": "2026"
+          }
+        }
+      ],
+      "mustAbstain": false,
+      "questionId": "Q11",
+      "text": "What is the current price of a signature cut at Curl Up Salon?",
+      "versionSensitive": true
+    },
+    {
+      "businessId": "biz-curl",
+      "commercialAuthority": false,
+      "expectedFacts": [
+        {
+          "critical": false,
+          "documentId": "curl-clara-oswin",
+          "factId": "F6",
+          "text": "Clara Oswin (not Oswald) booked a signature cut for 2026-10-02",
+          "version": 1,
+          "value": {
+            "kind": "appointment",
+            "client": "Clara Oswin",
+            "service": "signature-cut",
+            "date": "2026-10-02"
+          }
+        }
+      ],
+      "mustAbstain": false,
+      "questionId": "Q12",
+      "text": "What appointment does Clara Oswin have?",
+      "versionSensitive": false
+    },
+    {
+      "businessId": "biz-green",
+      "commercialAuthority": true,
+      "expectedFacts": [
+        {
+          "critical": true,
+          "documentId": "green-lawn-2026",
+          "factId": "F7",
+          "text": "2026 monthly lawn care at Greenfield Landscaping costs $120 per visit",
+          "version": 1,
+          "value": {
+            "kind": "price-per-visit",
+            "item": "monthly-lawn-care",
+            "priceUsd": 120,
+            "season": "2026"
+          }
+        }
+      ],
+      "mustAbstain": false,
+      "questionId": "Q13",
+      "text": "What is the current monthly lawn-care price?",
+      "versionSensitive": false
+    },
+    {
+      "businessId": "biz-green",
+      "commercialAuthority": false,
+      "expectedFacts": [],
+      "mustAbstain": true,
+      "questionId": "Q14",
+      "text": "What is the fixed price of a residential fence?",
+      "versionSensitive": false
+    },
+    {
+      "businessId": "biz-harbor",
+      "commercialAuthority": false,
+      "expectedFacts": [],
+      "mustAbstain": true,
+      "questionId": "Q15",
+      "text": "Scoped to Harbor View Hall only: what does the salon charge for a signature cut?",
+      "versionSensitive": false
+    }
+  ]
+}

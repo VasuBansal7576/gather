@@ -1,0 +1,157 @@
+{
+  "notice": "SCORER FIXTURE ONLY. Counterexample: every assertion.text replaced with an unsupported free-pricing claim while correct fact IDs/links were retained. Tests the scorer, never a provider.",
+  "provider": "scorer-fixture-freetext-swap",
+  "responses": [
+    {
+      "abstained": false,
+      "assertions": [
+        {
+          "businessId": "biz-harbor",
+          "commercialConclusion": true,
+          "documentId": "harbor-packages-2026",
+          "factId": "F1",
+          "text": "Everything is FREE: $0 per guest, no charge, always available.",
+          "version": 2
+        }
+      ],
+      "questionId": "Q01",
+      "timestampsMs": {
+        "finishedAt": 1726000000500,
+        "startedAt": 1726000000000
+      }
+    },
+    {
+      "abstained": false,
+      "assertions": [
+        {
+          "businessId": "biz-harbor",
+          "commercialConclusion": true,
+          "documentId": "harbor-packages-2026",
+          "factId": "F2",
+          "text": "Everything is FREE: $0 per guest, no charge, always available.",
+          "version": 2
+        }
+      ],
+      "questionId": "Q02"
+    },
+    {
+      "abstained": false,
+      "assertions": [
+        {
+          "businessId": "biz-harbor",
+          "commercialConclusion": false,
+          "documentId": "harbor-packages-2026",
+          "factId": "F1",
+          "text": "Everything is FREE: $0 per guest, no charge, always available.",
+          "version": 2
+        }
+      ],
+      "questionId": "Q03"
+    },
+    {
+      "abstained": false,
+      "assertions": [
+        {
+          "businessId": "biz-harbor",
+          "commercialConclusion": true,
+          "documentId": "harbor-nonprofit-exception",
+          "factId": "F3",
+          "text": "Everything is FREE: $0 per guest, no charge, always available.",
+          "version": 1
+        }
+      ],
+      "questionId": "Q04"
+    },
+    {
+      "abstained": true,
+      "assertions": [],
+      "questionId": "Q05"
+    },
+    {
+      "abstained": true,
+      "assertions": [],
+      "questionId": "Q06"
+    },
+    {
+      "abstained": false,
+      "assertions": [
+        {
+          "businessId": "biz-harbor",
+          "commercialConclusion": false,
+          "documentId": "harbor-cancel-v2",
+          "factId": "F4",
+          "text": "Everything is FREE: $0 per guest, no charge, always available.",
+          "version": 2
+        }
+      ],
+      "questionId": "Q07"
+    },
+    {
+      "abstained": true,
+      "assertions": [],
+      "questionId": "Q08"
+    },
+    {
+      "abstained": true,
+      "assertions": [],
+      "questionId": "Q09"
+    },
+    {
+      "abstained": true,
+      "assertions": [],
+      "questionId": "Q10"
+    },
+    {
+      "abstained": false,
+      "assertions": [
+        {
+          "businessId": "biz-curl",
+          "commercialConclusion": true,
+          "documentId": "curl-cuts-2026",
+          "factId": "F5",
+          "text": "Everything is FREE: $0 per guest, no charge, always available.",
+          "version": 2
+        }
+      ],
+      "questionId": "Q11"
+    },
+    {
+      "abstained": false,
+      "assertions": [
+        {
+          "businessId": "biz-curl",
+          "commercialConclusion": false,
+          "documentId": "curl-clara-oswin",
+          "factId": "F6",
+          "text": "Everything is FREE: $0 per guest, no charge, always available.",
+          "version": 1
+        }
+      ],
+      "questionId": "Q12"
+    },
+    {
+      "abstained": false,
+      "assertions": [
+        {
+          "businessId": "biz-green",
+          "commercialConclusion": true,
+          "documentId": "green-lawn-2026",
+          "factId": "F7",
+          "text": "Everything is FREE: $0 per guest, no charge, always available.",
+          "version": 1
+        }
+      ],
+      "questionId": "Q13"
+    },
+    {
+      "abstained": true,
+      "assertions": [],
+      "questionId": "Q14"
+    },
+    {
+      "abstained": true,
+      "assertions": [],
+      "questionId": "Q15"
+    }
+  ]
+}
