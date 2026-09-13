@@ -2,6 +2,7 @@ import { createDemoConnectors, type DemoConnectorSet } from "../connectors/demo.
 import type { BookingServiceDeps } from "./booking-service.ts";
 import { demoFixtureSlots } from "./demo-fixtures.ts";
 import { DurableDemoCalendar, DurableDemoEmail } from "./durable-demo-connectors.ts";
+import { createProviderConnectors, type ProviderConnectors } from "./provider-runtime/index.ts";
 import { GatherStore } from "./sqlite-store.ts";
 
 /**
@@ -10,11 +11,18 @@ import { GatherStore } from "./sqlite-store.ts";
  * SQLite. The demo connector's in-memory world is volatile by design and is
  * never the source of truth for durable claims; execution result receipts
  * persisted in SQLite survive restarts while demo memory does not.
+ *
+ * The booking deps are dispatching connectors: explicitly fictional fixture
+ * bookings stay on the durable demo adapters, while real bookings resolve
+ * their business's verified connection per call — disconnected, revoked, or
+ * ambiguous bindings fail closed instead of silently simulating.
  */
 export interface ServerRuntime {
   store: GatherStore;
   connectors: DemoConnectorSet;
   deps: BookingServiceDeps;
+  /** Composition hook for later intake/operator assembly. */
+  providers: ProviderConnectors;
 }
 
 let cached: ServerRuntime | null = null;
@@ -46,14 +54,23 @@ export function getRuntime(): ServerRuntime {
     nowMs: clockMs,
     timeoutAfterSuccessOperationKeys: timeoutKeys,
   });
+  const providers = createProviderConnectors({
+    store,
+    ownerId: ownerId(),
+    demo: {
+      calendar: new DurableDemoCalendar(store, connectors.calendar, clockMs),
+      email: new DurableDemoEmail(store, connectors.email),
+    },
+    secretsNamespace: databasePath(),
+  });
   const deps: BookingServiceDeps = {
     store,
-    calendar: new DurableDemoCalendar(store, connectors.calendar, clockMs),
-    email: new DurableDemoEmail(store, connectors.email),
+    calendar: providers.calendar,
+    email: providers.email,
     ownerId: ownerId(),
     now: () => new Date(clockMs()).toISOString(),
   };
-  cached = { store, connectors, deps };
+  cached = { store, connectors, deps, providers };
   return cached;
 }
 
