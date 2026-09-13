@@ -32,17 +32,25 @@ export function isApprovalInFlight(
 }
 
 /**
- * Recovery routing for a receipt: uncertain outcomes must be reconciled
- * against the execution before any retry; failed and partial outcomes retry
- * the action. Succeeded and pending receipts expose no recovery.
+ * Recovery routing for a receipt. `uncertain` always reconciles first — an
+ * explicit `recovery: 'retry'` declaration cannot skip verifying whether the
+ * execution already applied. For other statuses an explicit declaration wins;
+ * defaults are `failed` retries the action while `partial` reconciles first —
+ * an aggregate partial never lets the UI infer a definitive failed step.
+ * Succeeded and pending receipts expose no recovery.
  */
 export function receiptRecoveryKind(
-  receipt: Pick<ActionReceipt, 'status' | 'recoveryLabel' | 'executionId'>,
+  receipt: Pick<ActionReceipt, 'status' | 'recoveryLabel' | 'recovery' | 'executionId'>,
 ): 'retry' | 'reconcile' | undefined {
   if (!receipt.recoveryLabel) return undefined;
+  // Uncertain always reconciles first — even a mistaken 'retry' declaration
+  // cannot skip verifying whether the execution already applied.
   if (receipt.status === 'uncertain') {
     return receipt.executionId ? 'reconcile' : undefined;
   }
-  if (receipt.status === 'failed' || receipt.status === 'partial') return 'retry';
+  if (receipt.recovery === 'retry') return 'retry';
+  if (receipt.recovery === 'reconcile') return receipt.executionId ? 'reconcile' : undefined;
+  if (receipt.status === 'partial') return receipt.executionId ? 'reconcile' : undefined;
+  if (receipt.status === 'failed') return 'retry';
   return undefined;
 }

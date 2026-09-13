@@ -71,7 +71,7 @@ export const DEMO_BOOKINGS: BookingSummary[] = [
     budget: '$8,900',
     status: 'waiting',
     statusLabel: 'Approval in progress',
-    nextAction: 'Waiting for the host to report the outcome',
+    nextAction: 'Waiting for the approval outcome',
     clientInitials: 'MC',
     clientTone: 'blue',
     detail: {
@@ -171,6 +171,12 @@ export const DEMO_BOOKINGS: BookingSummary[] = [
         { id: 'owen-inquiry', label: 'Inquiry received', detail: 'Email from Owen & Co.', timestamp: 'Mon, 11:42 am', kind: 'inquiry' },
         { id: 'owen-warning', label: 'Availability check paused', detail: 'Calendar connection needs attention', timestamp: 'Mon, 11:47 am', kind: 'warning' },
       ],
+      waitingReason: {
+        title: 'Availability check is paused',
+        description: 'The Google Calendar connection expired, so Gather cannot verify Fri, 31 Oct yet. Reconnect it before approving — the date will be rechecked before any hold is created.',
+        actionLabel: 'Retry availability check',
+        connectionsRelated: true,
+      },
       receipts: [
         {
           id: 'demo-receipt-owen-availability',
@@ -260,10 +266,10 @@ export const DEMO_BOOKINGS: BookingSummary[] = [
           actionId: 'demo-action-priya-v3',
           executionId: 'demo-exec-priya-summary-1',
           label: 'Owner summary card',
-          detail: 'Partial — the calendar note was written but the summary email copy failed.',
+          detail: 'Partial — the calendar note was written but the summary email copy failed. Reconcile the execution before retrying anything.',
           status: 'partial',
           timestamp: 'Tue, 4:43 pm',
-          recoveryLabel: 'Retry owner summary',
+          recoveryLabel: 'Check what completed',
         },
       ],
     },

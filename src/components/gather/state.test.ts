@@ -35,13 +35,32 @@ test("approval is in flight via fingerprint prop or pending receipt", () => {
 
 test("receipt recovery routes retry vs reconcile honestly", () => {
   assert.equal(receiptRecoveryKind({ status: "failed", recoveryLabel: "Retry" }), "retry");
-  assert.equal(receiptRecoveryKind({ status: "partial", recoveryLabel: "Retry" }), "retry");
+  // Partial never infers a definitive failed step — it reconciles first.
+  assert.equal(
+    receiptRecoveryKind({ status: "partial", recoveryLabel: "Check", executionId: "e1" }),
+    "reconcile",
+  );
+  assert.equal(receiptRecoveryKind({ status: "partial", recoveryLabel: "Check" }), undefined);
   assert.equal(
     receiptRecoveryKind({ status: "uncertain", recoveryLabel: "Reconcile", executionId: "e1" }),
     "reconcile",
   );
   // An uncertain receipt without an execution id cannot be reconciled.
   assert.equal(receiptRecoveryKind({ status: "uncertain", recoveryLabel: "Reconcile" }), undefined);
+  // An explicit host-declared recovery wins over the defaults — except
+  // uncertain, which always reconciles first even if 'retry' is declared.
+  assert.equal(
+    receiptRecoveryKind({ status: "partial", recoveryLabel: "Retry", recovery: "retry" }),
+    "retry",
+  );
+  assert.equal(
+    receiptRecoveryKind({ status: "uncertain", recoveryLabel: "Retry", recovery: "retry", executionId: "e1" }),
+    "reconcile",
+  );
+  assert.equal(
+    receiptRecoveryKind({ status: "failed", recoveryLabel: "Reconcile", recovery: "reconcile", executionId: "e1" }),
+    "reconcile",
+  );
   // Succeeded and pending receipts never offer recovery.
   assert.equal(receiptRecoveryKind({ status: "succeeded", recoveryLabel: "Retry" }), undefined);
   assert.equal(receiptRecoveryKind({ status: "pending" }), undefined);

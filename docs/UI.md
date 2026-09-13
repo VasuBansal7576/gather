@@ -27,7 +27,7 @@ export function OwnerApp() {
       pendingApprovals={inFlightFingerprints}
       onNavigate={(view) => analytics.track('gather_view_opened', { view })}
       onSelectBooking={(bookingId) => router.navigate(`/bookings/${bookingId}`)}
-      onApproveProposal={(identity) => approveExactVersion(identity)}
+      onApproveProposal={async (identity) => { await approveExactVersion(identity); }}
       onEditProposal={(identity) => openProposalEditor(identity)}
       onConnect={(provider) => beginConnection(provider)}
       onRetryBlockedAction={() => reconnectCalendar()}
@@ -55,16 +55,26 @@ The host application owns the real mutation, confirmation, failure, and uncertai
 
 The callback carries the exact displayed identity, so an approval can never silently target a newer version.
 Before approving, the owner can inspect the `consequences` list (each step the host will attempt — recheck, provisional hold, offer send) and the source evidence for the proposal.
-The approve control stays disabled while the proposal's fingerprint is in `pendingApprovals` or any receipt on the booking is still pending, so the same version cannot be approved twice.
+The approve control stays disabled while the proposal's fingerprint is in `pendingApprovals`, any receipt on the booking is still pending, or a request was just sent and not yet acknowledged — so the same version cannot be approved twice.
 A sent approval only displays "waiting" — the workspace never presents a hold or a sent request as a confirmed booking.
+
+### Approval request lifecycle
+
+`onApproveProposal` may return a promise:
+
+- The click sets a synchronous `sending` guard so duplicate clicks are ignored.
+- Promise resolution clears the guard; the host's props (`pendingApprovals`, receipts) then own the pending display.
+- Promise rejection (or a synchronous throw) surfaces an observable "did not go through" state with a `Try approval again` control — nothing is marked sent or confirmed.
+- When the host's props next show the fingerprint acknowledged, a terminal receipt, or the proposal superseded, the local record is dropped so the button can never wedge in "waiting" after the host has moved on.
 
 ## Receipts and recovery
 
 `BookingDetail.receipts` lists one `ActionReceipt` per consequential step, each with an honest `status` of `pending`, `succeeded`, `failed`, `partial`, or `uncertain`.
 
-- `failed` and `partial` receipts with a `recoveryLabel` invoke `onRetryAction({ bookingId, actionId })` — the action retry path.
-- `uncertain` receipts with a `recoveryLabel` invoke `onReconcileExecution({ bookingId, executionId })` — reconciliation must happen before any retry.
-- The booking-level blocked notice routes its retry through the first recoverable receipt so the host receives exact context, with a separate "Review connections" navigation link.
+- `failed` receipts with a `recoveryLabel` invoke `onRetryAction({ bookingId, actionId })` — the action retry path.
+- `uncertain` and `partial` receipts with a `recoveryLabel` invoke `onReconcileExecution({ bookingId, executionId })` — the execution is verified before anything retries; an aggregate partial never lets the UI infer a definitive failed step.
+- A receipt may declare `recovery: 'retry' | 'reconcile'` explicitly when the host knows the definitive safe path — but `uncertain` always reconciles first, even if `'retry'` is mistakenly declared.
+- The booking-level waiting notice only renders evidence from `detail.waitingReason` (falling back to a neutral "waiting" notice and `nextAction`), routes its retry through the first recoverable receipt so the host receives exact context, and shows a "Review connections" link only when `waitingReason.connectionsRelated` is set.
 
 ## Props
 
@@ -75,10 +85,11 @@ A sent approval only displays "waiting" — the workspace never presents a hold 
 | `loading` | Shows the workspace skeleton while the host resolves data. |
 | `blockedState` | Shows a host-controlled blocked banner above the active view. |
 | `initialView` | Opens `today`, `bookings`, or `connections`. |
+| `dataMode` | `'demo'` keeps the simulation label on custom data that is still simulated; `'live'` hides it. Defaults to `'demo'` when fixtures are in use. |
 | `pendingApprovals` | Proposal fingerprints with an in-flight approval; matching approve controls stay disabled. |
 | `onNavigate` | Receives view changes. |
 | `onSelectBooking` | Receives a selected booking ID. |
-| `onApproveProposal` | Receives the exact `ProposalIdentity` for approval. |
+| `onApproveProposal` | Receives the exact `ProposalIdentity` for approval; may return a promise for the request lifecycle above. |
 | `onEditProposal` | Receives the exact `ProposalIdentity` for editing. |
 | `onConnect` | Receives the provider that needs connection or reconnection. |
 | `onRetryBlockedAction` | Receives a host-controlled retry request for a blocked state. |
@@ -92,7 +103,7 @@ The domain types are exported from the same entry point so the coordinator can m
 
 The interface uses a warm paper, ink, coral, sage, and gold palette with system sans-serif text and a restrained serif display face.
 There are no external image or paid font dependencies.
-All meaningful actions are native buttons with visible focus rings; disabled controls use `disabled`/`aria-disabled` with explanatory notes rather than silently doing nothing.
+All meaningful actions are native buttons with visible focus rings; controls without a real action behind them — new inquiry, search, filter, settings, manage, add connection, more menus — render disabled with honest product wording rather than pretending to work.
 The active navigation item exposes `aria-current`, loading exposes `role="status"`, blocked notices expose `role="status"`, and receipts update inside an `aria-live="polite"` region.
 The mobile layout changes from the desktop split booking view to a list-first detail route, and the navigation menu button actually expands the workspace nav on small screens.
 `prefers-reduced-motion` disables shimmer and interaction transitions.
