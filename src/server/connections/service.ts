@@ -55,6 +55,7 @@ interface ConnectionAccountRow {
   id: string;
   connectedAccountIdsJson: string;
   businessId: string;
+  ownerId: string;
   provider: string;
   accountKey: string;
   displayName: string;
@@ -171,6 +172,7 @@ export class ConnectionService {
         id TEXT PRIMARY KEY,
         connected_account_ids_json TEXT NOT NULL,
         business_id TEXT NOT NULL,
+        owner_id TEXT NOT NULL DEFAULT 'local-owner',
         provider TEXT NOT NULL,
         account_key TEXT NOT NULL,
         display_name TEXT NOT NULL,
@@ -194,6 +196,9 @@ export class ConnectionService {
     const cols = this.db.prepare("PRAGMA table_info(connection_accounts)").all() as Array<{ name: string }>;
     if (!cols.some((col) => col.name === "revision")) {
       this.db.exec("ALTER TABLE connection_accounts ADD COLUMN revision INTEGER NOT NULL DEFAULT 1");
+    }
+    if (!cols.some((col) => col.name === "owner_id")) {
+      this.db.exec("ALTER TABLE connection_accounts ADD COLUMN owner_id TEXT NOT NULL DEFAULT 'local-owner'");
     }
   }
 
@@ -220,9 +225,12 @@ export class ConnectionService {
   }
 
   private providerSummary(businessId: string, provider: ConnectionProvider): ProviderConnectionDTO {
-    const connectionRows = this.db.prepare(
-      "SELECT * FROM connection_accounts WHERE business_id = $b AND provider = $p",
-    ).all({ $b: businessId, $p: provider }) as SqlRow[];
+    const connectionRows = (
+      this.db.prepare("SELECT * FROM connection_accounts WHERE business_id = $b AND provider = $p").all({
+        $b: businessId,
+        $p: provider,
+      }) as SqlRow[]
+    ).filter((row) => String(row.owner_id ?? "local-owner") === this.ownerId);
     const linked = this.store.listConnectedAccounts(businessId).map((account) => this.toAccountDTO(account));
     if (provider === "google" && !this.googleApp) {
       return {
@@ -438,6 +446,10 @@ export class ConnectionService {
       throw new ConnectionError("EXCHANGE_FAILED", "Provider returned an empty verified account identity");
     }
     const existing = this.connectionByAccountKey("google", identity.accountKey);
+    if (existing && existing.ownerId !== this.ownerId) {
+      this.failSession(session.id);
+      throw new ConnectionError("NOT_FOUND", "No connected account for this owner");
+    }
     if (existing && existing.businessId !== session.businessId) {
       this.failSession(session.id);
       throw new ConnectionError(
@@ -450,13 +462,9 @@ export class ConnectionService {
     // only become the binding's refs when the DB commit succeeds — a failure
     // anywhere before commit leaves the prior valid binding and its secrets
     // untouched, and superseded refs are deleted only after commit.
-    const generation = randomUUID().slice(0, 12);
-    const stagedAccessRef = secretKey("google", identity.accountKey, "access", generation);
-    const stagedRefreshRef = token.refreshToken
-      ? secretKey("google", identity.accountKey, "refresh", generation)
-      : undefined;
-    this.secrets.set(stagedAccessRef, token.accessToken);
-    if (stagedRefreshRef) this.secrets.set(stagedRefreshRef, token.refreshToken!);
+    const staged = this.stageSecrets(token.accessToken, token.refreshToken, identity.accountKey);
+    const stagedAccessRef = staged.accessRef;
+    const stagedRefreshRef = staged.refreshRef;
     const priorMeta = existing ? this.tokenMeta(existing.id) : undefined;
     this.db.exec("BEGIN IMMEDIATE");
     try {
@@ -490,14 +498,15 @@ export class ConnectionService {
       }
       this.db.prepare(
         `INSERT INTO connection_accounts
-          (id, connected_account_ids_json, business_id, provider, account_key, display_name, scopes_json, status, revision, created_at, updated_at)
-         VALUES ($id, $cids, $b, 'google', $ak, $dn, $sj, 'connected', 1, $at, $at)
-         ON CONFLICT(id) DO UPDATE SET connected_account_ids_json = $cids, scopes_json = $sj, status = 'connected',
-           display_name = $dn, revision = connection_accounts.revision + 1, updated_at = $at`,
+          (id, connected_account_ids_json, business_id, owner_id, provider, account_key, display_name, scopes_json, status, revision, created_at, updated_at)
+          VALUES ($id, $cids, $b, $o, 'google', $ak, $dn, $sj, 'connected', 1, $at, $at)
+          ON CONFLICT(id) DO UPDATE SET connected_account_ids_json = $cids, scopes_json = $sj, status = 'connected',
+            display_name = $dn, revision = connection_accounts.revision + 1, updated_at = $at`,
       ).run({
         $id: connectionId,
         $cids: JSON.stringify(connectedIds),
         $b: session.businessId,
+        $o: this.ownerId,
         $ak: identity.accountKey,
         $dn: session.displayName ?? identity.displayName,
         $sj: JSON.stringify(grantedScopes),
@@ -542,6 +551,42 @@ export class ConnectionService {
     };
   }
 
+  /**
+   * Staged secret writes inside a cleanup boundary: if any write in the
+   * batch fails, refs already staged by this batch are removed and only a
+   * typed, redacted ConnectionError surfaces — never raw store or provider
+   * details, and never a half-staged binding.
+   */
+  private stageSecrets(
+    accessToken: string,
+    refreshToken: string | undefined,
+    accountKey: string,
+  ): { accessRef: string; refreshRef?: string } {
+    const generation = randomUUID().slice(0, 12);
+    const accessRef = secretKey("google", accountKey, "access", generation);
+    const refreshRef = refreshToken ? secretKey("google", accountKey, "refresh", generation) : undefined;
+    const staged: string[] = [];
+    try {
+      this.secrets.set(accessRef, accessToken);
+      staged.push(accessRef);
+      if (refreshRef && refreshToken) {
+        this.secrets.set(refreshRef, refreshToken);
+        staged.push(refreshRef);
+      }
+    } catch (error) {
+      for (const ref of staged) {
+        try {
+          this.secrets.delete(ref);
+        } catch {
+          // Best-effort cleanup; the typed error below still carries the signal.
+        }
+      }
+      if (error instanceof ConnectionError) throw error;
+      throw new ConnectionError("UNAVAILABLE", "Secret storage failed; no credentials were persisted and no binding was created");
+    }
+    return refreshRef ? { accessRef, refreshRef } : { accessRef };
+  }
+
   private failSession(sessionId: string): void {
     this.db.prepare("UPDATE connection_auth_sessions SET status = 'failed' WHERE id = $id").run({ $id: sessionId });
   }
@@ -563,6 +608,7 @@ export class ConnectionService {
       id: String(row.id),
       connectedAccountIdsJson: String(row.connected_account_ids_json),
       businessId: String(row.business_id),
+      ownerId: row.owner_id ? String(row.owner_id) : "local-owner",
       provider: String(row.provider),
       accountKey: String(row.account_key),
       displayName: String(row.display_name),
@@ -593,15 +639,17 @@ export class ConnectionService {
   /**
    * Canonical public→internal resolution: accepts either the internal
    * connection id or a public connected_accounts id (the ids callers see in
-   * getConnections DTOs) and returns the owning connection row. Business
-   * scope is enforced by callers after resolution.
+   * getConnections DTOs) and returns the owning connection row. Rows owned
+   * by a different configured owner never resolve — owner isolation rests
+   * on this filter plus the per-call business scope enforced by callers.
    */
   private resolveConnection(id: string): ConnectionAccountRow | undefined {
     const direct = this.connectionById(id);
-    if (direct) return direct;
+    if (direct && direct.ownerId === this.ownerId) return direct;
     const rows = this.db.prepare("SELECT * FROM connection_accounts").all() as SqlRow[];
     for (const row of rows) {
       const candidate = this.toConnectionRow(row);
+      if (candidate.ownerId !== this.ownerId) continue;
       if ((JSON.parse(candidate.connectedAccountIdsJson) as string[]).includes(id)) return candidate;
     }
     return undefined;
@@ -622,7 +670,10 @@ export class ConnectionService {
     }
     const meta = this.tokenMeta(connection.id);
     const cached = meta?.accessRef ? this.secrets.get(meta.accessRef) : undefined;
-    if (cached && meta?.accessExpiresAtMs && meta.accessExpiresAtMs - this.nowMs() > ACCESS_EXPIRY_SKEW_MS) {
+    // A recorded expiry of null means the provider omitted expires_in: the
+    // token is non-expiring and the cached value is served indefinitely.
+    // (An absent cached secret still falls through to refresh below.)
+    if (cached && (meta?.accessExpiresAtMs == null || meta.accessExpiresAtMs - this.nowMs() > ACCESS_EXPIRY_SKEW_MS)) {
       return cached;
     }
     const inFlight = this.refreshes.get(connection.id);
@@ -647,7 +698,9 @@ export class ConnectionService {
     if (!app) throw new ConnectionError("UNAVAILABLE", "Google connection is unavailable in this installation");
     const refreshToken = meta?.refreshRef ? this.secrets.get(meta.refreshRef) : undefined;
     if (!refreshToken) {
-      this.markRevoked(connection);
+      if (!this.markRevokedIfCurrent(connection)) {
+        throw new ConnectionError("STALE", "The connection changed while refreshing; re-resolve the account and retry");
+      }
       throw new ConnectionError("ACCESS_REVOKED", `Connection ${connection.id} has no usable refresh token`);
     }
     let token;
@@ -666,24 +719,28 @@ export class ConnectionService {
         error instanceof ConnectionError &&
         (error.providerError === "invalid_grant" || error.providerError === "unauthorized_client")
       ) {
-        this.markRevoked(connection);
+        if (!this.markRevokedIfCurrent(connection)) {
+          throw new ConnectionError("STALE", "The connection changed while refreshing; re-resolve the account and retry");
+        }
         throw new ConnectionError("ACCESS_REVOKED", `Connection ${connection.id} was revoked at the provider`);
       }
       if (error instanceof ConnectionError) throw error;
       throw new ConnectionError("EXCHANGE_FAILED", "Token refresh failed at the provider", { retryable: true });
     }
     // Staged publish under the revision fence.
-    const generation = randomUUID().slice(0, 12);
-    const stagedAccessRef = secretKey("google", connection.accountKey, "access", generation);
-    const stagedRefreshRef = token.refreshToken
-      ? secretKey("google", connection.accountKey, "refresh", generation)
-      : undefined;
-    this.secrets.set(stagedAccessRef, token.accessToken);
-    if (stagedRefreshRef) this.secrets.set(stagedRefreshRef, token.refreshToken!);
+    const staged = this.stageSecrets(token.accessToken, token.refreshToken, connection.accountKey);
+    const stagedAccessRef = staged.accessRef;
+    const stagedRefreshRef = staged.refreshRef;
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const current = this.connectionById(connection.id);
-      if (!current || current.status !== "connected" || current.revision !== connection.revision) {
+      if (
+        !current ||
+        current.status !== "connected" ||
+        current.revision !== connection.revision ||
+        current.businessId !== connection.businessId ||
+        current.ownerId !== connection.ownerId
+      ) {
         throw new ConnectionError(
           "STALE",
           "The connection changed while refreshing; the refreshed token was discarded",
@@ -724,14 +781,26 @@ export class ConnectionService {
     }
   }
 
-  private markRevoked(connection: ConnectionAccountRow): void {
-    const timestamp = nowIso();
-    this.db.prepare(
-      "UPDATE connection_accounts SET status = 'revoked', revision = revision + 1, updated_at = $at WHERE id = $id",
+  /**
+   * Fenced revocation: flips the binding to revoked only if it is still the
+   * exact revision, business, owner, and connected status captured before
+   * the provider exchange. Returns true when the revocation landed. A
+   * disconnect/reconnect (or another refresh) that lands mid-exchange makes
+   * this a no-op — a stale failure can never revoke a fresh binding, and
+   * callers translate the miss into STALE so they re-resolve and retry.
+   */
+  private markRevokedIfCurrent(connection: ConnectionAccountRow): boolean {
+    const changed = this.db.prepare(
+      `UPDATE connection_accounts SET status = 'revoked', revision = revision + 1, updated_at = $at
+       WHERE id = $id AND business_id = $b AND owner_id = $o AND revision = $rev AND status = 'connected'`,
     ).run({
-      $at: timestamp,
+      $at: nowIso(),
       $id: connection.id,
+      $b: connection.businessId,
+      $o: connection.ownerId,
+      $rev: connection.revision,
     });
+    if (Number(changed.changes) !== 1) return false;
     for (const id of JSON.parse(connection.connectedAccountIdsJson) as string[]) {
       try {
         this.store.setConnectedAccountStatus(id, "revoked");
@@ -739,6 +808,7 @@ export class ConnectionService {
         // Row already gone; keep going.
       }
     }
+    return true;
   }
 
   // -------------------------------------------------------------- disconnect

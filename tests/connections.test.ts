@@ -437,7 +437,7 @@ test("real transport invalid_grant marks revoked; transient error stays connecte
       new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
     const svc = new ConnectionService({
       store: fx.store, secrets: fx.secrets, transport: new FetchOAuthTransport({ fetchImpl }),
-      googleApp: APP, ownerId: "o", nowMs: () => fx.nowMs,
+      googleApp: APP, ownerId: "local-owner", nowMs: () => fx.nowMs,
     });
     // Seed a connected binding directly through the scripted path first.
     const scripted = service(fx);
@@ -458,7 +458,7 @@ test("real transport invalid_grant marks revoked; transient error stays connecte
     try {
       const svc2 = new ConnectionService({
         store: fx2.store, secrets: fx2.secrets, transport: new FetchOAuthTransport({ fetchImpl }),
-        googleApp: APP, ownerId: "o", nowMs: () => fx2.nowMs,
+        googleApp: APP, ownerId: "local-owner", nowMs: () => fx2.nowMs,
       });
       const svc2Scripted = service(fx2);
       const start2 = svc2Scripted.startAuthorization({ businessId: fx2.businessId, provider: "google" });
@@ -529,5 +529,143 @@ test("redirect userinfo, query, and hash ambiguities are rejected", () => {
     "http://localhost.evil.test/api/connections/google/callback",
   ]) {
     assert.throws(() => assertLoopbackRedirectUri(bad), ConnectionError);
+  }
+});
+
+test("non-expiring provider tokens are served from cache, never revoked", async () => {
+  const fx = fixture();
+  try {
+    // Provider omits expires_in and grants no refresh token: the access
+    // token is non-expiring and must be honored as-is.
+    fx.transport.tokenResponse = { accessToken: "access-forever", scope: APP.requiredScopes.join(" ") };
+    const svc = service(fx);
+    const start = svc.startAuthorization({ businessId: fx.businessId, provider: "google" });
+    await svc.completeAuthorization({ code: "c1", state: stateOf(start.authorizationUrl) });
+    const connectionId = (fx.store.db.prepare("SELECT id FROM connection_accounts").get() as Record<string, unknown>).id as string;
+    assert.equal(
+      await svc.accessToken({ accountId: connectionId, businessId: fx.businessId }),
+      "access-forever",
+    );
+    assert.equal(fx.transport.refreshCalls, 0, "no refresh attempted for a non-expiring token");
+    assert.equal(svc.getConnections(fx.businessId).providers[0]?.status, "connected");
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test("lost non-expiring secret without a refresh token is honestly revoked", async () => {
+  const fx = fixture();
+  try {
+    fx.transport.tokenResponse = { accessToken: "access-forever", scope: APP.requiredScopes.join(" ") };
+    const svc = service(fx);
+    const start = svc.startAuthorization({ businessId: fx.businessId, provider: "google" });
+    await svc.completeAuthorization({ code: "c1", state: stateOf(start.authorizationUrl) });
+    const connectionId = (fx.store.db.prepare("SELECT id FROM connection_accounts").get() as Record<string, unknown>).id as string;
+    // The secret store lost the token: nothing cached and nothing to refresh with.
+    const meta = fx.store.db.prepare("SELECT access_ref FROM connection_token_meta").get() as Record<string, unknown>;
+    fx.secrets.delete(String(meta.access_ref));
+    await assert.rejects(
+      svc.accessToken({ accountId: connectionId, businessId: fx.businessId }),
+      (e: unknown) => e instanceof ConnectionError && e.code === "ACCESS_REVOKED",
+    );
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test("stale invalid_grant after disconnect plus reconnect cannot revoke the fresh binding", async () => {
+  const fx = fixture();
+  try {
+    const svc = service(fx);
+    const first = svc.startAuthorization({ businessId: fx.businessId, provider: "google" });
+    await svc.completeAuthorization({ code: "c1", state: stateOf(first.authorizationUrl) });
+    const connectionId = (fx.store.db.prepare("SELECT id FROM connection_accounts").get() as Record<string, unknown>).id as string;
+    fx.store.db.prepare("UPDATE connection_token_meta SET access_expires_at_ms = $t").run({ $t: fx.nowMs - 1000 });
+    let release: () => void = () => undefined;
+    fx.transport.refreshGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const pending = svc.accessToken({ accountId: connectionId, businessId: fx.businessId });
+    await svc.disconnect({ accountId: connectionId, businessId: fx.businessId });
+    const second = svc.startAuthorization({ businessId: fx.businessId, provider: "google" });
+    await svc.completeAuthorization({ code: "c2", state: stateOf(second.authorizationUrl) });
+    fx.transport.refreshError = new ConnectionError("EXCHANGE_FAILED", "Token endpoint rejected the request (invalid_grant)", {
+      providerError: "invalid_grant",
+    });
+    release();
+    await assert.rejects(
+      pending,
+      (e: unknown) => e instanceof ConnectionError && e.code === "STALE",
+    );
+    const row = fx.store.db.prepare("SELECT status FROM connection_accounts WHERE id = $id").get({
+      $id: connectionId,
+    }) as Record<string, unknown>;
+    assert.equal(row.status, "connected", "the reconnected binding survives the stale failure");
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test("staging failure between access and refresh writes cleans up and stays typed", async () => {
+  const fx = fixture();
+  try {
+    const svc = service(fx);
+    const first = svc.startAuthorization({ businessId: fx.businessId, provider: "google" });
+    await svc.completeAuthorization({ code: "c1", state: stateOf(first.authorizationUrl) });
+    let sets = 0;
+    const flaky = {
+      get: (key: string) => fx.secrets.get(key),
+      delete: (key: string) => fx.secrets.delete(key),
+      set: (key: string, value: string) => {
+        sets += 1;
+        // Fail the refresh-token staging write specifically (after the
+        // PKCE write in startAuthorization and the access staging write).
+        if (sets === 3) throw new Error("raw keychain blowup with secret material");
+        fx.secrets.set(key, value);
+      },
+    };
+    const flakyService = new ConnectionService({
+      store: fx.store, secrets: flaky, transport: fx.transport,
+      googleApp: APP, ownerId: "local-owner", nowMs: () => fx.nowMs,
+    });
+    const second = flakyService.startAuthorization({ businessId: fx.businessId, provider: "google" });
+    await assert.rejects(
+      flakyService.completeAuthorization({ code: "c2", state: stateOf(second.authorizationUrl) }),
+      (e: unknown) => {
+        assert.ok(e instanceof ConnectionError, "only typed errors surface");
+        assert.ok(!String((e as Error).message).includes("secret material"), "raw details never surface");
+        return true;
+      },
+    );
+    const accessRefs = fx.secrets.keys().filter((key) => key.includes(":access:"));
+    assert.equal(accessRefs.length, 1, "the half-staged access ref is cleaned up");
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test("connections are bound to the configured owner: foreign owners resolve nothing", async () => {
+  const fx = fixture();
+  try {
+    const svc = service(fx);
+    const first = svc.startAuthorization({ businessId: fx.businessId, provider: "google" });
+    await svc.completeAuthorization({ code: "c1", state: stateOf(first.authorizationUrl) });
+    const publicId = svc.getConnections(fx.businessId).providers[0]!.accounts[0]!.id;
+    const foreign = new ConnectionService({
+      store: fx.store, secrets: fx.secrets, transport: fx.transport,
+      googleApp: APP, ownerId: "someone-else", nowMs: () => fx.nowMs,
+    });
+    await assert.rejects(
+      foreign.accessToken({ accountId: publicId, businessId: fx.businessId }),
+      (e: unknown) => e instanceof ConnectionError && e.code === "NOT_FOUND",
+    );
+    await assert.rejects(
+      foreign.disconnect({ accountId: publicId, businessId: fx.businessId }),
+      (e: unknown) => e instanceof ConnectionError && e.code === "NOT_FOUND",
+    );
+    // The owner's own binding is untouched by the foreign attempts.
+    assert.equal(svc.getConnections(fx.businessId).providers[0]?.status, "connected");
+  } finally {
+    fx.cleanup();
   }
 });
