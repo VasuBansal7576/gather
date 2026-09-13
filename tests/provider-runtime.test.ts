@@ -215,6 +215,8 @@ test("a real booking dispatches hold and email to its business's verified Google
   const fx = fixture();
   try {
     await connectAccount(fx, fx.businessId);
+    const bound = fx.providers.bindCalendar({ businessId: fx.businessId, calendarId: LIVE_CALENDAR_ID });
+    assert.deepEqual(bound, { ok: true });
     const { booking, action, holdKey, emailKey } = realBooking(fx);
 
     const availability = await fx.providers.calendar.checkAvailability({
@@ -264,7 +266,7 @@ test("missing, revoked, or ambiguous bindings fail closed — never silent demo"
   const fx = fixture();
   try {
     const { booking, holdKey } = realBooking(fx);
-    // No connection at all.
+    // No connection at all — and no binding.
     const missing = await fx.providers.calendar.createProvisionalHold({
       operationKey: holdKey,
       bookingId: booking.id,
@@ -277,8 +279,22 @@ test("missing, revoked, or ambiguous bindings fail closed — never silent demo"
     if (missing.status === "failed") assert.equal(missing.error.kind, "not_found");
     assert.equal(fx.http.requests.length, 0);
 
+    // Connected but UNBOUND: a real booking still cannot route — the
+    // proposal payload alone never establishes tenant scope.
     await connectAccount(fx, fx.businessId);
-    // Revoked: disconnect the account, then the hold must fail access_revoked.
+    const unbound = await fx.providers.calendar.createProvisionalHold({
+      operationKey: holdKey,
+      bookingId: booking.id,
+      calendarId: LIVE_CALENDAR_ID,
+      startAt: HOLD.startAt,
+      endAt: HOLD.endAt,
+      expiresAt: HOLD.expiresAt,
+    });
+    assert.equal(unbound.status, "failed");
+    if (unbound.status === "failed") assert.equal(unbound.error.kind, "not_found");
+
+    // Host binds the calendar durably, then the account is revoked.
+    assert.deepEqual(fx.providers.bindCalendar({ businessId: fx.businessId, calendarId: LIVE_CALENDAR_ID }), { ok: true });
     const account = fx.service.getConnections(fx.businessId).providers[0].accounts.find((a) => a.provider === "google_calendar");
     assert.ok(account);
     await fx.service.disconnect({ accountId: account.id, businessId: fx.businessId });
@@ -293,22 +309,15 @@ test("missing, revoked, or ambiguous bindings fail closed — never silent demo"
     assert.equal(revoked.status, "failed");
     if (revoked.status === "failed") assert.equal(revoked.error.kind, "access_revoked");
 
-    // Ambiguous: the revoked account reconnects AND a second google account
-    // is connected — two live google_calendar bindings for one business.
+    // Ambiguous: two live calendar accounts and an unbound calendar cannot
+    // be pinned — bind without an explicit account fails closed.
     await connectAccount(fx, fx.businessId);
     fx.oauth.identities.set("code-2", { accountKey: "google-sub-2", displayName: "Second account" });
     await connectAccount(fx, fx.businessId, "code-2");
-    const ambiguous = await fx.providers.calendar.createProvisionalHold({
-      operationKey: holdKey,
-      bookingId: booking.id,
-      calendarId: LIVE_CALENDAR_ID,
-      startAt: HOLD.startAt,
-      endAt: HOLD.endAt,
-      expiresAt: HOLD.expiresAt,
-    });
-    assert.equal(ambiguous.status, "failed");
-    if (ambiguous.status === "failed") assert.equal(ambiguous.error.kind, "conflict");
-    assert.match(ambiguous.status === "failed" ? ambiguous.error.message : "", /ambiguous/i);
+    const ambiguous = fx.providers.bindCalendar({ businessId: fx.businessId, calendarId: "cal-second" });
+    assert.equal(ambiguous.ok, false);
+    if (!ambiguous.ok) assert.equal(ambiguous.error.kind, "conflict");
+    assert.match(ambiguous.ok ? "" : ambiguous.error.message, /ambiguous/i);
   } finally {
     fx.cleanup();
   }
@@ -327,6 +336,7 @@ test("availability on an unbound calendar fails explicitly; tokens stay lazy and
     assert.equal(unbound.status, "failed");
     if (unbound.status === "failed") assert.equal(unbound.error.kind, "not_found");
 
+    assert.deepEqual(fx.providers.bindCalendar({ businessId: fx.businessId, calendarId: LIVE_CALENDAR_ID }), { ok: true });
     const { booking, holdKey } = realBooking(fx);
     const hold = await fx.providers.calendar.createProvisionalHold({
       operationKey: holdKey,
@@ -350,6 +360,7 @@ test("hold reconcile resolves its durable scope from the action payload after re
   const fx = fixture();
   try {
     await connectAccount(fx, fx.businessId);
+    assert.deepEqual(fx.providers.bindCalendar({ businessId: fx.businessId, calendarId: LIVE_CALENDAR_ID }), { ok: true });
     const { booking, holdKey } = realBooking(fx);
     const eventId = googleEventIdFor(holdKey);
     fx.http.onRequest = (req) =>
@@ -415,11 +426,19 @@ test("resolveAccountPorts supplies Google read ports only for verified bound acc
   }
 });
 
-test("tenant scope: a second business's bookings never use the first business's account", async () => {
+test("tenant scope: a bound calendar can never be claimed or used by another business", async () => {
   const fx = fixture();
   try {
     await connectAccount(fx, fx.businessId);
+    assert.deepEqual(fx.providers.bindCalendar({ businessId: fx.businessId, calendarId: LIVE_CALENDAR_ID }), { ok: true });
+
     const other = fx.store.createBusiness({ name: "Fictional Other Venue", timezone: "UTC" });
+    // The foreign business cannot claim the bound calendar.
+    const claim = fx.providers.bindCalendar({ businessId: other.id, calendarId: LIVE_CALENDAR_ID });
+    assert.equal(claim.ok, false);
+    if (!claim.ok) assert.equal(claim.error.kind, "conflict");
+
+    // Its bookings cannot route through it either — even with an approved payload.
     const { booking, holdKey } = realBooking(fx, other.id);
     const hold = await fx.providers.calendar.createProvisionalHold({
       operationKey: holdKey,
@@ -430,8 +449,52 @@ test("tenant scope: a second business's bookings never use the first business's 
       expiresAt: HOLD.expiresAt,
     });
     assert.equal(hold.status, "failed");
-    if (hold.status === "failed") assert.equal(hold.error.kind, "not_found");
+    if (hold.status === "failed") assert.equal(hold.error.kind, "conflict");
     assert.equal(fx.http.requests.length, 0);
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test("resolveCalendarPorts gives offer/intake composition an explicitly bound calendar connector", async () => {
+  const fx = fixture();
+  try {
+    await connectAccount(fx, fx.businessId);
+
+    // Before any proposal exists, the host port resolves only bound calendars.
+    const unbound = fx.providers.resolveCalendarPorts({ businessId: fx.businessId, calendarId: LIVE_CALENDAR_ID });
+    assert.equal(unbound.ok, false);
+    if (!unbound.ok) assert.equal(unbound.error.kind, "not_found");
+
+    assert.deepEqual(fx.providers.bindCalendar({ businessId: fx.businessId, calendarId: LIVE_CALENDAR_ID }), { ok: true });
+    const ports = fx.providers.resolveCalendarPorts({ businessId: fx.businessId, calendarId: LIVE_CALENDAR_ID });
+    assert.equal(ports.ok, true);
+    if (!ports.ok) return;
+    assert.equal(ports.ports.account.provider, "google_calendar");
+
+    // The port is a working live connector — usable before any proposal.
+    const availability = await ports.ports.calendar.checkAvailability({
+      operationKey: "op-offer-prep-1",
+      calendarId: LIVE_CALENDAR_ID,
+      startAt: HOLD.startAt,
+      endAt: HOLD.endAt,
+    });
+    assert.equal(availability.status, "succeeded");
+    assert.equal(availability.metadata.simulated, false);
+
+    // A foreign business and a fixture calendar both fail closed.
+    const other = fx.store.createBusiness({ name: "Fictional Other", timezone: "UTC" });
+    const foreign = fx.providers.resolveCalendarPorts({ businessId: other.id, calendarId: LIVE_CALENDAR_ID });
+    assert.equal(foreign.ok, false);
+    if (!foreign.ok) assert.equal(foreign.error.kind, "conflict");
+    const fixturePorts = fx.providers.resolveCalendarPorts({ businessId: fx.businessId, calendarId: "demo-calendar-001" });
+    assert.equal(fixturePorts.ok, false);
+    if (!fixturePorts.ok) assert.equal(fixturePorts.error.kind, "unsupported");
+
+    // Listing is owner-scoped and durable.
+    assert.deepEqual(fx.providers.listCalendarBindings(fx.businessId).map((b) => b.calendarId), [LIVE_CALENDAR_ID]);
+    assert.deepEqual(fx.providers.unbindCalendar({ businessId: fx.businessId, calendarId: LIVE_CALENDAR_ID }), { ok: true });
+    assert.equal(fx.providers.resolveCalendarPorts({ businessId: fx.businessId, calendarId: LIVE_CALENDAR_ID }).ok, false);
   } finally {
     fx.cleanup();
   }

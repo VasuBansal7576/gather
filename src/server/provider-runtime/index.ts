@@ -37,6 +37,10 @@ export function createProviderConnectors(options: ProviderRuntimeOptions): Provi
     email: new DispatchingEmail(resolver, options.demo),
     connectionService,
     resolveAccountPorts: (input) => resolver.resolveAccountPorts(input),
+    resolveCalendarPorts: (input) => resolver.resolveCalendarPorts(input),
+    bindCalendar: (input) => resolver.bindCalendar(input),
+    unbindCalendar: (input) => resolver.unbindCalendar(input),
+    listCalendarBindings: (businessId) => resolver.listCalendarBindings(businessId),
   };
 }
 
