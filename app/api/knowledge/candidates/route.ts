@@ -21,6 +21,10 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     const body: unknown = await request.json().catch(() => undefined);
     if (!isRecord(body)) return unknownErrorResponse(new Error("Request body must be a JSON object"));
     const runtime = getRuntime();
+    // Ownership guard (established local-owner model: every business row in
+    // this store belongs to the configured local owner; the approving owner
+    // identity is always host-derived). Fail closed on unknown businesses.
+    if (typeof body.businessId === "string") runtime.store.getBusiness(body.businessId);
     // All candidate intake runs through the strict validated host boundary:
     // every source reference is kind/locator/shape-checked before anything
     // persists. There is no raw serving bypass.
@@ -46,6 +50,8 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
     const status = request.nextUrl.searchParams.get("status");
     if (!businessId) return unknownErrorResponse(new Error("businessId query is required"));
     const runtime = getRuntime();
+    // Ownership guard: fail closed on unknown businesses (see POST above).
+    runtime.store.getBusiness(businessId);
     const service = new KnowledgeService(runtime.store);
     const candidates = service.listCandidates(businessId, status ? { status } : {});
     const found: { fictional?: boolean }[] = []; collectSources(candidates, found);
