@@ -262,8 +262,25 @@ export class GatherOpenClawRuntime {
         // true lifecycle and a later stop() can retry.
       }
     }
-    if (this.mcpBoundary) {
-      await this.mcpBoundary.close().catch(() => {});
+    // Report, don't hide: a failed close keeps the boundary owned and the
+    // error goes to the diagnostic log — the original start error still
+    // propagates to the caller.
+    const mcpError = await this.releaseMcpBoundary();
+    if (mcpError) {
+      this.options.log?.(`[runtime] MCP boundary close failed during rollback (ownership retained): ${mcpError.message}`);
+    }
+  }
+
+  /**
+   * Close the MCP boundary and release its references ONLY on observed
+   * close success. On failure the boundary/token/ref stay owned (the
+   * listener may still be bound) and the error is returned for the caller
+   * to surface — ownership is never silently dropped.
+   */
+  private async releaseMcpBoundary(): Promise<Error | null> {
+    if (!this.mcpBoundary) return null;
+    try {
+      await this.mcpBoundary.close();
       this.mcpBoundary = null;
       this.mcpRef = null;
       this.mcpToken = null;
@@ -273,6 +290,7 @@ export class GatherOpenClawRuntime {
       return error instanceof Error ? error : new Error(String(error));
     }
   }
+
 
   /**
    * Single-flight shutdown: concurrent stop() calls share the one in-flight
