@@ -1,21 +1,26 @@
 /**
  * SIMULATED query-scope tests for Gmail history polling.
  *
- * Regression: `users.history.list` documents `maxResults`, `pageToken`,
- * `startHistoryId`, `labelId`, and `historyTypes` — it has NO `q`
- * parameter. The poller previously sent `q` on history calls and assumed
- * scoped results; an accurate server ignores the unknown parameter and
- * returns unscoped changes, so off-topic mail leaked into scoped polls.
- * The scripted transport below models that accurate server: history
- * filtering happens ONLY via `labelId` (per-message label membership),
- * `q` on history is ignored (and its presence is recorded so tests can
- * assert it is never sent), and `messages.list` honors `q` (it documents
- * it). No live account verification has been performed; the live gate is
- * BLOCKED.
+ * The scripted in-process transport below models the documented provider
+ * semantics independently of the production mapping (it never calls
+ * production helpers to decide what the server returns, so it can catch
+ * mapping errors instead of mirroring them):
+ * - `users.history.list` filters by `labelId` only. The documented
+ *   parameter list has no `q`; the fake records its presence so tests can
+ *   assert the client never sends it. The precise fact under test is that
+ *   `q` is unsupported there — nothing here claims how any particular
+ *   server handles unknown parameters.
+ * - `users.messages.list` applies `labelIds` (a message must carry every
+ *   listed id) and excludes SPAM/TRASH-labeled messages unless
+ *   `includeSpamTrash=true`.
+ * "Out-of-scope" in these tests means only "outside the selected label",
+ * never a judgment of business relevance; no semantic filtering or
+ * calibration is claimed, and no live account verification has been
+ * performed — the live gate is BLOCKED.
  */
 import assert from "node:assert/strict";
 import test from "node:test";
-import { GmailInboxPoller, encodeCursor, resolveHistoryLabelScope } from "../src/connectors/google/incremental.ts";
+import { GmailInboxPoller, encodeCursor, resolveHistoryLabelScope, resolvePollScope } from "../src/connectors/google/incremental.ts";
 import type { GoogleHttpRequest, GoogleHttpResponse, GoogleHttpTransport } from "../src/connectors/google/transport.ts";
 
 function json(status: number, body: unknown): GoogleHttpResponse {
@@ -36,17 +41,24 @@ interface FakeWorld {
   transport: GoogleHttpTransport;
   log: GoogleHttpRequest[];
   historyUrls: URL[];
+  snapshotUrls: URL[];
   sawHistoryQ: boolean;
+  sawSnapshotQ: boolean;
 }
 
+/** Labels the documented provider treats as excluded without the flag. */
+const SPAM_TRASH = new Set(["SPAM", "TRASH"]);
+
 /**
- * Accurate loopback server: history honors `labelId` only (never `q`);
- * messages.list honors `q` for exact single-label scopes.
+ * Independent provider model, defined from the API parameter docs rather
+ * than the production scope table.
  */
 function world(pages: Array<{ historyId: string; records: Array<{ hid: string; message: FakeMessage }>; nextPageToken?: string }>, snapshot: FakeMessage[], watermark = "100"): FakeWorld {
   const log: GoogleHttpRequest[] = [];
   const historyUrls: URL[] = [];
+  const snapshotUrls: URL[] = [];
   let sawHistoryQ = false;
+  let sawSnapshotQ = false;
   const transport: GoogleHttpTransport = {
     request: (req: GoogleHttpRequest): Promise<GoogleHttpResponse> => {
       log.push(req);
@@ -67,31 +79,24 @@ function world(pages: Array<{ historyId: string; records: Array<{ hid: string; m
           historyId: page.historyId,
           history: kept.map((record) => historyRecord(record.hid, record.message)),
         };
-        const next = page.nextPageToken ?? (index + 1 < pages.length ? String(index + 1) : undefined);
-        if (kept.length === 0 && next !== undefined) {
-          // Server still advances paging past fully filtered pages.
-          body.nextPageToken = next;
-        } else if (next !== undefined && page.nextPageToken !== undefined) {
-          body.nextPageToken = next;
-        } else if (index + 1 < pages.length) {
-          body.nextPageToken = String(index + 1);
-        }
+        if (index + 1 < pages.length) body.nextPageToken = String(index + 1);
         return Promise.resolve(json(200, body));
       }
       if (url.pathname.endsWith("/messages")) {
-        const q = url.searchParams.get("q");
-        let ids = snapshot;
-        if (q !== null) {
-          const scope = resolveHistoryLabelScope(q);
-          if (scope === null) throw new Error(`fake server received a query the client must have rejected: ${q}`);
-          if (scope !== undefined) ids = ids.filter((message) => message.labels.includes(scope));
-        }
+        snapshotUrls.push(url);
+        if (url.searchParams.has("q")) sawSnapshotQ = true;
+        const required = url.searchParams.getAll("labelIds");
+        const includeSpamTrash = url.searchParams.get("includeSpamTrash") === "true";
+        const ids = snapshot.filter((message) => {
+          if (!includeSpamTrash && message.labels.some((label) => SPAM_TRASH.has(label))) return false;
+          return required.every((label) => message.labels.includes(label));
+        });
         return Promise.resolve(json(200, { messages: ids.map((message) => ({ id: message.id, threadId: message.threadId })) }));
       }
       return Promise.resolve(json(404, { error: { message: "unknown fake path" } }));
     },
   };
-  return { transport, log, historyUrls, get sawHistoryQ() { return sawHistoryQ; } };
+  return { transport, log, historyUrls, snapshotUrls, get sawHistoryQ() { return sawHistoryQ; }, get sawSnapshotQ() { return sawSnapshotQ; } };
 }
 
 function scopedPoller(fake: FakeWorld): GmailInboxPoller {
@@ -104,11 +109,15 @@ function scopedCursor(historyId: string, query = "in:inbox"): string {
 
 const IN1: FakeMessage = { id: "m-in-1", threadId: "t-in-1", labels: ["INBOX"] };
 const IN2: FakeMessage = { id: "m-in-2", threadId: "t-in-2", labels: ["INBOX"] };
-const OFF: FakeMessage = { id: "m-off", threadId: "t-off", labels: ["SENT"] };
+const SENT_OUTSIDE: FakeMessage = { id: "m-outside", threadId: "t-outside", labels: ["SENT"] };
+const SPAM1: FakeMessage = { id: "m-spam-1", threadId: "t-spam-1", labels: ["SPAM"] };
+const SPAM_NEW: FakeMessage = { id: "m-spam-new", threadId: "t-spam-new", labels: ["SPAM"] };
+const TRASH1: FakeMessage = { id: "m-trash-1", threadId: "t-trash-1", labels: ["TRASH"] };
+const TRASH_NEW: FakeMessage = { id: "m-trash-new", threadId: "t-trash-new", labels: ["TRASH"] };
 
-test("delta pagination retains relevant changes and excludes off-topic ones", async () => {
+test("delta pagination retains in-scope changes and excludes out-of-scope ones", async () => {
   const fake = world([
-    { historyId: "101", records: [{ hid: "101", message: IN1 }, { hid: "101", message: OFF }] },
+    { historyId: "101", records: [{ hid: "101", message: IN1 }, { hid: "101", message: SENT_OUTSIDE }] },
     { historyId: "102", records: [{ hid: "102", message: IN2 }] },
   ], []);
   const poll = scopedPoller(fake);
@@ -124,12 +133,12 @@ test("delta pagination retains relevant changes and excludes off-topic ones", as
   assert.ok(fake.historyUrls.every((url) => url.searchParams.get("labelId") === "INBOX"));
 });
 
-test("initial catch-up excludes off-topic arrivals and retains relevant ones", async () => {
+test("initial catch-up excludes out-of-scope arrivals and retains in-scope ones", async () => {
   const OLD: FakeMessage = { id: "m-old", threadId: "t-old", labels: ["INBOX"] };
   const NEW: FakeMessage = { id: "m-new", threadId: "t-new", labels: ["INBOX"] };
   const fake = world(
-    [{ historyId: "102", records: [{ hid: "102", message: NEW }, { hid: "102", message: OFF }] }],
-    [OLD, { id: "m-old-off", threadId: "t-old-off", labels: ["SENT"] }],
+    [{ historyId: "102", records: [{ hid: "102", message: NEW }, { hid: "102", message: SENT_OUTSIDE }] }],
+    [OLD, { id: "m-old-outside", threadId: "t-old-outside", labels: ["SENT"] }],
   );
   const poll = scopedPoller(fake);
   const result = await poll.pollInbox("op-scope-2", { query: "in:inbox", maxMessages: 10 });
@@ -139,11 +148,85 @@ test("initial catch-up excludes off-topic arrivals and retains relevant ones", a
   assert.equal(result.data.resetRequired, false);
   assert.equal(result.data.truncated, false);
   assert.equal(fake.sawHistoryQ, false);
+  assert.equal(fake.sawSnapshotQ, false);
+  assert.ok(fake.snapshotUrls.every((url) => url.searchParams.get("labelIds") === "INBOX"));
+});
+
+test("spam scope agrees across snapshot and delta (includeSpamTrash required)", async () => {
+  const fake = world(
+    [{ historyId: "102", records: [{ hid: "102", message: SPAM_NEW }, { hid: "102", message: IN1 }] }],
+    [SPAM1, IN1],
+  );
+  const poll = scopedPoller(fake);
+  const result = await poll.pollInbox("op-scope-spam", { query: "in:spam", maxMessages: 10 });
+  assert.equal(result.status, "succeeded");
+  if (result.status !== "succeeded") return;
+  // Existing spam from the snapshot plus the new spam arrival; the inbox
+  // message is out of this scope in both phases.
+  assert.deepEqual(result.data.changes.map((change) => change.messageId), ["m-spam-1", "m-spam-new"]);
+  assert.equal(result.data.truncated, false);
+  assert.equal(fake.sawHistoryQ, false);
+  assert.equal(fake.sawSnapshotQ, false);
+  assert.ok(fake.snapshotUrls.length > 0);
+  assert.ok(fake.snapshotUrls.every((url) => url.searchParams.get("labelIds") === "SPAM" && url.searchParams.get("includeSpamTrash") === "true"));
+  assert.ok(fake.historyUrls.every((url) => url.searchParams.get("labelId") === "SPAM"));
+});
+
+test("trash scope agrees across snapshot and delta (includeSpamTrash required)", async () => {
+  const fake = world(
+    [{ historyId: "102", records: [{ hid: "102", message: TRASH_NEW }, { hid: "102", message: IN1 }] }],
+    [TRASH1, IN1],
+  );
+  const poll = scopedPoller(fake);
+  const result = await poll.pollInbox("op-scope-trash", { query: "in:trash", maxMessages: 10 });
+  assert.equal(result.status, "succeeded");
+  if (result.status !== "succeeded") return;
+  assert.deepEqual(result.data.changes.map((change) => change.messageId), ["m-trash-1", "m-trash-new"]);
+  assert.equal(result.data.truncated, false);
+  assert.equal(fake.sawHistoryQ, false);
+  assert.equal(fake.sawSnapshotQ, false);
+  assert.ok(fake.snapshotUrls.every((url) => url.searchParams.get("labelIds") === "TRASH" && url.searchParams.get("includeSpamTrash") === "true"));
+  assert.ok(fake.historyUrls.every((url) => url.searchParams.get("labelId") === "TRASH"));
+});
+
+test("unfiltered snapshot and delta both cover the whole mailbox", async () => {
+  const fake = world(
+    [{ historyId: "102", records: [{ hid: "102", message: SPAM_NEW }, { hid: "102", message: TRASH_NEW }, { hid: "102", message: IN2 }] }],
+    [IN1, SPAM1, TRASH1],
+  );
+  const poll = scopedPoller(fake);
+  const result = await poll.pollInbox("op-scope-all", { maxMessages: 10 });
+  assert.equal(result.status, "succeeded");
+  if (result.status !== "succeeded") return;
+  // Unfiltered means all mailbox messages: nothing in the mailbox is
+  // dropped from either phase, including spam and trash.
+  assert.deepEqual(
+    result.data.changes.map((change) => change.messageId),
+    ["m-in-1", "m-spam-1", "m-trash-1", "m-spam-new", "m-trash-new", "m-in-2"],
+  );
+  assert.equal(result.data.truncated, false);
+  assert.equal(fake.sawHistoryQ, false);
+  assert.equal(fake.sawSnapshotQ, false);
+  assert.ok(fake.snapshotUrls.length > 0);
+  assert.ok(fake.snapshotUrls.every((url) => !url.searchParams.has("labelIds") && url.searchParams.get("includeSpamTrash") === "true"));
+  assert.ok(fake.historyUrls.every((url) => !url.searchParams.has("labelId")));
+});
+
+test("non-spam scopes exclude spam-labeled messages in both phases", async () => {
+  const fake = world(
+    [{ historyId: "102", records: [{ hid: "102", message: SPAM_NEW }, { hid: "102", message: IN2 }] }],
+    [IN1, SPAM1],
+  );
+  const poll = scopedPoller(fake);
+  const result = await poll.pollInbox("op-scope-nospam", { query: "in:inbox", maxMessages: 10 });
+  assert.equal(result.status, "succeeded");
+  if (result.status !== "succeeded") return;
+  assert.deepEqual(result.data.changes.map((change) => change.messageId), ["m-in-1", "m-in-2"]);
 });
 
 test("truncated scoped polls resume without loss, duplication, or broadening", async () => {
   const fake = world([
-    { historyId: "101", records: [{ hid: "101", message: IN1 }, { hid: "101", message: OFF }, { hid: "101", message: IN2 }] },
+    { historyId: "101", records: [{ hid: "101", message: IN1 }, { hid: "101", message: SENT_OUTSIDE }, { hid: "101", message: IN2 }] },
   ], []);
   const poll = scopedPoller(fake);
   const first = await poll.pollInbox("op-scope-3", { cursor: scopedCursor("100"), query: "in:inbox", maxMessages: 1 });
@@ -165,7 +248,7 @@ test("truncated scoped polls resume without loss, duplication, or broadening", a
 test("capped history pages resume the exact next page under scope", async () => {
   const fake = world([
     { historyId: "101", records: [{ hid: "101", message: IN1 }] },
-    { historyId: "102", records: [{ hid: "102", message: OFF }, { hid: "102", message: IN2 }] },
+    { historyId: "102", records: [{ hid: "102", message: SENT_OUTSIDE }, { hid: "102", message: IN2 }] },
   ], []);
   const poll = scopedPoller(fake);
   const first = await poll.pollInbox("op-scope-5", { cursor: scopedCursor("100"), query: "in:inbox", maxPages: 1 });
@@ -206,25 +289,6 @@ test("unsupported and changed queries are rejected before any HTTP call", async 
   assert.equal(fake.sawHistoryQ, false);
 });
 
-test("unfiltered polls send neither q nor labelId and return everything", async () => {
-  const fake = world(
-    [{ historyId: "101", records: [{ hid: "101", message: IN1 }, { hid: "101", message: OFF }] }],
-    [IN1, OFF],
-  );
-  const poll = scopedPoller(fake);
-  const delta = await poll.pollInbox("op-scope-7", { cursor: encodeCursor("100", { account: "me" }), maxMessages: 10 });
-  assert.equal(delta.status, "succeeded");
-  if (delta.status !== "succeeded") return;
-  assert.deepEqual(delta.data.changes.map((change) => change.messageId), ["m-in-1", "m-off"]);
-  const boot = await poll.pollInbox("op-scope-8", { maxMessages: 10 });
-  assert.equal(boot.status, "succeeded");
-  if (boot.status !== "succeeded") return;
-  assert.ok(boot.data.changes.some((change) => change.messageId === "m-off"));
-  assert.equal(fake.sawHistoryQ, false);
-  assert.ok(fake.historyUrls.length > 0);
-  assert.ok(fake.historyUrls.every((url) => !url.searchParams.has("labelId")));
-});
-
 test("scoped history expiry still demands reset, never partial progress", async () => {
   const log: GoogleHttpRequest[] = [];
   const transport: GoogleHttpTransport = {
@@ -257,4 +321,16 @@ test("resolveHistoryLabelScope maps exactly the supported boundary", async () =>
   for (const unsupported of ["", "   ", "from:x", "in:inbox from:x", "-in:inbox", "label:my-label", "in:inbox OR in:sent", "\"in:inbox\""]) {
     assert.equal(resolveHistoryLabelScope(unsupported), null, `must reject ${JSON.stringify(unsupported)}`);
   }
+});
+
+test("resolvePollScope carries explicit spam/trash inclusion for every accepted scope", async () => {
+  // Unfiltered covers the whole mailbox, spam and trash included.
+  assert.deepEqual(resolvePollScope(undefined), { includeSpamTrash: true });
+  // SPAM/TRASH scopes would snapshot empty without the flag.
+  assert.deepEqual(resolvePollScope("in:spam"), { labelId: "SPAM", includeSpamTrash: true });
+  assert.deepEqual(resolvePollScope("in:trash"), { labelId: "TRASH", includeSpamTrash: true });
+  // Other label scopes use the same population the history delta observes.
+  assert.deepEqual(resolvePollScope("in:inbox"), { labelId: "INBOX", includeSpamTrash: true });
+  assert.equal(resolvePollScope("from:x"), null);
+  assert.equal(resolvePollScope(""), null);
 });

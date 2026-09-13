@@ -17,19 +17,28 @@ Gmail (`users.history.list` reference; `messages.list`/`get`, `profile`):
   chronological records, monotonic but non-contiguous `historyId`
   (maxResults ≤ 500), `messagesAdded`/`messagesDeleted` buckets whose
   messages typically carry only `id`/`threadId`, per-response `historyId`
-  (the commit point), `nextPageToken` paging. `labelId` is the ONLY
-  server-side scope: this endpoint documents NO `q` parameter, so the
-  poller never sends one (an unknown parameter would be ignored and the
-  result silently broadened). The accepted query boundary is therefore
-  exact — absent (unfiltered) or a single system-label filter (`in:inbox`,
-  `in:sent`, `in:trash`, `in:spam`, `in:draft(s)`, `label:<system>`,
+  (the commit point), `nextPageToken` paging. `labelId` is the documented
+  server-side scope; the documented parameter list has no `q`, so the
+  poller never sends one. The accepted query boundary is therefore
+  exact — absent (unfiltered: the whole mailbox, spam and trash included)
+  or a single system-label filter (`in:inbox`, `in:sent`, `in:trash`,
+  `in:spam`, `in:draft(s)`, `label:<system>`,
   `is:unread|starred|important`), enforced via `labelId`; any other query
   is rejected as `invalid_request` before any HTTP call, never silently
-  broadened. An invalid or expired
+  broadened and never filtered by a local semantic heuristic. An invalid
+  or expired
   `startHistoryId` (valid ≥ a week, sometimes only hours) returns **HTTP
   404 — the documented expiry signal, verified by test, not an assumed
   410** — and the client must full-sync.
-- `GET …/messages?q&maxResults&pageToken` (ids only, ≤100/page requested),
+- `GET …/messages?labelIds&includeSpamTrash&maxResults&pageToken` (ids
+  only, ≤100/page requested): the bootstrap snapshot scopes with the
+  exact provider label parameters, never a `q` search alias. `labelIds`
+  keeps only messages carrying every listed id, and SPAM/TRASH messages
+  are excluded unless `includeSpamTrash=true` — while history has no such
+  exclusion. Snapshots therefore always set `includeSpamTrash=true`, so
+  the snapshot observes exactly the population the delta observes
+  (otherwise existing spam/trash messages would be lost and unfiltered
+  snapshot/delta membership would disagree).
   `GET …/messages/{id}`, `GET …/profile` (`historyId` bootstrap).
 - Quota (Gmail quota doc): `history.list` 2 units, `messages.list` 5,
   `messages.get` 20.

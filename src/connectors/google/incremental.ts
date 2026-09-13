@@ -38,11 +38,13 @@ import {
  *   for an uncompleted page — its continuation token plus the ids already
  *   emitted from it. A cursor presented for another account or query, or a
  *   legacy v1 cursor, is rejected before any HTTP call.
- * - Query scope is exact, never heuristic: absent (unfiltered) or a single
- *   system-label filter enforced server-side (`labelId` on history calls,
- *   `q` on the messages.list snapshot). `users.history.list` documents no
- *   `q` parameter, so arbitrary queries are rejected as `invalid_request`
- *   before any HTTP call instead of being silently broadened.
+ * - Query scope is exact, never heuristic: absent (unfiltered — the whole
+ *   mailbox, spam and trash included) or a single system-label filter,
+ *   enforced server-side (`labelId` on history calls; `labelIds` with
+ *   `includeSpamTrash` on the messages.list snapshot so both paths observe
+ *   the same population). `users.history.list` documents no `q` parameter,
+ *   so arbitrary queries are rejected as `invalid_request` before any HTTP
+ *   call instead of being silently broadened.
  * - `nextCursor` NEVER advances the base watermark past unvisited pages or
  *   un-emitted messages: a capped result resumes the exact page (replayed
  *   server-side, de-duplicated by message id, so repeats are possible but
@@ -79,18 +81,19 @@ export interface PollInboxOptions {
   cursor?: string;
   /**
    * Optional scope narrowing both paths. `users.history.list` (the delta
-   * path) documents `maxResults`, `pageToken`, `startHistoryId`, `labelId`,
-   * and `historyTypes` — it has NO `q` parameter, so an arbitrary Gmail
-   * search string must never be sent there: the server would ignore it and
-   * silently broaden the result. The accepted boundary is therefore exact:
-   * absent (unfiltered) or a single system-label filter (e.g. `in:inbox`,
+   * path) documents `labelId` but no `q`, so an arbitrary Gmail search
+   * string has no exact history equivalent. The accepted boundary is
+   * therefore exact: absent (unfiltered — the whole mailbox, including
+   * spam and trash) or a single system-label filter (e.g. `in:inbox`,
    * `in:sent`, `in:trash`, `in:spam`, `in:draft(s)`, `label:<system>`,
    * `is:unread|starred|important`), enforced server-side via `labelId` on
-   * history calls and via `q` on the `messages.list` snapshot (which does
-   * support `q`). Any other query is rejected as `invalid_request` before
-   * any HTTP call — never silently broadened. Fragments built from
-   * untrusted input must first pass through `escapeGmailQuery`
-   * (see gmail.ts) — never interpolate raw inquiry text into `q`.
+   * history calls and via `labelIds` + `includeSpamTrash` on the
+   * `messages.list` snapshot. Any other query is rejected as
+   * `invalid_request` before any HTTP call — never silently broadened,
+   * and never filtered by a local semantic heuristic. The value is a
+   * scope token matched exactly against the allowlist, not free search
+   * text: untrusted input must equal an allowlisted token, never be
+   * interpolated.
    */
   query?: string;
   /** Maximum history/list pages per poll (default 5). */
@@ -156,6 +159,34 @@ export function resolveHistoryLabelScope(query: string | undefined): string | un
     "is:important": "IMPORTANT",
   };
   return table[token] ?? null;
+}
+
+/**
+ * Full poll scope derived from one accepted query, covering both the
+ * history path (`labelId`) and the `messages.list` snapshot (`labelIds`
+ * plus `includeSpamTrash`).
+ *
+ * `messages.list` excludes SPAM and TRASH results unless
+ * `includeSpamTrash` is set, while `history.list` has no such exclusion —
+ * so a snapshot without the flag would lose existing spam/trash messages
+ * that the delta path observes (and an unfiltered snapshot would miss
+ * part of the mailbox the unfiltered delta reports). Snapshots therefore
+ * always set `includeSpamTrash: true`, making the snapshot population
+ * exactly the population the history delta observes: unfiltered means
+ * all mailbox messages, and a label scope means all messages carrying
+ * that label. Returns `null` when the query is outside the accepted
+ * boundary (see `resolveHistoryLabelScope`).
+ */
+export interface PollScope {
+  labelId?: string;
+  includeSpamTrash: boolean;
+}
+
+export function resolvePollScope(query: string | undefined): PollScope | null {
+  const labelId = resolveHistoryLabelScope(query);
+  if (labelId === null) return null;
+  if (labelId === undefined) return { includeSpamTrash: true };
+  return { labelId, includeSpamTrash: true };
 }
 
 export function encodeCursor(historyId: string, scope: InboxCursorScope = {}): string {
@@ -329,15 +360,16 @@ export class GmailInboxPoller {
     if (!Number.isInteger(maxPages) || maxPages < 1 || !Number.isInteger(maxMessages) || maxMessages < 1) {
       return { status: "failed", metadata: liveMetadata(operationKey, []), error: invalidRequest("maxPages and maxMessages must be positive integers") };
     }
-    // Scope check before any HTTP on either path: history.list has no `q`,
-    // so a query without an exact labelId equivalent cannot be enforced and
-    // is rejected instead of silently returning unscoped changes.
-    const labelId = resolveHistoryLabelScope(options.query);
-    if (labelId === null) {
+    // Scope check before any HTTP on either path: history.list documents
+    // no `q`, so a query without an exact label equivalent cannot be
+    // enforced and is rejected instead of silently returning out-of-scope
+    // changes.
+    const scope = resolvePollScope(options.query);
+    if (scope === null) {
       return { status: "failed", metadata: liveMetadata(operationKey, []), error: invalidRequest("Query has no exact Gmail history scope (supported: unfiltered or a single system-label filter such as in:inbox); refusing to poll unscoped rather than silently broadening") };
     }
     if (options.cursor === undefined) {
-      return this.fullSync(operationKey, options.query, labelId, maxPages, maxMessages);
+      return this.fullSync(operationKey, options.query, scope, maxPages, maxMessages);
     }
     const decoded = decodeCursor(options.cursor);
     if (decoded === undefined) {
@@ -348,7 +380,7 @@ export class GmailInboxPoller {
     if (decoded.account !== this.accountId() || (decoded.query ?? undefined) !== (options.query ?? undefined)) {
       return { status: "failed", metadata: liveMetadata(operationKey, []), error: invalidRequest("Cursor is bound to a different account or query; reset with a cursor-less full sync") };
     }
-    return this.deltaSync(operationKey, decoded, options.query, labelId, maxPages, maxMessages);
+    return this.deltaSync(operationKey, decoded, options.query, scope.labelId, maxPages, maxMessages);
   }
 
   /**
@@ -419,9 +451,8 @@ export class GmailInboxPoller {
         const url = withQuery(`${GMAIL_BASE_URL}/users/${encodeURIComponent(this.userId())}/history`, {
           startHistoryId: cursor.base,
           historyTypes: "messageAdded",
-          // The only supported server scoping: history.list documents
-          // labelId, not q. Never send q here — the server ignores unknown
-          // parameters and would silently broaden the result.
+          // The only documented server scoping for history: `labelId`.
+          // This endpoint documents no `q`, so none is ever sent here.
           ...(labelId === undefined ? {} : { labelId }),
           maxResults: "500",
           pageToken,
@@ -481,7 +512,7 @@ export class GmailInboxPoller {
   private async fullSync(
     operationKey: string,
     query: string | undefined,
-    labelId: string | undefined,
+    scope: PollScope,
     maxPages: number,
     maxMessages: number,
   ): Promise<ConnectorResult<InboxDelta>> {
@@ -517,14 +548,19 @@ export class GmailInboxPoller {
       data: { resetRequired: false, changes, nextCursor: cursor, truncated, provenance },
     });
     try {
-      // Phase 1: bounded id snapshot. messages.list documents `q`, so the
-      // accepted (label-mappable or absent) scope is enforced server-side
-      // here exactly.
+      // Phase 1: bounded id snapshot. Scoping uses the exact provider
+      // label parameters — `labelIds`, with `includeSpamTrash` always set
+      // so the snapshot covers the same population the history delta
+      // observes (messages.list excludes SPAM/TRASH by default; history
+      // has no such exclusion, so omitting the flag would lose existing
+      // spam/trash messages and split unfiltered snapshot/delta
+      // membership). No `q` alias is relied on for scope here.
       let pageToken: string | undefined;
       while (pagesLeft > 0) {
         pagesLeft -= 1;
         const url = withQuery(`${GMAIL_BASE_URL}/users/${encodeURIComponent(this.userId())}/messages`, {
-          ...(query === undefined ? {} : { q: query }),
+          ...(scope.labelId === undefined ? {} : { labelIds: scope.labelId }),
+          includeSpamTrash: scope.includeSpamTrash ? "true" : "false",
           maxResults: "100",
           pageToken,
         });
@@ -557,7 +593,7 @@ export class GmailInboxPoller {
       // instead of being skipped by a post-list cursor.
       let catchupResume: string | undefined;
       if (watermark !== undefined && pagesLeft > 0) {
-        const caught = await this.catchUp(operationKey, watermark, labelId, pagesLeft, maxMessages, seen, changes);
+        const caught = await this.catchUp(operationKey, watermark, scope.labelId, pagesLeft, maxMessages, seen, changes);
         if (caught.resetRequired) {
           return { status: "succeeded", metadata: liveMetadata(operationKey, provenance), data: { resetRequired: true, changes: [], truncated: false, provenance } };
         }
