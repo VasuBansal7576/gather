@@ -1,4 +1,4 @@
-import { writeGatewayConfig, type GatherMcpServerRef } from "./config.ts";
+import { resolveModelConfig, writeGatewayConfig, ModelConfigError, type GatherGatewayConfigOptions, type GatherMcpServerRef, type GatherModelSelection } from "./config.ts";
 import {
   GatherGatewayConnection,
   type GatherGatewayClientOptions,
@@ -32,6 +32,13 @@ export interface GatherOpenClawRuntimeOptions {
   rootDir: string;
   /** Dedicated loopback port for the gateway WS/HTTP listener. */
   gatewayPort: number;
+  /**
+   * Explicit model selection for the isolated agent (model + authorized
+   * subscription-profile metadata, ids only — never credentials).
+   * Optional: when absent, provision/start keep the existing
+   * control-plane/demo behavior and `modelStatus()` reports not-ready.
+   */
+  model?: GatherModelSelection;
   /** Optional Gather-owned MCP tools to expose to the isolated agent. */
   mcpTools?: readonly GatherTool[];
   /** Port for the MCP boundary; 0 = ephemeral (recommended). */
@@ -105,12 +112,52 @@ export class GatherOpenClawRuntime {
     return this.mcpRef?.url ?? null;
   }
 
+  /**
+   * Ready-for-model gate for the live-model runner: reports whether an
+   * explicit supported model selection is configured. Absent model fails
+   * clearly (`MODEL_NOT_CONFIGURED`) while control-plane/demo use stays
+   * valid; invalid selections report their reason instead of throwing.
+   * Validation itself runs at config-write time and throws there.
+   */
+  modelStatus(): { ready: boolean; model?: string; reason?: string } {
+    const selection = this.options.model;
+    if (selection === undefined) {
+      return { ready: false, reason: "MODEL_NOT_CONFIGURED: no explicit model selection was supplied; control-plane/demo use remains valid" };
+    }
+    try {
+      const resolved = resolveModelConfig(selection);
+      return { ready: true, model: resolved.model };
+    } catch (error) {
+      return { ready: false, reason: error instanceof Error ? `${error.name}(${("code" in error && typeof error.code === "string") ? error.code : "invalid"}): ${error.message}` : String(error) };
+    }
+  }
+
+  /**
+   * Throwing variant of the gate: returns the validated selection, or
+   * throws MODEL_NOT_CONFIGURED (absent) / the validation error
+   * (unsupported or unauthorized). For gating live-model runs.
+   */
+  requireModelSelection(): GatherModelSelection {
+    const selection = this.options.model;
+    if (selection === undefined) {
+      throw new ModelConfigError("MODEL_NOT_CONFIGURED", "No explicit model selection was supplied; pass options.model to enable live-model runs");
+    }
+    resolveModelConfig(selection);
+    return selection;
+  }
+
+  /** Single source for every config write so rewrites never drop the model. */
+  private configOptions(): GatherGatewayConfigOptions {
+    return {
+      gatherMcp: this.mcpRef ?? undefined,
+      ...(this.options.model === undefined ? {} : { model: this.options.model }),
+    };
+  }
+
   /** Creates Gather-owned directories and writes the isolated config. */
   provision(): { configPath: string } {
     ensureLayoutDirectories(this.layout);
-    const configPath = writeGatewayConfig(this.layout, {
-      gatherMcp: this.mcpRef ?? undefined,
-    });
+    const configPath = writeGatewayConfig(this.layout, this.configOptions());
     this.provisioned = true;
     return { configPath };
   }
@@ -168,7 +215,7 @@ export class GatherOpenClawRuntime {
           url: bound.url,
           toolInclude: this.mcpBoundary.toolNames,
         };
-        writeGatewayConfig(this.layout, { gatherMcp: this.mcpRef });
+        writeGatewayConfig(this.layout, this.configOptions());
       }
 
       const factory = this.deps.processFactory ?? ((opts) => new OpenClawGatewayProcess(opts));
@@ -220,7 +267,10 @@ export class GatherOpenClawRuntime {
       this.mcpBoundary = null;
       this.mcpRef = null;
       this.mcpToken = null;
-      writeGatewayConfig(this.layout, {});
+      writeGatewayConfig(this.layout, this.configOptions());
+      return null;
+    } catch (error) {
+      return error instanceof Error ? error : new Error(String(error));
     }
   }
 
