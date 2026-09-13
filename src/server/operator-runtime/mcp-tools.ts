@@ -29,14 +29,23 @@ export function operatorMcpTools(deps: OperatorRuntimeDeps): GatherTool[] {
 
   const waiting = defineGatherTool({
     name: "operator.waiting",
-    description: "List due coordination waiting items with their recommended next actions. Read-only; acting requires owner-approved paths outside this boundary.",
+    description: "List due coordination waiting items for the bound business with their recommended next actions. Read-only; acting requires owner-approved paths outside this boundary.",
     inputSchema: {
       limit: z.number().int().min(1).max(100).optional().describe("Maximum items to return"),
     },
     execution: "live",
     handler: async (args: { limit?: number }) => {
       const now = deps.now ? deps.now() : new Date().toISOString();
-      const items = deps.ledger.listDueWork({ nowIso: now, limit: args.limit ?? 25 });
+      // Business scope is enforced here, not just at claim time: the global
+      // ledger listing can hold foreign-business rows, and this bound view
+      // must never surface them. Unknown bookings fail closed (excluded).
+      const items = deps.ledger.listDueWork({ nowIso: now, limit: args.limit ?? 25 }).filter((item) => {
+        try {
+          return deps.store.getBooking(item.bookingId).businessId === deps.businessId;
+        } catch {
+          return false;
+        }
+      });
       return {
         content: [{ type: "text", text: JSON.stringify(items, null, 2) }],
         structuredContent: { waiting: items as unknown as Record<string, unknown> },

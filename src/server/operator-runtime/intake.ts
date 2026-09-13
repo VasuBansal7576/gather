@@ -1,8 +1,10 @@
 import type { InquiryMessage, InquiryThread } from "../../connectors/contracts.ts";
 import { proposeBookingIdentity } from "../../identity/service.ts";
 import type { IdentityHints } from "../../identity/service.ts";
+import { decodeSourceKey } from "../../identity/source-key.ts";
 import type { CoordinationLedger } from "../../coordination/ledger.ts";
 import type { GatherStore } from "../sqlite-store.ts";
+import { ServiceError } from "../booking-service.ts";
 import { OperatorIntakeStore } from "./store.ts";
 import type {
   IntakeItemRecord,
@@ -240,6 +242,88 @@ interface ThreadView {
   thread: InquiryThread;
   mine?: InquiryMessage;
   mineIndex: number;
+}
+
+/**
+ * Owner-controlled re-arm of one dead-lettered intake item. Host API only —
+ * deliberately NOT an MCP tool, so no model-invokable retry surface exists
+ * anywhere in this lane.
+ *
+ * Identity is validated three ways before anything moves: the canonical
+ * (account, message) row must exist under this runtime's account, its
+ * batch must belong to the same account, and the business must match —
+ * via the decoded source key when linked, via the linked booking when
+ * present, or via the connected-account record pinning this account to
+ * this business for never-linked rows. Anything else (unknown message,
+ * live item, foreign account/business) fails without touching state.
+ *
+ * The re-arm flips exactly one row from dead to retryable and preserves
+ * everything else: attempts, error text, and history are untouched, no
+ * rows are created, and no cursor checkpoint is read or written (so no
+ * unrelated cursor can rewind). The next sweep re-drives the item through
+ * the normal drain — ledger dedupe keys still prevent double ingestion —
+ * and a repeated failure dead-letters again immediately against the
+ * preserved attempt count. No bulk endpoint exists: one validated message
+ * per call, never an arbitrary retry, and no approval, link, or control
+ * is granted as a side effect.
+ */
+export function retryDeadLetteredItem(
+  deps: Pick<IntakeDeps, "store" | "accountId" | "businessId">,
+  input: { messageId: string },
+): IntakeItemRecord {
+  const intake = new OperatorIntakeStore(deps.store.db);
+  const item = intake.findItemByMessage(deps.accountId, input.messageId);
+  if (!item) {
+    throw new ServiceError("NOT_FOUND", `No intake item for message ${input.messageId} under account ${deps.accountId}; only captured items can be retried`, false);
+  }
+  let batchAccount: string;
+  try {
+    batchAccount = intake.getBatch(item.batchId).accountId;
+  } catch {
+    throw new ServiceError("NOT_FOUND", `Intake item ${item.id} names an unknown batch; refusing to guess its scope`, false);
+  }
+  if (batchAccount !== deps.accountId) {
+    throw new ServiceError("INVALID_REQUEST", `Intake item ${item.id} belongs to account ${batchAccount}, not ${deps.accountId}`, false);
+  }
+  if (!item.dead) {
+    throw new ServiceError("INVALID_REQUEST", `Intake item ${item.id} is ${item.status}, not dead-lettered; live retry flow is untouched`, false);
+  }
+  if (item.sourceKey !== undefined) {
+    let keyBusiness: string;
+    try {
+      keyBusiness = decodeSourceKey(item.sourceKey).businessId;
+    } catch {
+      throw new ServiceError("INVALID_REQUEST", `Intake item ${item.id} carries an undecodable source key; refusing to re-arm`, false);
+    }
+    if (keyBusiness !== deps.businessId) {
+      throw new ServiceError("INVALID_REQUEST", `Intake item ${item.id} is bound to business ${keyBusiness}, not ${deps.businessId}`, false);
+    }
+  } else if (item.bookingId !== undefined) {
+    let bookingBusiness: string;
+    try {
+      bookingBusiness = deps.store.getBooking(item.bookingId).businessId;
+    } catch {
+      throw new ServiceError("INVALID_REQUEST", `Intake item ${item.id} names an unknown booking; refusing to re-arm`, false);
+    }
+    if (bookingBusiness !== deps.businessId) {
+      throw new ServiceError("INVALID_REQUEST", `Intake item ${item.id} is bound to business ${bookingBusiness}, not ${deps.businessId}`, false);
+    }
+  } else {
+    let pinned: string | undefined;
+    try {
+      pinned = deps.store.getConnectedAccount(deps.accountId).businessId;
+    } catch {
+      pinned = undefined;
+    }
+    if (pinned !== deps.businessId) {
+      throw new ServiceError("INVALID_REQUEST", `Intake item ${item.id} was never linked and account ${deps.accountId} has no connected-account pin to business ${deps.businessId}; refusing to re-arm`, false);
+    }
+  }
+  const rearmed = deps.store.db.prepare("UPDATE intake_items SET dead = 0 WHERE id = $id AND dead = 1").run({ $id: item.id });
+  if (rearmed.changes !== 1) {
+    throw new ServiceError("INVALID_REQUEST", `Intake item ${item.id} is no longer dead-lettered`, false);
+  }
+  return { ...item, dead: false };
 }
 
 async function loadThread(deps: IntakeDeps, item: IntakeItemRecord): Promise<ThreadView | undefined> {

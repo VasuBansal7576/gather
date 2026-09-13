@@ -43,11 +43,17 @@ Gather owning business-specific durable intake, cursors, and receipts.
    infinite replay. Processing outcome is tracked per item: unsettled
    rows (`received`/`linked` after a crash), `needs_decision`, and
    `failed` rows inside the retry budget (`attempts`, bounded by
-   `MAX_INTAKE_ATTEMPTS = 5`) re-drive on later sweeps even when the poll
-   returns nothing new. Exhausted or permanent failures (e.g. dedupe
-   content conflicts) dead-letter (`dead = 1`): terminal, excluded from
-   retries, and surfaced in `listDeadLettered`/health — never silently
-   dropped. A history-404 expiry durably clears the dead cursor first,
+  `MAX_INTAKE_ATTEMPTS = 5`) re-drive on later sweeps even when the poll
+  returns nothing new. Exhausted or permanent failures (e.g. dedupe
+  content conflicts) dead-letter (`dead = 1`): terminal, excluded from
+  retries, and surfaced in `listDeadLettered`/health — never silently
+  dropped. Recovery is explicit and owner-controlled through the
+  `retryDeadLetteredItem` host API (never a model-invokable tool): one
+  validated `(business, account, message)` per call re-arms exactly one
+  dead row with attempts and history preserved, cursors untouched, and no
+  approval, link, or control granted — the next sweep re-drives it through
+  the normal drain (ledger dedupe still prevents double ingestion), and a
+  repeated failure dead-letters again immediately. A history-404 expiry durably clears the dead cursor first,
    so the next sweep full-syncs cursor-less instead of replaying expiry,
    and `settleReceivedBatches` retires crashed 'received' batches once
    their items resolve.
@@ -103,9 +109,12 @@ recent durable failures, always stamped with the host-declared
 result mode, never a bare caller boolean; health without any durable
 evidence assumes simulated rather than live. Simulated runs never claim
 live. MCP exposes three read-only live tools (`operator.health`,
-`operator.waiting`, `operator.intake.status`); every result is
-`authority: "advisory"`.
-There is deliberately no model-invokable approve/control/retry tool.
+`operator.waiting`, `operator.intake.status`); `operator.waiting` filters
+the global ledger listing to the bound `businessId` (unknown bookings
+fail closed), so one binding never surfaces another business's work;
+every result is `authority: "advisory"`.
+There is deliberately no model-invokable approve/control/retry tool —
+dead-letter recovery stays an owner-called host function.
 
 HTTP (`app/api/operator/`): `GET health`, `GET waiting`, `GET
 intake/status`, and host-called `POST sweep` (same-origin guarded).
@@ -148,7 +157,9 @@ Cursor-less bootstraps replay; consumers de-duplicate by message id
 (intake additionally dedupes to one canonical item row per
 account+message). Indefinite provider uncertainty stays uncertain
 (reconcile, don't force). Failed intake work dead-letters after
-`MAX_INTAKE_ATTEMPTS` — it is owner-visible, never auto-retried, and a
+`MAX_INTAKE_ATTEMPTS` — it is owner-visible, explicitly re-armable only
+through the validated `retryDeadLetteredItem` host call (one dead
+message per call, attempts preserved, cursors untouched), and a
 dead-lettered message is never reprocessed on later replays (a
 reclassification that would change the event kind surfaces as a
 dead-lettered conflict, not a silent rewrite).
