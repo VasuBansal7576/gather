@@ -19,7 +19,10 @@ function nowIso(): string {
  *   different hash is a conflict, never a silent overwrite.
  */
 export class RevisionLifecycleStore {
-  constructor(private readonly store: GatherStore) {
+  private readonly store: GatherStore;
+
+  constructor(store: GatherStore) {
+    this.store = store;
     this.store.db.exec(`
       CREATE TABLE IF NOT EXISTS booking_lifecycle (
         booking_id TEXT PRIMARY KEY,

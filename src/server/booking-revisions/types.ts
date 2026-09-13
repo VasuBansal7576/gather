@@ -108,6 +108,7 @@ export interface RevisionResponse {
   commandId: string;
   status: "revised" | "blocked";
   booking: Booking;
+  duplicate?: boolean;
   action?: ProposedAction;
   /** The superseded action id, so callers can see what was displaced. */
   supersedesActionId?: string;
@@ -120,6 +121,7 @@ export interface CancellationRequestResponse {
   commandId: string;
   status: "request_received" | "already_requested" | "already_verified";
   booking: Booking;
+  duplicate?: boolean;
   cancelState: "requested" | "verified";
   invalidatedApprovals: number;
   note: string;
@@ -129,6 +131,7 @@ export interface CancellationVerifyResponse {
   commandId: string;
   status: "verified" | "blocked";
   booking: Booking;
+  duplicate?: boolean;
   /** Local request recorded vs externally verified provider-side effect. */
   cancellationScope: "local_request" | "external_verified";
   blocked?: BlockedCondition[];
