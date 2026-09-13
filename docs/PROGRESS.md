@@ -14,7 +14,7 @@ The demo connectors and fixture workspace remain explicitly simulated and are no
 
 This checklist has a fixed total of 17 gates.
 
-Fourteen gates are accepted on the combined 425-test run and production build at `fd6c76b`.
+Fourteen gates are accepted on the combined 450-test run and production build at `f3b7894`.
 The preceding setup integration at `8b35a2d` passed its production build but only 380 of 381 combined tests; that failed run remains recorded below.
 The recurring isolated Gateway startup timeout remains an open reliability issue despite the passing rerun.
 This count describes the local application milestone only, not completion of the product requirements in [PRD.md](PRD.md).
@@ -27,7 +27,7 @@ This count describes the local application milestone only, not completion of the
 - [x] Connector fixtures cover provenance, unavailable dates, idempotency, and timeout reconciliation.
 - [x] Local launcher and doctor scripts are present and do not install packages or touch external runtimes.
 - [x] `npm ci` completes without credentials or network provider setup.
-- [x] Storage, connector, approval, recovery, offers, runtime, Google scope, owner-state, setup, backup and inquiry-capture checks pass together in the 425-test run on `fd6c76b`.
+- [x] Storage, connector, approval, recovery, offers, runtime, Google scope, owner-state, setup, backup, inquiry capture and confirmation/handoff checks pass together in the 450-test run on `f3b7894`.
   The preceding `dc07d55` run passed 330/331 with the isolated Gateway handshake timeout described below; this failure remains recorded.
 - [x] `npm run typecheck` passes.
 - [x] `npm run build` passes.
@@ -111,13 +111,15 @@ No credentials, personal OpenClaw configuration or data, provider actions, custo
 
 ## Workspace cleanup and dependency findings
 
-Nineteen completed review, failed-launch, runtime, dependency-maintenance, knowledge, delivery-evaluator, owner-workspace, setup, connection-service, backup, and inherited milestone worktrees were removed after checking clean tracked state and active worker ownership.
+Twenty-one completed review, failed-launch, runtime, dependency-maintenance, knowledge, delivery-evaluator, owner-workspace, setup, connection-service, backup, confirmation-service, and inherited milestone worktrees were removed after checking clean tracked state and active worker ownership.
 Original foundation, interface, connector-contract, and packaging commits remain preserved by local branch references; integrated review commits remain reachable on remote main.
 The completed knowledge commit is additionally preserved at `archive/gather-business-knowledge-640f57b`; its successor worker uses a separate business-operator worktree.
 The completed delivery evaluator is preserved at `archive/gather-delivery-readiness-e626000`; its successor uses a separate booking-delivery worktree.
 The completed owner workspace is preserved at `archive/gather-owner-host-fbafe11`; its worker now independently reviews the confirmation service.
 The setup UI, setup integration review, and connection service are preserved at `archive/gather-setup-ui-57e2518`, `archive/gather-setup-integration-9d65478`, and `archive/gather-connections-db6815f`.
 The completed backup implementation is preserved at `archive/gather-data-recovery-03cafd4`.
+The confirmation service is preserved at `archive/gather-booking-delivery-f7662de`; its successor uses a separate owner-delivery worktree.
+Ten fictional HTTP journey evidence files were copied and hash-verified into the main workspace's ignored review directory before removing their completed worktree.
 Active execution worktrees and unrelated work were preserved.
 
 Dependency remediation `64bb96e` was integrated as `1fbbb754` after compatibility review.
@@ -182,3 +184,13 @@ Waiting visibility and recovery are scoped to the bound business and account; mo
 Capture preserves the first observed message identity and does not provide a complete revision or deletion mirror.
 Production scheduling, provider-account composition and host registration remain separate implementation work in progress.
 Passing the actual isolated doctor in this run does not resolve the previously recurring startup timeout or establish model execution or connected-account behavior.
+
+## Confirmation and operational handoff integration
+
+The guarded confirmation and handoff service was integrated at `f3b7894` from `f7662de` after independent review and Astra's 64 focused tests plus type checking.
+All 450 combined tests and the production build passed on the integrated commit with no skipped tests.
+Confirmation requires current exact approval, individually successful hold and email executions, and fresh live-ready delivery evidence within the commit boundary.
+Handoffs distinguish blocked, preliminary and ready states; a preview receives a revision only when it matches persisted content.
+Regression checks include evidence changes in queued microtasks and at the transaction boundary, preventing a stale handoff from being saved.
+Internal evaluation bindings are omitted from HTTP response objects.
+These checks use isolated fixtures and scripted verifier results; actual provider confirmation and the owner-facing delivery screens remain unverified.
