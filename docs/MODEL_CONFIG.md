@@ -32,16 +32,20 @@ const runtime = new GatherOpenClawRuntime({
       profileId: "openai:bansalv8198@gmail.com", // metadata only, never a secret
       provider: "openai",              // must equal the model ref provider
       mode: "oauth",                         // literal: api_key is unrepresentable
-      email: "bansalv8198@gmail.com",        // optional, selection surfaces
+      email: "owner@example.test",           // fictional example: caller email is
+                                             // unverified display metadata only —
+                                             // never authorization evidence
       // displayName?: string                // optional, selection surfaces
     },
   } satisfies GatherModelSelection,
 });
 
-// Gate before live-model runs:
+// Gate before live-model runs (configured/unverified — configuration
+// alone never proves OAuth or model readiness; actual verification lives
+// in the separately managed live auth root):
 runtime.modelStatus();
-// → { ready: true, model: "openai/gpt-5.6-luna" }
-// → { ready: false, reason: "MODEL_NOT_CONFIGURED: ..." } when absent
+// → { configured: true, verified: false, model: "openai/gpt-5.6-luna" }
+// → { configured: false, verified: false, reason: "MODEL_NOT_CONFIGURED: ..." } when absent
 runtime.requireModelSelection(); // throws MODEL_NOT_CONFIGURED when absent
 ```
 

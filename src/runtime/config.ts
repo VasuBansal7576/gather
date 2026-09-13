@@ -74,7 +74,11 @@ export interface GatherModelAuthProfile {
   provider: string;
   /** Subscription-only route. Literal type: api_key is not expressible. */
   mode: "oauth";
-  /** Account email shown in profile selection/status surfaces. */
+  /**
+   * Unverified display metadata for profile selection/status surfaces —
+   * never authorization evidence and never proof of account ownership.
+   * Callers supply it; nothing here validates it against any account.
+   */
   email?: string;
   /** Human-readable label shown in profile selection/status surfaces. */
   displayName?: string;
