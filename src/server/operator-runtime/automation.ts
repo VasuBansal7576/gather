@@ -82,21 +82,37 @@ interface BindingRecord extends ProactiveBindingState {
    * writes can never mutate reported state or restart counters.
    */
   epoch: number;
+  /**
+   * True while this record is HELD behind a still-running prior sweep on
+   * the shared latch (registered during in-flight). The binding reports
+   * degraded — never "running" — until the old body observably settles,
+   * when the latch release promotes it. Revocation/stop clear this so a
+   * late settle cannot resurrect the record.
+   */
+  heldForPriorSweep: boolean;
 }
 
 interface SweepCell {
   inFlight: boolean;
   promise?: Promise<unknown>;
+  /**
+   * Business that owns the unsettled work on this latch. Retained even when
+   * the binding record was removed — remove() is NOT proof the old work
+   * ended, so a cross-business re-register while the latch is held must be
+   * rejected until the old body settles.
+   */
+  businessId?: string;
 }
 
 const bindings = new Map<string, BindingRecord>();
 
 /**
  * Per-account latch registry, independent of binding-record lifecycles.
- * removeProactiveBinding drops the record but keeps the cell until the
- * orphan body settles, so a re-register cannot start overlapping work.
- * Cells for accounts with no live binding are released when the orphan
- * completion is observed.
+ * removeProactiveBinding drops the record but keeps the cell — including
+ * its owning business — until the orphan body settles, so a re-register
+ * cannot start overlapping work and a cross-business re-register cannot
+ * sneak under still-live prior work. Cells are released on observed
+ * settle-with-no-binding, or immediately on idle removal.
  */
 const sweepCells = new Map<string, SweepCell>();
 
@@ -159,6 +175,17 @@ export function registerProactiveBinding(config: ProactiveBindingConfig): Proact
       `Proactive binding for account ${config.accountId} belongs to business ${existing.businessId}; remove it before rebinding to ${config.businessId}`,
     );
   }
+  // Retained-latch ownership: a removed binding leaves its business on the
+  // cell until the old body observably settles — remove() is not proof the
+  // work ended, so a cross-business rebind under live prior work is refused.
+  const cell = cellFor(config.accountId);
+  if (cell.inFlight && cell.businessId !== undefined && cell.businessId !== config.businessId) {
+    throw new Error(
+      `Proactive binding for account ${config.accountId} still has unsettled work owned by business ${cell.businessId}; register after it settles (remove does not end prior work)`,
+    );
+  }
+  cell.businessId = config.businessId;
+  const heldForPrior = cell.inFlight;
   if (existing?.timer !== undefined) {
     clearInterval(existing.timer);
     existing.epoch += 1; // late writes from a prior lifecycle are dead
@@ -167,7 +194,10 @@ export function registerProactiveBinding(config: ProactiveBindingConfig): Proact
     accountId: config.accountId,
     businessId: config.businessId,
     intervalMs,
-    status: "running",
+    // A binding registered behind a still-running prior sweep is HELD:
+    // degraded, never "running" — it cannot pretend to watch while the old
+    // body owns the latch, and it promotes on the observed settle.
+    status: heldForPrior ? "degraded" : "running",
     inFlight: false, // reported state comes from sweepCell, not this field
     totalRuns: 0,
     skippedOverlaps: 0,
@@ -179,8 +209,15 @@ export function registerProactiveBinding(config: ProactiveBindingConfig): Proact
     timer: undefined,
     // Registry latch, never a fresh object: overlap protection survives
     // refresh AND remove/re-register until the old body settles.
-    sweepCell: cellFor(config.accountId),
+    sweepCell: cell,
     epoch: 0,
+    heldForPriorSweep: heldForPrior,
+    ...(heldForPrior
+      ? {
+          lastError:
+            "prior sweep still in flight on this account; held until it settles — the body may be stuck, and work is never overlapped",
+        }
+      : {}),
   };
   record.timer = setInterval(() => {
     void tickBinding(config.accountId).catch(() => {
@@ -199,6 +236,10 @@ export function removeProactiveBinding(accountId: string): boolean {
   if (record.timer !== undefined) clearInterval(record.timer);
   record.epoch += 1; // any in-flight sweep's late writes die with the record
   bindings.delete(accountId);
+  // Idle cell: nothing owned it beyond this record — release it so accounts
+  // don't accumulate stale latch entries. An in-flight cell stays: it is the
+  // tombstone carrying business ownership until the orphan body settles.
+  if (!record.sweepCell.inFlight) sweepCells.delete(accountId);
   return true;
 }
 
@@ -223,6 +264,7 @@ export async function stopProactiveBinding(accountId: string, drainTimeoutMs = 3
   }
   record.status = "stopped";
   record.epoch += 1;
+  record.heldForPriorSweep = false; // stopped: a late settle must not revive it
   const cell = record.sweepCell;
   if (cell.inFlight && cell.promise) {
     const deadline = realDeadline(drainTimeoutMs);
@@ -330,6 +372,15 @@ export async function tickBinding(accountId: string): Promise<ProactiveSweepResu
     if (watchdog !== undefined) clearTimeout(watchdog);
     cell.inFlight = false;
     cell.promise = undefined;
+    // A live binding held behind this sweep is promoted on the observed
+    // settle — it reports running only now that the latch is truly free.
+    const live = bindings.get(accountId);
+    if (live && live.sweepCell === cell && live.heldForPriorSweep && live.status === "degraded") {
+      live.heldForPriorSweep = false;
+      live.status = "running";
+      live.lastError = undefined;
+      live.degradedAt = undefined; // the stuck reason died with the settled body
+    }
     if (!bindings.has(accountId)) sweepCells.delete(accountId);
   }
 }
@@ -351,6 +402,7 @@ export function noteProactiveRevocation(accountId: string, message: string): Pro
   }
   record.status = "degraded";
   record.epoch += 1;
+  record.heldForPriorSweep = false; // revoked: a late settle must not revive it
   record.lastError = message;
   record.degradedAt = nowIso(record);
   return snapshot(record);
