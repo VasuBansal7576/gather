@@ -178,7 +178,7 @@ export function GatherHostWorkspace() {
             <p style={{ margin: '0 0 18px', color: '#8a8a95', fontSize: 13 }}>
               {adapted?.dataMode === 'demo'
                 ? 'Load a set of fictional demo bookings so you can try the review and approval flow — nothing real is touched.'
-                : 'Nothing has arrived from your connected sources yet — new inquiries appear here automatically. You can also load fictional demo bookings to try the review and approval flow.'}
+                : 'Your apps are connected. There are no bookings to review yet. You can load fictional demo bookings to try the review and approval flow.'}
             </p>
             <button type="button" className="gather-approve-button" disabled={seeding} onClick={seedDemo}>
               {seeding ? 'Loading demo bookings…' : 'Load demo bookings'}
