@@ -25,7 +25,7 @@ This count describes the local application milestone only, not completion of the
 - [x] Connector fixtures cover provenance, unavailable dates, idempotency, and timeout reconciliation.
 - [x] Local launcher and doctor scripts are present and do not install packages or touch external runtimes.
 - [x] `npm ci` completes without credentials or network provider setup.
-- [x] Storage, connector, approval, recovery, offers, and runtime checks pass in one combined 158-test run on `1fbbb754`.
+- [x] Storage, connector, approval, recovery, offers, and runtime checks pass in one combined 247-test run on `dae72d8`.
   The earlier doctor timeout under concurrent load remains documented below.
 - [x] `npm run typecheck` passes.
 - [x] `npm run build` passes.
@@ -59,7 +59,8 @@ No live provider receipt or booking confirmation is established by these tests.
 ## Next integrated milestone
 
 The service is integrated; owner approval and recovery interactions remain under mounted browser review before API and UI integration.
-Parallel workers are implementing and correcting the isolated runtime adapter, Google provider adapters, business-aware offers, and persistent proactive booking work.
+The runtime adapter and business-aware offers module have passed component review and are integrated.
+Parallel workers are reviewing Google reads and confirmed knowledge, correcting durable identity and proactive work, and verifying delivery readiness and the owner workspace.
 Runtime worker evidence includes an actual isolated Gateway boot, protocol handshake, control-plane RPCs, and observed shutdown without model or Google calls.
 The local adapter gate is accepted after independent isolation and lifecycle review, 42/42 tests on `8bca2f2`, and actual isolated Gateway boot, handshake, control-plane RPC, and observed shutdown.
 On integrated `e81fab9`, the combined run passed 116/117 tests: the sentinel doctor spawned its child but did not receive hello-ok within 30 seconds, then shut down the child correctly.
@@ -74,7 +75,15 @@ The business-aware offers module was integrated as `8bc9674` from `997c2cf` afte
 Astra reran all 41 offer-specific tests and type checking on the integrated module.
 The module preserves approved floors and margin rules, does not claim profit when costs are unknown, checks scoped availability and local-time alternatives, and binds deterministic offer fingerprints.
 It still requires host wiring to confirmed business facts, fresh availability, and exact owner approval before owner-facing acceptance.
-Proactive-work, business-knowledge, and delivery-readiness modules remain under independent review and integration.
+Durable booking identity was integrated as `a430f52` from `f60f8f8` after independent review, 111 tests, ten adverse reproductions, and Astra rerunning all 27 identity checks.
+Bindings are scoped to trusted accounts, corrections carry exact monotonic revisions, old provider proof is cleared on reassignment, and link/audit writes plus legacy schema upgrades are atomic.
+Google incremental inbox and bounded document reads were integrated as `5eff0d9` from `16ca877` after independent review and Astra rerunning 54 adapter tests.
+Cursors bind a stable account identity and query, preserve capped page progress, and catch arrivals during initial sync; malformed or skipped content remains explicitly incomplete.
+Persistent booking waiting work was integrated as `dae72d8` from `7f21c7e` after Astra reran 37 coordination tests, type checking, and both exact migration counterexamples.
+Review verified scoped deduplication, reply suppression, persisted pause controls, claim fencing, and legacy migrations that preserve queued work and live leases.
+All 247 tests, type checking, and the production build pass on the combined integration.
+These are component acceptances; business knowledge, delivery readiness, owner interaction polish, and actual runtime intake wiring remain under review or implementation.
+The isolated-runtime intake integration now has verified dependency artifacts; live provider and model execution remain separate blocked gates.
 The next demonstrable owner journey is explicit demo initialization, exact proposal review and approval, individually persisted hold and email receipts, and restart recovery through the workspace.
 
 The full product requirements and build ownership are recorded in [PRD.md](PRD.md) and [ORCHESTRATION.md](ORCHESTRATION.md).
@@ -92,7 +101,7 @@ No credentials, personal OpenClaw configuration or data, provider actions, custo
 
 ## Workspace cleanup and dependency findings
 
-Ten completed review, failed-launch, runtime, and inherited milestone worktrees were removed after checking clean tracked state and active worker ownership.
+Twelve completed review, failed-launch, runtime, dependency-maintenance, and inherited milestone worktrees were removed after checking clean tracked state and active worker ownership.
 Original foundation, interface, connector-contract, and packaging commits remain preserved by local branch references; integrated review commits remain reachable on remote main.
 Active execution worktrees and unrelated work were preserved.
 
