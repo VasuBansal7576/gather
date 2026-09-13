@@ -60,7 +60,9 @@ Guards, evaluated before persisting:
    invalidated; claimed work fenced).
 
 `verifyCancellation` flips the booking to `cancelled` only when **all**
-conditions verify against the **current** action:
+conditions verify across **every proposal on the booking** — current and
+superseded (a hold executed under a since-superseded proposal is still a
+live provider event, so current-action-only discovery would leak it):
 
 - No pending/uncertain/partial executions (`actions_not_settled`).
 - Every succeeded hold has a durably recorded release
@@ -86,9 +88,14 @@ requested, prior status kept) from `"external_verified"` (cancelled).
 key: ledger first, then the local paused flag, so crashes replay safely)
 and set the module lifecycle flag. While paused, approve, retry, prepare,
 persist, and confirm refuse with retryable `BOOKING_PAUSED`; already
-executed receipts and statuses are never rewritten. Resume on a cancelled
-(or cancellation-requested) booking is refused — cancellation is
-terminal.
+executed receipts and statuses are never rewritten. Pause and
+cancellation-request are mutually exclusive, so a booking can never
+strand in requested+paused (verify refuses paused bookings while resume
+refuses requested ones): requesting while paused fails with retryable
+`BOOKING_PAUSED` (resume first, then request — due work stays suppressed
+throughout), and pausing a requested booking is refused (verify
+cancellation instead). Resume on a cancelled (or verified) booking is
+refused — cancellation is terminal.
 
 ## Narrow shared hooks (Astra note)
 
