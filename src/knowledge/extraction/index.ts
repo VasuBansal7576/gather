@@ -9,6 +9,12 @@ export {
   type SubmittedExtraction,
 } from "./backend.ts";
 export {
+  OpenClawExtractionBackend,
+  OPENCLAW_BACKEND_ID,
+  type OpenClawExtractionBackendOptions,
+  type OpenClawExtractionScope,
+} from "./openclaw-backend.ts";
+export {
   ExtractionScopeConflictError,
   createExtractionLedger,
   getExtractionRun,
