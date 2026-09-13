@@ -10,8 +10,10 @@
  *   node --experimental-strip-types scripts/gather-live-model.mjs \
  *     --business <businessId> --thread <threadId> \
  *     --file <driveFileId> --calendar <calendarId> \
- *     --model openai-codex/gpt-5.6-luna --auth-profile <profileId> \
+ *     --model openai/gpt-5.6-luna --auth-profile <profileId> \
  *     [--allow-live] [--idempotency-key <key>]
+ * (provider id is `openai`, verified against the installed schema —
+ * never the legacy `openai-codex` prefix)
  *
  * Exit codes: 0 proposal prepared, 2 usage, 3 refused (not authorized or
  * model unconfigured), 4 tool/policy failure.
