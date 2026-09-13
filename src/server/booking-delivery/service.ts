@@ -4,7 +4,7 @@ import type { AcceptedProposal, BookingSnapshot, OperationalHandoff, ReadinessDe
 import { buildHandoff } from "../../delivery/handoff.ts";
 import { evaluateBookingReadiness } from "../../delivery/verifiers.ts";
 import type { Booking, ProposedAction } from "../../domain/contracts.ts";
-import { emailOperationKey, holdOperationKey, ServiceError } from "../booking-service.ts";
+import { emailOperationKey, holdOperationKey, requireBookingWritable, ServiceError } from "../booking-service.ts";
 import type { GatherStore } from "../sqlite-store.ts";
 import { DeliveryStore } from "./store.ts";
 import { CollectingVerifiers, StoreDeliveryVerifiers } from "./verifiers.ts";
@@ -266,6 +266,7 @@ function bindingSnapshot(deps: BookingDeliveryDeps, bookingId: string, actionId:
 export async function confirmBooking(deps: BookingDeliveryDeps, input: ConfirmRequestDTO): Promise<ConfirmResponseDTO> {
   const { store, delivery } = deps;
   const booking = store.getBooking(input.bookingId);
+  requireBookingWritable(store, booking.id);
   const action = store.getProposedAction(input.proposedActionId);
   if (action.bookingId !== booking.id) {
     throw new ServiceError("CROSS_BOOKING", "Proposed action belongs to a different booking; cross-booking confirmation is denied", false);

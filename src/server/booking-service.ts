@@ -21,6 +21,7 @@ import type {
 } from "./dto.ts";
 import { DEMO_MARKER } from "./dto.ts";
 import type { ActionExecution, Booking } from "../domain/contracts.ts";
+import { RevisionLifecycleStore } from "./booking-revisions/lifecycle-store.ts";
 
 export type ServiceErrorCode =
   | "NOT_FOUND"
@@ -33,6 +34,8 @@ export type ServiceErrorCode =
   | "RECONCILE_PENDING"
   | "EXECUTION_FAILED"
   | "UNCERTAIN"
+  | "BOOKING_PAUSED"
+  | "CANCELLATION_REQUESTED"
   | "INVALID_REQUEST";
 
 export class ServiceError extends Error {
@@ -305,6 +308,30 @@ export function getWorkspace(store: GatherStore, deps?: Pick<BookingServiceDeps,
     connections,
     notice: "DEMO ONLY: all records and receipts are local fixtures/simulated integrations, not live provider state.",
   };
+}
+
+/**
+ * Narrow G11 writability gate (shared hook owned by booking-revisions
+ * lifecycle state). Paused bookings refuse new writes but keep every
+ * already-executed receipt and status exactly as observed; cancellation
+ * requested/verified bookings refuse new writes because their authority
+ * was invalidated at request time. Read-only paths and uncertainty
+ * resolution (reconcile) are never gated here.
+ */
+export function requireBookingWritable(store: GatherStore, bookingId: string): void {
+  const lifecycle = new RevisionLifecycleStore(store).getLifecycle(bookingId);
+  if (lifecycle.paused) {
+    throw new ServiceError("BOOKING_PAUSED", "Booking is paused by owner control; resume before approving, retrying, preparing, or confirming", true);
+  }
+  if (lifecycle.cancelState !== "none") {
+    throw new ServiceError(
+      "CANCELLATION_REQUESTED",
+      lifecycle.cancelState === "verified"
+        ? "Booking cancellation is verified terminal; no new proposals, approvals, or confirmations are accepted"
+        : "Booking cancellation was requested and its authority invalidated; verify cancellation instead of writing new proposals",
+      false,
+    );
+  }
 }
 
 /** Exact-version approval gate shared by approve + retry paths. */
@@ -710,6 +737,7 @@ function durableWindowMessage(conflictingKey: string): string {
 export async function approveAndExecute(deps: BookingServiceDeps, input: ApproveRequestDTO): Promise<ApproveResponseDTO> {
   const { store } = deps;
   const action = requireExactApproval(store, input);
+  requireBookingWritable(store, action.bookingId);
   const booking = store.getBooking(action.bookingId);
   requireSupportedKind(action.kind);
   // Validate the executable consequences BEFORE recording an approval: an
@@ -796,6 +824,7 @@ export async function retryFailedSteps(deps: BookingServiceDeps, proposedActionI
   const { store } = deps;
   const action = store.getProposedAction(proposedActionId);
   store.getBooking(action.bookingId);
+  requireBookingWritable(store, action.bookingId);
   // Even when every step already succeeded, retry must verify the current
   // proposal still carries a live exact-version approval.
   requireLiveApproval(store, action.id);
