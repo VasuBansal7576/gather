@@ -7,9 +7,11 @@ import {
   describeCorrectEffect,
   describeExceptionEffect,
   describeRejectEffect,
+  formatMoneyPart,
   formatValue,
   groupOf,
   isFixtureOnly,
+  LoadGeneration,
   parseValueJson,
   sortCandidatesForReview,
 } from "../src/knowledge-owner/state.ts";
@@ -102,6 +104,43 @@ test("value formatting stays bounded and source flags stay explicit", () => {
   assert.ok(long.length <= 60, "long values are truncated");
   assert.equal(isFixtureOnly([DOC]), true);
   assert.equal(isFixtureOnly([{ kind: "manual", locator: "gather://knowledge-exception/booking/EVT-1" }]), false);
+});
+
+test("money renders only with explicit source currency, never guessed", () => {
+  assert.equal(formatMoneyPart(120000, "USD"), "$1,200.00");
+  assert.equal(formatMoneyPart(135000, "GBP"), "£1,350.00");
+  assert.equal(formatValue({ amountCents: 120000, currency: "USD" }), "$1,200.00");
+  assert.equal(
+    formatValue({ amountCents: 120000 }),
+    "120000 minor units (currency not stated)",
+    "missing currency is an honest minor-unit label, not a guessed dollar",
+  );
+  const noSymbol = formatValue({ amountCents: 5000 });
+  assert.ok(!noSymbol.includes("$") && !noSymbol.includes("£") && !noSymbol.includes("₹"), "no currency symbol without source currency");
+  assert.equal(
+    formatValue({ amountCents: 5000, currency: "NOT-A-CURRENCY" }),
+    "5000 minor units (currency not stated)",
+    "invalid currency falls back to the honest label",
+  );
+  assert.equal(
+    formatValue({ amountCents: 9500, currency: "USD", note: "per guest" }),
+    "$95.00 · note: per guest",
+    "extra fields still render beside the money",
+  );
+  assert.ok(!/profit/i.test(formatValue({ amountCents: 9500, currency: "USD" })), "never claims profit");
+});
+
+test("load generations drop stale responses so switches never show old business data", () => {
+  const data = new LoadGeneration();
+  const venues = new LoadGeneration();
+  const slowA = data.next();
+  const fastB = data.next();
+  assert.equal(data.isCurrent(slowA), false, "delayed A response after B must be dropped");
+  assert.equal(data.isCurrent(fastB), true);
+  // Independent loaders never invalidate each other.
+  const venueRun = venues.next();
+  assert.equal(venues.isCurrent(venueRun), true);
+  assert.equal(data.isCurrent(fastB), true);
 });
 
 test("owner-typed JSON values reject non-objects with guidance", () => {

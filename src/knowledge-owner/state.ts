@@ -106,13 +106,58 @@ export function subjectLabel(candidate: Pick<KnowledgeCandidate, "subjectId" | "
 }
 
 /**
- * Bounded one-line summary of a fact value. Objects render as `k: v` pairs;
- * long text is truncated so a large document value cannot blow out the card.
+ * Monetary rendering with explicit source currency only. A numeric
+ * amountCents paired with a usable currency renders via Intl in that
+ * currency; without one it renders an honest minor-unit label. Currency is
+ * never guessed and profit is never claimed here.
+ */
+export function formatMoneyPart(amountCents: number, currency: unknown): string {
+  if (typeof currency === "string" && currency.trim().length > 0) {
+    try {
+      return new Intl.NumberFormat("en-US", { style: "currency", currency: currency.trim() }).format(amountCents / 100);
+    } catch {
+      // Invalid currency code: fall through to the honest label below.
+    }
+  }
+  return `${amountCents} minor units (currency not stated)`;
+}
+
+/**
+ * Load generation guard: each async load carries a monotonically
+ * increasing generation and only the latest generation may commit its
+ * success, error, or cleanup. Late responses from a superseded business
+ * selection are dropped so out-of-order delivery can never overwrite the
+ * current business view, loading state, or action state.
+ */
+export class LoadGeneration {
+  private current = 0;
+  next(): number {
+    this.current += 1;
+    return this.current;
+  }
+  isCurrent(generation: number): boolean {
+    return generation === this.current;
+  }
+}
+
+/**
+ * Bounded one-line summary of a fact value. Known monetary values render
+ * through formatMoneyPart; other objects render as `k: v` pairs; long text
+ * is truncated so a large document value cannot blow out the card.
  */
 export function formatValue(value: Record<string, unknown>, maxLength = 160): string {
   const parts: string[] = [];
-  for (const [key, entry] of Object.entries(value)) {
-    parts.push(`${key}: ${formatScalar(entry)}`);
+  const amount = value.amountCents;
+  if (typeof amount === "number" && Number.isFinite(amount)) {
+    parts.push(formatMoneyPart(amount, value.currency));
+    for (const [key, entry] of Object.entries(value)) {
+      if (key === "amountCents" || key === "currency") continue;
+      parts.push(`${key}: ${formatScalar(entry)}`);
+    }
+  } else {
+    for (const [key, entry] of Object.entries(value)) {
+      parts.push(`${key}: ${formatScalar(entry)}`);
+    }
   }
   const joined = parts.join(" · ");
   return joined.length > maxLength ? `${joined.slice(0, maxLength - 1)}…` : joined;

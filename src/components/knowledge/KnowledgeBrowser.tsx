@@ -10,6 +10,7 @@ import {
   conflictingCandidates,
   countNeedsReview,
   groupOf,
+  LoadGeneration,
   newCommandId,
   sortCandidatesForReview,
 } from "../../knowledge-owner/state.ts";
@@ -52,6 +53,11 @@ function errorMessage(error: unknown, fallback: string): { message: string; retr
 export function KnowledgeBrowser(): React.JSX.Element {
   const api = useMemo(() => createKnowledgeOwnerApi((input, init) => fetch(input, init)), []);
   const inFlight = useRef(new Set<string>());
+  // Independent generations for the venue list and the venue data: a late
+  // response from a superseded selection is dropped before it can commit
+  // success, error, or cleanup over the current business view.
+  const businessesGen = useRef(new LoadGeneration());
+  const dataGen = useRef(new LoadGeneration());
 
   const [businesses, setBusinesses] = useState<KnowledgeBusiness[]>([]);
   const [businessesState, setBusinessesState] = useState<LoadState>({ kind: "idle" });
@@ -69,11 +75,15 @@ export function KnowledgeBrowser(): React.JSX.Element {
   const [withheld, setWithheld] = useState<WithheldFact[]>([]);
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [mutation, setMutation] = useState<MutationStatus>({ errors: {} });
+  const businessRef = useRef(businessId);
+  businessRef.current = businessId;
 
   const loadBusinesses = useCallback(async () => {
+    const generation = businessesGen.current.next();
     setBusinessesState({ kind: "loading" });
     try {
       const list = await api.getBusinesses();
+      if (!businessesGen.current.isCurrent(generation)) return;
       setBusinesses(list);
       setBusinessesState({ kind: "ready" });
       if (list.length > 0 && !list.some((business) => business.id === businessId)) {
@@ -88,6 +98,7 @@ export function KnowledgeBrowser(): React.JSX.Element {
         setBusinessId(next);
       }
     } catch (error) {
+      if (!businessesGen.current.isCurrent(generation)) return;
       const { message, retryable } = errorMessage(error, "Gather could not load your venues.");
       setBusinessesState({ kind: "error", message, retryable });
     }
@@ -95,6 +106,7 @@ export function KnowledgeBrowser(): React.JSX.Element {
   }, [api]);
 
   const loadData = useCallback(async (id: string) => {
+    const generation = dataGen.current.next();
     setDataState({ kind: "loading" });
     setMutation({ errors: {} });
     try {
@@ -103,12 +115,14 @@ export function KnowledgeBrowser(): React.JSX.Element {
         api.getSnapshot(id),
         api.listFacts(id),
       ]);
+      if (!dataGen.current.isCurrent(generation)) return;
       setCandidates(candidateRes.candidates);
       setSnapshot(snapshotRes.snapshot);
       setWithheld(snapshotRes.snapshot.withheld);
       setFacts(factsRes.facts);
       setDataState({ kind: "ready" });
     } catch (error) {
+      if (!dataGen.current.isCurrent(generation)) return;
       const { message, retryable } = errorMessage(error, "Gather could not load business understanding.");
       setDataState({ kind: "error", message, retryable });
     }
@@ -119,7 +133,16 @@ export function KnowledgeBrowser(): React.JSX.Element {
   }, [loadBusinesses]);
 
   useEffect(() => {
-    if (businessId) void loadData(businessId);
+    if (!businessId) return;
+    // Clear the previous venue's data before loading: stale candidates,
+    // facts, and messages must never present as the newly selected venue.
+    setCandidates([]);
+    setFacts([]);
+    setSnapshot(undefined);
+    setWithheld([]);
+    setMutation({ errors: {} });
+    setBusyKey(null);
+    void loadData(businessId);
   }, [businessId, loadData]);
 
   const chooseBusiness = useCallback((id: string) => {
@@ -141,6 +164,7 @@ export function KnowledgeBrowser(): React.JSX.Element {
     apply: () => Promise<unknown>,
   ): Promise<void> => {
     if (!businessId || inFlight.current.has(key)) return;
+    const startedFor = businessId;
     inFlight.current.add(key);
     setBusyKey(key);
     setMutation((current) => ({ ok: undefined, errors: { ...current.errors, [key]: undefined as unknown as string } }));
@@ -150,6 +174,15 @@ export function KnowledgeBrowser(): React.JSX.Element {
     } catch (error) {
       failure = errorMessage(error, `${label} failed`).message;
     }
+    // The venue may have switched mid-decision: only touch the current
+    // view when it is still the venue this decision started for. A switch
+    // already triggers its own load; stale success, error, busy, and
+    // refresh writes for the old venue are dropped here.
+    if (businessRef.current !== startedFor) {
+      inFlight.current.delete(key);
+      setBusyKey((current) => (current === key ? null : current));
+      return;
+    }
     try {
       await refresh();
     } catch {
@@ -158,6 +191,10 @@ export function KnowledgeBrowser(): React.JSX.Element {
       failure = failure ?? "The decision applied, but the latest data did not reload — retry before acting on it.";
     } finally {
       inFlight.current.delete(key);
+    }
+    if (businessRef.current !== startedFor) {
+      setBusyKey((current) => (current === key ? null : current));
+      return;
     }
     setBusyKey((current) => (current === key ? null : current));
     if (failure) {
