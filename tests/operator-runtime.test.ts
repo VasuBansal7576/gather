@@ -230,6 +230,12 @@ test("uncertain approved work reconciles and resolves as done", async () => {
     const reserved = fx.store.reserveStepExecution(action.id, 1, holdKey, { claimToken: "fixture", leaseMs: 60000, nowMs: Date.parse(NOW) });
     assert.equal(reserved.created, true);
     fx.store.markExecutionUncertain(reserved.execution.id, "fixture lost response");
+    // Email leg already succeeded (durable receipt): only the hold needs truth.
+    const mailReserved = fx.store.reserveStepExecution(action.id, 1, emailOperationKey(action.id, 1), { claimToken: "fixture", leaseMs: 60000, nowMs: Date.parse(NOW) });
+    fx.store.completeActionExecution(mailReserved.execution.id, {
+      status: "succeeded",
+      result: { sentEmail: { messageId: "fixture-message-1" } },
+    });
     const ingested = fx.ledger.ingestEvent({
       dedupeKey: "k-change-op",
       kind: "change",
@@ -254,12 +260,16 @@ test("uncertain approved work reconciles and resolves as done", async () => {
       booking: { ...base.booking, calendar: demo.calendar, email: demo.email },
     };
     const report = await drainDueWork(deps);
-    // Uncertain reconciled (read-only provider truth, no new write); the
-    // item resolves done with no new approval minted by the operator.
+    // Uncertain reconciled (read-only provider truth, no new write); with
+    // every required step succeeded the item resolves done, with no new
+    // approval minted by the operator.
     assert.equal(report.reconciled.length, 1);
     assert.equal(report.awaitingOwner.length, 0);
     assert.equal(fx.store.listApprovals(action.id).length, 1, "operator reconciled but never re-approved");
     assert.equal(demo.store.listProvisionalHolds().length, 1, "no duplicate provider write");
+    const waitingId = ingested.createdWaiting[0]!.id;
+    const row = fx.store.db.prepare("SELECT status FROM coord_waiting WHERE id = $id").get({ $id: waitingId }) as { status: string };
+    assert.equal(row.status, "done");
   } finally {
     fx.cleanup();
   }
@@ -717,6 +727,185 @@ test("reply between claim and dispatch suppresses instead of executing", async (
     assert.deepEqual(result.awaitingOwner, []);
     // The execution was NOT reconciled: suppression won the race.
     assert.equal(fx.store.getActionExecution(reserved.execution.id).status, "uncertain");
+  } finally {
+    fx.cleanup();
+  }
+});
+
+function approvedHoldAction(fx: Fixture, id: string) {
+  const action = fx.store.createProposedAction({
+    id,
+    bookingId: fx.bookingId,
+    kind: "create_provisional_hold",
+    payload: {
+      startAt: "2030-07-12T17:00:00.000Z",
+      endAt: "2030-07-12T23:00:00.000Z",
+      expiresAt: "2030-07-13T23:00:00.000Z",
+      calendarId: "demo-calendar-001",
+      emailTo: ["guest@example.test"],
+      emailSubject: "s",
+      emailBody: "b",
+    },
+    sourceReferences: [],
+  });
+  fx.store.approveProposedAction(action.id, "test-owner");
+  return action;
+}
+
+function linkWaitingToAction(fx: Fixture, actionId: string): string {
+  const ingested = fx.ledger.ingestEvent({
+    dedupeKey: `k-link-${actionId}`,
+    kind: "change",
+    bookingId: fx.bookingId,
+    sourceId: `m-${actionId}`,
+    sourceKind: "email",
+    observedAt: NOW,
+  });
+  assert.ok(ingested.createdWaiting.length >= 1);
+  for (const item of ingested.createdWaiting) {
+    fx.store.db.prepare("UPDATE coord_waiting SET detail_json = $detail, due_at = $due WHERE id = $id").run({
+      $detail: JSON.stringify({ proposedActionId: actionId }),
+      $due: NOW,
+      $id: item.id,
+    });
+  }
+  return ingested.createdWaiting[0]!.id;
+}
+
+function waitingStatus(fx: Fixture, id: string): string {
+  const row = fx.store.db.prepare("SELECT status FROM coord_waiting WHERE id = $id").get({ $id: id }) as { status: string };
+  return row.status;
+}
+
+test("pending-only executions never resolve done", async () => {
+  const fx = fixture();
+  try {
+    const action = approvedHoldAction(fx, "a-op-pending");
+    // Reserved but never completed: provider truth unknown.
+    fx.store.reserveStepExecution(action.id, 1, holdOperationKey(action.id, 1), { claimToken: "t", leaseMs: 60000, nowMs: Date.parse(NOW) });
+    const waitingId = linkWaitingToAction(fx, action.id);
+    const report = await drainDueWork(depsFor(fx, historyTransport([])));
+    assert.deepEqual(report.reconciled, []);
+    assert.deepEqual(report.awaitingOwner, [waitingId]);
+    assert.equal(waitingStatus(fx, waitingId), "claimed", "stays open, never resolved done");
+    assert.equal(fx.store.getExecutionByIdempotencyKey(holdOperationKey(action.id, 1))?.status, "pending");
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test("hold-only success without any email receipt never resolves done", async () => {
+  const fx = fixture();
+  try {
+    const action = approvedHoldAction(fx, "a-op-holdonly");
+    const reserved = fx.store.reserveStepExecution(action.id, 1, holdOperationKey(action.id, 1), { claimToken: "t", leaseMs: 60000, nowMs: Date.parse(NOW) });
+    fx.store.completeActionExecution(reserved.execution.id, { status: "succeeded", result: { hold: { holdId: "h-1" } } });
+    const waitingId = linkWaitingToAction(fx, action.id);
+    const report = await drainDueWork(depsFor(fx, historyTransport([])));
+    assert.deepEqual(report.reconciled, []);
+    assert.deepEqual(report.awaitingOwner, [waitingId]);
+    assert.equal(waitingStatus(fx, waitingId), "claimed", "missing email leg stays open");
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test("superseded proposal versions never resolve or execute", async () => {
+  const fx = fixture();
+  try {
+    const action = approvedHoldAction(fx, "a-op-stale");
+    fx.store.replaceProposedAction(action.id, {
+      kind: "create_provisional_hold",
+      payload: {
+        startAt: "2030-07-12T17:00:00.000Z",
+        endAt: "2030-07-12T23:00:00.000Z",
+        expiresAt: "2030-07-13T23:00:00.000Z",
+        calendarId: "demo-calendar-001",
+        emailTo: ["guest@example.test"],
+        emailSubject: "changed",
+        emailBody: "b",
+      },
+      sourceReferences: [],
+    });
+    const waitingId = linkWaitingToAction(fx, action.id);
+    const deps = depsFor(fx, historyTransport([]));
+    let sends = 0;
+    const realSend = deps.booking.email.sendEmail.bind(deps.booking.email);
+    deps.booking.email.sendEmail = async (request) => {
+      sends += 1;
+      return realSend(request);
+    };
+    const report = await drainDueWork(deps);
+    assert.deepEqual(report.reconciled, []);
+    assert.deepEqual(report.awaitingOwner, [waitingId]);
+    assert.equal(sends, 0, "stale versions never execute");
+    assert.equal(waitingStatus(fx, waitingId), "claimed");
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test("same-clock reply suppresses instead of executing", async () => {
+  const fx = fixture();
+  try {
+    const action = approvedHoldAction(fx, "a-op-sameclock");
+    const reserved = fx.store.reserveStepExecution(action.id, 1, holdOperationKey(action.id, 1), { claimToken: "t", leaseMs: 60000, nowMs: Date.parse(NOW) });
+    fx.store.markExecutionUncertain(reserved.execution.id, "fixture");
+    const waitingId = linkWaitingToAction(fx, action.id);
+    const deps = depsFor(fx, historyTransport([]));
+    const { claimDueItems, dispatchClaimedItems } = await import("../src/server/operator-runtime/due-work.ts");
+    const { claimed } = claimDueItems(deps);
+    assert.equal(claimed.length, 1);
+    // Reply ingested in the SAME clock tick as the claim: receipt ordering
+    // still suppresses instead of executing.
+    fx.ledger.ingestEvent({
+      dedupeKey: "k-reply-sameclock",
+      kind: "reply",
+      bookingId: fx.bookingId,
+      sourceId: "m-sameclock",
+      sourceKind: "email",
+      observedAt: NOW,
+    });
+    const result = await dispatchClaimedItems(deps, claimed);
+    assert.deepEqual(result.reconciled, []);
+    assert.deepEqual(result.awaitingOwner, []);
+    assert.equal(fx.store.getActionExecution(reserved.execution.id).status, "uncertain", "untouched by suppression");
+    assert.equal(waitingStatus(fx, waitingId), "suppressed");
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test("other-business queue saturation cannot starve this business", async () => {
+  const fx = fixture();
+  try {
+    const otherBusiness = fx.store.createBusiness({ name: "Other", timezone: "UTC" });
+    for (let index = 0; index < 55; index += 1) {
+      const booking = fx.store.createBooking({ id: `b-foreign-${index}`, businessId: otherBusiness.id, eventName: "Foreign", sourceReferences: [] });
+      fx.ledger.ingestEvent({
+        dedupeKey: `k-foreign-${index}`,
+        kind: "change",
+        bookingId: booking.id,
+        sourceId: `m-foreign-${index}`,
+        sourceKind: "email",
+        observedAt: NOW,
+      });
+    }
+    const own = fx.ledger.ingestEvent({
+      dedupeKey: "k-own-sat",
+      kind: "change",
+      bookingId: fx.bookingId,
+      sourceId: "m-own-sat",
+      sourceKind: "email",
+      observedAt: NOW,
+    });
+    assert.ok(own.createdWaiting.length >= 1);
+    const deps = depsFor(fx, historyTransport([]));
+    const { claimDueItems } = await import("../src/server/operator-runtime/due-work.ts");
+    // Default limit 50 with 55 foreign items ahead: own work is still found.
+    const { claimed } = claimDueItems(deps);
+    assert.ok(claimed.some((item) => item.bookingId === fx.bookingId), "own business work is claimed despite saturation");
+    assert.ok(claimed.every((item) => item.bookingId === fx.bookingId), "nothing foreign is ever claimed here");
   } finally {
     fx.cleanup();
   }
