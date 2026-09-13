@@ -19,23 +19,34 @@ import {
  *
  * Trust boundaries:
  * - Scope is host-validated at construction (business + account); every run
- *   lands on ONE deterministic session key derived from that scope, so a
- *   result can never be adopted across scopes.
- * - The caller's persisted idempotency key is folded into a scope-bound
- *   gateway idempotency key — retries dedupe at the gateway, and the same
- *   caller key under a different scope can never alias a foreign run.
+ *   lands on an isolated stable per-task session derived from scope +
+ *   caller idempotency key + source digest, so concurrent tasks never share
+ *   a transcript and a result can never be adopted across scopes, tasks, or
+ *   source versions. Retries (same key + digest) resolve to the identical
+ *   session and gateway key.
+ * - The caller's persisted idempotency key and the pinned source digest
+ *   fold into a scope-bound gateway idempotency key — retries dedupe at the
+ *   gateway, the same caller key under a different scope or digest can never
+ *   alias a foreign run, and a resubmitted key supersedes its older run ids.
  * - Task/result identity comes from the runtime's trusted submit/wait
  *   envelopes (runId, acceptedAt, status) — never from model output. The
  *   awaited payload is parsed strictly to `unknown` under a byte bound and
  *   handed to the host for full validation.
  * - The instruction carries an in-text task marker bound to the caller's
- *   idempotency key; the result is the first assistant reply AFTER the
- *   instruction that carries that exact marker, so a stale or foreign
- *   session message can never pass for this task's result.
+ *   idempotency key, matched as an exact marker line (never a substring, so
+ *   prefix-colliding keys cannot collide); the result is the first assistant
+ *   reply AFTER the instruction that carries that exact marker, inside the
+ *   task's own session only. Model text and echoed markers are never
+ *   identity authority — the session binding and trusted envelope are.
  * - Source text is submitted as untrusted fenced content with an explicit
  *   not-instruction rule; the model has no path to approve facts, spend, or
  *   send — the instruction grants nothing and the runtime's tool deny-list
  *   enforces the rest.
+ *
+ * Restart limitation: the submitted-run map is in-memory, so a run id from
+ * before a restart awaits as "unknown" until the caller re-submits (same
+ * key + digest rebinds the identical session and gateway key); nothing is
+ * ever adopted from an unbound id.
  *
  * This module registers nothing and reads no configuration: the host
  * supplies the channel. An unavailable runtime fails honestly — channel
@@ -101,6 +112,8 @@ export class OpenClawExtractionBackend implements ExtractionBackend {
   private readonly maxResultBytes: number;
   /** In-scope submissions only: runId -> the session + marker it was bound to. */
   private readonly submitted = new Map<string, { sessionKey: string; marker: string }>();
+  /** Latest run id per marker: awaiting an older id for a resubmitted task reports superseded. */
+  private readonly latestRunByMarker = new Map<string, string>();
   private readonly sessionScopeKey: string;
 
   constructor(options: OpenClawExtractionBackendOptions) {
@@ -117,9 +130,15 @@ export class OpenClawExtractionBackend implements ExtractionBackend {
     this.sessionScopeKey = `extraction:${this.scope.businessId}:${this.scope.accountId}`;
   }
 
-  /** One deterministic session per (business, account, agent) — stable across restarts. */
-  private sessionKey(): string {
-    return bookingSessionKey(this.sessionScopeKey, this.agentId);
+  /**
+   * Isolated stable task scope: scope + caller key + source digest. The
+   * channel derives the session from this string, so distinct digests never
+   * share a transcript (no stale-history aliasing) while identical retries
+   * resolve to the identical session. Uniqueness survives gateway slug
+   * sanitization via the digest suffix in bookingSessionKey.
+   */
+  private taskScopeString(idempotencyKey: string, sourceDigest: string): string {
+    return `${this.sessionScopeKey}:${idempotencyKey}:${sourceDigest}`;
   }
 
   /** In-text marker binding a history result to this exact caller command. */
@@ -162,17 +181,24 @@ export class OpenClawExtractionBackend implements ExtractionBackend {
     if (submission.idempotencyKey.trim().length === 0) {
       throw new BackendUnavailableError("extraction submission requires an idempotency key");
     }
-    // Scope-bound gateway key: the caller's persisted key dedupes within
-    // this business+account session and can never adopt another scope's run.
+    if (submission.sourceDigest.trim().length === 0) {
+      throw new BackendUnavailableError("extraction submission requires a pinned source digest");
+    }
+    const taskScope = this.taskScopeString(submission.idempotencyKey, submission.sourceDigest);
+    // Scope-bound gateway key: the caller key + pinned digest dedupe within
+    // this business+account scope. Same key + digest retries the identical
+    // run; the same caller key under a different scope or digest can never
+    // adopt another run.
     const gatewayKey = stableTaskIdempotencyKey({
-      bookingId: this.sessionScopeKey,
+      bookingId: taskScope,
       step: "extract",
-      identity: { idempotencyKey: submission.idempotencyKey },
+      identity: { idempotencyKey: submission.idempotencyKey, sourceDigest: submission.sourceDigest },
     });
+    const marker = this.marker(submission.idempotencyKey);
     let submitted;
     try {
       submitted = await this.tasks.submitTask({
-        bookingId: this.sessionScopeKey,
+        bookingId: taskScope,
         message: this.buildInstruction(submission),
         idempotencyKey: gatewayKey,
         agentId: this.agentId,
@@ -186,8 +212,9 @@ export class OpenClawExtractionBackend implements ExtractionBackend {
     }
     this.submitted.set(submitted.runId, {
       sessionKey: submitted.sessionKey,
-      marker: this.marker(submission.idempotencyKey),
+      marker,
     });
+    this.latestRunByMarker.set(marker, submitted.runId);
     return {
       taskId: submitted.runId,
       acceptedAt: submitted.acceptedAt,
@@ -196,16 +223,22 @@ export class OpenClawExtractionBackend implements ExtractionBackend {
   }
 
   /**
-   * Await one run and recover its result from the scoped session history.
-   * Only task ids submitted by THIS backend scope may be awaited — a foreign
-   * or pre-restart id resolves "unknown", never an adopted result. Wait
-   * statuses map 1:1 (timeout is wait-only; "error" covers cancellation);
-   * transport failures throw and the host reports backend_unavailable.
+   * Await one run and recover its result from the task's own session
+   * history. Only run ids submitted by THIS backend scope may be awaited —
+   * a foreign or pre-restart id resolves "unknown", never an adopted
+   * result. A run id superseded by a newer submission under the same caller
+   * key reports an explicit error instead of aliasing the newer run's
+   * result. Wait statuses map 1:1 (timeout is wait-only; "error" covers
+   * cancellation); transport failures throw and the host reports
+   * backend_unavailable.
    */
   async awaitExtraction(taskId: string, timeoutMs: number): Promise<AwaitedExtraction> {
     const known = this.submitted.get(taskId);
     if (!known) {
       return { status: "unknown", payload: null, error: "task id was not submitted by this backend scope; refusing a foreign run" };
+    }
+    if (this.latestRunByMarker.get(known.marker) !== taskId) {
+      return { status: "error", payload: null, error: "task id was superseded by a newer submission under the same caller key; await the latest task id" };
     }
     const wait = await this.tasks.waitForRun({ runId: taskId, timeoutMs });
     if (wait.status === "timeout") {
@@ -256,15 +289,25 @@ function messageRole(raw: unknown): string | undefined {
 }
 
 /**
- * The first assistant text after the LAST user message carrying the marker.
- * Scanning backward pins the newest task message, so earlier runs — or text
- * a hostile source smuggled in — can never be picked up as this result.
+ * The first assistant text after the LAST user message carrying the exact
+ * marker line. The marker is matched as a full `Task marker: <marker>` line
+ * — never a substring — so a caller key that prefixes another key
+ * (cmd-1 vs cmd-10) can never collide. Scanning backward pins the newest
+ * task message, and each task reads only its own isolated session, so
+ * earlier runs, interleaved foreign replies, and smuggled source text can
+ * never be picked up as this result. Model text is never identity
+ * authority: the session binding and trusted submit envelope are.
  */
 function resultTextAfterMarker(entries: SessionHistoryEntry[], marker: string): string | undefined {
+  const markerLine = `Task marker: ${marker}`;
+  const carriesMarker = (raw: unknown): boolean => {
+    const text = messageText(raw);
+    if (messageRole(raw) !== "user" || text === undefined) return false;
+    return text.split("\n").some((line) => line.trim() === markerLine);
+  };
   let taskIndex = -1;
   for (let index = entries.length - 1; index >= 0; index -= 1) {
-    const text = messageText(entries[index]?.raw);
-    if (messageRole(entries[index]?.raw) === "user" && text !== undefined && text.includes(marker)) {
+    if (carriesMarker(entries[index]?.raw)) {
       taskIndex = index;
       break;
     }
