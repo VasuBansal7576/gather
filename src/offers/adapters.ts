@@ -65,6 +65,7 @@ export function adaptBusinessFacts(input: unknown): AdaptedKnowledge {
   let floorCents: number | null = null;
   let minMarginBps: number | null = null;
   let depositBps: number | null = null;
+  let costsComplete = false;
   const priceBookSources: SourceReference[] = [];
 
   for (const [index, entry] of input.entries()) {
@@ -100,7 +101,7 @@ export function adaptBusinessFacts(input: unknown): AdaptedKnowledge {
             spaces: [{ ...value, confidence, sourceReferences: sources }],
             policies: [],
             scopedExceptions: [],
-            priceBook: { currency: "USD", lines: [], costs: [], floorCents: null, minMarginBps: null, depositBps: null, sourceReferences: [] },
+            priceBook: { currency: "USD", lines: [], costs: [], floorCents: null, minMarginBps: null, depositBps: null, costsComplete: false, sourceReferences: [] },
             services: [],
             sourceReferences: [],
           }).spaces[0] as BusinessKnowledge["spaces"][number]);
@@ -111,7 +112,7 @@ export function adaptBusinessFacts(input: unknown): AdaptedKnowledge {
             spaces: [],
             policies: [{ ...value, confidence, sourceReferences: sources }],
             scopedExceptions: [],
-            priceBook: { currency: "USD", lines: [], costs: [], floorCents: null, minMarginBps: null, depositBps: null, sourceReferences: [] },
+            priceBook: { currency: "USD", lines: [], costs: [], floorCents: null, minMarginBps: null, depositBps: null, costsComplete: false, sourceReferences: [] },
             services: [],
             sourceReferences: [],
           }).policies[0] as BusinessKnowledge["policies"][number]);
@@ -122,7 +123,7 @@ export function adaptBusinessFacts(input: unknown): AdaptedKnowledge {
             spaces: [],
             policies: [],
             scopedExceptions: [{ ...value, confidence: undefined, sourceReferences: sources }],
-            priceBook: { currency: "USD", lines: [], costs: [], floorCents: null, minMarginBps: null, depositBps: null, sourceReferences: [] },
+            priceBook: { currency: "USD", lines: [], costs: [], floorCents: null, minMarginBps: null, depositBps: null, costsComplete: false, sourceReferences: [] },
             services: [],
             sourceReferences: [],
           }).scopedExceptions[0] as BusinessKnowledge["scopedExceptions"][number]);
@@ -134,7 +135,7 @@ export function adaptBusinessFacts(input: unknown): AdaptedKnowledge {
             spaces: [],
             policies: [],
             scopedExceptions: [],
-            priceBook: { currency: "USD", lines: [{ ...value, sourceReferences: sources }], costs: [], floorCents: null, minMarginBps: null, depositBps: null, sourceReferences: [] },
+            priceBook: { currency: "USD", lines: [{ ...value, confidence, sourceReferences: sources }], costs: [], floorCents: null, minMarginBps: null, depositBps: null, costsComplete: false, sourceReferences: [] },
             services: [],
             sourceReferences: [],
           }).priceBook.lines[0] as BusinessKnowledge["priceBook"]["lines"][number]);
@@ -146,7 +147,7 @@ export function adaptBusinessFacts(input: unknown): AdaptedKnowledge {
             spaces: [],
             policies: [],
             scopedExceptions: [],
-            priceBook: { currency: "USD", lines: [], costs: [{ ...value, sourceReferences: sources }], floorCents: null, minMarginBps: null, depositBps: null, sourceReferences: [] },
+            priceBook: { currency: "USD", lines: [], costs: [{ ...value, confidence, sourceReferences: sources }], floorCents: null, minMarginBps: null, depositBps: null, costsComplete: false, sourceReferences: [] },
             services: [],
             sourceReferences: [],
           }).priceBook.costs[0] as BusinessKnowledge["priceBook"]["costs"][number]);
@@ -176,6 +177,16 @@ export function adaptBusinessFacts(input: unknown): AdaptedKnowledge {
           } else {
             throw new Error("pricing_bounds.depositBps must be a non-negative integer or null");
           }
+          /* Source-backed completeness attestation for the cost ledger,
+             including genuine zero-cost businesses. Defaults to false:
+             an empty cost list alone never counts as complete. */
+          if (value.costsComplete === undefined) {
+            costsComplete = false;
+          } else if (typeof value.costsComplete === "boolean") {
+            costsComplete = value.costsComplete;
+          } else {
+            throw new Error("pricing_bounds.costsComplete must be a boolean when present");
+          }
           priceBookSources.push(...sources);
           break;
         }
@@ -184,7 +195,7 @@ export function adaptBusinessFacts(input: unknown): AdaptedKnowledge {
             spaces: [],
             policies: [],
             scopedExceptions: [],
-            priceBook: { currency: "USD", lines: [], costs: [], floorCents: null, minMarginBps: null, depositBps: null, sourceReferences: [] },
+            priceBook: { currency: "USD", lines: [], costs: [], floorCents: null, minMarginBps: null, depositBps: null, costsComplete: false, sourceReferences: [] },
             services: [{ ...value, sourceReferences: sources }],
             sourceReferences: [],
           }).services[0] as BusinessKnowledge["services"][number]);
@@ -204,7 +215,7 @@ export function adaptBusinessFacts(input: unknown): AdaptedKnowledge {
       spaces,
       policies,
       scopedExceptions,
-      priceBook: { currency, lines, costs, floorCents, minMarginBps, depositBps, sourceReferences: priceBookSources },
+      priceBook: { currency, lines, costs, costsComplete, floorCents, minMarginBps, depositBps, sourceReferences: priceBookSources },
       services,
       sourceReferences: seenSources,
     },
@@ -217,7 +228,7 @@ export interface AvailabilityBuildInput {
   observedAt: string;
   asOf: string;
   maxFreshnessMs?: number;
-  slots: { startAt: string; endAt: string; available: boolean; reason?: string; sourceReferences: SourceReference[] }[];
+  slots: { startAt: string; endAt: string; available: boolean; reason?: string; spaceIds?: string[]; sourceReferences: SourceReference[] }[];
   sourceReferences: SourceReference[];
 }
 

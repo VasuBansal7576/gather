@@ -81,6 +81,7 @@ export interface PriceLine {
   pricingBasis: PricingBasis;
   /** Null means the unit price is unknown: it must never be invented. */
   unitCents: number | null;
+  confidence: FactConfidence;
   sourceReferences: SourceReference[];
 }
 
@@ -89,6 +90,7 @@ export interface CostLine {
   label: string;
   /** Null means the cost is unknown or incomplete. */
   amountCents: number | null;
+  confidence: FactConfidence;
   sourceReferences: SourceReference[];
 }
 
@@ -96,6 +98,13 @@ export interface PriceBook {
   currency: string;
   lines: PriceLine[];
   costs: CostLine[];
+  /**
+   * Source-backed attestation that the cost ledger is complete. An empty
+   * costs array (or any null amount) means UNKNOWN costs unless this is
+   * true — including genuine zero-cost businesses, which must attest that
+   * explicitly rather than relying on an empty list.
+   */
+  costsComplete: boolean;
   /** Null means no floor is configured. */
   floorCents: number | null;
   /** Null means no margin target is configured. Basis points, e.g. 2000 = 20%. */
@@ -126,6 +135,12 @@ export interface AvailabilitySlot {
   endAt: string;
   available: boolean;
   reason?: string;
+  /**
+   * Spaces this slot is evidence for. Absent or empty means venue-wide
+   * evidence; when present, only the listed spaces may use the slot, so
+   * Room A availability can never authorize Room B.
+   */
+  spaceIds?: string[];
   sourceReferences: SourceReference[];
 }
 
@@ -215,6 +230,7 @@ export type ProfitabilityClaim =
   | "profitable"
   | "below_floor"
   | "below_margin"
+  | "unprofitable"
   | "unknown";
 
 export interface ProfitabilityAssessment {

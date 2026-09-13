@@ -34,9 +34,22 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
 
+const KNOWN_SOURCE_KINDS = new Set([
+  "connected_account",
+  "document",
+  "email",
+  "calendar",
+  "manual",
+  "fixture",
+]);
+
 function isSourceReference(value: unknown): value is SourceReference {
   if (!isRecord(value)) return false;
-  return isNonEmptyString(value.kind) && isNonEmptyString(value.locator);
+  if (typeof value.kind !== "string" || !KNOWN_SOURCE_KINDS.has(value.kind)) return false;
+  if (!isNonEmptyString(value.locator)) return false;
+  if (value.label !== undefined && typeof value.label !== "string") return false;
+  if (value.fictional !== undefined && typeof value.fictional !== "boolean") return false;
+  return true;
 }
 
 function readSourceReferences(value: unknown, path: string): SourceReference[] {
@@ -88,6 +101,15 @@ function canonicalize(value: unknown): unknown {
 
 function fingerprintOf(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(canonicalize(value))).digest("hex");
+}
+
+/** Display money in proper currency units; never amountCents glued to a code. */
+export function formatMoney(amountCents: number, currency: string): string {
+  try {
+    return new Intl.NumberFormat("en-US", { style: "currency", currency }).format(amountCents / 100);
+  } catch {
+    return `${(amountCents / 100).toFixed(2)} ${currency}`;
+  }
 }
 
 function stableId(parts: Record<string, string>): string {
@@ -272,6 +294,7 @@ function readPriceBook(value: unknown, path: string): PriceBook {
       label: line.label,
       pricingBasis: basis,
       unitCents: readNonNegativeIntOrNull(line.unitCents, `${path}.lines[${index}].unitCents`),
+      confidence: readConfidence(line.confidence, `${path}.lines[${index}].confidence`),
       sourceReferences: readSourceReferences(line.sourceReferences, `${path}.lines[${index}].sourceReferences`),
     };
   });
@@ -283,13 +306,18 @@ function readPriceBook(value: unknown, path: string): PriceBook {
       costId: cost.costId,
       label: cost.label,
       amountCents: readNonNegativeIntOrNull(cost.amountCents, `${path}.costs[${index}].amountCents`),
+      confidence: readConfidence(cost.confidence, `${path}.costs[${index}].confidence`),
       sourceReferences: readSourceReferences(cost.sourceReferences, `${path}.costs[${index}].sourceReferences`),
     };
   });
+  if (typeof value.costsComplete !== "boolean") {
+    throw new Error(`${path}.costsComplete must be an explicit boolean attesting whether the cost ledger is complete`);
+  }
   return {
     currency: value.currency,
     lines,
     costs,
+    costsComplete: value.costsComplete,
     floorCents: readNonNegativeIntOrNull(value.floorCents, `${path}.floorCents`),
     minMarginBps: readNonNegativeIntOrNull(value.minMarginBps, `${path}.minMarginBps`),
     depositBps: readNonNegativeIntOrNull(value.depositBps, `${path}.depositBps`),
@@ -340,6 +368,12 @@ function readSlot(value: unknown, path: string): AvailabilitySlot {
   };
   const reason = readOptionalNonEmptyString(value.reason, `${path}.reason`);
   if (reason !== undefined) slot.reason = reason;
+  if (value.spaceIds !== undefined) {
+    if (!Array.isArray(value.spaceIds) || !value.spaceIds.every((entry) => isNonEmptyString(entry))) {
+      throw new Error(`${path}.spaceIds must be an array of non-empty strings when present`);
+    }
+    slot.spaceIds = [...value.spaceIds] as string[];
+  }
   return slot;
 }
 
@@ -468,6 +502,21 @@ function rangeCovers(slot: AvailabilitySlot, start: string, end: string): boolea
   return slot.available && covers(slot.startAt, slot.endAt, start, end);
 }
 
+/** Two windows overlap when they share at least one instant. */
+function rangesOverlap(leftStart: string, leftEnd: string, rightStart: string, rightEnd: string): boolean {
+  const a = parseInstant(leftStart);
+  const b = parseInstant(leftEnd);
+  const c = parseInstant(rightStart);
+  const d = parseInstant(rightEnd);
+  if (!Number.isFinite(a) || !Number.isFinite(b) || !Number.isFinite(c) || !Number.isFinite(d)) return false;
+  return a < d && b > c;
+}
+
+/** A slot is evidence for a space when it is venue-wide or names the space. */
+function slotServesSpace(slot: AvailabilitySlot, spaceId: string): boolean {
+  return slot.spaceIds === undefined || slot.spaceIds.length === 0 || slot.spaceIds.includes(spaceId);
+}
+
 function hoursBetween(start: string, end: string): number {
   return Math.max(1, Math.ceil((parseInstant(end) - parseInstant(start)) / 3_600_000));
 }
@@ -501,10 +550,13 @@ function assessProfitability(args: {
   totalCents: number | null;
   unknownPriceIds: string[];
   costs: PriceBook["costs"];
+  costsComplete: boolean;
   floorCents: number | null;
   minMarginBps: number | null;
+  currency: string;
 }): ProfitabilityAssessment {
   const unknownCostIds = args.costs.filter((cost) => cost.amountCents === null).map((cost) => cost.costId);
+  const unattestedLedger = !args.costsComplete;
   const base = {
     totalCents: args.totalCents,
     costTotalCents: null as number | null,
@@ -514,10 +566,33 @@ function assessProfitability(args: {
     unknownCostIds,
     unknownPriceIds: [...args.unknownPriceIds],
   };
-  if (args.totalCents === null || unknownCostIds.length > 0) {
+  if (args.totalCents === null) {
     const reasons: string[] = [];
-    if (args.totalCents === null) reasons.push(`unknown unit prices (${base.unknownPriceIds.join(", ") || "none listed"})`);
+    if (base.unknownPriceIds.length > 0) reasons.push(`unknown unit prices (${base.unknownPriceIds.join(", ")})`);
     if (unknownCostIds.length > 0) reasons.push(`unknown or incomplete costs (${unknownCostIds.join(", ")})`);
+    if (unattestedLedger) reasons.push("the cost ledger has no source-backed completeness attestation");
+    return {
+      ...base,
+      claim: "unknown",
+      explanation: `Profitability cannot be claimed: ${reasons.join("; ") || "the total cannot be computed"}. No price or cost was invented to fill the gap.`,
+    };
+  }
+  /* The pricing floor is a separate permission from cost knowledge: a known
+     total below the floor is rejected even when costs are unknown. */
+  if (args.floorCents !== null && args.totalCents < args.floorCents) {
+    return {
+      ...base,
+      claim: "below_floor",
+      explanation: `Total ${formatMoney(args.totalCents, args.currency)} is below the approved floor ${formatMoney(args.floorCents, args.currency)}; the offer is rejected instead of discounting past the boundary.`,
+    };
+  }
+  /* Margin permission and profitability knowledge need a complete ledger:
+     unknown costs, or an unattested ledger (including a bare empty list),
+     keep profitability explicitly unknown. */
+  if (unknownCostIds.length > 0 || unattestedLedger) {
+    const reasons: string[] = [];
+    if (unknownCostIds.length > 0) reasons.push(`unknown or incomplete costs (${unknownCostIds.join(", ")})`);
+    if (unattestedLedger) reasons.push("the cost ledger has no source-backed completeness attestation (an empty cost list alone proves nothing)");
     return {
       ...base,
       claim: "unknown",
@@ -525,23 +600,26 @@ function assessProfitability(args: {
     };
   }
   const costTotal = args.costs.reduce((sum, cost) => sum + (cost.amountCents ?? 0), 0);
-  if (args.floorCents !== null && args.totalCents < args.floorCents) {
+  const profit = args.totalCents - costTotal;
+  /* Positive profit must actually be > 0: breaking even is not profitable,
+     and no margin target does not mean profitable. */
+  if (profit <= 0) {
     return {
       ...base,
       costTotalCents: costTotal,
-      claim: "below_floor",
-      explanation: `Total ${args.totalCents} is below the approved floor ${args.floorCents}; the offer is rejected instead of discounting past the boundary.`,
+      claim: "unprofitable",
+      explanation: `Known costs ${formatMoney(costTotal, args.currency)} meet or exceed the total ${formatMoney(args.totalCents, args.currency)} (profit ${formatMoney(profit, args.currency)}); the offer is rejected instead of selling at a known loss.`,
     };
   }
   if (args.minMarginBps !== null) {
-    const marginBps = args.totalCents === 0 ? 0 : Math.floor(((args.totalCents - costTotal) / args.totalCents) * 10_000);
+    const marginBps = Math.floor((profit / args.totalCents) * 10_000);
     if (marginBps < args.minMarginBps) {
       return {
         ...base,
         costTotalCents: costTotal,
         marginBps,
         claim: "below_margin",
-        explanation: `Margin ${marginBps}bps is below the approved minimum ${args.minMarginBps}bps; the offer is rejected instead of selling at any cost.`,
+        explanation: `Margin ${marginBps}bps on profit ${formatMoney(profit, args.currency)} is below the approved minimum ${args.minMarginBps}bps; the offer is rejected instead of selling at any cost.`,
       };
     }
     return {
@@ -549,14 +627,14 @@ function assessProfitability(args: {
       costTotalCents: costTotal,
       marginBps,
       claim: "profitable",
-      explanation: `Total ${args.totalCents} clears floor ${args.floorCents ?? "none"} with margin ${marginBps}bps against minimum ${args.minMarginBps}bps.`,
+      explanation: `Total ${formatMoney(args.totalCents, args.currency)} clears floor ${args.floorCents === null ? "none" : formatMoney(args.floorCents, args.currency)} with margin ${marginBps}bps against minimum ${args.minMarginBps}bps.`,
     };
   }
   return {
     ...base,
     costTotalCents: costTotal,
     claim: "profitable",
-    explanation: `Total ${args.totalCents} clears floor ${args.floorCents ?? "none"}; no margin target is configured.`,
+    explanation: `Known profit ${formatMoney(profit, args.currency)} is positive; no margin target is configured, which waives the margin permission but never implies profit on its own.`,
   };
 }
 
@@ -573,6 +651,16 @@ interface CandidateAttempt {
   profitability: ProfitabilityAssessment;
 }
 
+/** Confidence/source check: probable/uncertain facts, or empty provenance, need an explicit owner decision. */
+function needsEvidenceDecision(confidence: string, sources: SourceReference[]): boolean {
+  return confidence !== "verified" || sources.length === 0;
+}
+
+function describeConfidence(confidence: string, sources: SourceReference[]): string {
+  if (sources.length === 0) return "unattributed (no source references)";
+  return `marked ${confidence}`;
+}
+
 function buildCandidate(args: {
   inquiry: InquiryRequirements;
   knowledge: BusinessKnowledge;
@@ -585,23 +673,48 @@ function buildCandidate(args: {
   supersedesFingerprint?: string;
   alternativeNote?: string;
 }): CandidateAttempt {
-  const { inquiry, knowledge, availability, space, startAt, endAt, rank, version } = args;
+  const { inquiry, knowledge, availability, space, startAt, endAt, version } = args;
+  let rank = args.rank;
   const conflicts: ConflictItem[] = [];
+  const decisions: OwnerDecisionRequest[] = [];
   const priced = priceLines(knowledge.priceBook, inquiry.guestCount, startAt, endAt);
   const profitability = assessProfitability({
     totalCents: priced.totalCents,
     unknownPriceIds: priced.unknownPriceIds,
     costs: knowledge.priceBook.costs,
+    costsComplete: knowledge.priceBook.costsComplete,
     floorCents: knowledge.priceBook.floorCents,
     minMarginBps: knowledge.priceBook.minMarginBps,
+    currency: knowledge.priceBook.currency,
   });
-  if (profitability.claim === "below_floor" || profitability.claim === "below_margin") {
+  if (profitability.claim === "below_floor" || profitability.claim === "below_margin" || profitability.claim === "unprofitable") {
+    const code = profitability.claim === "below_floor" ? "below_price_floor" : profitability.claim === "below_margin" ? "below_margin" : "unprofitable";
     conflicts.push({
-      code: profitability.claim === "below_floor" ? "below_price_floor" : "below_margin",
+      code,
       detail: profitability.explanation,
       evidence: dedupeSources([knowledge.priceBook.sourceReferences]),
     });
-    return { conflicts, decisions: [], policyNotes: [], scopeNotes: [], profitability };
+    return { conflicts, decisions, policyNotes: [], scopeNotes: [], profitability };
+  }
+
+  /* Window evidence: an available slot must cover the window for THIS space,
+     and any overlapping busy/conflicting evidence blocks the claimed window. */
+  const covering = availability.slots.filter(
+    (slot) => rangeCovers(slot, startAt, endAt) && slotServesSpace(slot, space.spaceId),
+  );
+  const blockers = availability.slots.filter(
+    (slot) => !slot.available && rangesOverlap(slot.startAt, slot.endAt, startAt, endAt),
+  );
+  if (covering.length === 0 || blockers.length > 0) {
+    const details: string[] = [];
+    if (covering.length === 0) details.push(`no available slot covers ${startAt} to ${endAt} for ${space.name}`);
+    if (blockers.length > 0) details.push(`${blockers.length} busy/conflicting slot${blockers.length === 1 ? "" : "s"} overlap${blockers.length === 1 ? "s" : ""} the claimed window`);
+    conflicts.push({
+      code: "conflicting_availability",
+      detail: `${details.join("; ")}.`,
+      evidence: dedupeSources([...blockers.map((slot) => slot.sourceReferences), availability.sourceReferences]),
+    });
+    return { conflicts, decisions, policyNotes: [], scopeNotes: [], profitability };
   }
 
   const policy = evaluatePolicies(inquiry, knowledge);
@@ -609,8 +722,77 @@ function buildCandidate(args: {
   if (policy.blocking.length > 0) {
     return { conflicts, decisions: policy.decisions, policyNotes: policy.notes, scopeNotes: policy.scopeNotes, profitability };
   }
+  decisions.push(...policy.decisions);
+  /* Probable/uncertain (or unattributed) applicable policies need explicit review too. */
+  for (const rule of knowledge.policies.filter((candidate) => policyApplies(candidate, inquiry))) {
+    if (needsEvidenceDecision(rule.confidence, rule.sourceReferences)) {
+      decisions.push({
+        code: "unverified_policy",
+        question: `Policy "${rule.statement}" (${rule.policyId}) is ${describeConfidence(rule.confidence, rule.sourceReferences)}; confirm it before sending?`,
+        context: "Consequential policy evidence below verified confidence needs an explicit owner decision.",
+        evidence: [...rule.sourceReferences],
+      });
+    }
+  }
 
-  const covering = availability.slots.filter((slot) => rangeCovers(slot, startAt, endAt));
+  /* Consequential capacity and pricing evidence below verified confidence. */
+  if (needsEvidenceDecision(space.confidence, space.sourceReferences)) {
+    decisions.push({
+      code: "unverified_capacity",
+      question: `Capacity for ${space.name} (${space.capacityMin}-${space.capacityMax}) is ${describeConfidence(space.confidence, space.sourceReferences)}; confirm before sending?`,
+      context: "The guest count cannot be sold against unverified capacity without an owner decision.",
+      evidence: [...space.sourceReferences],
+    });
+  }
+  for (const line of knowledge.priceBook.lines) {
+    if (needsEvidenceDecision(line.confidence, line.sourceReferences)) {
+      decisions.push({
+        code: "unverified_pricing",
+        question: `Price line "${line.label}" (${line.lineId}) is ${describeConfidence(line.confidence, line.sourceReferences)}; confirm before sending?`,
+        context: "Totals built from unverified prices need an explicit owner decision.",
+        evidence: [...line.sourceReferences],
+      });
+    }
+  }
+  for (const cost of knowledge.priceBook.costs) {
+    if (cost.amountCents !== null && needsEvidenceDecision(cost.confidence, cost.sourceReferences)) {
+      decisions.push({
+        code: "unverified_pricing",
+        question: `Cost "${cost.label}" (${cost.costId}) is ${describeConfidence(cost.confidence, cost.sourceReferences)}; confirm before sending?`,
+        context: "Margins computed from unverified costs need an explicit owner decision.",
+        evidence: [...cost.sourceReferences],
+      });
+    }
+  }
+  /* Unknown profitability — including an unknown total — is unresolved and keeps the result not ready-to-send. */
+  if (profitability.claim === "unknown") {
+    decisions.push({
+      code: "unknown_profitability",
+      question: priced.totalCents === null
+        ? "The offer total is unknown; establish the missing prices or costs before sending?"
+        : "Profitability is unknown because cost knowledge is incomplete; complete it or accept sending without a profit claim?",
+      context: profitability.explanation,
+      evidence: dedupeSources([knowledge.priceBook.sourceReferences]),
+    });
+  }
+
+  /* Budget applies to every candidate: a known over-budget total is never
+     suitable as-is — demote it and require an explicit decision. */
+  if (priced.totalCents !== null && inquiry.budgetCents?.max !== undefined && priced.totalCents > inquiry.budgetCents.max) {
+    rank = "alternative";
+    conflicts.push({
+      code: "exceeds_budget",
+      detail: `Offer total ${formatMoney(priced.totalCents, knowledge.priceBook.currency)} exceeds the stated budget maximum ${formatMoney(inquiry.budgetCents.max, knowledge.priceBook.currency)}.`,
+      evidence: dedupeSources([inquiry.sourceReferences, knowledge.priceBook.sourceReferences]),
+    });
+    decisions.push({
+      code: "over_budget_approval",
+      question: `Show this offer even though it exceeds the stated budget maximum of ${formatMoney(inquiry.budgetCents.max, knowledge.priceBook.currency)}?`,
+      context: "A known-over-budget candidate is never suitable without an explicit owner decision.",
+      evidence: dedupeSources([inquiry.sourceReferences, knowledge.priceBook.sourceReferences]),
+    });
+  }
+
   const offerId = `offer:${stableId({ inquiry: inquiry.inquiryId, space: space.spaceId, start: startAt, end: endAt })}`;
   const depositCents =
     priced.totalCents === null || knowledge.priceBook.depositBps === null
@@ -620,12 +802,12 @@ function buildCandidate(args: {
     `Offer ${rank === "primary" ? "covers" : "alternatively covers"} ${inquiry.guestCount} guests for ${inquiry.eventType} in ${space.name} from ${startAt} to ${endAt}.`,
     priced.totalCents === null
       ? `Total is unknown because unit prices are missing for ${priced.unknownPriceIds.join(", ")}; profitability is not claimed.`
-      : `Total ${priced.totalCents} ${knowledge.priceBook.currency} across ${priced.lines.length} priced lines.`,
+      : `Total ${formatMoney(priced.totalCents, knowledge.priceBook.currency)} across ${priced.lines.length} priced lines.`,
     depositCents === null
       ? "Deposit cannot be computed until the total and deposit rule are both known."
-      : `Deposit ${depositCents} ${knowledge.priceBook.currency} is due under the configured deposit rule.`,
+      : `Deposit ${formatMoney(depositCents, knowledge.priceBook.currency)} is due under the configured deposit rule.`,
     `Capacity check: ${inquiry.guestCount} guests fit ${space.name} (${space.capacityMin}-${space.capacityMax}).`,
-    `Availability evidence: fresh calendar observation covering the offered window (${covering.length} covering slot${covering.length === 1 ? "" : "s"}).`,
+    `Availability evidence: fresh calendar observation covering the offered window for this space (${covering.length} covering slot${covering.length === 1 ? "" : "s"}, no overlapping busy evidence).`,
     ...policy.scopeNotes,
     ...policy.notes,
     `Pricing boundary: ${profitability.explanation}`,
@@ -664,7 +846,87 @@ function buildCandidate(args: {
     ...(args.supersedesFingerprint === undefined ? {} : { supersedesFingerprint: args.supersedesFingerprint }),
     ...(args.alternativeNote === undefined ? {} : { note: args.alternativeNote }),
   };
-  return { candidate, conflicts, decisions: policy.decisions, policyNotes: policy.notes, scopeNotes: policy.scopeNotes, profitability };
+  return { candidate, conflicts, decisions, policyNotes: policy.notes, scopeNotes: policy.scopeNotes, profitability };
+}
+
+/* ------------------------------------------------------------------ */
+/* Duration-preserving alternatives                                  */
+/* ------------------------------------------------------------------ */
+
+const DAY_MS = 86_400_000;
+
+interface CarvedWindow {
+  startAt: string;
+  endAt: string;
+  /** True when the window keeps the requested clock time on another date. */
+  sameClockTime: boolean;
+}
+
+function windowOverlapsBusy(slots: AvailabilitySlot[], start: string, end: string): boolean {
+  return slots.some((slot) => !slot.available && rangesOverlap(slot.startAt, slot.endAt, start, end));
+}
+
+function timeOfDay(when: string): string {
+  return new Date(parseInstant(when)).toISOString().slice(11, 19);
+}
+
+export function formatDuration(durationMs: number): string {
+  const hours = Math.floor(durationMs / 3_600_000);
+  const minutes = Math.round((durationMs - hours * 3_600_000) / 60_000);
+  return minutes === 0 ? `${hours}h` : `${hours}h ${minutes}m`;
+}
+
+/**
+ * Carve alternative windows that preserve the requested duration. Each
+ * available slot first offers the requested clock time on its own dates;
+ * only when that does not fit (or collides with busy evidence) does the
+ * earliest fitting window serve, flagged as a time shift so the host asks
+ * instead of silently replacing an evening dinner with a midnight slot.
+ */
+function carveAlternativeWindows(args: {
+  requestedStart: string;
+  requestedEnd: string;
+  slots: AvailabilitySlot[];
+  limit: number;
+}): CarvedWindow[] {
+  const durationMs = parseInstant(args.requestedEnd) - parseInstant(args.requestedStart);
+  if (!Number.isFinite(durationMs) || durationMs <= 0) return [];
+  const requested = new Date(parseInstant(args.requestedStart));
+  const reqH = requested.getUTCHours();
+  const reqM = requested.getUTCMinutes();
+  const reqS = requested.getUTCSeconds();
+  const reqTod = timeOfDay(args.requestedStart);
+  const out: CarvedWindow[] = [];
+  const ordered = args.slots
+    .filter((slot) => slot.available)
+    .sort((left, right) => left.startAt.localeCompare(right.startAt));
+  for (const slot of ordered) {
+    if (out.length >= args.limit) break;
+    const slotStart = parseInstant(slot.startAt);
+    const slotEnd = parseInstant(slot.endAt);
+    if (!Number.isFinite(slotStart) || !Number.isFinite(slotEnd) || slotEnd - slotStart < durationMs) continue;
+    const base = new Date(slotStart);
+    let candidate = Date.UTC(base.getUTCFullYear(), base.getUTCMonth(), base.getUTCDate(), reqH, reqM, reqS);
+    let guard = 0;
+    while (candidate < slotStart && guard < 366) {
+      candidate += DAY_MS;
+      guard += 1;
+    }
+    if (candidate + durationMs <= slotEnd) {
+      const startAt = new Date(candidate).toISOString();
+      const endAt = new Date(candidate + durationMs).toISOString();
+      if (!windowOverlapsBusy(args.slots, startAt, endAt)) {
+        out.push({ startAt, endAt, sameClockTime: true });
+        continue;
+      }
+    }
+    const fallbackStart = new Date(slotStart).toISOString();
+    const fallbackEnd = new Date(slotStart + durationMs).toISOString();
+    if (!windowOverlapsBusy(args.slots, fallbackStart, fallbackEnd)) {
+      out.push({ startAt: fallbackStart, endAt: fallbackEnd, sameClockTime: timeOfDay(fallbackStart) === reqTod });
+    }
+  }
+  return out;
 }
 
 /* ------------------------------------------------------------------ */
@@ -736,6 +998,7 @@ export function prepareOffer(input: unknown): OfferPreparationResult {
       ownerQuestion: "Which approved price lines apply to this event?",
     });
   }
+  const preparedMs = parseInstant(preparedAt);
   const observedMs = parseInstant(availability.observedAt);
   const asOfMs = parseInstant(availability.asOf);
   if (!Number.isFinite(observedMs) || !Number.isFinite(asOfMs)) {
@@ -745,11 +1008,21 @@ export function prepareOffer(input: unknown): OfferPreparationResult {
       detail: "Availability evidence has no usable observation timestamps.",
       ownerQuestion: "Can availability be rechecked now so the evidence is fresh?",
     });
-  } else if (asOfMs - observedMs > availability.maxFreshnessMs) {
+  } else if (observedMs > asOfMs || asOfMs > preparedMs) {
+    /* Freshness is judged on the trusted preparation clock: evidence stamped
+       after preparation, or observed after it was read, is inconsistent and
+       cannot authorize an offer. */
+    missingInformation.push({
+      code: "stale_availability",
+      field: "availability.observedAt/asOf",
+      detail: `Availability timestamps are inconsistent with the trusted preparation clock (observedAt ${availability.observedAt}, asOf ${availability.asOf}, preparedAt ${preparedAt}).`,
+      ownerQuestion: "Recheck calendar availability now so the evidence predates preparation?",
+    });
+  } else if (preparedMs - observedMs > availability.maxFreshnessMs) {
     missingInformation.push({
       code: "stale_availability",
       field: "availability.observedAt",
-      detail: `Availability was observed ${asOfMs - observedMs}ms ago, beyond the ${availability.maxFreshnessMs}ms freshness bound.`,
+      detail: `Availability was observed ${preparedMs - observedMs}ms before the trusted preparation clock, beyond the ${availability.maxFreshnessMs}ms freshness bound.`,
       ownerQuestion: "Recheck calendar availability immediately before preparing the offer?",
     });
   }
@@ -817,8 +1090,9 @@ export function prepareOffer(input: unknown): OfferPreparationResult {
   const blocked = missingInformation.length > 0;
 
   if (!blocked && validWindow && orderedSpaces.length > 0) {
-    const requestedCovered = availability.slots.some((slot) => rangeCovers(slot, inquiry.startAt, inquiry.endAt));
-    if (requestedCovered) {
+    const windowBusy = windowOverlapsBusy(availability.slots, inquiry.startAt, inquiry.endAt);
+    const windowCovered = availability.slots.some((slot) => rangeCovers(slot, inquiry.startAt, inquiry.endAt));
+    if (!windowBusy && windowCovered) {
       let primaryPlaced = false;
       for (const space of orderedSpaces) {
         const attempt = buildCandidate({
@@ -845,17 +1119,22 @@ export function prepareOffer(input: unknown): OfferPreparationResult {
       const unavailableEvidence = availability.slots.filter((slot) => !slot.available);
       conflicts.push({
         code: "requested_date_unavailable",
-        detail: `The requested window ${inquiry.startAt} to ${inquiry.endAt} is not covered by any available slot.`,
+        detail: windowBusy
+          ? `The requested window ${inquiry.startAt} to ${inquiry.endAt} overlaps busy/conflicting evidence and cannot be claimed as feasible.`
+          : `The requested window ${inquiry.startAt} to ${inquiry.endAt} is not covered by any available slot.`,
         evidence: dedupeSources([
           ...unavailableEvidence.map((slot) => slot.sourceReferences),
           availability.sourceReferences,
         ]),
       });
-      const alternates = availability.slots
-        .filter((slot) => slot.available)
-        .sort((left, right) => left.startAt.localeCompare(right.startAt))
-        .slice(0, 3);
-      for (const slot of alternates) {
+      const durationMs = endMs - startMs;
+      const carved = carveAlternativeWindows({
+        requestedStart: inquiry.startAt,
+        requestedEnd: inquiry.endAt,
+        slots: availability.slots,
+        limit: 3,
+      });
+      for (const window of carved) {
         const space = orderedSpaces[0];
         if (space === undefined) break;
         const attempt = buildCandidate({
@@ -863,37 +1142,41 @@ export function prepareOffer(input: unknown): OfferPreparationResult {
           knowledge,
           availability,
           space,
-          startAt: slot.startAt,
-          endAt: slot.endAt,
+          startAt: window.startAt,
+          endAt: window.endAt,
           rank: "alternative",
           version,
           ...(supersedesFingerprint === undefined ? {} : { supersedesFingerprint }),
-          alternativeNote: `Alternative date: the requested window is unavailable; this offer uses evidenced available slot ${slot.startAt} to ${slot.endAt}.`,
+          alternativeNote: `Alternative ${window.sameClockTime ? "same time, different date" : "different time"}: the requested window is unavailable; this offer preserves the requested ${formatDuration(durationMs)} duration at ${window.startAt} to ${window.endAt}.`,
         });
         conflicts.push(...attempt.conflicts.filter((conflict) => conflict.code !== "requested_date_unavailable"));
         ownerDecisions.push(...attempt.decisions);
+        if (attempt.candidate !== undefined) {
+          offers.push(attempt.candidate);
+          if (!window.sameClockTime) {
+            ownerDecisions.push({
+              code: "alternative_time_shift",
+              question: `The only fitting window is ${window.startAt} to ${window.endAt}, outside the requested clock time; ask the customer before sending?`,
+              context: "No suitable-time alternative was evidenced, so the shifted time needs an explicit decision instead of silently replacing the request.",
+              evidence: dedupeSources([availability.sourceReferences]),
+            });
+          }
+        }
         if (primaryProfitability === undefined) primaryProfitability = attempt.profitability;
-        if (attempt.candidate !== undefined) offers.push(attempt.candidate);
       }
-      if (alternates.length === 0) {
+      if (carved.length === 0) {
         conflicts.push({
           code: "no_alternative_slots",
-          detail: "No available alternative slots were evidenced, so no alternative can be offered.",
+          detail: "No available alternative window fitting the requested duration was evidenced, so no alternative can be offered.",
           evidence: [...availability.sourceReferences],
         });
       }
     }
   }
 
-  /* Budget boundary: explicit conflict, never a silent overrun. */
+  /* Budget demotion already happened per candidate inside buildCandidate;
+     every over-budget offer above carries its conflict and decision. */
   const primary = offers.find((offer) => offer.rank === "primary");
-  if (primary !== undefined && primary.totalCents !== null && inquiry.budgetCents?.max !== undefined && primary.totalCents > inquiry.budgetCents.max) {
-    conflicts.push({
-      code: "exceeds_budget",
-      detail: `Offer total ${primary.totalCents} exceeds the stated budget maximum ${inquiry.budgetCents.max}.`,
-      evidence: dedupeSources([primary.sources, inquiry.sourceReferences]),
-    });
-  }
 
   const profitability: ProfitabilityAssessment =
     primaryProfitability ??
@@ -901,12 +1184,23 @@ export function prepareOffer(input: unknown): OfferPreparationResult {
       totalCents: null,
       unknownPriceIds: knowledge.priceBook.lines.filter((line) => line.unitCents === null).map((line) => line.lineId),
       costs: knowledge.priceBook.costs,
+      costsComplete: knowledge.priceBook.costsComplete,
       floorCents: knowledge.priceBook.floorCents,
       minMarginBps: knowledge.priceBook.minMarginBps,
+      currency: knowledge.priceBook.currency,
     });
 
+  /* feasible means ready-to-send: a primary candidate with a known,
+     claimed-profitable total and no unresolved missing, conflict, or owner
+     decision — including policy, confidence, budget, time-shift, and
+     unknown-profitability decisions. */
   const status: OfferStatus =
-    primary !== undefined && missingInformation.length === 0 && conflicts.length === 0
+    primary !== undefined &&
+    primary.totalKnown &&
+    primary.profitabilityClaimed &&
+    missingInformation.length === 0 &&
+    conflicts.length === 0 &&
+    ownerDecisions.length === 0
       ? "feasible"
       : offers.length > 0
         ? "alternatives"
@@ -929,14 +1223,14 @@ export function prepareOffer(input: unknown): OfferPreparationResult {
   const consequences: string[] = [];
   if (primary !== undefined) {
     consequences.push(
-      `Primary offer ${primary.offerId} v${version}: ${primary.guestCount} guests in ${primary.spaceName}, total ${primary.totalCents === null ? "unknown" : `${primary.totalCents} ${primary.currency}`}.`,
+      `Primary offer ${primary.offerId} v${version}: ${primary.guestCount} guests in ${primary.spaceName}, total ${primary.totalCents === null ? "unknown" : formatMoney(primary.totalCents, primary.currency)}.`,
     );
   }
   for (const offer of offers.filter((item) => item.rank === "alternative")) {
     consequences.push(`Alternative ${offer.offerId}: ${offer.spaceName} from ${offer.startAt} to ${offer.endAt}.`);
   }
   if (status === "feasible") {
-    consequences.push("The offer is feasible under current evidence; owner approval must still bind this exact version and fingerprint.");
+    consequences.push("The offer is ready-to-send under current evidence; owner approval must still bind this exact version and fingerprint.");
     consequences.push("Availability must be rechecked immediately before any provisional hold; this result is not a hold.");
   } else if (status === "alternatives") {
     consequences.push("No primary offer can be sent as-is; review the alternatives, conflicts, and owner decisions before proceeding.");
