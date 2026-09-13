@@ -1,0 +1,48 @@
+import type { ActionReceipt, BookingSummary, Proposal } from './types';
+
+/**
+ * Recover the selected booking when the bookings list changes.
+ * Keeps the current selection while its id still exists (preserving context
+ * across refreshes), falls back to the first booking when it disappears, and
+ * returns undefined when the list is empty.
+ */
+export function resolveSelectedBookingId(
+  bookings: readonly Pick<BookingSummary, 'id'>[],
+  currentId: string | undefined,
+): string | undefined {
+  if (currentId !== undefined && bookings.some((booking) => booking.id === currentId)) {
+    return currentId;
+  }
+  return bookings[0]?.id;
+}
+
+/**
+ * An approval is in flight when the host reports the proposal fingerprint as
+ * pending, or when any receipt for this booking is still pending. Either way
+ * the approve control must stay disabled so the same version cannot be
+ * approved twice.
+ */
+export function isApprovalInFlight(
+  proposal: Pick<Proposal, 'fingerprint'>,
+  pendingFingerprints: readonly string[] | undefined,
+  receipts: readonly ActionReceipt[] | undefined,
+): boolean {
+  if (pendingFingerprints?.includes(proposal.fingerprint)) return true;
+  return receipts?.some((receipt) => receipt.status === 'pending') ?? false;
+}
+
+/**
+ * Recovery routing for a receipt: uncertain outcomes must be reconciled
+ * against the execution before any retry; failed and partial outcomes retry
+ * the action. Succeeded and pending receipts expose no recovery.
+ */
+export function receiptRecoveryKind(
+  receipt: Pick<ActionReceipt, 'status' | 'recoveryLabel' | 'executionId'>,
+): 'retry' | 'reconcile' | undefined {
+  if (!receipt.recoveryLabel) return undefined;
+  if (receipt.status === 'uncertain') {
+    return receipt.executionId ? 'reconcile' : undefined;
+  }
+  if (receipt.status === 'failed' || receipt.status === 'partial') return 'retry';
+  return undefined;
+}
