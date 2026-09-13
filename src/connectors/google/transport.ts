@@ -58,6 +58,21 @@ export class TransportNetworkError extends Error {
 }
 
 /**
+ * Response body exceeded the configured streaming byte cap. Adapters map
+ * this to a fail-closed over-cap result; it is never a timeout and never
+ * authorizes uncertainty about a write.
+ */
+export class TransportBodyTooLargeError extends Error {
+  readonly kind = "body_too_large" as const;
+  readonly limitBytes: number;
+  constructor(limitBytes: number, message = `Response body exceeded the ${limitBytes}-byte streaming cap`) {
+    super(message);
+    this.name = "TransportBodyTooLargeError";
+    this.limitBytes = limitBytes;
+  }
+}
+
+/**
  * Supplies a ready-to-use OAuth 2.0 access token for one request. Refresh,
  * storage, and onboarding own this; adapters only consume the returned
  * string and must never log it.
@@ -73,6 +88,7 @@ export interface GoogleAdapterOptions {
 
 export const CALENDAR_BASE_URL = "https://www.googleapis.com/calendar/v3";
 export const GMAIL_BASE_URL = "https://gmail.googleapis.com/gmail/v1";
+export const DRIVE_BASE_URL = "https://www.googleapis.com";
 
 /** Thrown when no approved token is available; adapters map it to access_revoked. */
 export class TokenUnavailableError extends Error {
@@ -88,6 +104,8 @@ export interface AuthorizedRequest {
   url: string;
   body?: string;
   contentType?: string;
+  /** Extra headers (e.g. Range for capped downloads). Never Authorization. */
+  headers?: Record<string, string>;
 }
 
 /**
@@ -108,7 +126,7 @@ export async function authorized(
   if (token.trim().length === 0) {
     throw new TokenUnavailableError("Token supplier returned an empty token");
   }
-  const headers: Record<string, string> = { Authorization: `Bearer ${token}`, Accept: "application/json" };
+  const headers: Record<string, string> = { Authorization: `Bearer ${token}`, Accept: "application/json", ...(req.headers ?? {}) };
   if (req.body !== undefined) {
     headers["Content-Type"] = req.contentType ?? "application/json";
   }
@@ -135,6 +153,8 @@ export type { ConnectorMetadata };
 
 /** Least-privilege scopes required by each adapter surface. */
 export const GOOGLE_SCOPES = {
+  /** Document content retrieval (explicit IDs only, never account scan). */
+  driveReadonly: "https://www.googleapis.com/auth/drive.readonly",
   /** Event reads (reconcile/409 verification). */
   calendarRead: "https://www.googleapis.com/auth/calendar.readonly",
   /** Availability reads via freeBusy.query (least privilege for busy intervals). */
@@ -147,12 +167,20 @@ export const GOOGLE_SCOPES = {
 export type FetchImpl = (
   url: string,
   init: { method: string; headers: Record<string, string>; body?: string; signal: AbortSignal },
-) => Promise<{ status: number; headers: Record<string, string>; text: () => Promise<string> }>;
+) => Promise<{ status: number; headers: Record<string, string>; text: () => Promise<string>; streamBytes?: AsyncIterable<Uint8Array> }>;
 
 export interface FetchTransportOptions {
   fetchImpl?: FetchImpl;
   /** Bounded per-request timeout. No request may hang indefinitely. */
   timeoutMs?: number;
+  /**
+   * Optional streaming response cap: body bytes are counted as they arrive
+   * and the request aborts with TransportBodyTooLargeError past the cap, so
+   * memory stays bounded even when the server ignores Range. Absent by
+   * default (fully backward compatible): without it the whole body buffers
+   * exactly as before, and timeout/uncertain-write behavior is untouched.
+   */
+  maxBytes?: number;
 }
 
 const DEFAULT_FETCH_TIMEOUT_MS = 30_000;
@@ -171,17 +199,29 @@ export function createFetchTransport(options: FetchTransportOptions = {}): Googl
     response.headers.forEach((value, key) => {
       headers[key] = value;
     });
-    return { status: response.status, headers, text: () => response.text() };
+    const webBody = response.body;
+    return {
+      status: response.status,
+      headers,
+      text: () => response.text(),
+      streamBytes: webBody === null || webBody === undefined ? undefined : readWebStream(webBody),
+    };
   });
   const timeoutMs = options.timeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS;
+  const maxBytes = options.maxBytes;
   return {
     request: async (req: GoogleHttpRequest): Promise<GoogleHttpResponse> => {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
       try {
         const response = await fetchImpl(req.url, { method: req.method, headers: req.headers, body: req.body, signal: controller.signal });
-        return { status: response.status, headers: response.headers, text: await response.text() };
+        if (maxBytes === undefined) {
+          return { status: response.status, headers: response.headers, text: await response.text() };
+        }
+        const text = await readCappedBody(response, maxBytes);
+        return { status: response.status, headers: response.headers, text };
       } catch (error) {
+        if (error instanceof TransportBodyTooLargeError) throw error;
         if (error instanceof Error && (error.name === "AbortError" || error instanceof TransportTimeoutError)) {
           throw new TransportTimeoutError(`Request aborted after ${timeoutMs}ms; a write may have been accepted`);
         }
@@ -191,6 +231,49 @@ export function createFetchTransport(options: FetchTransportOptions = {}): Googl
       }
     },
   };
+}
+
+async function *readWebStream(body: ReadableStream<Uint8Array>): AsyncIterable<Uint8Array> {
+  const reader = body.getReader();
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) return;
+      if (value !== undefined) yield value;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+/**
+ * Read a response body with a hard byte cap. When the fetch impl supplies a
+ * byte stream, chunks are counted as they arrive and the cap aborts before
+ * unbounded memory is consumed; otherwise the buffered body is length
+ * checked (correctness bound, memory as before). Either way an over-cap
+ * body throws TransportBodyTooLargeError instead of truncating silently.
+ */
+async function readCappedBody(
+  response: { text: () => Promise<string>; streamBytes?: AsyncIterable<Uint8Array> },
+  maxBytes: number,
+): Promise<string> {
+  if (response.streamBytes === undefined) {
+    const body = await response.text();
+    if (Buffer.byteLength(body, "utf-8") > maxBytes) {
+      throw new TransportBodyTooLargeError(maxBytes);
+    }
+    return body;
+  }
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for await (const chunk of response.streamBytes) {
+    total += chunk.length;
+    if (total > maxBytes) {
+      throw new TransportBodyTooLargeError(maxBytes);
+    }
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks).toString("utf-8");
 }
 
 export function withQuery(base: string, params: Record<string, string | undefined>): string {
