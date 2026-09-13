@@ -242,9 +242,12 @@ export interface GatherWorkspaceProps {
    * Marks whether the data shown is simulated. Defaults to `'demo'` when the
    * local fixtures are in use and `'live'` when the host supplies both
    * bookings and connections — pass `'demo'` explicitly whenever custom data
-   * is still simulated so the label is never hidden.
+   * is still simulated so the label is never hidden. `'unknown'` preserves
+   * the server's unverified-evidence marker: real records whose provider
+   * proof is not established — rendered with its own honest banner, never
+   * collapsed into demo (falsely simulated) or live (unproven).
    */
-  dataMode?: 'demo' | 'live';
+  dataMode?: 'demo' | 'live' | 'unknown';
   /**
    * Proposal fingerprints with an approval request currently in flight.
    * Matching approve controls stay disabled so the same version cannot be

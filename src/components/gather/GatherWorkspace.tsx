@@ -197,6 +197,17 @@ function DemoLabel() {
   return <span className="gather-demo-label"><span className="gather-demo-dot" />Demo data</span>;
 }
 
+function UnverifiedLabel() {
+  return <span className="gather-demo-label"><span className="gather-unverified-dot" />Unverified data</span>;
+}
+
+/** Which honesty badge the workspace shows — demo fixtures vs real-but-unverified records. */
+type DataBadge = 'demo' | 'unverified';
+
+function DataBadgeLabel({ badge }: { badge: DataBadge }) {
+  return badge === 'demo' ? <DemoLabel /> : <UnverifiedLabel />;
+}
+
 function Logo() {
   return (
     <div className="gather-logo" aria-label="Gather">
@@ -774,14 +785,14 @@ function BookingDetailPanel({
 function TodayView({
   bookings,
   connectedSourceCount,
-  showDemoData,
+  dataBadge,
   selectedBooking,
   onOpen,
   onNavigate,
 }: {
   bookings: BookingSummary[];
   connectedSourceCount: number;
-  showDemoData: boolean;
+  dataBadge?: DataBadge;
   selectedBooking?: BookingSummary;
   /** Opens the booking's detail — navigates to the bookings view (mobile detail on narrow screens). */
   onOpen: (booking: BookingSummary) => void;
@@ -792,7 +803,7 @@ function TodayView({
   return (
     <>
       <PageIntro eyebrow="Your day, your way" title="Welcome back" description={`${formatToday()} · a little room to breathe before the next service.`}>
-        {showDemoData ? <DemoLabel /> : null}
+        {dataBadge ? <DataBadgeLabel badge={dataBadge} /> : null}
       </PageIntro>
       <div className="gather-briefing-grid">
         <BriefingCard eyebrow="Needs your eye" title={`${reviewCount} ${reviewCount === 1 ? 'proposal' : 'proposals'} to review`} detail="The details are assembled. You decide what feels right for your room." icon="sparkle" tone="coral"><button type="button" className="gather-card-link" onClick={() => onNavigate('bookings')}>Open review queue <Icon name="arrow-up-right" size={14} /></button></BriefingCard>
@@ -819,7 +830,7 @@ function LoadingState() {
 
 function BookingsView({
   bookings,
-  showDemoData,
+  dataBadge,
   selectedBooking,
   approvalPending,
   approvalFailed,
@@ -837,7 +848,7 @@ function BookingsView({
   onMobileDetailChange,
 }: {
   bookings: BookingSummary[];
-  showDemoData: boolean;
+  dataBadge?: DataBadge;
   selectedBooking?: BookingSummary;
   approvalPending: boolean;
   approvalFailed: boolean;
@@ -867,7 +878,7 @@ function BookingsView({
         <div className="gather-triage-list-head">
           <h2>Bookings <span>{bookings.length}</span></h2>
           <div className="gather-triage-list-actions">
-            {showDemoData ? <DemoLabel /> : null}
+            {dataBadge ? <DataBadgeLabel badge={dataBadge} /> : null}
             <button className="gather-icon-button" type="button" aria-label="Filter bookings" disabled aria-disabled="true" title="Filtering is not available yet"><Icon name="settings" size={15} /></button>
           </div>
         </div>
@@ -905,14 +916,14 @@ function ConnectionCard({ connection, hostWired, onConnect }: { connection: Conn
   return <article className={`gather-connection-card ${connection.connected ? 'is-connected' : 'is-needs-attention'}`}><div className="gather-connection-top"><span className={`gather-connection-icon is-${connection.provider}`}><Icon name={connectionIcon(connection.provider)} size={21} /></span><span className={connection.connected ? 'gather-connected-label' : 'gather-attention-label'}>{connection.connected ? <><Icon name="check" size={13} />Connected</> : <><Icon name="warning" size={13} />Needs attention</>}</span></div><h2>{connection.name}</h2><p>{connection.description}</p><div className="gather-connection-footer"><span>{connection.connected ? connection.lastSynced : connection.detail}</span>{connection.connected ? <button type="button" className="gather-text-button" disabled aria-disabled="true" title="Managing connections is not available yet">Manage <Icon name="chevron-right" size={14} /></button> : <button type="button" className="gather-approve-button gather-small-button" disabled={!hostWired} aria-disabled={!hostWired} title={hostWired ? `Reconnect ${connection.name}` : 'Reconnecting is not available in this workspace yet'} onClick={() => onConnect(connection.provider)}><Icon name="refresh" size={15} />Reconnect</button>}</div>{!connection.connected && !hostWired ? <p className="gather-connection-note">Reconnecting is not available in this demo workspace — the button stays off instead of pretending to work.</p> : null}</article>;
 }
 
-function ConnectionsView({ connections, showDemoData, hostWired, onConnect }: { connections: Connection[]; showDemoData: boolean; hostWired: boolean; onConnect: (provider: ConnectionProvider) => void }) {
+function ConnectionsView({ connections, dataBadge, hostWired, onConnect }: { connections: Connection[]; dataBadge?: DataBadge; hostWired: boolean; onConnect: (provider: ConnectionProvider) => void }) {
   const connectedCount = connections.filter((connection) => connection.connected).length;
   const calendarConnected = connections.some((connection) => connection.provider === 'calendar' && connection.connected);
   const calendarNudge = calendarConnected
     ? 'Your calendar is connected — availability is rechecked before every proposal is sent.'
     : 'Connect your calendar to unlock reliable availability checks for every proposal.';
   return <>
-    <PageIntro eyebrow="Business context" title="Connections" description="Gather works from the tools you already use. Choose what it can read, and keep authority in your hands.">{showDemoData ? <DemoLabel /> : null}<button type="button" className="gather-secondary-button" disabled aria-disabled="true" title="Adding a connection is not available yet"><Icon name="plus" size={16} />Add connection</button></PageIntro>
+    <PageIntro eyebrow="Business context" title="Connections" description="Gather works from the tools you already use. Choose what it can read, and keep authority in your hands.">{dataBadge ? <DataBadgeLabel badge={dataBadge} /> : null}<button type="button" className="gather-secondary-button" disabled aria-disabled="true" title="Adding a connection is not available yet"><Icon name="plus" size={16} />Add connection</button></PageIntro>
     <div className="gather-connection-banner"><span className="gather-banner-icon"><Icon name="sparkle" size={19} /></span><div><strong>{connectedCount} of {connections.length} sources are ready</strong><p>{calendarNudge}</p></div><span className="gather-banner-progress" aria-label={`${connectedCount} of ${connections.length} connected`}><span style={{ width: `${connections.length ? (connectedCount / connections.length) * 100 : 0}%` }} /></span></div>
     <div className="gather-section-heading gather-connections-heading"><div><span className="gather-eyebrow">Connected tools</span><h2>Keep your context close</h2></div><span className="gather-muted-label">Your data stays yours</span></div>
     <div className="gather-connections-grid">{connections.map((connection) => <ConnectionCard key={connection.provider} connection={connection} hostWired={hostWired} onConnect={onConnect} />)}</div>
@@ -939,9 +950,12 @@ export function GatherWorkspace({
 }: GatherWorkspaceProps) {
   const bookings = bookingsProp ?? DEMO_BOOKINGS;
   const connections = connectionsProp ?? DEMO_CONNECTIONS;
-  const isDemoData = dataMode !== undefined
-    ? dataMode === 'demo'
-    : bookingsProp === undefined || connectionsProp === undefined;
+  // Three-state honesty marker: 'demo' data gets the simulated label,
+  // 'unknown' gets an unverified badge — real records must never read as
+  // simulated, and unverified evidence must never read as live.
+  const dataBadge: DataBadge | undefined = dataMode !== undefined
+    ? dataMode === 'demo' ? 'demo' : dataMode === 'unknown' ? 'unverified' : undefined
+    : bookingsProp === undefined || connectionsProp === undefined ? 'demo' : undefined;
   const [activeView, setActiveView] = useState<WorkspaceView>(initialView);
   const [mobileDetail, setMobileDetail] = useState(false);
   const [selectedBookingId, setSelectedBookingId] = useState<string>();
@@ -1038,10 +1052,10 @@ export function GatherWorkspace({
     <main className="gather-main">
       {blockedState ? <BlockedNotice title={blockedState.title} description={blockedState.description} actionLabel={blockedState.actionLabel} onAction={onRetryBlockedAction} /> : null}
       {loading ? <LoadingState /> : <>
-        {isDemoData && activeView !== 'bookings' ? <div className="gather-demo-ribbon"><DemoLabel /><span>Simulated records are shown here — nothing shown is real or confirmed.</span></div> : null}
-        {activeView === 'today' ? <TodayView bookings={bookings} connectedSourceCount={connections.filter((connection) => connection.connected).length} showDemoData={isDemoData} selectedBooking={selectedBooking} onOpen={openBooking} onNavigate={navigate} /> : null}
-        {activeView === 'bookings' ? <BookingsView bookings={bookings} showDemoData={isDemoData} selectedBooking={selectedBooking} approvalPending={approvalPending} approvalFailed={approvalFailed} canApprove={onApproveProposal !== undefined} canEdit={onEditProposal !== undefined} canRetryBlocked={canRetryBlocked} onSelect={selectBooking} onApprove={approveProposal} onEdit={editProposal} onBlockedAction={retryBlocked} onReviewConnections={() => navigate('connections')} onRetryAction={retryAction} onReconcileExecution={reconcileExecution} mobileDetail={mobileDetail} onMobileDetailChange={setMobileDetail} /> : null}
-        {activeView === 'connections' ? <ConnectionsView connections={connections} showDemoData={isDemoData} hostWired={onConnect !== undefined} onConnect={connect} /> : null}
+        {dataBadge && activeView !== 'bookings' ? <div className="gather-demo-ribbon"><DataBadgeLabel badge={dataBadge} /><span>{dataBadge === 'demo' ? 'Simulated records are shown here — nothing shown is real or confirmed.' : 'Real records are shown here, but provider evidence is unverified — nothing shown is confirmed.'}</span></div> : null}
+        {activeView === 'today' ? <TodayView bookings={bookings} connectedSourceCount={connections.filter((connection) => connection.connected).length} dataBadge={dataBadge} selectedBooking={selectedBooking} onOpen={openBooking} onNavigate={navigate} /> : null}
+        {activeView === 'bookings' ? <BookingsView bookings={bookings} dataBadge={dataBadge} selectedBooking={selectedBooking} approvalPending={approvalPending} approvalFailed={approvalFailed} canApprove={onApproveProposal !== undefined} canEdit={onEditProposal !== undefined} canRetryBlocked={canRetryBlocked} onSelect={selectBooking} onApprove={approveProposal} onEdit={editProposal} onBlockedAction={retryBlocked} onReviewConnections={() => navigate('connections')} onRetryAction={retryAction} onReconcileExecution={reconcileExecution} mobileDetail={mobileDetail} onMobileDetailChange={setMobileDetail} /> : null}
+        {activeView === 'connections' ? <ConnectionsView connections={connections} dataBadge={dataBadge} hostWired={onConnect !== undefined} onConnect={connect} /> : null}
       </>}
     </main>
   </div>;
