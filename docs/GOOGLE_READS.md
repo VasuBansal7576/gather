@@ -25,7 +25,11 @@ Gmail (`users.history.list` reference; `messages.list`/`get`, `profile`):
   `in:spam`, `in:draft(s)`, `label:<system>`,
   `is:unread|starred|important`), enforced via `labelId`; any other query
   is rejected as `invalid_request` before any HTTP call, never silently
-  broadened and never filtered by a local semantic heuristic. An invalid
+  broadened and never filtered by a local semantic heuristic. Scope
+  acceptance covers `messageAdded` intake only: the poller requests no
+  other history type, so label removals, deletions, and other mailbox
+  mutations are not mirrored — never treat a scoped poll as a complete
+  view of label membership or as capturing all mailbox mutations. An invalid
   or expired
   `startHistoryId` (valid ≥ a week, sometimes only hours) returns **HTTP
   404 — the documented expiry signal, verified by test, not an assumed

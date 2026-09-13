@@ -138,27 +138,30 @@ export function resolveHistoryLabelScope(query: string | undefined): string | un
   if (query === undefined) return undefined;
   const token = query.trim().toLowerCase();
   if (token.length === 0 || /\s/.test(token)) return null;
-  const table: Record<string, string> = {
-    "in:inbox": "INBOX",
-    "in:sent": "SENT",
-    "in:trash": "TRASH",
-    "in:spam": "SPAM",
-    "in:draft": "DRAFT",
-    "in:drafts": "DRAFT",
-    "label:inbox": "INBOX",
-    "label:sent": "SENT",
-    "label:trash": "TRASH",
-    "label:spam": "SPAM",
-    "label:draft": "DRAFT",
-    "label:drafts": "DRAFT",
-    "label:unread": "UNREAD",
-    "label:starred": "STARRED",
-    "label:important": "IMPORTANT",
-    "is:unread": "UNREAD",
-    "is:starred": "STARRED",
-    "is:important": "IMPORTANT",
-  };
-  return table[token] ?? null;
+  // Map (not a plain-object index): inherited properties such as
+  // `__proto__` or `constructor` must resolve to null, never to a
+  // non-string that could escape as an invalid label scope on the wire.
+  const table = new Map<string, string>([
+    ["in:inbox", "INBOX"],
+    ["in:sent", "SENT"],
+    ["in:trash", "TRASH"],
+    ["in:spam", "SPAM"],
+    ["in:draft", "DRAFT"],
+    ["in:drafts", "DRAFT"],
+    ["label:inbox", "INBOX"],
+    ["label:sent", "SENT"],
+    ["label:trash", "TRASH"],
+    ["label:spam", "SPAM"],
+    ["label:draft", "DRAFT"],
+    ["label:drafts", "DRAFT"],
+    ["label:unread", "UNREAD"],
+    ["label:starred", "STARRED"],
+    ["label:important", "IMPORTANT"],
+    ["is:unread", "UNREAD"],
+    ["is:starred", "STARRED"],
+    ["is:important", "IMPORTANT"],
+  ]);
+  return table.get(token) ?? null;
 }
 
 /**

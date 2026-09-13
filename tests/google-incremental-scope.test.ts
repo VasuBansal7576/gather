@@ -269,7 +269,10 @@ test("unsupported and changed queries are rejected before any HTTP call", async 
   const poll = scopedPoller(fake);
   const calls = () => fake.log.length;
   // Arbitrary search syntax has no exact history equivalent: rejected, never broadened.
-  for (const query of ["from:someone@example.test", "in:inbox from:x", "-in:inbox", "", "   ", "label:custom-label", "in:inbox OR in:sent"]) {
+  // The inherited-property keys resolve to non-strings on a plain-object
+  // index, so they are the observable regression for own-key-only lookup:
+  // they must reject exactly like any other unsupported query.
+  for (const query of ["from:someone@example.test", "in:inbox from:x", "-in:inbox", "", "   ", "label:custom-label", "in:inbox OR in:sent", "__proto__", "constructor", "toString", "hasOwnProperty", "valueOf"]) {
     const before = calls();
     const bootstrap = await poll.pollInbox("op-scope-reject", { query });
     assert.equal(bootstrap.status, "failed", `bootstrap must reject ${JSON.stringify(query)}`);
@@ -318,7 +321,7 @@ test("resolveHistoryLabelScope maps exactly the supported boundary", async () =>
   assert.equal(resolveHistoryLabelScope("is:unread"), "UNREAD");
   assert.equal(resolveHistoryLabelScope("is:starred"), "STARRED");
   assert.equal(resolveHistoryLabelScope("is:important"), "IMPORTANT");
-  for (const unsupported of ["", "   ", "from:x", "in:inbox from:x", "-in:inbox", "label:my-label", "in:inbox OR in:sent", "\"in:inbox\""]) {
+  for (const unsupported of ["", "   ", "from:x", "in:inbox from:x", "-in:inbox", "label:my-label", "in:inbox OR in:sent", "\"in:inbox\"", "__proto__", "constructor", "toString", "hasOwnProperty", "valueOf"]) {
     assert.equal(resolveHistoryLabelScope(unsupported), null, `must reject ${JSON.stringify(unsupported)}`);
   }
 });
@@ -333,4 +336,6 @@ test("resolvePollScope carries explicit spam/trash inclusion for every accepted 
   assert.deepEqual(resolvePollScope("in:inbox"), { labelId: "INBOX", includeSpamTrash: true });
   assert.equal(resolvePollScope("from:x"), null);
   assert.equal(resolvePollScope(""), null);
+  assert.equal(resolvePollScope("__proto__"), null);
+  assert.equal(resolvePollScope("constructor"), null);
 });
