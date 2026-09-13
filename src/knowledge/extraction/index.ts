@@ -19,6 +19,9 @@ export {
   MAX_VALUE_BYTES,
   MAX_VALUE_DEPTH,
   MAX_VALUE_KEYS,
+  MAX_VALUE_NODES,
+  MAX_VALUE_TOTAL_KEYS,
+  deriveIntakeId,
   extractSourceCandidates,
   type AcceptedExtraction,
   type ExtractionOutcome,
@@ -26,3 +29,13 @@ export {
   type ExtractSourceInput,
   type RejectedExtraction,
 } from "./extract.ts";
+export {
+  createExtractionLedger,
+  getExtractionRun,
+  listExtractionRunCandidates,
+  recordExtractionCandidate,
+  recordExtractionRun,
+  type ExtractionLedger,
+  type ExtractionRunCandidate,
+  type ExtractionRunRecord,
+} from "./ledger.ts";
