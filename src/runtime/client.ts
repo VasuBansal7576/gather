@@ -1,3 +1,4 @@
+import { connect as connectTcp } from "node:net";
 import {
   GatewayClient,
   GatewayClientRequestError,
@@ -81,9 +82,30 @@ export class GatewayRequestFailed extends Error {
   }
 }
 
+/**
+ * One bounded TCP probe of the gateway's loopback listener. Resolves true on
+ * accept, false on refusal/timeout — never throws on an absent listener.
+ */
+function probeTcpAccept(url: string, timeoutMs: number): Promise<boolean> {
+  return new Promise((resolvePromise) => {
+    const target = new URL(url);
+    const socket = connectTcp({ host: target.hostname, port: Number(target.port) });
+    const done = (accepted: boolean) => {
+      socket.removeAllListeners();
+      socket.destroy();
+      resolvePromise(accepted);
+    };
+    socket.setTimeout(timeoutMs);
+    socket.once("connect", () => done(true));
+    socket.once("timeout", () => done(false));
+    socket.once("error", () => done(false));
+  });
+}
+
 export class GatherGatewayConnection {
   private readonly options: GatherGatewayClientOptions;
   private readonly factory: GatewayTransportFactory;
+  private readonly probeListener: (url: string, timeoutMs: number) => Promise<boolean>;
   private transport: GatewayTransport | null = null;
   private hello: HelloOk | null = null;
   private state: GatewayConnectionState = "disconnected";
@@ -91,10 +113,14 @@ export class GatherGatewayConnection {
 
   constructor(
     options: GatherGatewayClientOptions,
-    deps: { transportFactory?: GatewayTransportFactory } = {},
+    deps: {
+      transportFactory?: GatewayTransportFactory;
+      probeListener?: (url: string, timeoutMs: number) => Promise<boolean>;
+    } = {},
   ) {
     this.options = options;
     this.factory = deps.transportFactory ?? defaultFactory;
+    this.probeListener = deps.probeListener ?? probeTcpAccept;
   }
 
   get currentState(): GatewayConnectionState {
@@ -115,14 +141,50 @@ export class GatherGatewayConnection {
   }
 
   /**
+   * Waits for the gateway's loopback listener to accept TCP. The child binds
+   * its port only after config/plugin load (~10-15 s cold); starting the WS
+   * transport before the listener exists feeds it refused sockets whose
+   * exponential backoff can overshoot the whole readiness deadline. The probe
+   * shares the connect deadline — elapsed probe time is subtracted from the
+   * handshake budget, never added to it.
+   */
+  private async waitForListener(deadlineMs: number): Promise<void> {
+    for (;;) {
+      if (this.state === "closed") {
+        throw new Error("connection closed while waiting for the gateway listener");
+      }
+      const remaining = deadlineMs - Date.now();
+      if (remaining <= 0) {
+        throw new Error(`gateway listener did not accept connections before the readiness deadline`);
+      }
+      // One refused probe is instant on loopback; cap each attempt so a
+      // hung SYN can't stall past the deadline or delay cancellation.
+      if (await this.probeListener(this.options.url, Math.min(1500, remaining))) return;
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, Math.min(250, Math.max(1, deadlineMs - Date.now()))));
+    }
+  }
+
+  /**
    * Connects and waits for `hello-ok` — the documented application-readiness
-   * signal. Rejects if not ready within timeoutMs. The underlying client owns
-   * socket reconnect/backoff; this deadline covers the whole handshake.
+   * signal. Rejects if not ready within timeoutMs, a deadline covering BOTH
+   * the listener probe and the authenticated handshake. The underlying client
+   * owns socket reconnect/backoff once the transport starts.
    */
   async connect(opts: { timeoutMs?: number } = {}): Promise<HelloOk> {
     if (this.transport) throw new Error("connection already started");
     const timeoutMs = opts.timeoutMs ?? 30000;
+    const deadlineMs = Date.now() + timeoutMs;
     this.setState("connecting");
+
+    // Gate the real transport on the assigned listener accepting — TCP
+    // accept is liveness only, NOT readiness; hello-ok below stays the
+    // authoritative readiness proof.
+    try {
+      await this.waitForListener(deadlineMs);
+    } catch (error) {
+      this.setState("closed");
+      throw error;
+    }
 
     this.transport = this.factory({
       url: this.options.url,
@@ -158,7 +220,7 @@ export class GatherGatewayConnection {
         rejectPromise(
           new Error(`gateway hello-ok not received within ${timeoutMs}ms`),
         );
-      }, timeoutMs);
+      }, Math.max(1, deadlineMs - Date.now()));
       this.readyResolve = (hello) => {
         clearTimeout(deadline);
         resolvePromise(hello);

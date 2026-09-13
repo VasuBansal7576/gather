@@ -45,6 +45,7 @@ import {
   GatherGatewayConnection,
   OpenClawGatewayProcess,
   ensureLayoutDirectories,
+  ensureMcpToken,
   resolveGatherOpenClawLayout,
   writeGatewayConfig,
 } from "../src/runtime/index.ts";
@@ -270,9 +271,12 @@ async function main() {
     `unique Gather-owned config written to ${layout.configPath} (tokens via env substitution, no secrets in file)`,
   );
 
+  // The config registers the gather MCP server with a ${GATHER_MCP_TOKEN}
+  // substitution; provide the token so the boundary is actually available.
   gateway = new OpenClawGatewayProcess({
     layout,
     executable: { command: binary },
+    mcpToken: ensureMcpToken(layout),
     log,
   });
 
