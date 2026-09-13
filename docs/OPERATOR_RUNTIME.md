@@ -51,22 +51,30 @@ Provider payment text is evidence, never proof.
 
 ## Due-work drain (`drainDueWork`)
 
-Selection and execution are both scoped: only waiting items whose booking
-belongs to this runtime's business are claimed, and an item executes only
-for a proposal bound to the same booking with a live exact-version
-approval verified read-only. Immediately before any effect the drain
-revalidates: the row is still claimed by us with a matching fencing
-token, the booking is not paused/cancelled, and no customer reply arrived
-since the claim (a late reply suppresses instead of executing).
+Selection scopes before the limit: due work is listed per booking of this
+runtime's business (a supported ledger query), merged oldest-first and
+capped — a full page of foreign-business rows can never starve this
+business, and foreign rows are never even read. An item executes only for
+a proposal bound to the same booking with a live exact-version approval
+verified read-only. Immediately before any effect the drain revalidates:
+the row is still claimed by us with a matching fencing token under a live
+lease, the booking is not paused/cancelled, and no customer reply arrived
+since the claim (ledger receipt ordering with a same-clock inclusive
+fence — a late reply suppresses instead of executing).
 
-Execution is reconcile-only: uncertain steps reconcile (read-only
-provider truth, never a new write). Failed or never-run steps report
-`awaitingOwner` — retrying an old approved offer is not automatically
-authorized follow-up messaging, and resending customer email as an
-automatic consequence of intake timing is never permitted here. The drain
-NEVER calls `approveAndExecute`: the operator path cannot mint owner
-approval. Nothing resolves as done on failure; failures surface in the
-durable failure log.
+Completion is durable-or-nothing: an item resolves done only after every
+exact required step for the current proposal version (hold AND email
+receipts under the stable per-step keys) is succeeded. Pending-only,
+hold-only, failed, superseded-version, or still-uncertain states stay
+open (`awaitingOwner` or still claimed) — never resolved done. Execution
+is reconcile-only: uncertain steps reconcile (read-only provider truth,
+never a new write). Failed or never-run steps report `awaitingOwner` —
+retrying an old approved offer is not automatically authorized follow-up
+messaging, and resending customer email as an automatic consequence of
+intake timing is never permitted here. The drain NEVER calls
+`approveAndExecute`: the operator path cannot mint owner approval.
+Nothing resolves as done on failure; failures surface in the durable
+failure log.
 
 ## Health and tools
 

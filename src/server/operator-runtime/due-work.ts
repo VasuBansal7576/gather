@@ -1,4 +1,5 @@
-import { reconcileExecution } from "../booking-service.ts";
+import { emailOperationKey, holdOperationKey, reconcileExecution } from "../booking-service.ts";
+import type { WaitingItem } from "../../coordination/contracts.ts";
 import type { DueWorkReport, OperatorRuntimeDeps } from "./types.ts";
 import { OperatorIntakeStore } from "./store.ts";
 
@@ -22,18 +23,32 @@ export interface ClaimedWorkItem {
 }
 
 /**
- * Claim phase: list due work scoped to this runtime's business, then claim
- * with fencing. Selection itself is scoped — waiting items whose booking
- * belongs to another business are never claimed here.
+ * Claim phase with scope-before-limit: due work is listed per booking of
+ * this runtime's business (a supported ledger query), so a full global
+ * page of foreign-business items can never starve this business — foreign
+ * rows are never even read. Pages merge oldest-first and cap at `limit`,
+ * so every sweep makes progress on the oldest open work.
  */
 export function claimDueItems(
   deps: OperatorRuntimeDeps,
   input: { limit?: number; claimedBy?: string } = {},
 ): { claimed: ClaimedWorkItem[]; skipped: string[] } {
   const now = nowIso(deps);
-  const due = deps.ledger.listDueWork({ nowIso: now, limit: input.limit ?? 50 });
-  const scoped = due.filter((item) => bookingBusiness(deps, item.bookingId) === deps.businessId);
-  if (scoped.length === 0) return { claimed: [], skipped: due.map((item) => item.id) };
+  const total = input.limit ?? 50;
+  let bookings: Array<{ id: string }>;
+  try {
+    bookings = deps.store.listBookings(deps.businessId);
+  } catch {
+    return { claimed: [], skipped: [] };
+  }
+  const due: WaitingItem[] = [];
+  for (const booking of bookings) {
+    const items = deps.ledger.listDueWork({ nowIso: now, limit: total, bookingId: booking.id });
+    due.push(...items);
+  }
+  due.sort((left, right) => left.dueAt.localeCompare(right.dueAt));
+  const scoped = due.slice(0, total);
+  if (scoped.length === 0) return { claimed: [], skipped: [] };
   const result = deps.ledger.claimDueWork({
     ids: scoped.map((item) => item.id),
     claimedBy: input.claimedBy ?? "operator-sweep",
@@ -47,7 +62,7 @@ export function claimDueItems(
       claimedAt: item.claimedAt,
       detail: item.detail as Record<string, unknown>,
     })),
-    skipped: [...due.filter((entry) => !scoped.some((item) => item.id === entry.id)).map((entry) => entry.id), ...result.skippedIds],
+    skipped: [...result.skippedIds],
   };
 }
 
@@ -95,13 +110,22 @@ export async function dispatchClaimedItems(
 }
 
 async function dispatchOne(deps: OperatorRuntimeDeps, item: ClaimedWorkItem, claimedBy: string): Promise<"reconciled" | "awaitingOwner" | "skipped"> {
-  // 1. Still ours? Re-read the row: status, owner, and fencing token.
+  // 1. Still ours? Re-read the row: status, owner, fencing token, and a
+  // live lease — an expired lease is never executed under, even with a
+  // matching token.
   const current = readWaiting(deps, item.id);
   if (!current || current.status !== "claimed" || current.claimedBy !== claimedBy) {
     return "skipped";
   }
   if (current.claimToken === undefined || item.claimToken === undefined || current.claimToken !== item.claimToken) {
     return "skipped";
+  }
+  if (current.claimExpiresAt !== undefined) {
+    const expiresMs = Date.parse(current.claimExpiresAt);
+    const nowMs = Date.parse(nowIso(deps));
+    if (!Number.isFinite(expiresMs) || !Number.isFinite(nowMs) || expiresMs <= nowMs) {
+      return "skipped";
+    }
   }
   // 2. Booking still runnable? Pause (or cancel) after the claim stops dispatch.
   if (controlState(deps, item.bookingId) !== null) {
@@ -139,24 +163,35 @@ async function dispatchOne(deps: OperatorRuntimeDeps, item: ClaimedWorkItem, cla
   if (!live) {
     return "awaitingOwner";
   }
-  // 5. Reconcile uncertain steps only. Failed or never-run steps (which
-  // would send customer email on retry) stay with the owner.
-  const executions = deps.store.listActionExecutions(actionId);
-  const uncertain = executions.filter((entry) => entry.status === "uncertain" || entry.status === "partial");
-  if (uncertain.length === 0) {
-    const failed = executions.some((entry) => entry.status === "failed");
-    if (failed || executions.length === 0) return "awaitingOwner";
+  // 5. Durable completion only: EVERY exact required executable step for
+  // the current proposal version (hold AND email receipts under the stable
+  // per-step keys) must be succeeded. Anything missing, pending, failed,
+  // or still uncertain afterwards stays open — never resolved done.
+  // Failed or never-run steps (which would send customer email on retry)
+  // stay with the owner; only read-only reconciliation runs here.
+  if (action.kind !== "create_provisional_hold") {
+    return "awaitingOwner";
+  }
+  const holdKey = holdOperationKey(actionId, action.proposalVersion);
+  const mailKey = emailOperationKey(actionId, action.proposalVersion);
+  let progressed = false;
+  for (const key of [holdKey, mailKey]) {
+    const step = deps.store.getExecutionByIdempotencyKey(key);
+    if (step && (step.status === "uncertain" || step.status === "partial")) {
+      await reconcileExecution(deps.booking, step.id);
+      progressed = true;
+    }
+  }
+  const holdOk = deps.store.getExecutionByIdempotencyKey(holdKey)?.status === "succeeded";
+  const mailOk = deps.store.getExecutionByIdempotencyKey(mailKey)?.status === "succeeded";
+  if (holdOk && mailOk) {
     await resolveDone(deps, item);
     return "reconciled";
   }
-  for (const execution of uncertain) {
-    await reconcileExecution(deps.booking, execution.id);
+  if (progressed) {
+    return "reconciled";
   }
-  const after = deps.store.listActionExecutions(actionId);
-  if (after.every((entry) => entry.status === "succeeded")) {
-    await resolveDone(deps, item);
-  }
-  return "reconciled";
+  return "awaitingOwner";
 }
 
 async function resolveDone(deps: OperatorRuntimeDeps, item: ClaimedWorkItem): Promise<void> {
@@ -168,9 +203,10 @@ function readWaiting(deps: OperatorRuntimeDeps, id: string): {
   claimedBy?: string;
   claimToken?: string;
   claimedAt?: string;
+  claimExpiresAt?: string;
   updatedAt: string;
 } | undefined {
-  const found = deps.store.db.prepare("SELECT status, claimed_by, claim_token, claimed_at, updated_at FROM coord_waiting WHERE id = $id").get({ $id: id });
+  const found = deps.store.db.prepare("SELECT status, claimed_by, claim_token, claimed_at, claim_expires_at, updated_at FROM coord_waiting WHERE id = $id").get({ $id: id });
   const value = rowOf(found);
   if (!value) return undefined;
   return {
@@ -178,6 +214,7 @@ function readWaiting(deps: OperatorRuntimeDeps, id: string): {
     claimedBy: value.claimed_by ? String(value.claimed_by) : undefined,
     claimToken: value.claim_token ? String(value.claim_token) : undefined,
     claimedAt: value.claimed_at ? String(value.claimed_at) : undefined,
+    claimExpiresAt: value.claim_expires_at ? String(value.claim_expires_at) : undefined,
     updatedAt: String(value.updated_at),
   };
 }
@@ -191,6 +228,11 @@ function controlState(deps: OperatorRuntimeDeps, bookingId: string): string | nu
 }
 
 function replySince(deps: OperatorRuntimeDeps, bookingId: string, sinceIso: string): boolean {
+  // Authoritative ledger receipt ordering: any non-stale reply received at
+  // or after the claim fence suppresses. The >= fence is deliberate — a
+  // reply sharing the claim's clock tick is still evidence the customer
+  // answered, and suppressing is always the safe direction. Replies already
+  // visible at claim time were handled by the ledger's claim-time recheck.
   const sinceMs = Date.parse(sinceIso);
   if (!Number.isFinite(sinceMs)) return false;
   const rows = deps.store.db.prepare(
@@ -200,7 +242,7 @@ function replySince(deps: OperatorRuntimeDeps, bookingId: string, sinceIso: stri
     const received = rowOf(entry)?.received_at;
     if (typeof received === "string") {
       const ms = Date.parse(received);
-      if (Number.isFinite(ms) && ms > sinceMs) return true;
+      if (Number.isFinite(ms) && ms >= sinceMs) return true;
     }
   }
   return false;
