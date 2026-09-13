@@ -6,7 +6,7 @@
  */
 import assert from "node:assert/strict";
 import test from "node:test";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import {
   chmodSync,
   createWriteStream,
@@ -157,9 +157,22 @@ test("restore writes a new database the owner can restart on; originals intact",
     assert.equal(out.status, 0, out.stderr);
     assert.match(out.stdout, /restore ok/);
     assert.equal(statSync(restored).mode & 0o777, 0o600);
-    // Byte-identity of the copy itself, captured before any read-write open
-    // (opening read-write may legitimately rewrite bytes via checkpointing).
-    assert.equal(sha256(snap), sha256(restored));
+    // Content identity (not byte identity: restore snapshots through
+    // VACUUM INTO, which reformats pages by design). Same tables, same rows.
+    const snapDb = new DatabaseSync(snap, { readOnly: true });
+    const restDb = new DatabaseSync(restored, { readOnly: true });
+    try {
+      const names = (db: DatabaseSync) =>
+        (db.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all() as Array<{ name: string }>).map((r) => r.name);
+      assert.deepEqual(names(restDb), names(snapDb));
+      for (const table of ["businesses", "bookings"] as const) {
+        const n = (db: DatabaseSync) => (db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n;
+        assert.equal(n(restDb), n(snapDb), `${table} row counts must match`);
+      }
+    } finally {
+      snapDb.close();
+      restDb.close();
+    }
     // Restart analogue: a fresh GatherStore opens the restored file with full data.
     const restarted = new GatherStore(restored);
     try {
@@ -291,6 +304,183 @@ test("missing source and unknown command fail without side effects", () => {
     assert.ok(!existsSync(join(dir, "out.sqlite")));
     const bad = run(["defragment", "--dest", join(dir, "x.sqlite")]);
     assert.notEqual(bad.status, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Genuine concurrent-destination race: a victim file lands AFTER the
+ * requireAbsent check but BEFORE publication. link(2) publication must
+ * fail with EEXIST and leave the victim byte-identical; the old
+ * check-then-renameSync sequence would silently clobber it and exit 0.
+ */
+test("concurrent destination creation cannot clobber: existing file untouched", async () => {
+  const dir = tmpRoot();
+  try {
+    // Large enough that VACUUM INTO leaves a wide, reliably hittable window.
+    const { store, dbPath } = liveStore(dir, 1500);
+    try {
+      const beforeDb = sha256(dbPath);
+      const dest = join(dir, "race-victim.sqlite");
+      let landed = false;
+      for (let attempt = 0; attempt < 5 && !landed; attempt += 1) {
+        if (existsSync(dest)) rmSync(dest);
+        const child = spawn(process.execPath, [SCRIPT, "backup", "--db", dbPath, "--dest", dest], {
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        const chunks: Buffer[] = [];
+        child.stderr?.on("data", (c: Buffer) => chunks.push(c));
+        const exited = new Promise<number>((resolve) => {
+          child.on("exit", (code) => resolve(code ?? -1));
+        });
+        const deadline = Date.now() + 90_000;
+        while (Date.now() < deadline) {
+          const code = child.exitCode;
+          if (code !== null) break;
+          const partials = readdirSync(dir).filter((f) => f === `race-victim.sqlite.partial-${child.pid}`);
+          if (partials.length > 0 && !existsSync(dest)) {
+            writeFileSync(dest, "VICTIM-CONTENT-MUST-SURVIVE");
+            landed = true;
+            break;
+          }
+          await sleepMs(5);
+        }
+        const status = await exited;
+        if (!landed) continue; // child won before the victim landed; retry.
+        assert.notEqual(status, 0, "publication into a raced destination must fail");
+        assert.equal(readFileSync(dest, "utf-8"), "VICTIM-CONTENT-MUST-SURVIVE", "victim file must be byte-intact");
+        assert.deepEqual(
+          readdirSync(dir).filter((f) => f.includes(".partial-")),
+          [],
+          "our staging file must be cleaned; nothing else touched",
+        );
+      }
+      assert.ok(landed, "race window must be hit within attempts");
+      assert.equal(sha256(dbPath), beforeDb, "source intact");
+    } finally {
+      store.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("two simultaneous publishers serialize: one valid destination, no leftovers", async () => {
+  const dir = tmpRoot();
+  try {
+    const { store, dbPath } = liveStore(dir, 200);
+    try {
+      const dest = join(dir, "duel.sqlite");
+      const runOnce = () =>
+        new Promise<number>((resolve) => {
+          const child = spawn(process.execPath, [SCRIPT, "backup", "--db", dbPath, "--dest", dest], {
+            stdio: ["ignore", "ignore", "ignore"],
+          });
+          child.on("exit", (code) => resolve(code ?? -1));
+        });
+      const [first, second] = await Promise.all([runOnce(), runOnce()]);
+      // Exactly one publisher wins however the writes interleave; the loser
+      // refuses (requireAbsent or EEXIST) instead of overwriting.
+      assert.equal([first, second].filter((s) => s === 0).length, 1, `exactly one winner, got ${first}/${second}`);
+      assert.ok(integrityOk(dest), "winning destination is a valid database");
+      assert.deepEqual(
+        readdirSync(dir).filter((f) => f.includes(".partial-")),
+        [],
+        "loser cleans only its own staging file",
+      );
+      const db = new DatabaseSync(dest, { readOnly: true });
+      try {
+        assert.equal((db.prepare("SELECT COUNT(*) AS n FROM bookings").get() as { n: number }).n, 200);
+      } finally {
+        db.close();
+      }
+    } finally {
+      store.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a foreign staging file is never deleted by our run", () => {
+  const dir = tmpRoot();
+  try {
+    const { store, dbPath } = liveStore(dir, 1);
+    try {
+      const dest = join(dir, "guarded.sqlite");
+      const foreign = `${dest}.partial-42424242`;
+      writeFileSync(foreign, "another process owns this");
+      const before = sha256(foreign);
+      const out = run(["backup", "--db", dbPath, "--dest", dest]);
+      assert.equal(out.status, 0, out.stderr);
+      assert.equal(sha256(foreign), before, "foreign staging file must survive our run");
+      assert.ok(integrityOk(dest));
+    } finally {
+      store.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("backup refuses non-Gather SQLite without touching anything", () => {
+  const dir = tmpRoot();
+  try {
+    const other = join(dir, "other.sqlite");
+    const db = new DatabaseSync(other);
+    db.exec("CREATE TABLE widgets(id TEXT PRIMARY KEY); INSERT INTO widgets VALUES ('w');");
+    db.close();
+    const dest = join(dir, "other-backup.sqlite");
+    const out = run(["backup", "--db", other, "--dest", dest]);
+    assert.notEqual(out.status, 0, "non-Gather database must be refused");
+    assert.match(out.stderr, /not a Gather database/);
+    assert.ok(!existsSync(dest), "no destination may be created");
+    assert.deepEqual(
+      readdirSync(dir).filter((f) => f.includes(".partial-")),
+      [],
+      "no staging file may remain",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("restore preserves uncheckpointed WAL rows from a live snapshot", () => {
+  const dir = tmpRoot();
+  try {
+    const { store, businessId, dbPath } = liveStore(dir, 2);
+    try {
+      // Two more rows committed after the last checkpoint opportunity stay
+      // in the WAL while the writer holds the database open.
+      store.createBooking({ businessId, eventName: "Fictional wal-row-A", sourceReferences: [FIXTURE_SOURCE] });
+      store.createBooking({ businessId, eventName: "Fictional wal-row-B", sourceReferences: [FIXTURE_SOURCE] });
+      assert.ok(existsSync(`${dbPath}-wal`), "rows must sit in the WAL before restore");
+      // Restore straight from the LIVE main file (sidecars alongside): the
+      // old copyFileSync path would silently drop the two WAL rows.
+      const restored = join(dir, "wal-restored.sqlite");
+      const out = run(["restore", "--snapshot", dbPath, "--dest", restored]);
+      assert.equal(out.status, 0, out.stderr);
+      const db = new DatabaseSync(restored, { readOnly: true });
+      try {
+        const names = (db.prepare("SELECT event_name FROM bookings ORDER BY event_name").all() as Array<{ event_name: string }>).map(
+          (r) => r.event_name,
+        );
+        assert.ok(names.includes("Fictional wal-row-A"), `WAL row A preserved, got ${names.length} rows`);
+        assert.ok(names.includes("Fictional wal-row-B"), `WAL row B preserved, got ${names.length} rows`);
+        assert.equal(names.length, 4);
+        assert.ok(integrityOk(restored));
+      } finally {
+        db.close();
+      }
+    } finally {
+      store.close();
+    }
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
