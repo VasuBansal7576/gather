@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -11,6 +11,7 @@ import {
   allocateLoopbackPort,
   ensureLayoutDirectories,
   resolveGatherOpenClawLayout,
+  type RuntimeConnectionLike,
   type SpawnLike,
 } from "../src/runtime/index.ts";
 
@@ -373,5 +374,74 @@ test("start() after a failed stop refuses until the owned child exits; late exit
     await proc.stop(200, 200);
   } finally {
     cleanup();
+  }
+});
+
+test("a failed spawn releases ownership so retry can recover, with fast stop", async () => {
+  const { layout, cleanup } = fixtureLayout();
+  try {
+    ensureLayoutDirectories(layout);
+    // Passes executable validation (exists, regular file, +x) but the
+    // kernel cannot spawn it: a genuine ENOENT with no process behind it.
+    const script = join(layout.secretsDir, "fake-openclaw");
+    writeFileSync(script, "#!/nonexistent-interpreter-xyz\n", { mode: 0o755 });
+    const proc = new OpenClawGatewayProcess(
+      { layout, executable: { command: script } },
+      { skipExecutableVerification: true },
+    );
+    await assert.rejects(proc.start(), /failed to spawn/);
+    assert.equal(proc.currentState, "failed");
+    // No owned process: stop() returns at once instead of burning bounded
+    // waits on a child that was never born.
+    const stoppedAt = Date.now();
+    await proc.stop(500, 200);
+    assert.ok(Date.now() - stoppedAt < 2000, "stop with no owned child is immediate");
+    assert.equal(proc.currentState, "stopped");
+    // Recovery: a working binary at the same path starts normally.
+    writeFileSync(script, "#!/bin/sh\nsleep 5\n");
+    await proc.start();
+    assert.equal(proc.currentState, "running");
+    assert.ok((proc.pid ?? 0) > 0, "real child spawned");
+    await proc.stop(500, 200);
+    assert.equal(proc.currentState, "stopped");
+  } finally {
+    cleanup();
+  }
+});
+
+test("facade recovers from a bad executable and stops clean", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "gather-cancel-facade-"));
+  try {
+    const port = await allocateLoopbackPort();
+    const script = join(directory, "fake-openclaw");
+    writeFileSync(script, "#!/nonexistent-interpreter-xyz\n", { mode: 0o755 });
+    const fakeConnection = {
+      currentState: "connecting",
+      isReady: false,
+      connect: async () => {},
+      close: async () => {},
+    } as unknown as RuntimeConnectionLike;
+    const runtime = new GatherOpenClawRuntime(
+      { rootDir: join(directory, "openclaw"), gatewayPort: port },
+      {
+        processFactory: (opts) =>
+          new OpenClawGatewayProcess(
+            { layout: opts.layout, executable: { command: script }, log: opts.log },
+            { skipExecutableVerification: true },
+          ),
+        connectionFactory: () => fakeConnection,
+      },
+    );
+    await assert.rejects(runtime.start(), /failed to spawn/);
+    const stoppedAt = Date.now();
+    await runtime.stop();
+    assert.ok(Date.now() - stoppedAt < 5000, "facade stop after failed start settles fast");
+    writeFileSync(script, "#!/bin/sh\nsleep 5\n");
+    await runtime.start();
+    assert.equal(runtime.state.process, "running");
+    await runtime.stop();
+    assert.deepEqual(runtime.state, { process: "stopped", connection: "disconnected" });
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
   }
 });
