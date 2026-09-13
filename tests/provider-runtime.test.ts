@@ -499,3 +499,206 @@ test("resolveCalendarPorts gives offer/intake composition an explicitly bound ca
     fx.cleanup();
   }
 });
+
+test("retained ports fail closed after unbind: the Astra stale-port sequence", async () => {
+  const fx = fixture();
+  try {
+    await connectAccount(fx, fx.businessId);
+    assert.deepEqual(fx.providers.bindCalendar({ businessId: fx.businessId, calendarId: LIVE_CALENDAR_ID }), { ok: true });
+    const resolved = fx.providers.resolveCalendarPorts({ businessId: fx.businessId, calendarId: LIVE_CALENDAR_ID });
+    assert.equal(resolved.ok, true);
+    if (!resolved.ok) return;
+    assert.deepEqual(fx.providers.unbindCalendar({ businessId: fx.businessId, calendarId: LIVE_CALENDAR_ID }), { ok: true });
+    // The previously resolved port must NOT act: no fresh resolve happened here.
+    const httpBefore = fx.http.requests.length;
+    const stale = await resolved.ports.calendar.checkAvailability({
+      operationKey: "op-stale-port-1",
+      calendarId: LIVE_CALENDAR_ID,
+      startAt: HOLD.startAt,
+      endAt: HOLD.endAt,
+    });
+    assert.equal(stale.status, "failed");
+    if (stale.status === "failed") assert.equal(stale.error.kind, "not_found");
+    assert.equal(fx.http.requests.length, httpBefore, "no provider HTTP on a stale port");
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test("same-account rebind after unbind invalidates the old port via generation", async () => {
+  const fx = fixture();
+  try {
+    await connectAccount(fx, fx.businessId);
+    assert.deepEqual(fx.providers.bindCalendar({ businessId: fx.businessId, calendarId: LIVE_CALENDAR_ID }), { ok: true });
+    const first = fx.providers.resolveCalendarPorts({ businessId: fx.businessId, calendarId: LIVE_CALENDAR_ID });
+    assert.equal(first.ok, true);
+    if (!first.ok) return;
+    assert.deepEqual(fx.providers.unbindCalendar({ businessId: fx.businessId, calendarId: LIVE_CALENDAR_ID }), { ok: true });
+    assert.deepEqual(fx.providers.bindCalendar({ businessId: fx.businessId, calendarId: LIVE_CALENDAR_ID }), { ok: true });
+    // The old port is stale even though business and account match again.
+    const httpBefore = fx.http.requests.length;
+    const old = await first.ports.calendar.checkAvailability({
+      operationKey: "op-old-gen-1",
+      calendarId: LIVE_CALENDAR_ID,
+      startAt: HOLD.startAt,
+      endAt: HOLD.endAt,
+    });
+    assert.equal(old.status, "failed");
+    if (old.status === "failed") assert.equal(old.error.kind, "conflict");
+    assert.equal(fx.http.requests.length, httpBefore);
+    // A fresh resolve carries the new generation and works.
+    const fresh = fx.providers.resolveCalendarPorts({ businessId: fx.businessId, calendarId: LIVE_CALENDAR_ID });
+    assert.equal(fresh.ok, true);
+    if (!fresh.ok) return;
+    const availability = await fresh.ports.calendar.checkAvailability({
+      operationKey: "op-new-gen-1",
+      calendarId: LIVE_CALENDAR_ID,
+      startAt: HOLD.startAt,
+      endAt: HOLD.endAt,
+    });
+    assert.equal(availability.status, "succeeded");
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test("revocation after resolve fails retained ports as access_revoked", async () => {
+  const fx = fixture();
+  try {
+    await connectAccount(fx, fx.businessId);
+    assert.deepEqual(fx.providers.bindCalendar({ businessId: fx.businessId, calendarId: LIVE_CALENDAR_ID }), { ok: true });
+    const resolved = fx.providers.resolveCalendarPorts({ businessId: fx.businessId, calendarId: LIVE_CALENDAR_ID });
+    assert.equal(resolved.ok, true);
+    if (!resolved.ok) return;
+    const accountId = resolved.ports.account.id;
+    await fx.service.disconnect({ accountId, businessId: fx.businessId });
+    const httpBefore = fx.http.requests.length;
+    const revoked = await resolved.ports.calendar.checkAvailability({
+      operationKey: "op-revoked-port-1",
+      calendarId: LIVE_CALENDAR_ID,
+      startAt: HOLD.startAt,
+      endAt: HOLD.endAt,
+    });
+    assert.equal(revoked.status, "failed");
+    if (revoked.status === "failed") assert.equal(revoked.error.kind, "access_revoked");
+    assert.equal(fx.http.requests.length, httpBefore, "no provider HTTP once revoked");
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test("concurrent and foreign binds surface typed conflicts, never raw constraint errors", async () => {
+  const fx = fixture();
+  try {
+    await connectAccount(fx, fx.businessId);
+    assert.deepEqual(fx.providers.bindCalendar({ businessId: fx.businessId, calendarId: LIVE_CALENDAR_ID }), { ok: true });
+    // A second handle (foreign owner) racing the same calendar id hits the
+    // primary key: it must read back a typed conflict, not a raw throw.
+    const foreignSecrets = new MemorySecretStore();
+    const foreignService = new ConnectionService({
+      store: fx.store,
+      secrets: foreignSecrets,
+      transport: fx.oauth,
+      googleApp: APP,
+      ownerId: "foreign-owner",
+    });
+    const foreignProviders = createProviderConnectors({
+      store: fx.store,
+      ownerId: "foreign-owner",
+      demo: {
+        calendar: new DurableDemoCalendar(fx.store, createDemoConnectors({ calendarSlots: demoFixtureSlots() }).calendar),
+        email: new DurableDemoEmail(fx.store, createDemoConnectors({ calendarSlots: demoFixtureSlots() }).email),
+      },
+      connectionService: foreignService,
+      transport: fx.http,
+    });
+    // Give the foreign owner a distinct connected account so its bind
+    // reaches the contested INSERT (the row is invisible to it): the
+    // primary-key loss must read back as a typed conflict, not a raw throw.
+    fx.oauth.identities.set("foreign-code-1", { accountKey: "google-sub-9", displayName: "Fictional Foreign" });
+    const foreignStart = foreignService.startAuthorization({ businessId: fx.businessId, provider: "google" });
+    await foreignService.completeAuthorization({
+      code: "foreign-code-1",
+      state: new URL(foreignStart.authorizationUrl).searchParams.get("state") ?? "",
+    });
+    const raced = foreignProviders.bindCalendar({ businessId: fx.businessId, calendarId: LIVE_CALENDAR_ID });
+    assert.equal(raced.ok, false);
+    if (!raced.ok) assert.equal(raced.error.kind, "conflict");
+    // Raw conflicting row, same story: typed conflict, original proof kept.
+    const other = fx.store.createBusiness({ name: "Fictional Rival", timezone: "UTC" });
+    fx.store.db
+      .prepare(
+        "INSERT INTO provider_calendar_bindings (calendar_id, business_id, owner_id, connection_account_id, generation, status, created_at) VALUES ('race-cal-1', $b, 'local-owner', 'x', 1, 'bound', '2026-01-01T00:00:00.000Z')",
+      )
+      .run({ $b: other.id });
+    const clash = fx.providers.bindCalendar({ businessId: fx.businessId, calendarId: "race-cal-1" });
+    assert.equal(clash.ok, false);
+    if (!clash.ok) assert.equal(clash.error.kind, "conflict");
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test("unbind compares exact business and account; tombstone preserves rebinding", async () => {
+  const fx = fixture();
+  try {
+    await connectAccount(fx, fx.businessId);
+    assert.deepEqual(fx.providers.bindCalendar({ businessId: fx.businessId, calendarId: LIVE_CALENDAR_ID }), { ok: true });
+    const accountId = fx.providers.listCalendarBindings(fx.businessId)[0]!.accountId;
+    // Wrong account pin refuses to release another account's binding.
+    const mismatch = fx.providers.unbindCalendar({ businessId: fx.businessId, calendarId: LIVE_CALENDAR_ID, accountId: "ghost-acct" });
+    assert.equal(mismatch.ok, false);
+    if (!mismatch.ok) assert.equal(mismatch.error.kind, "conflict");
+    // Foreign business cannot release it either.
+    const other = fx.store.createBusiness({ name: "Fictional Other", timezone: "UTC" });
+    const foreign = fx.providers.unbindCalendar({ businessId: other.id, calendarId: LIVE_CALENDAR_ID });
+    assert.equal(foreign.ok, false);
+    if (!foreign.ok) assert.equal(foreign.error.kind, "not_found");
+    // Exact match releases; the tombstone keeps history and rebinding works.
+    assert.deepEqual(
+      fx.providers.unbindCalendar({ businessId: fx.businessId, calendarId: LIVE_CALENDAR_ID, accountId }),
+      { ok: true },
+    );
+    assert.deepEqual(fx.providers.listCalendarBindings(fx.businessId), []);
+    assert.deepEqual(fx.providers.bindCalendar({ businessId: fx.businessId, calendarId: LIVE_CALENDAR_ID }), { ok: true });
+    assert.deepEqual(fx.providers.listCalendarBindings(fx.businessId).map((b) => b.calendarId), [LIVE_CALENDAR_ID]);
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test("pre-generation binding rows migrate and stay enforceable", async () => {
+  const fx = fixture();
+  try {
+    await connectAccount(fx, fx.businessId);
+    // Simulate a legacy database: drop and recreate the table without the
+    // new columns, insert a legacy row, then rebuild the resolver view.
+    fx.store.db.exec("DROP TABLE provider_calendar_bindings");
+    fx.store.db.exec(
+      "CREATE TABLE provider_calendar_bindings (calendar_id TEXT PRIMARY KEY, business_id TEXT NOT NULL, owner_id TEXT NOT NULL, connection_account_id TEXT NOT NULL, created_at TEXT NOT NULL)",
+    );
+    const accountId = fx.service
+      .getConnections(fx.businessId)
+      .providers.find((p) => p.provider === "google")!
+      .accounts.find((a) => a.provider === "google_calendar")!.id;
+    fx.store.db
+      .prepare("INSERT INTO provider_calendar_bindings VALUES ('legacy-cal-1', $b, 'local-owner', $a, '2026-01-01T00:00:00.000Z')")
+      .run({ $b: fx.businessId, $a: accountId });
+    // A fresh resolver migrates the schema; the legacy row reads as bound
+    // generation 1 and guards ports like any other binding.
+    const migrated = createProviderConnectors({
+      store: fx.store,
+      ownerId: "local-owner",
+      demo: {
+        calendar: new DurableDemoCalendar(fx.store, createDemoConnectors({ calendarSlots: demoFixtureSlots() }).calendar),
+        email: new DurableDemoEmail(fx.store, createDemoConnectors({ calendarSlots: demoFixtureSlots() }).email),
+      },
+      connectionService: fx.service,
+      transport: fx.http,
+    });
+    const ports = migrated.resolveCalendarPorts({ businessId: fx.businessId, calendarId: "legacy-cal-1" });
+    assert.equal(ports.ok, true);
+  } finally {
+    fx.cleanup();
+  }
+});
