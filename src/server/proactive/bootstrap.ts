@@ -233,9 +233,9 @@ export async function refreshProactiveHost(drainTimeoutMs = 5000): Promise<Proac
   for (const business of businesses) {
     // A pause/unconfigure/ineligible branch above awaits per account; a
     // disable landing inside any of those awaits must stop this refresh
-    // from reaching the next business's registration — the registration
-    // itself performs a fresh token read. The post-loop drain then stops
-    // anything already managed.
+    // from reaching the next business's registration — registering under
+    // the kill-switch arms a polling timer that the emergency pause exists
+    // to forbid. The post-loop drain then stops anything already managed.
     if (isDisabled()) break;
     try {
       if (business.status !== "active") {
