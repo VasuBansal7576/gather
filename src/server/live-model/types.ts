@@ -106,6 +106,9 @@ export interface LiveRunRecord {
   runId: string;
   businessId: string;
   accountId: string;
+  /** The submitted remote run identity, when one exists — preserved so a
+   * continuing live run is never re-submitted as a duplicate. */
+  gatewayRunId?: string;
   /** Designated inputs this run was claimed for; resubmits must match exactly. */
   designation: { threadId: string; fileId: string; calendarId: string };
   mode: "scripted" | "live";

@@ -426,3 +426,187 @@ test("live mode without consent reads nothing; missing model is explicit", async
     cleanupFx(fx);
   }
 });
+
+/**
+ * Live-path scripted verification: the REAL lifecycle (runtime.start() ->
+ * run-scoped MCP boundary on loopback -> runtime.tasks submit/wait ->
+ * server-side audit/proposal read-back) runs end-to-end. The only stand-in
+ * is the gateway child + WS connection pair; a scripted "model" drives the
+ * four tools over the real boundary, exactly what the isolated agent would
+ * do through the gateway's own MCP client. No planner exists on this path.
+ */
+test("live path: runtime.tasks drives the run and the proposal is read server-side", async () => {
+  const fx = await fixture();
+  process.env.GATHER_LIVE_CONSENT = "1";
+  try {
+    const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
+    const { StreamableHTTPClientTransport } = await import("@modelcontextprotocol/sdk/client/streamableHttp.js");
+    const { GatherOpenClawRuntime } = await import("../src/runtime/openclaw-runtime.ts");
+    const agentCalls: Array<{ sessionKey?: unknown; idempotencyKey?: unknown; message?: unknown }> = [];
+    let rt: InstanceType<typeof GatherOpenClawRuntime> | undefined;
+    let processStopped = false;
+    const conn = {
+      ready: false,
+      get isReady() { return this.ready; },
+      currentState: "disconnected" as const,
+      async connect() { this.ready = true; },
+      async close() { this.ready = false; },
+      async request<T>(method: string, params?: unknown): Promise<T> {
+        const p = (params ?? {}) as Record<string, unknown>;
+        if (method === "agent") {
+          agentCalls.push(p);
+          // The scripted model stand-in: drive the four tools over the REAL
+          // boundary the started runtime is serving (loopback + bearer).
+          const client = new Client({ name: "scripted-model", version: "0.1.0" });
+          await client.connect(new StreamableHTTPClientTransport(new URL(rt!.mcpUrl!), {
+            requestInit: { headers: { authorization: `Bearer ${rt!.mcpAuthToken}` } },
+          }));
+          await client.callTool({ name: "gather.read_inquiry", arguments: {} });
+          await client.callTool({ name: "gather.read_venue_policy", arguments: {} });
+          await client.callTool({ name: "gather.check_availability", arguments: { ...SLOT } });
+          await client.callTool({ name: "gather.prepare_proposal", arguments: { ...SLOT, guestCount: 12, notes: "GATHER TEST only." } });
+          await client.close();
+          return { runId: "gw-live-run-1", acceptedAt: 1700000000000 } as T;
+        }
+        if (method === "agent.wait") {
+          return { status: "ok", runId: String(p.runId), endedAt: 1700000001000 } as T;
+        }
+        throw new Error(`unexpected method ${method}`);
+      },
+    };
+    const record = await runLiveExecution(
+      { ...baseInput(fx), mode: "live", allowLive: true, idempotencyKey: "exec-live-1" },
+      baseDeps(fx, {
+        tasks: undefined,
+        planner: undefined,
+        runtimeFactory: (options: unknown, deps: unknown) => {
+          rt = new GatherOpenClawRuntime(
+            options as ConstructorParameters<typeof GatherOpenClawRuntime>[0],
+            {
+              ...(deps as object),
+              processFactory: () => ({
+                gatewayToken: "gw-token",
+                pid: 4242,
+                currentState: processStopped ? "stopped" : "running",
+                async start() {},
+                async stop() { processStopped = true; },
+              }),
+              connectionFactory: () => conn as never,
+            },
+          );
+          return rt;
+        },
+      }),
+    );
+    assert.equal(record.status, "ok");
+    assert.equal(record.simulated, false);
+    // One submit through runtime.tasks carrying the instruction; the run
+    // record's steps come from the durable audit, not the model's reply.
+    assert.equal(agentCalls.length, 1);
+    assert.match(String(agentCalls[0]?.message ?? ""), /gather\.read_inquiry/);
+    assert.deepEqual(
+      record.steps.map((step) => [step.tool, step.ok]),
+      [["readInquiry", true], ["readVenuePolicy", true], ["checkAvailability", true], ["prepareProposal", true]],
+    );
+    const proposal = record.proposal!;
+    assert.equal(proposal.terms.totalGbp, 600);
+    const action = fx.store.getProposedAction(proposal.proposedActionId);
+    assert.equal(action.status, "pending_approval");
+    const calls = listToolCalls(fx.store, record.runId);
+    assert.equal(calls.length, 4);
+    // The owned runtime was reaped by close().
+    assert.equal(processStopped, true);
+  } finally {
+    delete process.env.GATHER_LIVE_CONSENT;
+    cleanupFx(fx);
+  }
+});
+
+test("live path: wait timeout preserves the run identity as continuing", async () => {
+  const fx = await fixture();
+  process.env.GATHER_LIVE_CONSENT = "1";
+  try {
+    const { GatherOpenClawRuntime } = await import("../src/runtime/openclaw-runtime.ts");
+    const conn = {
+      get isReady() { return true; },
+      currentState: "ready" as const,
+      async connect() {},
+      async close() {},
+      async request<T>(method: string, params?: unknown): Promise<T> {
+        const p = (params ?? {}) as Record<string, unknown>;
+        if (method === "agent") return { runId: "gw-live-run-slow", acceptedAt: 1700000000000 } as T;
+        if (method === "agent.wait") return { status: "timeout", runId: String(p.runId) } as T;
+        throw new Error(`unexpected method ${method}`);
+      },
+    };
+    const record = await runLiveExecution(
+      { ...baseInput(fx), mode: "live", allowLive: true, idempotencyKey: "exec-live-slow", runTimeoutMs: 300 },
+      baseDeps(fx, {
+        tasks: undefined,
+        planner: undefined,
+        runtimeFactory: (options: unknown, deps: unknown) =>
+          new GatherOpenClawRuntime(
+            options as ConstructorParameters<typeof GatherOpenClawRuntime>[0],
+            {
+              ...(deps as object),
+              processFactory: () => ({ gatewayToken: "gw-token", pid: 1, currentState: "running", async start() {}, async stop() {} }),
+              connectionFactory: () => conn as never,
+            },
+          ),
+      }),
+    );
+    assert.equal(record.status, "continuing");
+    assert.match(record.error ?? "", /gw-live-run-slow/);
+  } finally {
+    delete process.env.GATHER_LIVE_CONSENT;
+    cleanupFx(fx);
+  }
+});
+
+test("live path: replaying a continuing run returns pending without a duplicate submit", async () => {
+  const fx = await fixture();
+  process.env.GATHER_LIVE_CONSENT = "1";
+  try {
+    const { GatherOpenClawRuntime } = await import("../src/runtime/openclaw-runtime.ts");
+    let agentSubmits = 0;
+    const conn = {
+      get isReady() { return true; },
+      currentState: "ready" as const,
+      async connect() {},
+      async close() {},
+      async request<T>(method: string, params?: unknown): Promise<T> {
+        const p = (params ?? {}) as Record<string, unknown>;
+        if (method === "agent") { agentSubmits += 1; return { runId: "gw-live-run-slow", acceptedAt: 1700000000000 } as T; }
+        if (method === "agent.wait") return { status: "timeout", runId: String(p.runId) } as T;
+        throw new Error(`unexpected method ${method}`);
+      },
+    };
+    const deps = baseDeps(fx, {
+      tasks: undefined,
+      planner: undefined,
+      runtimeFactory: (options: unknown, runtimeDeps: unknown) =>
+        new GatherOpenClawRuntime(
+          options as ConstructorParameters<typeof GatherOpenClawRuntime>[0],
+          {
+            ...(runtimeDeps as object),
+            processFactory: () => ({ gatewayToken: "gw-token", pid: 1, currentState: "running", async start() {}, async stop() {} }),
+            connectionFactory: () => conn as never,
+          },
+        ),
+    });
+    const input = { ...baseInput(fx), mode: "live" as const, allowLive: true, idempotencyKey: "exec-live-dupe", runTimeoutMs: 300 };
+    const first = await runLiveExecution(input, deps);
+    assert.equal(first.status, "continuing");
+    assert.equal(first.gatewayRunId, "gw-live-run-slow");
+    // Same key while the remote run may still be executing: honest pending,
+    // never a second remote run under the same caller key.
+    const second = await runLiveExecution(input, deps);
+    assert.equal(second.runId, first.runId);
+    assert.equal(second.status, "continuing");
+    assert.equal(second.gatewayRunId, "gw-live-run-slow");
+    assert.equal(agentSubmits, 1, "a continuing live run is never re-submitted");
+  } finally {
+    delete process.env.GATHER_LIVE_CONSENT;
+    cleanupFx(fx);
+  }
+});

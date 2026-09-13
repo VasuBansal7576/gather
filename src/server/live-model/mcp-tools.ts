@@ -3,7 +3,7 @@ import type { CalendarConnector, DocumentRetriever, InquiryThreadReader } from "
 import type { GatherStore } from "../sqlite-store.ts";
 import { defineGatherTool, type GatherTool, type GatherToolExecution, type GatherToolResult } from "../../runtime/mcp.ts";
 import { createLiveTools } from "./tools.ts";
-import type { AvailabilityAttestation, InquiryTerms, VenuePolicy } from "./types.ts";
+import type { AvailabilityAttestation, InquiryTerms, PreparedProposal, VenuePolicy } from "./types.ts";
 import { LiveModelError } from "./types.ts";
 
 /**
@@ -42,6 +42,9 @@ export interface LiveMcpScope {
     inquiry?: InquiryTerms;
     policy?: VenuePolicy;
     availability?: AvailabilityAttestation;
+    /** Server-side capture of the prepared proposal — the run record reads
+     * this, never the model's narration. */
+    proposal?: PreparedProposal;
   };
 }
 
@@ -168,6 +171,7 @@ export function createLiveMcpTools(scope: LiveMcpScope): GatherTool[] {
               notes: args.notes,
             },
           });
+          scope.state.proposal = proposal;
           record("gather.prepare_proposal", true);
           return ok(`Proposal ${proposal.proposedActionId}: GBP ${proposal.terms.totalGbp} (pending owner approval; no receipt)`, {
             bookingId: proposal.bookingId,
