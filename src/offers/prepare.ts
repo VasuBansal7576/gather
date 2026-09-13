@@ -63,6 +63,28 @@ function readSourceReferences(value: unknown, path: string): SourceReference[] {
   return value as SourceReference[];
 }
 
+export function readSourceReferenceList(value: unknown, path: string): SourceReference[] {
+  return readSourceReferences(value, path).map((source) => ({ ...source }));
+}
+
+/**
+ * Explicit, supported currency only: a verified fact never makes an absent
+ * or malformed field verified. The code must render through the same Intl
+ * path used for display, so anything Intl rejects (or that is not a
+ * three-letter code) is malformed, never defaulted to USD.
+ */
+export function readCurrency(value: unknown, path: string): string {
+  if (typeof value !== "string" || !/^[A-Z]{3}$/.test(value)) {
+    throw new Error(`${path} must be an explicit ISO 4217 currency code (e.g. USD); an absent or malformed currency is never defaulted`);
+  }
+  try {
+    new Intl.NumberFormat("en-US", { style: "currency", currency: value });
+  } catch {
+    throw new Error(`${path} currency "${value}" is not supported for display; use an explicit supported code`);
+  }
+  return value;
+}
+
 function readOptionalNonEmptyString(value: unknown, path: string): string | undefined {
   if (value === undefined) return undefined;
   if (!isNonEmptyString(value)) throw new Error(`${path} must be a non-empty string when present`);
@@ -329,7 +351,7 @@ export function readServiceCapability(value: unknown, path: string): ServiceCapa
 
 function readPriceBook(value: unknown, path: string): PriceBook {
   if (!isRecord(value)) throw new Error(`${path} must be an object`);
-  if (!isNonEmptyString(value.currency)) throw new Error(`${path}.currency must be a non-empty string`);
+  const currency = readCurrency(value.currency, `${path}.currency`);
   if (!Array.isArray(value.lines)) throw new Error(`${path}.lines must be an array`);
   if (!Array.isArray(value.costs)) throw new Error(`${path}.costs must be an array`);
   const lines = value.lines.map((line, index) => readPriceLine(line, `${path}.lines[${index}]`));
@@ -338,7 +360,7 @@ function readPriceBook(value: unknown, path: string): PriceBook {
     throw new Error(`${path}.costsComplete must be an explicit boolean attesting whether the cost ledger is complete`);
   }
   return {
-    currency: value.currency,
+    currency,
     lines,
     costs,
     costsComplete: value.costsComplete,
@@ -1229,13 +1251,17 @@ export function prepareOffer(input: unknown): OfferPreparationResult {
   if (!blocked && validWindow && orderedSpaces.length > 0) {
     /* Primary path: only spaces whose requested window is covered for them
        and free of their own busy evidence are attempted, so Room B busy
-       never blocks Room A (and vice versa). */
+       never blocks Room A (and vice versa). Every claimable space is
+       evaluated and the first fully-clean candidate becomes primary, so a
+       suitable room is never left unused behind a decision-blocked first
+       fit: candidates needing owner decisions are not offered in a clean
+       result — the owner re-runs preparation after resolving them upstream
+       instead of inheriting another room's pending decision. */
     const cleanSpaces = orderedSpaces.filter((space) =>
       windowClaimableForSpace(availability.slots, inquiry.startAt, inquiry.endAt, space.spaceId),
     );
     if (cleanSpaces.length > 0) {
-      let primaryPlaced = false;
-      for (const space of cleanSpaces) {
+      const evaluated: CandidateAttempt[] = cleanSpaces.map((space) => {
         const attempt = buildCandidate({
           inquiry,
           knowledge,
@@ -1243,18 +1269,45 @@ export function prepareOffer(input: unknown): OfferPreparationResult {
           space,
           startAt: inquiry.startAt,
           endAt: inquiry.endAt,
-          rank: primaryPlaced ? "alternative" : "primary",
+          rank: "alternative",
           version,
           ...(supersedesFingerprint === undefined ? {} : { supersedesFingerprint }),
         });
-        conflicts.push(...attempt.conflicts);
-        ownerDecisions.push(...attempt.decisions);
         if (primaryProfitability === undefined) primaryProfitability = attempt.profitability;
-        if (attempt.candidate !== undefined) {
-          offers.push(attempt.candidate);
-          if (attempt.candidate.rank === "primary") primaryPlaced = true;
+        return attempt;
+      });
+      let primaryIndex = evaluated.findIndex(
+        (attempt) => attempt.candidate !== undefined && attempt.conflicts.length === 0 && attempt.decisions.length === 0,
+      );
+      if (primaryIndex === -1) primaryIndex = evaluated.findIndex((attempt) => attempt.candidate !== undefined);
+      if (primaryIndex === -1) {
+        /* No candidate at all: surface every attempt's findings, as before. */
+        for (const attempt of evaluated) {
+          conflicts.push(...attempt.conflicts);
+          ownerDecisions.push(...attempt.decisions);
         }
-        if (primaryPlaced) break;
+      } else {
+        /* Rebuild the promoted candidate as primary so rank wording and the
+           fingerprint match exactly what approval must bind. */
+        const promoted = buildCandidate({
+          inquiry,
+          knowledge,
+          availability,
+          space: cleanSpaces[primaryIndex] as SpaceKnowledge,
+          startAt: inquiry.startAt,
+          endAt: inquiry.endAt,
+          rank: "primary",
+          version,
+          ...(supersedesFingerprint === undefined ? {} : { supersedesFingerprint }),
+        });
+        conflicts.push(...promoted.conflicts);
+        ownerDecisions.push(...promoted.decisions);
+        if (promoted.candidate !== undefined) offers.push(promoted.candidate);
+        /* Other fully-clean candidates are explicit alternatives. */
+        evaluated.forEach((attempt, index) => {
+          if (index === primaryIndex || attempt.candidate === undefined) return;
+          if (attempt.conflicts.length === 0 && attempt.decisions.length === 0) offers.push(attempt.candidate);
+        });
       }
     } else {
       const unavailableEvidence = availability.slots.filter((slot) => !slot.available);

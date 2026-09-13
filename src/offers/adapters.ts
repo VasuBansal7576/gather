@@ -3,11 +3,13 @@ import {
   canonicalizeValue,
   readAvailabilityEvidence,
   readCostLine,
+  readCurrency,
   readPolicyRule,
   readPriceLine,
   readServiceCapability,
   readSpaceKnowledge,
   readScopedExceptionValue,
+  readSourceReferenceList,
   readTimezone,
 } from "./prepare.ts";
 import type {
@@ -105,7 +107,7 @@ function readBoundsRecord(value: unknown, path: string): BoundsRecord {
     costsComplete = value.costsComplete;
   }
   return {
-    currency: isNonEmptyString(value.currency) ? value.currency : "USD",
+    currency: readCurrency(value.currency, `${path}.currency`),
     floorCents: readBound("floorCents"),
     minMarginBps: readBound("minMarginBps"),
     depositBps: readBound("depositBps"),
@@ -190,7 +192,15 @@ export function adaptBusinessFacts(input: unknown, scope?: unknown): AdaptedKnow
     }
     if (fact.businessId !== undefined) businessIds.add(fact.businessId);
     const value = fact.value as Record<string, unknown>;
-    const sources = fact.sourceReferences as SourceReference[];
+    /* Source arrays are validated as real source objects: a malformed
+       element cannot mint verified authority through an `as` assertion. */
+    let sources: SourceReference[];
+    try {
+      sources = readSourceReferenceList(fact.sourceReferences, `fact.sourceReferences:${fact.id}`);
+    } catch (error) {
+      unparseable.push({ factId: fact.id, key: fact.key, reason: describeFailure(error) });
+      continue;
+    }
     seenSources.push(...sources);
     const path = `${fact.key}:${fact.id}`;
     try {
