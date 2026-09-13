@@ -8,6 +8,12 @@ import {
   type ExtractionBackend,
   type PinnedSource,
 } from "./backend.ts";
+import {
+  createExtractionLedger,
+  recordExtractionCandidate,
+  recordExtractionRun,
+  type ExtractionLedger,
+} from "./ledger.ts";
 
 /**
  * Bounded source-to-candidate extraction boundary (host side).
@@ -34,6 +40,14 @@ export const MAX_CANDIDATES = 20;
 export const MAX_VALUE_BYTES = 4096;
 export const MAX_VALUE_DEPTH = 6;
 export const MAX_VALUE_KEYS = 64;
+/** Aggregate budget across the whole value: total nodes and total keys. */
+export const MAX_VALUE_NODES = 10_000;
+/**
+ * Total keys anywhere in the value. Sized below what the byte cap already
+ * admits (~450 tiny keys fit 4096 bytes), so this bound is reachable and
+ * names key-bloat specifically instead of failing as opaque bytes.
+ */
+export const MAX_VALUE_TOTAL_KEYS = 256;
 export const MAX_KEY_BYTES = 128;
 export const MAX_SUBJECT_BYTES = 256;
 export const MAX_EVIDENCE_SPANS = 8;
@@ -119,6 +133,43 @@ function sha256Hex(text: string): string {
   return createHash("sha256").update(text, "utf-8").digest("hex");
 }
 
+/**
+ * Canonical intake identity for one extracted candidate position. Every
+ * component is host-observed (never model-asserted): owning business and
+ * account, exact source locator and revision, the computed content digest,
+ * the backend run that produced it, and the caller command plus position.
+ */
+export function deriveIntakeId(parts: {
+  businessId: string;
+  accountId: string;
+  locator: string;
+  sourceRevision?: string;
+  contentDigest: string;
+  backendId: string;
+  taskId: string;
+  idempotencyKey: string;
+  index: number;
+}): string {
+  const material = [
+    parts.businessId,
+    parts.accountId,
+    parts.locator,
+    parts.sourceRevision ?? "",
+    parts.contentDigest,
+    parts.backendId,
+    parts.taskId,
+    parts.idempotencyKey,
+    String(parts.index),
+  ].join("");
+  return `ex_${sha256Hex(material).slice(0, 32)}`;
+}
+
+/** True only for primary-key collisions on the candidate identity row. */
+function isIntakeIdentityConflict(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /UNIQUE constraint failed: knowledge_candidates/i.test(message);
+}
+
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const proto = Object.getPrototypeOf(value);
@@ -126,6 +177,7 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 }
 
 function jsonDepth(value: unknown, depth = 0): number {
+  // Only called after checkJsonBudget caps depth: recursion stays bounded.
   if (Array.isArray(value)) {
     let max = depth;
     for (const item of value) max = Math.max(max, jsonDepth(item, depth + 1));
@@ -139,13 +191,53 @@ function jsonDepth(value: unknown, depth = 0): number {
   return depth;
 }
 
-function isFiniteJson(value: unknown): boolean {
-  if (value === undefined) return false;
-  if (typeof value === "number") return Number.isFinite(value);
-  if (typeof value === "string" || typeof value === "boolean" || value === null) return true;
-  if (Array.isArray(value)) return value.every(isFiniteJson);
-  if (isPlainObject(value)) return Object.values(value).every(isFiniteJson);
-  return false;
+/**
+ * Iterative bounded JSON walk: no recursion, so cyclic or abyssal backend
+ * objects cannot overflow the stack. Runs BEFORE any serialization or depth
+ * computation — a value that exceeds node, depth, key, or finiteness budgets
+ * is rejected without ever calling JSON.stringify on it.
+ */
+function checkJsonBudget(value: unknown): { ok: true } | { ok: false; reason: string } {
+  let nodes = 0;
+  let totalKeys = 0;
+  const ancestors = new Set<unknown>();
+  const stack: { node: unknown; depth: number; closing: boolean }[] = [{ node: value, depth: 0, closing: false }];
+  while (stack.length > 0) {
+    const frame = stack.pop() as { node: unknown; depth: number; closing: boolean };
+    if (frame.closing) {
+      ancestors.delete(frame.node);
+      continue;
+    }
+    nodes += 1;
+    if (nodes > MAX_VALUE_NODES) return { ok: false, reason: `value exceeds max ${MAX_VALUE_NODES} JSON nodes` };
+    if (frame.depth > MAX_VALUE_DEPTH) return { ok: false, reason: `value exceeds max depth ${MAX_VALUE_DEPTH}` };
+    const node = frame.node;
+    if (node === undefined) return { ok: false, reason: "value must be finite JSON (no undefined)" };
+    if (typeof node === "number") {
+      if (!Number.isFinite(node)) return { ok: false, reason: "value must be finite JSON (no NaN/Infinity)" };
+      continue;
+    }
+    if (typeof node === "string" || typeof node === "boolean" || node === null) continue;
+    if (typeof node !== "object") return { ok: false, reason: "value must be finite JSON (no functions/symbols)" };
+    if (ancestors.has(node)) return { ok: false, reason: "value contains a cyclic reference" };
+    ancestors.add(node);
+    if (Array.isArray(node)) {
+      stack.push({ node, depth: frame.depth, closing: true });
+      for (let index = node.length - 1; index >= 0; index -= 1) {
+        stack.push({ node: node[index], depth: frame.depth + 1, closing: false });
+      }
+      continue;
+    }
+    if (!isPlainObject(node)) return { ok: false, reason: "value must be plain JSON objects and arrays" };
+    const keys = Object.keys(node);
+    totalKeys += keys.length;
+    if (totalKeys > MAX_VALUE_TOTAL_KEYS) return { ok: false, reason: `value exceeds max ${MAX_VALUE_TOTAL_KEYS} total keys` };
+    stack.push({ node, depth: frame.depth, closing: true });
+    for (let index = keys.length - 1; index >= 0; index -= 1) {
+      stack.push({ node: (node as Record<string, unknown>)[keys[index] as string], depth: frame.depth + 1, closing: false });
+    }
+  }
+  return { ok: true };
 }
 
 interface ValidatedRaw {
@@ -184,7 +276,10 @@ function validateRawCandidate(raw: unknown, text: string): { ok: true; value: Va
   }
   const value = raw.value;
   if (!isPlainObject(value)) return { ok: false, reason: "value must be a finite JSON object" };
-  if (!isFiniteJson(value)) return { ok: false, reason: "value must be finite JSON (no NaN/Infinity/undefined/functions)" };
+  // Budget first (iterative, cycle-safe): only values inside node/depth/key
+  // budgets may be serialized or walked recursively below.
+  const budget = checkJsonBudget(value);
+  if (!budget.ok) return { ok: false, reason: budget.reason };
   if (Buffer.byteLength(JSON.stringify(value), "utf-8") > MAX_VALUE_BYTES) {
     return { ok: false, reason: `value exceeds ${MAX_VALUE_BYTES} bytes` };
   }
@@ -242,6 +337,7 @@ export async function extractSourceCandidates(
   service: KnowledgeService,
   backend: ExtractionBackend,
   input: ExtractSourceInput,
+  ledger?: ExtractionLedger,
 ): Promise<ExtractionOutcome> {
   if (input.idempotencyKey.trim().length === 0) {
     return fail("invalid", backend, "idempotencyKey is required");
@@ -261,6 +357,9 @@ export async function extractSourceCandidates(
   if (!Number.isInteger(maxCandidates) || maxCandidates < 1 || maxCandidates > MAX_CANDIDATES) {
     return fail("invalid", backend, `maxCandidates must be an integer in 1..${MAX_CANDIDATES}`);
   }
+  if (input.awaitTimeoutMs !== undefined && (!Number.isInteger(input.awaitTimeoutMs) || input.awaitTimeoutMs <= 0)) {
+    return fail("invalid", backend, "awaitTimeoutMs must be a positive integer when present");
+  }
 
   let taskId: string;
   try {
@@ -270,43 +369,75 @@ export async function extractSourceCandidates(
       text: input.text,
       maxCandidates,
     });
+    // The submission echo is validated before anything downstream may name
+    // this run: a backend that answers for another command is not ours.
+    if (typeof submitted.taskId !== "string" || submitted.taskId.length === 0) {
+      return fail("backend_unavailable", backend, "backend submission returned no usable task id");
+    }
+    if (submitted.idempotencyKey !== input.idempotencyKey) {
+      return fail("backend_unavailable", backend, "backend submission echoed a different idempotency key; refusing a foreign run");
+    }
     taskId = submitted.taskId;
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
     return fail("backend_unavailable", backend, `extraction submit failed: ${detail.slice(0, 300)}`);
   }
 
+
+  // Every terminal outcome after a validated submission is recorded in the
+  // ledger (attempt audit); pre-submit rejections record nothing because no
+  // backend run exists to trace.
+  const finish = (outcome: ExtractionOutcome): ExtractionOutcome => {
+    if (ledger !== undefined) {
+      recordExtractionRun(ledger, {
+        idempotencyKey: input.idempotencyKey,
+        businessId: input.source.businessId,
+        accountId: input.source.accountId,
+        locator: input.source.locator,
+        sourceRevision: input.source.sourceRevision ?? null,
+        contentDigest: digest,
+        backendId: backend.backendId,
+        taskId,
+        simulated: backend.simulated,
+        status: outcome.status,
+        reason: outcome.reason ?? null,
+      });
+    }
+    return outcome;
+  };
+
   let awaited: AwaitedExtraction;
   try {
     awaited = await backend.awaitExtraction(taskId, input.awaitTimeoutMs ?? DEFAULT_AWAIT_TIMEOUT_MS);
-  } catch (error) {
-    if (error instanceof BackendUnavailableError) {
-      return fail("backend_unavailable", backend, `extraction await failed: ${error.message.slice(0, 300)}`, taskId);
-    }
-    throw error;
+  } catch {
+    // Every await failure — timeout, transport, or programmer error — is a
+    // bounded backend_unavailable outcome with zero rows fed, never a raw
+    // throw past the boundary.
+    return fail("backend_unavailable", backend, "extraction await failed before a terminal result", taskId);
   }
   if (awaited.status !== "ok") {
-    return fail("backend_unavailable", backend, `backend run ended ${awaited.status}${awaited.error ? `: ${awaited.error.slice(0, 300)}` : ""}`, taskId);
+    return finish(fail("backend_unavailable", backend, `backend run ended ${awaited.status}${awaited.error ? `: ${awaited.error.slice(0, 300)}` : ""}`, taskId));
   }
 
   const payload = awaited.payload;
   if (!isPlainObject(payload)) {
-    return fail("invalid", backend, "backend payload must be a JSON object", taskId);
+    return finish(fail("invalid", backend, "backend payload must be a JSON object", taskId));
   }
   const rawCandidates = payload.candidates;
   if (!Array.isArray(rawCandidates)) {
-    return fail("invalid", backend, "backend payload must carry a candidates array", taskId);
+    return finish(fail("invalid", backend, "backend payload must carry a candidates array", taskId));
   }
   if (rawCandidates.length > maxCandidates) {
-    return fail("invalid", backend, `backend returned ${rawCandidates.length} candidates, exceeding the accepted max ${maxCandidates}`, taskId);
+    return finish(fail("invalid", backend, `backend returned ${rawCandidates.length} candidates, exceeding the accepted max ${maxCandidates}`, taskId));
   }
   if (rawCandidates.length === 0) {
-    return { status: "no_relevant_facts", backendId: backend.backendId, taskId, simulated: backend.simulated, accepted: [], rejected: [], reason: "backend returned no candidates" };
+    return finish({ status: "no_relevant_facts", backendId: backend.backendId, taskId, simulated: backend.simulated, accepted: [], rejected: [], reason: "backend returned no candidates" });
   }
 
   const accepted: AcceptedExtraction[] = [];
   const rejected: RejectedExtraction[] = [];
   const refs = hostSourceReferences(input.source);
+  const runNote = `extracted via ${backend.backendId}/${taskId}${backend.simulated ? " (simulated)" : ""}`;
   rawCandidates.forEach((raw, index) => {
     const validated = validateRawCandidate(raw, input.text);
     if (!validated.ok) {
@@ -314,6 +445,24 @@ export async function extractSourceCandidates(
       return;
     }
     const v = validated.value;
+    // Canonical intake identity binds business + account + source locator +
+    // revision + content digest + backend task + caller command + position:
+    // retries reproduce it exactly (stable dedupe), while any altered
+    // replay (different bytes, source, or command) names a different row
+    // instead of colliding. A primary-key hit therefore always means the
+    // same command re-ran against changed model content, and is reported
+    // deterministically rather than leaking a raw UNIQUE error.
+    const intakeId = deriveIntakeId({
+      businessId: input.source.businessId,
+      accountId: input.source.accountId,
+      locator: input.source.locator,
+      sourceRevision: input.source.sourceRevision,
+      contentDigest: digest,
+      backendId: backend.backendId,
+      taskId,
+      idempotencyKey: input.idempotencyKey,
+      index,
+    });
     try {
       const stored: KnowledgeCandidate = service.intakeCandidate({
         businessId: input.source.businessId,
@@ -325,20 +474,54 @@ export async function extractSourceCandidates(
         // business ids, or provenance are never read, never stored.
         sourceReferences: refs,
         ...(input.source.sourceRevision === undefined ? {} : { sourceRevision: input.source.sourceRevision }),
-        intakeId: `${input.idempotencyKey}:candidate-${index}`,
+        intakeId,
+        note: runNote,
       });
       accepted.push({ key: v.key, subjectId: v.subjectId, value: v.value, confidence: v.confidence, candidateId: stored.id, evidence: v.evidence });
+      if (ledger !== undefined) {
+        recordExtractionCandidate(ledger, input.idempotencyKey, {
+          candidateIndex: index,
+          candidateId: stored.id,
+          intakeId,
+          factKey: v.key,
+          subjectId: v.subjectId,
+          confidence: v.confidence,
+          evidenceJson: JSON.stringify(v.evidence),
+        });
+      }
     } catch (error) {
+      if (isIntakeIdentityConflict(error)) {
+        rejected.push({ index, reason: "intake identity already used for different content; altered replays are rejected, never merged" });
+        return;
+      }
       const detail = error instanceof Error ? `${(error as { code?: unknown }).code ?? error.name}: ${error.message}` : String(error);
       rejected.push({ index, reason: `intake rejected: ${detail.slice(0, 300)}` });
     }
   });
 
-  if (accepted.length === 0) {
-    return { status: "invalid", backendId: backend.backendId, taskId, simulated: backend.simulated, accepted, rejected, reason: "no candidate survived validation" };
+  const terminal: ExtractionOutcome = (() => {
+    if (accepted.length === 0) {
+      return { status: "invalid", backendId: backend.backendId, taskId, simulated: backend.simulated, accepted, rejected, reason: "no candidate survived validation" };
+    }
+    if (rejected.length > 0) {
+      return { status: "needs_review", backendId: backend.backendId, taskId, simulated: backend.simulated, accepted, rejected, reason: `${rejected.length} of ${rawCandidates.length} candidates failed validation; accepted entries are pending only` };
+    }
+    return { status: "accepted", backendId: backend.backendId, taskId, simulated: backend.simulated, accepted, rejected };
+  })();
+  if (ledger !== undefined) {
+    recordExtractionRun(ledger, {
+      idempotencyKey: input.idempotencyKey,
+      businessId: input.source.businessId,
+      accountId: input.source.accountId,
+      locator: input.source.locator,
+      sourceRevision: input.source.sourceRevision ?? null,
+      contentDigest: digest,
+      backendId: backend.backendId,
+      taskId,
+      simulated: backend.simulated,
+      status: terminal.status,
+      reason: terminal.reason ?? null,
+    });
   }
-  if (rejected.length > 0) {
-    return { status: "needs_review", backendId: backend.backendId, taskId, simulated: backend.simulated, accepted, rejected, reason: `${rejected.length} of ${rawCandidates.length} candidates failed validation; accepted entries are pending only` };
-  }
-  return { status: "accepted", backendId: backend.backendId, taskId, simulated: backend.simulated, accepted, rejected };
+  return terminal;
 }

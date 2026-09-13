@@ -352,3 +352,209 @@ test("prior battery: owner confirm after extraction mints the only verified fact
     assert.ok(snap.facts.some((f) => f.key === "policy"));
   } finally { fx.cleanup(); }
 });
+
+test("abyssal and cyclic values fail closed with typed invalid, never throw", async () => {
+  const fx = fixture();
+  try {
+    let deep: unknown = 0;
+    for (let i = 0; i < 200_000; i += 1) deep = { a: deep };
+    const abyss = await extractSourceCandidates(fx.service, new FakeBackend(() => ok([{
+      key: "space", subjectId: "deep", value: { v: deep }, confidence: "probable", evidence: ["x"],
+    }])), input(fx, "evidence x here", "op-deep"));
+    assert.equal(abyss.status, "invalid");
+    assert.equal(abyss.accepted.length, 0);
+    const cyclic: Record<string, unknown> = { a: 1 };
+    cyclic.self = cyclic;
+    const loop = await extractSourceCandidates(fx.service, new FakeBackend(() => ok([{
+      key: "space", subjectId: "loop", value: { v: cyclic }, confidence: "probable", evidence: ["x"],
+    }])), input(fx, "evidence x here", "op-loop"));
+    assert.equal(loop.status, "invalid");
+    assert.ok(loop.rejected.some((r) => /cyclic/i.test(r.reason)));
+    assert.equal(fx.service.listCandidates(fx.businessId).length, 0);
+  } finally { fx.cleanup(); }
+});
+
+test("aggregate key budget rejects wide values before serialization", async () => {
+  const fx = fixture();
+  try {
+    const wide: Record<string, unknown> = {};
+    for (let i = 0; i < 300; i += 1) wide[`k${i}`] = i;
+    const out = await extractSourceCandidates(fx.service, new FakeBackend(() => ok([{
+      key: "space", subjectId: "wide", value: wide, confidence: "probable", evidence: ["x"],
+    }])), input(fx, "evidence x here", "op-wide"));
+    assert.equal(out.status, "invalid");
+    assert.ok(out.rejected.some((r) => /total keys/i.test(r.reason)));
+  } finally { fx.cleanup(); }
+});
+
+test("cross-business same key and bytes intake separately, never collides", async () => {
+  const fx = fixture();
+  const other = fx.store.createBusiness({ name: "Second Hall", timezone: "UTC" });
+  try {
+    const text = "The hall seats forty guests.";
+    const cand = () => ({
+      key: "space", subjectId: "hall",
+      value: { spaceId: "hall", name: "Hall", capacityMin: 1, capacityMax: 40 },
+      confidence: "probable" as const, evidence: ["seats forty guests"],
+    });
+    const first = await extractSourceCandidates(fx.service, new FakeBackend(() => ok([cand()])), {
+      source: pinned(fx.businessId), text, idempotencyKey: "op-shared-key",
+    });
+    const second = await extractSourceCandidates(fx.service, new FakeBackend(() => ok([cand()])), {
+      source: { ...pinned(other.id), businessId: other.id }, text, idempotencyKey: "op-shared-key",
+    });
+    assert.equal(first.status, "accepted");
+    assert.equal(second.status, "accepted");
+    assert.notEqual(first.accepted[0]?.candidateId, second.accepted[0]?.candidateId);
+    assert.equal(fx.service.listCandidates(fx.businessId).length, 1);
+    assert.equal(fx.service.listCandidates(other.id).length, 1);
+  } finally { fx.cleanup(); }
+});
+
+test("altered same-command replay is rejected deterministically, never raw UNIQUE", async () => {
+  const fx = fixture();
+  try {
+    const text = "The hall seats forty guests.";
+    const first = await extractSourceCandidates(fx.service, new FakeBackend(() => ok([{
+      key: "space", subjectId: "hall",
+      value: { spaceId: "hall", name: "Hall", capacityMin: 1, capacityMax: 40 },
+      confidence: "probable", evidence: ["seats forty guests"],
+    }])), { source: pinned(fx.businessId), text, idempotencyKey: "op-altered" });
+    assert.equal(first.status, "accepted");
+    const second = await extractSourceCandidates(fx.service, new FakeBackend(() => ok([{
+      key: "space", subjectId: "hall",
+      value: { spaceId: "hall", name: "Hall CHANGED", capacityMin: 1, capacityMax: 40 },
+      confidence: "probable", evidence: ["seats forty guests"],
+    }])), { source: pinned(fx.businessId), text, idempotencyKey: "op-altered" });
+    // Zero survivors: invalid with a deterministic reason, never a raw leak.
+    assert.equal(second.status, "invalid");
+    assert.ok(second.rejected.some((r) => /already used for different content/.test(r.reason)), JSON.stringify(second.rejected));
+    assert.ok(!JSON.stringify(second).includes("UNIQUE constraint"));
+  } finally { fx.cleanup(); }
+});
+
+test("submission echo mismatch and bad await timeout fail before any storage", async () => {
+  const fx = fixture();
+  try {
+    const liar = {
+      backendId: "fake-liar", simulated: true,
+      submits: [] as string[],
+      async submitExtraction(sub: { idempotencyKey: string }) {
+        this.submits.push(sub.idempotencyKey);
+        return { taskId: "t-x", acceptedAt: 1, idempotencyKey: "different-key" };
+      },
+      async awaitExtraction(): Promise<AwaitedExtraction> {
+        throw new Error("unreachable");
+      },
+    };
+    const echoed = await extractSourceCandidates(fx.service, liar, input(fx, "Some text here.", "op-echo"));
+    assert.equal(echoed.status, "backend_unavailable");
+    assert.match(echoed.reason ?? "", /different idempotency key/);
+    assert.equal(fx.service.listCandidates(fx.businessId).length, 0);
+    const badTimeout = await extractSourceCandidates(
+      fx.service, new FakeBackend(() => ok([])), { ...input(fx, "Some text here.", "op-timeout"), awaitTimeoutMs: -5 },
+    );
+    assert.equal(badTimeout.status, "invalid");
+  } finally { fx.cleanup(); }
+});
+
+test("generic await throws map to backend_unavailable, never raw", async () => {
+  const fx = fixture();
+  try {
+    const flaky = {
+      backendId: "fake-flaky", simulated: true,
+      async submitExtraction(sub: { idempotencyKey: string }) {
+        return { taskId: "t-f", acceptedAt: 1, idempotencyKey: sub.idempotencyKey };
+      },
+      async awaitExtraction(): Promise<AwaitedExtraction> {
+        throw new Error("socket hangup");
+      },
+    };
+    const out = await extractSourceCandidates(fx.service, flaky, input(fx, "Some text here.", "op-flaky"));
+    assert.equal(out.status, "backend_unavailable");
+    assert.equal(out.accepted.length, 0);
+    assert.equal(fx.service.listCandidates(fx.businessId).length, 0);
+  } finally { fx.cleanup(); }
+});
+
+test("ledger persists attributable run lineage durably on the same handle", async () => {
+  const fx = fixture();
+  try {
+    const { createExtractionLedger, getExtractionRun, listExtractionRunCandidates } = await import(
+      "../src/knowledge/extraction/ledger.ts"
+    );
+    const ledger = createExtractionLedger(fx.store.db);
+    const text = "The hall seats forty guests with garden views.";
+    const out = await extractSourceCandidates(
+      fx.service,
+      new FakeBackend(() => ok([{
+        key: "space", subjectId: "hall",
+        value: { spaceId: "hall", name: "Hall", capacityMin: 1, capacityMax: 40 },
+        confidence: "probable", evidence: ["seats forty guests", "garden views"],
+      }])),
+      { source: pinned(fx.businessId), text, idempotencyKey: "op-ledger-1" },
+      ledger,
+    );
+    assert.equal(out.status, "accepted");
+    const run = getExtractionRun(ledger, "op-ledger-1");
+    assert.ok(run !== undefined);
+    assert.equal(run?.businessId, fx.businessId);
+    assert.equal(run?.accountId, "fictional-account-1");
+    assert.equal(run?.locator, "fixture://fictional/gmail/thread-9");
+    assert.equal(run?.sourceRevision, "thread-r1");
+    assert.equal(run?.backendId, "fake-extraction");
+    assert.equal(typeof run?.taskId, "string");
+    assert.equal(run?.simulated, true);
+    assert.equal(run?.status, "accepted");
+    assert.equal(run?.contentDigest.length, 64);
+    const rows = listExtractionRunCandidates(ledger, "op-ledger-1");
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0]?.candidateId, out.accepted[0]?.candidateId);
+    assert.deepEqual(JSON.parse(rows[0]?.evidenceJson ?? "[]"), ["seats forty guests", "garden views"]);
+    // A failed run is recorded too, with zero candidate rows.
+    const failed = await extractSourceCandidates(
+      fx.service,
+      new FakeBackend(() => ({ status: "error" as const, payload: null, error: "boom" })),
+      { source: pinned(fx.businessId), text, idempotencyKey: "op-ledger-2" },
+      ledger,
+    );
+    assert.equal(failed.status, "backend_unavailable");
+    assert.equal(getExtractionRun(ledger, "op-ledger-2")?.status, "backend_unavailable");
+    assert.equal(listExtractionRunCandidates(ledger, "op-ledger-2").length, 0);
+  } finally { fx.cleanup(); }
+});
+
+test("simulated origin survives on real sources through confirmation", async () => {
+  const fx = fixture();
+  try {
+    const { createExtractionLedger, getExtractionRun } = await import(
+      "../src/knowledge/extraction/ledger.ts"
+    );
+    const ledger = createExtractionLedger(fx.store.db);
+    const text = "The hall seats forty guests.";
+    const realSource = {
+      businessId: fx.businessId, accountId: "real-acct-1", kind: "document" as const,
+      locator: "drive://real-doc-1", label: "Real Doc",
+    };
+    const out = await extractSourceCandidates(
+      fx.service,
+      new FakeBackend(() => ok([{
+        key: "space", subjectId: "hall",
+        value: { spaceId: "hall", name: "Hall", capacityMin: 1, capacityMax: 40 },
+        confidence: "probable", evidence: ["seats forty guests"],
+      }])),
+      { source: realSource, text, idempotencyKey: "op-sim-1" },
+      ledger,
+    );
+    assert.equal(out.status, "accepted");
+    // Owner confirmation is not evidence of an actual model run: the ledger
+    // still says simulated, and the candidate note says so too.
+    const confirmed = fx.service.confirmCandidate({
+      businessId: fx.businessId, actor: OWNER, candidateId: out.accepted[0]?.candidateId ?? "",
+    });
+    assert.equal(confirmed.fact.confidence, "verified");
+    assert.equal(getExtractionRun(ledger, "op-sim-1")?.simulated, true);
+    const stored = fx.service.listCandidates(fx.businessId)[0];
+    assert.match(stored?.note ?? "", /simulated/);
+  } finally { fx.cleanup(); }
+});

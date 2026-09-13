@@ -51,10 +51,11 @@ extractSourceCandidates(
       locator: string; label?: string; fictional?: boolean; sourceRevision?: string;
     };
     text: string;                    // bounded retrieved text, never silently cut
-    idempotencyKey: string;          // caller-persisted; per-candidate intake ids derive from it
+    idempotencyKey: string;          // caller-persisted per (business, source, bytes); intake ids derive from it
     contentDigest?: string;          // sha256 hex; mismatch fails closed before any backend call
     maxCandidates?: number;          // 1..MAX_CANDIDATES
-    awaitTimeoutMs?: number;         // default 30_000
+    awaitTimeoutMs?: number;         // positive integer; default 30_000
+    ledger?: ExtractionLedger;       // optional same-handle lineage ledger (createExtractionLedger)
   },
 ): Promise<{
   status: "accepted" | "no_relevant_facts" | "needs_review" | "invalid" | "backend_unavailable";
@@ -70,10 +71,39 @@ Outcome semantics: `accepted` (all fed, pending only), `no_relevant_facts`
 (empty array, zero rows), `needs_review` (valid subset fed as pending with
 explicit per-candidate reasons for the rest), `invalid` (nothing fed —
 malformed payload, bound/digest violations, zero survivors), and
-`backend_unavailable` (submit/await failure or non-`ok` terminal status,
-nothing fed). Runtime wiring must persist `idempotencyKey` per
-(source, bytes) pair and reuse it on retry; replays dedupe via derived
-intake ids.
+`backend_unavailable` (submit/await failure, echo mismatch, or non-`ok`
+terminal status, nothing fed). Runtime wiring must persist `idempotencyKey`
+per (business, source, bytes) pair — cross-business or cross-account reuse
+of one key collides — and reuse it on retry; replays dedupe via derived
+intake ids. The submission idempotency echo and task id are validated
+before anything downstream may name the run; every await failure maps to
+`backend_unavailable`, never a raw throw.
+
+## Canonical intake identity and lineage ledger
+
+Per-candidate intake ids derive deterministically from business + account +
+source locator + revision + content digest + backend id + task id + caller
+command + position. Retries reproduce them exactly (stable dedupe through
+intake's content match); an altered replay under the same command hits the
+identity row with different content and is rejected deterministically
+instead of leaking a raw `UNIQUE` error.
+
+`createExtractionLedger(db)` opens two extraction-owned tables on the same
+SQLite handle (never a second database): `extraction_runs` (one row per
+idempotency key: business, account, locator, revision, digest, backend,
+task, simulated flag, terminal status) and `extraction_run_candidates`
+(index, candidate/intake ids, key, subject, confidence, original evidence
+quotes). Every post-submit terminal outcome records its run row; candidate
+rows record first-write-wins. Simulated origin therefore survives owner
+confirmation and snapshots: the ledger still names the fake backend run,
+and each candidate row carries an extraction note — owner confirmation is
+never evidence of an actual model run.
+
+Account isolation note: intake content-dedupe is business-scoped, so two
+accounts sharing one locator and value still resolve to one candidate row;
+callers must scope locators and idempotency keys per account, and the
+ledger (which records the true account per run) is the tiebreaker for
+audit.
 
 ## Bounds
 
@@ -81,7 +111,7 @@ intake ids.
 | --- | --- | --- |
 | source text | 32_768 bytes | `invalid`, backend never called |
 | candidates per result | ≤ 20 | `invalid` whole result |
-| candidate value | ≤ 4096 bytes JSON, depth ≤ 6, ≤ 64 top-level keys, finite only | per-candidate reject |
+| candidate value | ≤ 4096 bytes JSON, depth ≤ 6, ≤ 64 top-level keys, ≤ 256 total keys, ≤ 10_000 nodes, finite only | per-candidate reject |
 | key / subjectId | ≤ 128 / ≤ 256 bytes | per-candidate reject |
 | evidence spans | 1..8 quotes, each ≤ 2000 bytes, each a verbatim substring of source text | per-candidate reject |
 
