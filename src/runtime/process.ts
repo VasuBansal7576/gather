@@ -433,6 +433,9 @@ export class OpenClawGatewayProcess {
       }
     });
     child.on("exit", (code, signal) => {
+      // Generational guard: a late exit from a superseded child must never
+      // clear the CURRENT generation's ownership or state.
+      if (this.child !== child) return;
       this.lastExit = { code, signal };
       if (this.state !== "stopping" && this.state !== "failed") {
         this.state = "stopped";
@@ -440,9 +443,24 @@ export class OpenClawGatewayProcess {
       this.child = null;
     });
     child.on("error", () => {
+      if (this.child !== child) return;
       if (this.state !== "stopping") this.state = "failed";
     });
     return child;
+  }
+
+  /**
+   * Race a promise against a deadline, clearing the timer when the promise
+   * wins so no orphaned setTimeout handle outlives the race.
+   */
+  private static raceTimeout<T>(promise: Promise<T>, ms: number): Promise<T | "timeout"> {
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<"timeout">((resolvePromise) => {
+      timer = setTimeout(() => resolvePromise("timeout"), ms);
+    });
+    return Promise.race([promise, timeout]).finally(() => {
+      if (timer !== undefined) clearTimeout(timer);
+    });
   }
 
   /**
@@ -462,8 +480,17 @@ export class OpenClawGatewayProcess {
    * minimal env and one retry.
    */
   async start(): Promise<void> {
-    if (this.state === "running" || this.state === "starting") {
+    if (this.state === "running" || this.state === "starting" || this.state === "repairing" || this.state === "stopping") {
       throw new Error(`gateway process already ${this.state}`);
+    }
+    // Ownership fence: a child whose exit was never observed is still ours —
+    // starting now would overwrite the tracked reference and orphan a
+    // possibly-live process. Only an observed exit (or a successful stop)
+    // releases it.
+    if (this.child !== null || this.repairChild !== null) {
+      throw new Error(
+        "a child process is still owned without an observed exit; call stop() and wait for its exit before starting again",
+      );
     }
     this.stopRequested = false;
     this.state = "starting";
@@ -497,6 +524,15 @@ export class OpenClawGatewayProcess {
       );
     }
 
+    if (this.stopRequested) {
+      // stop() landed while the first child was still in its early-exit
+      // window: abort the whole startup before a repair child is even
+      // spawned — never begin new owned work after cancellation.
+      this.state = "failed";
+      throw new Error(
+        "openclaw gateway stop requested during startup; aborted before doctor repair",
+      );
+    }
     if (this.repairAttempted) {
       this.state = "failed";
       throw new Error(
@@ -551,10 +587,14 @@ export class OpenClawGatewayProcess {
     }
     const exit = this.exitPromise.then(({ code }) => ({ kind: "exit" as const, code }));
     const error = this.spawnErrorPromise.then((err) => ({ kind: "error" as const, error: err }));
-    const alive = new Promise<null>((resolvePromise) =>
-      setTimeout(() => resolvePromise(null), graceMs),
+    const alive = new Promise<{ kind: "alive" }>((resolvePromise) => {
+      const timer = setTimeout(() => resolvePromise({ kind: "alive" }), graceMs);
+      // Clear the deadline the moment either sibling wins — no orphaned handle.
+      void Promise.allSettled([exit, error]).then(() => clearTimeout(timer));
+    });
+    return Promise.race([exit, error, alive]).then((result) =>
+      result.kind === "alive" ? null : result,
     );
-    return Promise.race([exit, error, alive]);
   }
 
   /**
@@ -713,12 +753,10 @@ export class OpenClawGatewayProcess {
       } catch {
         // Delivery failure: the bounded wait below still applies.
       }
-      const reaped = await Promise.race([
+      const reaped = await OpenClawGatewayProcess.raceTimeout(
         this.repairExitPromise.then(() => "exited" as const),
-        new Promise<"timeout">((resolvePromise) =>
-          setTimeout(() => resolvePromise("timeout"), killGraceMs),
-        ),
-      ]);
+        killGraceMs,
+      );
       if (reaped === "timeout") {
         this.state = "failed";
         throw new Error(
@@ -739,21 +777,17 @@ export class OpenClawGatewayProcess {
     }
 
     child.kill("SIGTERM");
-    const first = await Promise.race([
+    const first = await OpenClawGatewayProcess.raceTimeout(
       exitPromise.then(() => "exited" as const),
-      new Promise<"timeout">((resolvePromise) =>
-        setTimeout(() => resolvePromise("timeout"), exitTimeoutMs),
-      ),
-    ]);
+      exitTimeoutMs,
+    );
 
     if (first === "timeout") {
       child.kill("SIGKILL");
-      const second = await Promise.race([
+      const second = await OpenClawGatewayProcess.raceTimeout(
         exitPromise.then(() => "exited" as const),
-        new Promise<"timeout">((resolvePromise) =>
-          setTimeout(() => resolvePromise("timeout"), killGraceMs),
-        ),
-      ]);
+        killGraceMs,
+      );
       if (second === "timeout") {
         // No observed exit even after SIGKILL: do not claim stopped, do not
         // release the child reference.

@@ -273,23 +273,43 @@ export class GatherOpenClawRuntime {
   }
 
   private async stopInternal(): Promise<void> {
-    if (this.startPromise) {
-      // Let an in-flight startup settle before tearing down.
-      await this.startPromise.catch(() => {});
-    }
-    if (this.connection) {
-      await this.connection.close().catch(() => {});
-      this.connection = null;
-    }
+    const inFlightStart = this.startPromise;
     let stopError: unknown = null;
+    // Prompt cancellation: reach the owned child/repair immediately instead
+    // of waiting for an in-flight start() to settle on its own — a stop
+    // requested during a doctor repair must abort the post-repair respawn,
+    // not wait out the repair deadline.
     if (this.process) {
       try {
         await this.process.stop(this.options.stopTimeoutMs ?? 10000);
-        this.process = null;
       } catch (error) {
         // Child exit was not observed: keep the reference, release nothing.
         stopError = error;
       }
+    }
+    if (inFlightStart) {
+      await inFlightStart.catch(() => {});
+    }
+    // Second pass only when needed: after an in-flight start() settles (the
+    // startup may have spawned — or begun a repair on — a child after the
+    // first stop ran) or when the first stop could not observe the exit
+    // (retry the reap). A clean stop with nothing in flight skips it, so
+    // callers never see a spurious extra stop. The reference is released
+    // only after an observed-clean stop; an earlier failure is still
+    // reported even when the retry observes the exit.
+    if (this.process && (inFlightStart !== null || stopError !== null)) {
+      try {
+        await this.process.stop(this.options.stopTimeoutMs ?? 10000);
+        this.process = null;
+      } catch (error) {
+        stopError ??= error;
+      }
+    } else if (this.process) {
+      this.process = null;
+    }
+    if (this.connection) {
+      await this.connection.close().catch(() => {});
+      this.connection = null;
     }
     // An MCP close failure is reported, not swallowed: the boundary stays
     // owned (listener may still be bound) and the error propagates.

@@ -144,9 +144,24 @@ tokens):
   or repair error event likewise rejects without dropping a possibly-live
   child; a late exit afterwards still releases tracking. `stop()` reaps a
   tracked repair under its own bound and likewise never claims stopped
-  without an observed exit. `stop()` during a repair additionally cancels
-  the post-repair respawn: the pending `start()` aborts instead of spawning
-  after teardown. Process survival is not readiness.
+  without an observed exit.
+
+  Cancellation is prompt at BOTH layers: `runtime.stop()` reaches the
+  process's tracked child immediately (it does not wait for the in-flight
+  `start()` to settle first), so a stop during a repair kills the repair
+  child and the pending `start()` aborts without respawning — the public
+  facade path, not just direct `process.stop()`. A stop that lands before
+  the repair even spawns aborts startup before `doctor --fix` runs, and a
+  second stop pass after the in-flight start settles reaps anything the
+  startup created during the wait.
+
+  `start()` singleflights across every non-idle state (`running`,
+  `starting`, `repairing`, `stopping`) and additionally refuses while ANY
+  child is still owned without an observed exit — a restart can never
+  overwrite the tracked reference into an orphan, and a late exit/close
+  from a superseded child can never clear the current generation's
+  ownership (the exit handler is generational). Process survival is not
+  readiness.
 - **Readiness**: `connect()` resolves on `hello-ok` within a caller deadline
   (default 30 s, unchanged — the deadline is the readiness signal, not a
   knob for hiding slow-boot failures). The doctor records it as
