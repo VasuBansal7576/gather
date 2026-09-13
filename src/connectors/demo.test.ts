@@ -46,6 +46,7 @@ const document: DocumentRecord = {
 
 const availableSlot: CalendarSlot = {
   slotId: "slot-available",
+  calendarId: "calendar-001",
   startAt: "2026-06-12T17:00:00.000Z",
   endAt: "2026-06-12T23:00:00.000Z",
   available: true,
@@ -54,6 +55,7 @@ const availableSlot: CalendarSlot = {
 
 const unavailableSlot: CalendarSlot = {
   slotId: "slot-unavailable",
+  calendarId: "calendar-001",
   startAt: "2026-06-13T17:00:00.000Z",
   endAt: "2026-06-13T23:00:00.000Z",
   available: false,
@@ -103,12 +105,25 @@ test("returns unavailable slots and refuses a hold on them", async () => {
   const connectors = createDemoConnectors({ calendarSlots: [availableSlot, unavailableSlot] });
   const availability = await connectors.calendar.checkAvailability({
     operationKey: "demo-availability-001",
+    calendarId: "calendar-001",
     startAt: "2026-06-13T17:00:00.000Z",
     endAt: "2026-06-13T23:00:00.000Z",
   });
   assert.equal(availability.status, "succeeded");
   if (availability.status !== "succeeded") return;
   assert.equal(availability.data.slots[0]?.available, false);
+
+  // A different calendar sees none of calendar-001's slots: availability is
+  // strictly scoped and cannot leak across calendars.
+  const foreign = await connectors.calendar.checkAvailability({
+    operationKey: "demo-availability-002",
+    calendarId: "calendar-002",
+    startAt: "2026-06-13T17:00:00.000Z",
+    endAt: "2026-06-13T23:00:00.000Z",
+  });
+  assert.equal(foreign.status, "succeeded");
+  if (foreign.status !== "succeeded") return;
+  assert.equal(foreign.data.slots.length, 0);
 
   const hold = await connectors.calendar.createProvisionalHold({
     operationKey: "demo-hold-unavailable-001",

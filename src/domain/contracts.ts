@@ -127,6 +127,9 @@ export interface ActionExecution {
   startedAt: ISODateTime;
   completedAt?: ISODateTime;
   reconciledAt?: ISODateTime;
+  /** Ownership claim on a pending row: only the claim holder may execute. */
+  claimToken?: string;
+  claimExpiresAt?: ISODateTime;
 }
 
 export interface ActionOutcome {
