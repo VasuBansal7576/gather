@@ -98,9 +98,10 @@ export interface IngestResult {
   stale: boolean;
   eventId: string;
   /**
-   * For pause/resume/cancel: whether the control was honored. Untrusted
-   * customer/provider control requests are recorded but NOT honored; they
-   * raise a change_review decision instead. Undefined for other kinds.
+   * Always false from ingestEvent: intake records control requests as owner
+   * decisions and honors nothing, no matter what sourceKind or payload it
+   * carries. Honored control flows only through applyOwnerControl, which
+   * reports controlHonored: true with host attestation.
    */
   controlHonored?: boolean;
   createdWaiting: WaitingItem[];
@@ -143,6 +144,76 @@ export interface ResolveWaitingInput {
 
 export interface ReleaseStaleClaimsInput {
   nowIso: string;
+}
+
+/**
+ * Trusted owner control intake. Authority comes ONLY from calling this
+ * host-owned method with an explicit owner attestation — never from raw
+ * event fields. `ingestEvent` can never honor pause/resume/cancel no matter
+ * what sourceKind or payload it carries, so provider bodies cannot forge
+ * control by choosing sourceKind "manual"/"owner" or an authorizedBy value.
+ */
+export type OwnerControlKind = "pause" | "resume" | "cancel";
+
+export interface OwnerControlInput {
+  /** Stable idempotency key for safe retry (host-assigned). */
+  dedupeKey: string;
+  kind: OwnerControlKind;
+  bookingId: string;
+  /** Owner identity attested by the host (e.g. the approving owner id). */
+  attestedBy: string;
+  note?: string;
+  /** When the owner issued the control (ISO-8601, defaults to intake time). */
+  observedAt?: string;
+}
+
+export interface OwnerControlResult {
+  duplicate: boolean;
+  eventId: string;
+  controlHonored: true;
+  pausedWaitingIds: string[];
+  resumedWaitingIds: string[];
+  invalidatedWaitingIds: string[];
+}
+
+/**
+ * Authoritative receipt recording. Only this host-attested call — naming an
+ * explicit trusted verifier and receipt locator — retires deposit followups.
+ * Raw `verifiedReceipt` booleans inside provider payloads never retire
+ * anything; `ingestEvent` payment signals are evidence only.
+ */
+export interface VerifiedReceiptInput {
+  /** Stable idempotency key for safe retry (host-assigned). */
+  dedupeKey: string;
+  bookingId: string;
+  /** Authoritative receipt locator (provider receipt id, ledger entry, ...). */
+  receiptLocator: string;
+  /** Trusted verifier identity attested by the host (never provider text). */
+  verifiedBy: string;
+  note?: string;
+  /** When the receipt was verified (ISO-8601, defaults to intake time). */
+  observedAt?: string;
+}
+
+export interface VerifiedReceiptResult {
+  duplicate: boolean;
+  eventId: string;
+  suppressedWaitingIds: string[];
+  depositCheck: WaitingItem;
+}
+
+export type ControlState = "active" | "paused" | "cancelled";
+
+/**
+ * How the ledger treats the shared Gather tables (bookings/businesses).
+ * - "auto" (default): read them when present; ignore when absent
+ *   (standalone contract); any other query failure is rethrown (fail-closed).
+ * - "required": the tables must exist; absence throws (integration guard).
+ * - "off": never read shared state; only the ledger's own control table
+ *   governs pause/cancel.
+ */
+export interface LedgerOptions {
+  sharedTables?: "auto" | "required" | "off";
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -232,6 +303,47 @@ export function assertValidResolveInput(value: unknown): asserts value is Resolv
 export function assertValidReleaseInput(value: unknown): asserts value is ReleaseStaleClaimsInput {
   if (!isRecord(value)) throw new Error("release input must be an object");
   if (!isIsoDateTime(value.nowIso)) throw new Error("nowIso must be an ISO-8601 timestamp");
+}
+
+const OWNER_CONTROL_KINDS: ReadonlySet<string> = new Set(["pause", "resume", "cancel"]);
+
+export function assertValidOwnerControlInput(value: unknown): asserts value is OwnerControlInput {
+  if (!isRecord(value)) throw new Error("owner control input must be an object");
+  if (!isNonEmptyString(value.dedupeKey)) throw new Error("dedupeKey must be a non-empty string");
+  if (typeof value.kind !== "string" || !OWNER_CONTROL_KINDS.has(value.kind)) {
+    throw new Error("kind must be one of pause|resume|cancel");
+  }
+  if (!isNonEmptyString(value.bookingId)) throw new Error("bookingId must be a non-empty string");
+  if (!isNonEmptyString(value.attestedBy)) throw new Error("attestedBy must be a non-empty owner identity attested by the host");
+  if (value.note !== undefined && typeof value.note !== "string") throw new Error("note must be a string when present");
+  if (value.observedAt !== undefined && !isIsoDateTime(value.observedAt)) {
+    throw new Error("observedAt must be an ISO-8601 timestamp when present");
+  }
+}
+
+export function assertValidVerifiedReceiptInput(value: unknown): asserts value is VerifiedReceiptInput {
+  if (!isRecord(value)) throw new Error("verified receipt input must be an object");
+  if (!isNonEmptyString(value.dedupeKey)) throw new Error("dedupeKey must be a non-empty string");
+  if (!isNonEmptyString(value.bookingId)) throw new Error("bookingId must be a non-empty string");
+  if (!isNonEmptyString(value.receiptLocator)) throw new Error("receiptLocator must be a non-empty string");
+  if (!isNonEmptyString(value.verifiedBy)) throw new Error("verifiedBy must be a non-empty trusted verifier identity attested by the host");
+  if (value.note !== undefined && typeof value.note !== "string") throw new Error("note must be a string when present");
+  if (value.observedAt !== undefined && !isIsoDateTime(value.observedAt)) {
+    throw new Error("observedAt must be an ISO-8601 timestamp when present");
+  }
+}
+
+export function assertValidLedgerOptions(value: unknown): asserts value is LedgerOptions {
+  if (value === undefined) return;
+  if (!isRecord(value)) throw new Error("ledger options must be an object when present");
+  if (
+    value.sharedTables !== undefined &&
+    value.sharedTables !== "auto" &&
+    value.sharedTables !== "required" &&
+    value.sharedTables !== "off"
+  ) {
+    throw new Error('sharedTables must be one of auto|required|off when present');
+  }
 }
 
 export function recommendedFor(kind: WaitingKind): {

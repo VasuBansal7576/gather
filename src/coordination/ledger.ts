@@ -3,21 +3,30 @@ import type { DatabaseSync } from "node:sqlite";
 import {
   assertValidClaimInput,
   assertValidEventInput,
+  assertValidLedgerOptions,
   assertValidListDueWorkInput,
+  assertValidOwnerControlInput,
   assertValidReleaseInput,
   assertValidResolveInput,
+  assertValidVerifiedReceiptInput,
   recommendedFor,
 } from "./contracts.ts";
 import type {
   ClaimDueWorkInput,
   ClaimDueWorkResult,
+  ControlState,
   CoordinationEventInput,
   CoordinationEventRecord,
   IngestResult,
+  LedgerOptions,
   ListDueWorkInput,
+  OwnerControlInput,
+  OwnerControlResult,
   RecommendedAction,
   ReleaseStaleClaimsInput,
   ResolveWaitingInput,
+  VerifiedReceiptInput,
+  VerifiedReceiptResult,
   WaitingItem,
   WaitingKind,
   WaitingStatus,
@@ -39,6 +48,16 @@ function parseRecord(value: unknown): Record<string, unknown> {
 
 function nowIso(): string {
   return new Date().toISOString();
+}
+
+/** Normalize a validated ISO-8601 timestamp to epoch millis for comparison. */
+function epochOf(value: string): number {
+  return Date.parse(value);
+}
+
+/** Normalize a validated ISO-8601 timestamp to canonical UTC for storage. */
+function storedIso(value: string): string {
+  return new Date(value).toISOString();
 }
 
 function plusHours(baseIso: string, hours: number): string {
@@ -76,37 +95,10 @@ function followupDueAt(input: CoordinationEventInput): string {
   return plusHours(input.observedAt, 48);
 }
 
-/**
- * Owner-authority gate for consequential controls. Pause/resume/cancel are
- * honored only from trusted owner controls (manual/owner source carrying an
- * explicit owner identity). Customer or provider messages can only raise a
- * decision request — they never mutate waiting state by themselves.
- */
-function isTrustedControl(input: CoordinationEventInput): boolean {
-  if (input.kind !== "pause" && input.kind !== "resume" && input.kind !== "cancel") return true;
-  if (input.sourceKind !== "manual" && input.sourceKind !== "owner") return false;
-  const authorizedBy: unknown = input.payload?.authorizedBy;
-  return typeof authorizedBy === "string" && authorizedBy.trim().length > 0;
-}
-
-/**
- * Verified receipt evidence that may retire a followup. Message text alone
- * never qualifies: verification requires an explicit receipt locator from a
- * payment-provider or trusted owner/manual source.
- */
-function verifiedReceiptLocator(input: CoordinationEventInput): string | null {
-  if (input.kind !== "payment_signal") return null;
-  if (input.sourceKind !== "payment" && input.sourceKind !== "manual" && input.sourceKind !== "owner") return null;
-  const verified: unknown = input.payload?.verifiedReceipt;
-  const locator: unknown = input.payload?.receiptLocator;
-  if (verified !== true || typeof locator !== "string" || locator.trim().length === 0) return null;
-  return locator.trim();
-}
-
 const SCHEMA = `
   CREATE TABLE IF NOT EXISTS coord_events (
     id TEXT PRIMARY KEY,
-    dedupe_key TEXT NOT NULL UNIQUE,
+    dedupe_key TEXT NOT NULL,
     kind TEXT NOT NULL,
     booking_id TEXT NOT NULL,
     source_id TEXT NOT NULL,
@@ -115,10 +107,11 @@ const SCHEMA = `
     received_at TEXT NOT NULL,
     revision INTEGER,
     payload_json TEXT NOT NULL,
-    stale INTEGER NOT NULL DEFAULT 0
+    stale INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (booking_id, dedupe_key)
   );
   CREATE INDEX IF NOT EXISTS idx_coord_events_booking ON coord_events(booking_id);
-  CREATE INDEX IF NOT EXISTS idx_coord_events_dedupe ON coord_events(dedupe_key);
+  CREATE INDEX IF NOT EXISTS idx_coord_events_dedupe ON coord_events(booking_id, dedupe_key);
   CREATE TABLE IF NOT EXISTS coord_waiting (
     id TEXT PRIMARY KEY,
     booking_id TEXT NOT NULL,
@@ -132,12 +125,20 @@ const SCHEMA = `
     claimed_at TEXT,
     resolution_note TEXT,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    claim_token TEXT,
+    claim_expires_at TEXT
   );
   CREATE INDEX IF NOT EXISTS idx_coord_waiting_booking_status_due
     ON coord_waiting(booking_id, status, due_at);
   CREATE INDEX IF NOT EXISTS idx_coord_waiting_status_due
     ON coord_waiting(status, due_at);
+  CREATE TABLE IF NOT EXISTS coord_control (
+    booking_id TEXT PRIMARY KEY,
+    state TEXT NOT NULL CHECK (state IN ('paused', 'cancelled')),
+    updated_at TEXT NOT NULL,
+    source_event_id TEXT NOT NULL
+  );
 `;
 
 /**
@@ -150,17 +151,22 @@ const SCHEMA = `
  * only return ready decisions for guarded Gather services (or the OpenClaw
  * host loop) to act on.
  *
- * External events are evidence: source IDs + observed timestamps are
- * preserved, but message text alone never verifies payment, availability,
- * or authority. Ordering for late/duplicate events follows received
- * (monotonic insert) order plus per-booking revisions, never observed
- * timestamps alone.
+ * Authority model: `ingestEvent` treats EVERYTHING as evidence and can never
+ * honor pause/resume/cancel or retire deposit reminders, no matter what
+ * sourceKind or payload it carries. Control authority flows only through
+ * `applyOwnerControl` (explicit host attestation) and receipt retirement
+ * only through `recordVerifiedReceipt` (explicit trusted verifier).
  */
 export class CoordinationLedger {
   private readonly db: DatabaseSync;
+  private readonly sharedTables: "auto" | "required" | "off";
 
-  constructor(db: DatabaseSync) {
+  constructor(db: DatabaseSync, options?: unknown) {
+    assertValidLedgerOptions(options);
+    const opts: LedgerOptions = (options ?? {}) as LedgerOptions;
     this.db = db;
+    this.sharedTables = opts.sharedTables ?? "auto";
+    this.upgradeLegacyDedupeScope();
     this.db.exec(SCHEMA);
     this.ensureColumn("coord_waiting", "claim_token", "TEXT");
     this.ensureColumn("coord_waiting", "claim_expires_at", "TEXT");
@@ -174,7 +180,62 @@ export class CoordinationLedger {
     }
   }
 
-  /** Durable, idempotent intake. Safe to retry; concurrent duplicates collapse on dedupe_key. */
+  /**
+   * Upgrade pre-scoped databases: the original schema enforced a GLOBAL
+   * dedupe_key UNIQUE, contradicting the documented per-booking scope.
+   * Migrates rows into the scoped schema, preserving all data.
+   */
+  private upgradeLegacyDedupeScope(): void {
+    let definition: unknown;
+    try {
+      const found = this.db.prepare("SELECT sql FROM sqlite_master WHERE name = 'coord_events'").get();
+      definition = found ? asRow(found).sql : null;
+    } catch {
+      return;
+    }
+    if (typeof definition !== "string") return;
+    const scoped = this.db.prepare("PRAGMA index_list(coord_events)").all() as SqlRow[];
+    for (const entry of scoped) {
+      const row = asRow(entry);
+      if (row.origin !== "u" && row.origin !== "pk") continue;
+      const columns = this.db.prepare(`PRAGMA index_info(${String(row.name)})`).all() as SqlRow[];
+      const names = columns
+        .map((column) => asRow(column))
+        .sort((left, right) => Number(left.seqno) - Number(right.seqno))
+        .map((column) => this.columnNameForIndex(Number(column.cid)));
+      if (names.length === 2 && names[0] === "booking_id" && names[1] === "dedupe_key") return;
+    }
+    // Legacy global-unique schema: migrate rows into the scoped shape.
+    this.db.exec("ALTER TABLE coord_events RENAME TO coord_events_legacy");
+    try {
+      this.db.exec(SCHEMA);
+      this.db.exec(`
+        INSERT INTO coord_events
+          (id, dedupe_key, kind, booking_id, source_id, source_kind, observed_at, received_at, revision, payload_json, stale)
+        SELECT id, dedupe_key, kind, booking_id, source_id, source_kind, observed_at, received_at, revision, payload_json, stale
+        FROM coord_events_legacy
+      `);
+      this.db.exec("DROP TABLE coord_events_legacy");
+    } catch (error) {
+      try {
+        this.db.exec("ALTER TABLE coord_events_legacy RENAME TO coord_events");
+      } catch {
+        // Surface the original migration failure below.
+      }
+      throw error;
+    }
+  }
+
+  private columnNameForIndex(cid: number): string {
+    const info = this.db.prepare("PRAGMA table_info(coord_events)").all() as SqlRow[];
+    for (const row of info) {
+      const record = asRow(row);
+      if (Number(record.cid) === cid) return String(record.name);
+    }
+    return "";
+  }
+
+  /** Durable, idempotent intake. Safe to retry; concurrent duplicates collapse on (booking, dedupe_key). */
   ingestEvent(raw: unknown): IngestResult {
     assertValidEventInput(raw);
     const input = raw;
@@ -187,36 +248,19 @@ export class CoordinationLedger {
     };
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      const existing = this.db
-        .prepare("SELECT * FROM coord_events WHERE dedupe_key = $key LIMIT 1")
-        .get({ $key: input.dedupeKey });
+      const existing = this.findEvent(input.bookingId, input.dedupeKey);
       if (existing) {
-        const stored = this.toEventRecord(asRow(existing));
-        const storedFingerprint = eventContentFingerprint({
-          kind: stored.kind,
-          bookingId: stored.bookingId,
-          sourceId: stored.sourceId,
-          sourceKind: stored.sourceKind,
-          observedAt: stored.observedAt,
-          revision: stored.revision,
-          payload: stored.payload,
-        });
-        const incomingFingerprint = eventContentFingerprint({
+        this.assertSameContent(existing, {
           kind: input.kind,
           bookingId: input.bookingId,
           sourceId: input.sourceId,
           sourceKind: input.sourceKind,
-          observedAt: new Date(input.observedAt).toISOString(),
+          observedAt: storedIso(input.observedAt),
           revision: input.revision,
           payload: input.payload ?? {},
         });
-        if (storedFingerprint !== incomingFingerprint) {
-          throw new Error(
-            `Coordination dedupe key reuse with different content: ${input.dedupeKey} (scoped to booking ${stored.bookingId})`,
-          );
-        }
         this.db.exec("COMMIT");
-        return { duplicate: true, stale: stored.stale, eventId: stored.id, ...empty };
+        return { duplicate: true, stale: existing.stale, eventId: existing.id, ...empty };
       }
 
       const maxRevision = this.maxRevisionForBooking(input.bookingId);
@@ -251,24 +295,176 @@ export class CoordinationLedger {
     }
   }
 
+  /**
+   * Trusted owner control. Authority comes ONLY from the host calling this
+   * method with an explicit owner attestation. Raw event fields can never
+   * reach this path: `ingestEvent` records control requests as decisions
+   * and honors nothing.
+   */
+  applyOwnerControl(raw: unknown): OwnerControlResult {
+    assertValidOwnerControlInput(raw);
+    const input: OwnerControlInput = raw;
+    const timestamp = nowIso();
+    const observedAt = storedIso(input.observedAt ?? timestamp);
+    const empty: { pausedWaitingIds: string[]; resumedWaitingIds: string[]; invalidatedWaitingIds: string[] } = {
+      pausedWaitingIds: [],
+      resumedWaitingIds: [],
+      invalidatedWaitingIds: [],
+    };
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const parts = {
+        kind: input.kind,
+        bookingId: input.bookingId,
+        sourceId: `owner-control:${input.dedupeKey}`,
+        sourceKind: "owner-control",
+        observedAt,
+        revision: undefined,
+        payload: { attestedBy: input.attestedBy, ...(input.note === undefined ? {} : { note: input.note }) },
+      };
+      const existing = this.findEvent(input.bookingId, input.dedupeKey);
+      if (existing) {
+        // Attested redelivery: identity is the stable key plus semantic
+        // content. observedAt defaults to intake time, so it is excluded
+        // from the comparison — otherwise every retry would conflict.
+        this.assertSameContent(existing, parts, true);
+        this.db.exec("COMMIT");
+        return { duplicate: true, eventId: existing.id, controlHonored: true, ...empty };
+      }
+      const eventId = this.insertAttestedEvent({ ...parts, dedupeKey: input.dedupeKey });
+      const affected = { ...empty };
+      if (input.kind === "pause") {
+        this.setControlState(input.bookingId, "paused", eventId, timestamp);
+        for (const id of this.waitingIdsIn(input.bookingId, ["pending"])) {
+          this.db
+            .prepare(`UPDATE coord_waiting SET status = 'paused', updated_at = $at WHERE id = $id`)
+            .run({ $at: timestamp, $id: id });
+          affected.pausedWaitingIds.push(id);
+        }
+        // Fence in-flight work: claimed items must not complete after a pause.
+        for (const id of this.waitingIdsIn(input.bookingId, ["claimed"])) {
+          this.invalidateWaiting(id, `Invalidated by pause (owner control ${input.dedupeKey})`, timestamp);
+          affected.invalidatedWaitingIds.push(id);
+        }
+      } else if (input.kind === "resume") {
+        if (this.getControlState(input.bookingId) === "cancelled") {
+          throw new Error(`Booking ${input.bookingId} is cancelled; resume is refused (cancellation is terminal)`);
+        }
+        this.clearControlState(input.bookingId);
+        for (const id of this.waitingIdsIn(input.bookingId, ["paused"])) {
+          this.db
+            .prepare(`UPDATE coord_waiting SET status = 'pending', updated_at = $at WHERE id = $id`)
+            .run({ $at: timestamp, $id: id });
+          affected.resumedWaitingIds.push(id);
+        }
+      } else {
+        this.setControlState(input.bookingId, "cancelled", eventId, timestamp);
+        for (const id of this.waitingIdsIn(input.bookingId, ["pending", "paused", "claimed"])) {
+          this.invalidateWaiting(id, `Invalidated by cancellation (owner control ${input.dedupeKey})`, timestamp);
+          affected.invalidatedWaitingIds.push(id);
+        }
+      }
+      this.db.exec("COMMIT");
+      return { duplicate: false, eventId, controlHonored: true, ...affected };
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        // Surface the original failure.
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Authoritative receipt recording. Only this host-attested call — naming an
+   * explicit trusted verifier and receipt locator — retires deposit
+   * followups. Raw `verifiedReceipt` booleans in provider payloads never do.
+   * The deposit is still recorded as unverified evidence for the
+   * confirmation worker (G12), never counted as paid.
+   */
+  recordVerifiedReceipt(raw: unknown): VerifiedReceiptResult {
+    assertValidVerifiedReceiptInput(raw);
+    const input: VerifiedReceiptInput = raw;
+    const timestamp = nowIso();
+    const observedAt = storedIso(input.observedAt ?? timestamp);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const parts = {
+        kind: "payment_signal",
+        bookingId: input.bookingId,
+        sourceId: `trusted-receipt:${input.dedupeKey}`,
+        sourceKind: "trusted-receipt",
+        observedAt,
+        revision: undefined,
+        payload: {
+          receiptLocator: input.receiptLocator,
+          verifiedBy: input.verifiedBy,
+          ...(input.note === undefined ? {} : { note: input.note }),
+        },
+      };
+      const existing = this.findEvent(input.bookingId, input.dedupeKey);
+      if (existing) {
+        // Same stable-identity rule as owner control: observedAt defaults to
+        // intake time and is excluded from redelivery comparison.
+        this.assertSameContent(existing, parts, true);
+        const prior = this.db
+          .prepare("SELECT * FROM coord_waiting WHERE source_event_id = $event AND kind = 'deposit_check' LIMIT 1")
+          .get({ $event: existing.id });
+        if (!prior) throw new Error(`Receipt event ${input.dedupeKey} has no deposit check; refusing to invent one`);
+        this.db.exec("COMMIT");
+        return { duplicate: true, eventId: existing.id, suppressedWaitingIds: [], depositCheck: this.toWaitingItem(asRow(prior)) };
+      }
+      const eventId = this.insertAttestedEvent({ ...parts, dedupeKey: input.dedupeKey });
+      const suppressedWaitingIds = this.suppressFollowups(input.bookingId, timestamp);
+      const depositCheck = this.insertWaiting(
+        input.bookingId,
+        "deposit_check",
+        "done",
+        observedAt,
+        eventId,
+        undefined,
+        {
+          reason: "receipt_evidence_attached_for_confirmation",
+          verifiedPayment: false,
+          receiptLocator: input.receiptLocator,
+          verifiedBy: input.verifiedBy,
+          note: "Receipt evidence recorded by a trusted verifier; confirmation still requires the authoritative receipt check.",
+        },
+      );
+      this.db.exec("COMMIT");
+      return { duplicate: false, eventId, suppressedWaitingIds, depositCheck };
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        // Surface the original failure.
+      }
+      throw error;
+    }
+  }
+
   /** Narrow drain contract for the runtime/host loop: pending waiting due at or before now. */
   listDueWork(raw: unknown): WaitingItem[] {
     assertValidListDueWorkInput(raw);
     const input: ListDueWorkInput = raw;
     const limit = input.limit ?? 50;
+    // Normalize before comparing: stored timestamps are canonical UTC, and a
+    // caller-supplied offset (e.g. +02:00) must not change drain semantics.
+    const now = storedIso(input.nowIso);
     const rows = input.bookingId
       ? this.db
           .prepare(
             `SELECT * FROM coord_waiting WHERE status = 'pending' AND due_at <= $now AND booking_id = $booking
              ORDER BY due_at ASC LIMIT $limit`,
           )
-          .all({ $now: input.nowIso, $booking: input.bookingId, $limit: limit })
+          .all({ $now: now, $booking: input.bookingId, $limit: limit })
       : this.db
           .prepare(
             `SELECT * FROM coord_waiting WHERE status = 'pending' AND due_at <= $now
              ORDER BY due_at ASC LIMIT $limit`,
           )
-          .all({ $now: input.nowIso, $limit: limit });
+          .all({ $now: now, $limit: limit });
     const items = rows.map((row) => this.toWaitingItem(asRow(row)));
     return items.filter((item) => !this.isBlockedBySharedState(item.bookingId));
   }
@@ -316,19 +512,26 @@ export class CoordinationLedger {
    * released waiting ids.
    */
   releaseStaleClaims(raw: unknown): string[] {
+    assertValidReleaseInput(raw);
     const input: ReleaseStaleClaimsInput = raw;
-    if (!input || typeof input !== "object") throw new Error("release input must be an object");
-    assertValidReleaseInput(input);
     const timestamp = nowIso();
+    // Epoch comparison: caller clocks in any valid ISO shape behave identically.
+    const nowMs = epochOf(input.nowIso);
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const rows = this.db
         .prepare(
-          `SELECT id FROM coord_waiting
-           WHERE status = 'claimed' AND claim_expires_at IS NOT NULL AND claim_expires_at <= $now`,
+          `SELECT id, claim_expires_at FROM coord_waiting
+           WHERE status = 'claimed' AND claim_expires_at IS NOT NULL`,
         )
-        .all({ $now: input.nowIso });
-      const ids = rows.map((row) => String(asRow(row).id));
+        .all();
+      const ids: string[] = [];
+      for (const row of rows) {
+        const record = asRow(row);
+        const expires = String(record.claim_expires_at);
+        if (!Number.isFinite(Date.parse(expires)) || Date.parse(expires) > nowMs) continue;
+        ids.push(String(record.id));
+      }
       for (const id of ids) {
         this.db
           .prepare(
@@ -351,9 +554,13 @@ export class CoordinationLedger {
 
   /**
    * Guarded services mark work finished (or superseded) after they act.
-   * Claimed work requires its fencing token: a stale worker holding an
-   * expired or superseded claim cannot complete someone else's work, so no
-   * external effect is duplicated after uncertainty.
+   * Claimed work requires its fencing token, which must be present and
+   * match: a stale worker holding an expired or superseded claim cannot
+   * complete someone else's work. Pending work resolves without a token —
+   * but presenting any token against pending work throws, so a stale token
+   * can never silently complete a released claim. No external effect is
+   * duplicated after uncertainty by this ledger alone; services must still
+   * use stable operation keys and reconcile.
    */
   resolveWaiting(raw: unknown): WaitingItem {
     assertValidResolveInput(raw);
@@ -362,13 +569,16 @@ export class CoordinationLedger {
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const current = this.getWaiting(input.id);
-      if (current.status !== "pending" && current.status !== "claimed") {
-        throw new Error(`Waiting ${input.id} is ${current.status} and cannot be resolved`);
-      }
-      if (current.status === "claimed" && current.claimToken) {
-        if (input.claimToken !== current.claimToken) {
+      if (current.status === "claimed") {
+        if (!current.claimToken || input.claimToken !== current.claimToken) {
           throw new Error(`Waiting ${input.id} was claimed by another worker (stale claim token)`);
         }
+      } else if (current.status === "pending") {
+        if (input.claimToken !== undefined) {
+          throw new Error(`Waiting ${input.id} is pending with no active claim (stale claim token)`);
+        }
+      } else {
+        throw new Error(`Waiting ${input.id} is ${current.status} and cannot be resolved`);
       }
       this.db
         .prepare(
@@ -400,10 +610,17 @@ export class CoordinationLedger {
     return rows.map((row) => this.toWaitingItem(asRow(row)));
   }
 
-  getEventByDedupeKey(dedupeKey: string): CoordinationEventRecord {
-    const found = this.db.prepare("SELECT * FROM coord_events WHERE dedupe_key = $key").get({ $key: dedupeKey });
-    if (!found) throw new Error(`Coordination event not found: ${dedupeKey}`);
-    return this.toEventRecord(asRow(found));
+  getEventByDedupeKey(bookingId: string, dedupeKey: string): CoordinationEventRecord {
+    if (!bookingId || bookingId.trim().length === 0) throw new Error("bookingId must be a non-empty string");
+    const found = this.findEvent(bookingId, dedupeKey);
+    if (!found) throw new Error(`Coordination event not found: ${bookingId}/${dedupeKey}`);
+    return found;
+  }
+
+  /** Persisted owner-control state for a booking (active when absent). */
+  controlStateForBooking(bookingId: string): ControlState {
+    if (!bookingId || bookingId.trim().length === 0) throw new Error("bookingId must be a non-empty string");
+    return this.getControlState(bookingId) ?? "active";
   }
 
   private claimOne(id: string, claimedBy: string, nowIsoValue: string, leaseMs: number): string {
@@ -411,15 +628,16 @@ export class CoordinationLedger {
     if (!found) return "skipped";
     const item = this.toWaitingItem(asRow(found));
     if (item.status !== "pending") return "skipped";
-    if (Date.parse(item.dueAt) > Date.parse(nowIsoValue)) return "skipped";
+    if (epochOf(item.dueAt) > epochOf(nowIsoValue)) return "skipped";
     if (this.isBlockedBySharedState(item.bookingId)) return "skipped";
-    // Reply arrived after the list snapshot: suppress instead of handing out
-    // a reminder the customer already answered.
-    if (item.kind === "followup" && this.replyObservedSince(item.bookingId, item.createdAt)) {
+    if (this.getControlState(item.bookingId) !== null) return "skipped";
+    // Reply received after the list snapshot: suppress instead of handing
+    // out a reminder the customer already answered.
+    if (item.kind === "followup" && this.replyReceivedSince(item.bookingId, item.createdAt)) {
       this.db
         .prepare(`UPDATE coord_waiting SET status = 'suppressed', resolution_note = $note, updated_at = $at WHERE id = $id`)
         .run({
-          $note: "Suppressed at claim time: reply observed after the drain snapshot",
+          $note: "Suppressed at claim time: reply received after the drain snapshot",
           $at: nowIso(),
           $id: id,
         });
@@ -470,14 +688,65 @@ export class CoordinationLedger {
     return typeof value === "string" ? value : null;
   }
 
-  private replyObservedSince(bookingId: string, createdAt: string): boolean {
-    const found = this.db
+  /**
+   * Received-order reply check: any non-stale reply received at or after the
+   * waiting item was created answers it, regardless of source-clock skew in
+   * observedAt. Stale (older-than-processed) replies never suppress.
+   */
+  private replyReceivedSince(bookingId: string, createdAt: string): boolean {
+    const createdMs = epochOf(createdAt);
+    const rows = this.db
       .prepare(
-        `SELECT id FROM coord_events
-         WHERE booking_id = $booking AND kind = 'reply' AND stale = 0 AND observed_at >= $created LIMIT 1`,
+        `SELECT received_at FROM coord_events
+         WHERE booking_id = $booking AND kind = 'reply' AND stale = 0`,
       )
-      .get({ $booking: bookingId, $created: createdAt });
-    return found !== null && found !== undefined;
+      .all({ $booking: bookingId });
+    for (const row of rows) {
+      const received = asRow(row).received_at;
+      if (typeof received === "string" && Number.isFinite(Date.parse(received)) && Date.parse(received) >= createdMs) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private findEvent(bookingId: string, dedupeKey: string): CoordinationEventRecord | null {
+    const found = this.db
+      .prepare("SELECT * FROM coord_events WHERE booking_id = $booking AND dedupe_key = $key LIMIT 1")
+      .get({ $booking: bookingId, $key: dedupeKey });
+    return found ? this.toEventRecord(asRow(found)) : null;
+  }
+
+  private assertSameContent(
+    stored: CoordinationEventRecord,
+    incoming: {
+      kind: string;
+      bookingId: string;
+      sourceId: string;
+      sourceKind: string;
+      observedAt: string;
+      revision?: number;
+      payload: Record<string, unknown>;
+    },
+    ignoreObserved = false,
+  ): void {
+    const storedParts = {
+      kind: stored.kind,
+      bookingId: stored.bookingId,
+      sourceId: stored.sourceId,
+      sourceKind: stored.sourceKind,
+      observedAt: ignoreObserved ? "" : stored.observedAt,
+      revision: stored.revision,
+      payload: stored.payload,
+    };
+    const incomingParts = ignoreObserved ? { ...incoming, observedAt: "" } : incoming;
+    const storedFingerprint = eventContentFingerprint(storedParts);
+    const incomingFingerprint = eventContentFingerprint(incomingParts);
+    if (storedFingerprint !== incomingFingerprint) {
+      throw new Error(
+        `Coordination dedupe key reuse with different content: ${incoming.bookingId}/${stored.dedupeKey} (scoped to booking ${stored.bookingId})`,
+      );
+    }
   }
 
   private insertEvent(input: CoordinationEventInput, stale: boolean): string {
@@ -495,13 +764,92 @@ export class CoordinationLedger {
         $booking: input.bookingId,
         $sourceId: input.sourceId,
         $sourceKind: input.sourceKind,
-        $observed: new Date(input.observedAt).toISOString(),
+        $observed: storedIso(input.observedAt),
         $received: nowIso(),
         $revision: input.revision ?? null,
         $payload: JSON.stringify(input.payload ?? {}),
         $stale: stale ? 1 : 0,
       });
     return id;
+  }
+
+  private insertAttestedEvent(input: {
+    dedupeKey: string;
+    kind: string;
+    bookingId: string;
+    sourceId: string;
+    sourceKind: string;
+    observedAt: string;
+    revision?: number;
+    payload: Record<string, unknown>;
+  }): string {
+    const id = randomUUID();
+    this.db
+      .prepare(
+        `INSERT INTO coord_events
+         (id, dedupe_key, kind, booking_id, source_id, source_kind, observed_at, received_at, revision, payload_json, stale)
+         VALUES ($id, $dedupe, $kind, $booking, $sourceId, $sourceKind, $observed, $received, $revision, $payload, 0)`,
+      )
+      .run({
+        $id: id,
+        $dedupe: input.dedupeKey,
+        $kind: input.kind,
+        $booking: input.bookingId,
+        $sourceId: input.sourceId,
+        $sourceKind: input.sourceKind,
+        $observed: input.observedAt,
+        $received: nowIso(),
+        $revision: input.revision ?? null,
+        $payload: JSON.stringify(input.payload),
+      });
+    return id;
+  }
+
+  private getControlState(bookingId: string): "paused" | "cancelled" | null {
+    const found = this.db.prepare("SELECT state FROM coord_control WHERE booking_id = $booking").get({ $booking: bookingId });
+    if (!found) return null;
+    const state = String(asRow(found).state);
+    return state === "paused" || state === "cancelled" ? state : null;
+  }
+
+  private setControlState(bookingId: string, state: "paused" | "cancelled", eventId: string, timestamp: string): void {
+    this.db
+      .prepare(
+        `INSERT INTO coord_control (booking_id, state, updated_at, source_event_id)
+         VALUES ($booking, $state, $at, $event)
+         ON CONFLICT (booking_id) DO UPDATE SET state = $state, updated_at = $at, source_event_id = $event`,
+      )
+      .run({ $booking: bookingId, $state: state, $at: timestamp, $event: eventId });
+  }
+
+  private clearControlState(bookingId: string): void {
+    this.db.prepare("DELETE FROM coord_control WHERE booking_id = $booking").run({ $booking: bookingId });
+  }
+
+  private waitingIdsIn(bookingId: string, statuses: WaitingStatus[]): string[] {
+    const placeholders = statuses.map((_, index) => `$s${index}`).join(", ");
+    const params: Record<string, string> = { $booking: bookingId };
+    statuses.forEach((status, index) => {
+      params[`$s${index}`] = status;
+    });
+    const rows = this.db
+      .prepare(`SELECT id FROM coord_waiting WHERE booking_id = $booking AND status IN (${placeholders})`)
+      .all(params);
+    return rows.map((row) => String(asRow(row).id));
+  }
+
+  private invalidateWaiting(id: string, note: string, timestamp: string): void {
+    this.db
+      .prepare(`UPDATE coord_waiting SET status = 'invalidated', resolution_note = $note, updated_at = $at WHERE id = $id`)
+      .run({ $note: note, $at: timestamp, $id: id });
+  }
+
+  /** Entry status for newly raised work: cancelled bookings invalidate, paused bookings hide. */
+  private entryStatus(bookingId: string, shared: "cancelled" | "paused" | null): WaitingStatus {
+    const control = this.getControlState(bookingId);
+    if (control === "cancelled" || shared === "cancelled") return "invalidated";
+    if (control === "paused") return "paused";
+    return "pending";
   }
 
   private applySideEffects(
@@ -515,33 +863,31 @@ export class CoordinationLedger {
     const resumedWaitingIds: string[] = [];
     let controlHonored: boolean | undefined;
     const timestamp = nowIso();
+    const shared = this.sharedBlockReason(input.bookingId);
 
     switch (input.kind) {
       case "inquiry": {
-        if (this.sharedBlockReason(input.bookingId) === "cancelled") {
-          createdWaiting.push(
-            this.insertWaiting(input.bookingId, "followup", "invalidated", followupDueAt(input), eventId, input.revision, {
-              reason: "booking_cancelled",
-              note: "Booking is cancelled; followup invalidated at intake.",
-            }),
-          );
-          invalidatedWaitingIds.push(createdWaiting[createdWaiting.length - 1]?.id ?? "");
-          break;
-        }
-        // A paused business stays drain-excluded until it is active again,
-        // so the followup is kept pending (restorable) rather than invalidated.
-        createdWaiting.push(
-          this.insertWaiting(input.bookingId, "followup", "pending", followupDueAt(input), eventId, input.revision, {
-            reason: "awaiting_customer_reply",
-            sourceId: input.sourceId,
-          }),
+        const item = this.insertWaiting(
+          input.bookingId,
+          "followup",
+          this.entryStatus(input.bookingId, shared),
+          followupDueAt(input),
+          eventId,
+          input.revision,
+          {
+            ...(this.entryStatus(input.bookingId, shared) === "invalidated"
+              ? { reason: "booking_cancelled", note: "Booking is cancelled; followup invalidated at intake." }
+              : { reason: "awaiting_customer_reply", sourceId: input.sourceId }),
+          },
         );
+        createdWaiting.push(item);
+        if (item.status === "invalidated") invalidatedWaitingIds.push(item.id);
         break;
       }
       case "reply": {
-        // Reply-before-followup: a reply observed before a followup is due
-        // suppresses pending followups raised from earlier evidence.
-        for (const id of this.suppressFollowups(input.bookingId, new Date(input.observedAt).toISOString(), input, timestamp)) {
+        // Received-order suppression: a non-stale reply received now answers
+        // pending followups regardless of source-clock skew in observedAt.
+        for (const id of this.suppressFollowups(input.bookingId, timestamp)) {
           suppressedWaitingIds.push(id);
         }
         break;
@@ -550,164 +896,97 @@ export class CoordinationLedger {
         const prior = this.db
           .prepare(
             `SELECT id, revision FROM coord_waiting
-             WHERE booking_id = $booking AND kind = 'change_review' AND status = 'pending'`,
+             WHERE booking_id = $booking AND kind = 'change_review' AND (status = 'pending' OR status = 'claimed')`,
           )
           .all({ $booking: input.bookingId });
         for (const row of prior) {
           const r = asRow(row);
           const priorRevision = typeof r.revision === "number" ? r.revision : null;
-          if (input.revision === undefined || priorRevision === null || input.revision > priorRevision) {
+          // Equal revisions supersede: two concurrent rev-2 changes must not
+          // leave two pending reviews for the same owner decision.
+          if (input.revision === undefined || priorRevision === null || input.revision >= priorRevision) {
             const id = String(r.id);
-            this.db
-              .prepare(
-                `UPDATE coord_waiting SET status = 'invalidated', resolution_note = $note, updated_at = $at WHERE id = $id`,
-              )
-              .run({
-                $note: `Superseded by change revision ${input.revision ?? "unversioned"} (event ${input.dedupeKey})`,
-                $at: timestamp,
-                $id: id,
-              });
+            this.invalidateWaiting(
+              id,
+              `Superseded by change revision ${input.revision ?? "unversioned"} (event ${input.dedupeKey})`,
+              timestamp,
+            );
             invalidatedWaitingIds.push(id);
           }
         }
-        createdWaiting.push(
-          this.insertWaiting(
-            input.bookingId,
-            "change_review",
-            "pending",
-            new Date(input.observedAt).toISOString(),
-            eventId,
-            input.revision,
-            { reason: "booking_change_requires_review", sourceId: input.sourceId },
-          ),
+        const item = this.insertWaiting(
+          input.bookingId,
+          "change_review",
+          this.entryStatus(input.bookingId, shared),
+          storedIso(input.observedAt),
+          eventId,
+          input.revision,
+          { reason: "booking_change_requires_review", sourceId: input.sourceId },
         );
+        createdWaiting.push(item);
+        if (item.status === "invalidated") invalidatedWaitingIds.push(item.id);
         break;
       }
       case "payment_signal": {
-        const receipt = verifiedReceiptLocator(input);
-        if (receipt !== null) {
-          // Verified receipt evidence retires the chase: no new waiting, and
-          // pending followups are suppressed. This is still not a confirmed
-          // deposit — confirmation requires the authoritative receipt check
-          // by the confirmation worker (G12).
-          for (const id of this.suppressFollowups(input.bookingId, new Date(input.observedAt).toISOString(), input, timestamp)) {
-            suppressedWaitingIds.push(id);
-          }
-          createdWaiting.push(
-            this.insertWaiting(
-              input.bookingId,
-              "deposit_check",
-              "done",
-              new Date(input.observedAt).toISOString(),
-              eventId,
-              input.revision,
-              {
-                reason: "receipt_evidence_attached_for_confirmation",
-                verifiedPayment: false,
-                receiptLocator: receipt,
-                note: "Receipt evidence recorded; confirmation still requires the authoritative receipt check.",
-              },
-            ),
-          );
-          break;
-        }
-        // Evidence only: message text claiming payment never verifies a deposit.
-        createdWaiting.push(
-          this.insertWaiting(
-            input.bookingId,
-            "deposit_check",
-            "pending",
-            new Date(input.observedAt).toISOString(),
-            eventId,
-            input.revision,
-            {
-              reason: "payment_claim_requires_authoritative_receipt",
-              verifiedPayment: false,
-              sourceId: input.sourceId,
-              note: "Verify against the payment provider receipt; message text is not proof of payment.",
-            },
-          ),
+        // Evidence only, always: message text claiming payment never verifies
+        // a deposit and never retires reminders. Retirement requires
+        // recordVerifiedReceipt with a trusted verifier attestation.
+        const item = this.insertWaiting(
+          input.bookingId,
+          "deposit_check",
+          this.entryStatus(input.bookingId, shared),
+          storedIso(input.observedAt),
+          eventId,
+          input.revision,
+          {
+            reason: "payment_claim_requires_authoritative_receipt",
+            verifiedPayment: false,
+            sourceId: input.sourceId,
+            note: "Verify against the payment provider receipt; message text is not proof of payment.",
+          },
         );
+        createdWaiting.push(item);
+        if (item.status === "invalidated") invalidatedWaitingIds.push(item.id);
         break;
       }
       case "resource_signal": {
-        createdWaiting.push(
-          this.insertWaiting(
-            input.bookingId,
-            "resource_check",
-            "pending",
-            new Date(input.observedAt).toISOString(),
-            eventId,
-            input.revision,
-            { reason: "resource_state_requires_verification", sourceId: input.sourceId },
-          ),
+        const item = this.insertWaiting(
+          input.bookingId,
+          "resource_check",
+          this.entryStatus(input.bookingId, shared),
+          storedIso(input.observedAt),
+          eventId,
+          input.revision,
+          { reason: "resource_state_requires_verification", sourceId: input.sourceId },
         );
+        createdWaiting.push(item);
+        if (item.status === "invalidated") invalidatedWaitingIds.push(item.id);
         break;
       }
       case "pause":
       case "resume":
       case "cancel": {
-        if (!isTrustedControl(input)) {
-          // Untrusted control request: record the event, honor nothing, and
-          // raise a decision for the owner instead.
-          controlHonored = false;
-          createdWaiting.push(
-            this.insertWaiting(
-              input.bookingId,
-              "change_review",
-              "pending",
-              new Date(input.observedAt).toISOString(),
-              eventId,
-              input.revision,
-              {
-                reason: "untrusted_control_request_requires_owner_decision",
-                requestedControl: input.kind,
-                sourceId: input.sourceId,
-                note: `A ${input.sourceKind} message requested ${input.kind}; owner authority is required before acting.`,
-              },
-            ),
-          );
-          break;
-        }
-        controlHonored = true;
-        if (input.kind === "pause") {
-          const pending = this.db
-            .prepare(`SELECT id FROM coord_waiting WHERE booking_id = $booking AND status = 'pending'`)
-            .all({ $booking: input.bookingId });
-          for (const row of pending) {
-            const id = String(asRow(row).id);
-            this.db
-              .prepare(`UPDATE coord_waiting SET status = 'paused', updated_at = $at WHERE id = $id`)
-              .run({ $at: timestamp, $id: id });
-            pausedWaitingIds.push(id);
-          }
-        } else if (input.kind === "resume") {
-          const paused = this.db
-            .prepare(`SELECT id FROM coord_waiting WHERE booking_id = $booking AND status = 'paused'`)
-            .all({ $booking: input.bookingId });
-          for (const row of paused) {
-            const id = String(asRow(row).id);
-            this.db
-              .prepare(`UPDATE coord_waiting SET status = 'pending', updated_at = $at WHERE id = $id`)
-              .run({ $at: timestamp, $id: id });
-            resumedWaitingIds.push(id);
-          }
-        } else {
-          const open = this.db
-            .prepare(
-              `SELECT id FROM coord_waiting WHERE booking_id = $booking AND (status = 'pending' OR status = 'paused')`,
-            )
-            .all({ $booking: input.bookingId });
-          for (const row of open) {
-            const id = String(asRow(row).id);
-            this.db
-              .prepare(
-                `UPDATE coord_waiting SET status = 'invalidated', resolution_note = $note, updated_at = $at WHERE id = $id`,
-              )
-              .run({ $note: `Invalidated by cancellation (event ${input.dedupeKey})`, $at: timestamp, $id: id });
-            invalidatedWaitingIds.push(id);
-          }
-        }
+        // Intake NEVER honors control: sourceKind and payload.authorizedBy
+        // are raw event fields and prove nothing about the owner. Record the
+        // request and raise an owner decision instead. Honored control flows
+        // only through applyOwnerControl with host attestation.
+        controlHonored = false;
+        createdWaiting.push(
+          this.insertWaiting(
+            input.bookingId,
+            "change_review",
+            this.entryStatus(input.bookingId, shared),
+            storedIso(input.observedAt),
+            eventId,
+            input.revision,
+            {
+              reason: "untrusted_control_request_requires_owner_decision",
+              requestedControl: input.kind,
+              sourceId: input.sourceId,
+              note: `A ${input.sourceKind} message requested ${input.kind}; owner authority is required before acting. Use applyOwnerControl with host attestation.`,
+            },
+          ),
+        );
         break;
       }
     }
@@ -715,25 +994,25 @@ export class CoordinationLedger {
     return { controlHonored, createdWaiting, suppressedWaitingIds, invalidatedWaitingIds, pausedWaitingIds, resumedWaitingIds };
   }
 
-  private suppressFollowups(
-    bookingId: string,
-    replyObservedIso: string,
-    input: CoordinationEventInput,
-    timestamp: string,
-  ): string[] {
+  /**
+   * Received-order suppression: every pending or claimed followup for the
+   * booking is answered by an event received now. Claimed items move too, so
+   * their fencing tokens die with the obsolete work instead of completing it.
+   */
+  private suppressFollowups(bookingId: string, timestamp: string): string[] {
     const ids: string[] = [];
     const pending = this.db
       .prepare(
-        `SELECT id, created_at FROM coord_waiting
-         WHERE booking_id = $booking AND kind = 'followup' AND status = 'pending' AND created_at <= $observed`,
+        `SELECT id FROM coord_waiting
+         WHERE booking_id = $booking AND kind = 'followup' AND (status = 'pending' OR status = 'claimed')`,
       )
-      .all({ $booking: bookingId, $observed: replyObservedIso });
+      .all({ $booking: bookingId });
     for (const row of pending) {
       const id = String(asRow(row).id);
       this.db
         .prepare(`UPDATE coord_waiting SET status = 'suppressed', resolution_note = $note, updated_at = $at WHERE id = $id`)
         .run({
-          $note: `Suppressed by ${input.kind} ${input.sourceId} observed at ${input.observedAt}`,
+          $note: `Suppressed by received reply: customer answered before followup was acted on`,
           $at: timestamp,
           $id: id,
         });
@@ -788,14 +1067,24 @@ export class CoordinationLedger {
   }
 
   private toWaitingItem(value: SqlRow): WaitingItem {
-    const kind = String(value.kind) as WaitingKind;
-    const recommendation = recommendedFor(kind);
+    const kind = String(value.kind);
+    if (kind !== "followup" && kind !== "deposit_check" && kind !== "resource_check" && kind !== "change_review") {
+      throw new Error(`Corrupt waiting row ${String(value.id)}: unknown kind ${kind}`);
+    }
+    const status = String(value.status);
+    if (
+      status !== "pending" && status !== "claimed" && status !== "done" &&
+      status !== "suppressed" && status !== "invalidated" && status !== "paused"
+    ) {
+      throw new Error(`Corrupt waiting row ${String(value.id)}: unknown status ${status}`);
+    }
+    const recommendation = recommendedFor(kind as WaitingKind);
     const detail = parseRecord(value.detail_json);
     return {
       id: String(value.id),
       bookingId: String(value.booking_id),
-      kind,
-      status: value.status as WaitingStatus,
+      kind: kind as WaitingKind,
+      status: status as WaitingStatus,
       dueAt: String(value.due_at),
       detail,
       sourceEventId: String(value.source_event_id),
@@ -832,14 +1121,17 @@ export class CoordinationLedger {
 
   /**
    * Drain-time guard: never surface due work for a cancelled booking or a
-   * paused business. Reads the shared Gather tables when present; a bare
-   * injected connection without them simply yields no exclusion.
+   * paused business. Reads the shared Gather tables according to the
+   * declared mode. Fail-closed: unexpected query failures are rethrown so a
+   * broken integration surfaces instead of leaking guarded work; only an
+   * explicitly absent foundation (standalone contract) yields no exclusion.
    */
   private isBlockedBySharedState(bookingId: string): boolean {
     return this.sharedBlockReason(bookingId) !== null;
   }
 
   private sharedBlockReason(bookingId: string): "cancelled" | "paused" | null {
+    if (this.sharedTables === "off") return null;
     try {
       const booking = this.db.prepare("SELECT business_id, status FROM bookings WHERE id = $id").get({ $id: bookingId });
       if (!booking) return null;
@@ -850,8 +1142,10 @@ export class CoordinationLedger {
       const business = this.db.prepare("SELECT status FROM businesses WHERE id = $id").get({ $id: businessId });
       if (!business) return null;
       return String(asRow(business).status) === "paused" ? "paused" : null;
-    } catch {
-      return null;
+    } catch (error) {
+      if (this.sharedTables === "required") throw error;
+      if (error instanceof Error && /no such table/i.test(error.message)) return null;
+      throw error;
     }
   }
 }
