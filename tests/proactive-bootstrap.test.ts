@@ -124,6 +124,9 @@ interface MailboxScript {
   listed: Array<{ id: string; threadId: string }>;
   added: Array<{ id: string; threadId: string }>;
   failInbox: boolean;
+  /** When true, inbox requests block until releaseInbox fires. */
+  holdInbox: boolean;
+  releaseInbox?: () => void;
 }
 
 /** Scripted fictional Gmail: per-bearer-token mailboxes over the real poller/reader. */
@@ -133,7 +136,7 @@ class ScriptedGmail {
   boxFor(auth: string): MailboxScript {
     let box = this.boxes.get(auth);
     if (!box) {
-      box = { historyId: "9000", listed: [], added: [], failInbox: false };
+      box = { historyId: "9000", listed: [], added: [], failInbox: false, holdInbox: false };
       this.boxes.set(auth, box);
     }
     return box;
@@ -145,6 +148,14 @@ class ScriptedGmail {
     this.requests.push(req);
     const auth = req.headers.Authorization ?? "";
     const box = this.boxFor(auth);
+    if (box.holdInbox && (req.url.includes("/history") || req.url.includes("/messages") || req.url.includes("/profile"))) {
+      await new Promise<void>((resolve) => {
+        box.releaseInbox = () => {
+          box.holdInbox = false;
+          resolve();
+        };
+      });
+    }
     if (box.failInbox && (req.url.includes("/history") || req.url.includes("/messages") || req.url.includes("/profile"))) {
       return this.json(500, { error: { message: "fictional mailbox failure" } });
     }
@@ -519,6 +530,182 @@ test("owner calendar choice pins one verified account and hides technical mappin
       assert.equal(error.code, "CALENDAR_ACCOUNT_AMBIGUOUS");
     }
   } finally {
+    cleanupFx(fx);
+  }
+});
+
+test("emergency disable gates every ensure/refresh — zero provider polls while off", async () => {
+  const fx = fixture();
+  const hadEnv = process.env.GATHER_PROACTIVE_DISABLE;
+  process.env.GATHER_PROACTIVE_DISABLE = "1";
+  try {
+    const business = fx.store.createBusiness({ name: "Disabled Hall", timezone: "UTC" });
+    await connectAccount(fx, business.id, "code-a", "google-sub-a");
+    const tokenCallsAfterConnect = fx.oauth.tokenCalls; // auth itself is allowed
+    const httpAfterConnect = fx.gmail.requests.length;
+    hosted(fx); // initial bootstrap under disable
+    let report = await refreshProactiveHost();
+    const accountId = gmailAccountId(fx, business.id);
+    assert.equal(getProactiveBinding(accountId), undefined, "nothing registered while disabled");
+    assert.deepEqual(listOperatorAccounts(), []);
+
+    // The defect: later ensure/refresh calls must stay inert too.
+    hosted(fx);
+    hosted(fx);
+    report = await refreshProactiveHost();
+    await refreshProactiveHost();
+    assert.equal(getProactiveBinding(accountId), undefined, "repeated ensure/refresh registers nothing");
+    assert.equal(fx.gmail.requests.length, httpAfterConnect, "zero provider polls while disabled");
+    assert.equal(fx.oauth.tokenCalls, tokenCallsAfterConnect, "no token supply while disabled");
+    assert.equal(report.accounts.length, 0);
+
+    // Re-enable: the next refresh registers and polls normally.
+    delete process.env.GATHER_PROACTIVE_DISABLE;
+    await refreshProactiveHost();
+    assert.equal(getProactiveBinding(accountId)?.status, "running", "re-enable resumes registration");
+    assert.equal((await tickBinding(accountId)).ok, true);
+  } finally {
+    if (hadEnv === undefined) delete process.env.GATHER_PROACTIVE_DISABLE;
+    else process.env.GATHER_PROACTIVE_DISABLE = hadEnv;
+    await stopProactiveHost(1000).catch(() => undefined);
+    cleanupFx(fx);
+  }
+});
+
+test("enabled then disabled drains bindings and stays stopped until re-enabled", async () => {
+  const fx = fixture();
+  const hadEnv = process.env.GATHER_PROACTIVE_DISABLE;
+  try {
+    const business = fx.store.createBusiness({ name: "Drain Hall", timezone: "UTC" });
+    await connectAccount(fx, business.id, "code-a", "google-sub-a");
+    fx.gmail.boxFor("Bearer access-google-sub-a").listed.push({ id: "m-1", threadId: "t-1" });
+    hosted(fx);
+    await refreshProactiveHost();
+    const accountId = gmailAccountId(fx, business.id);
+    assert.equal(getProactiveBinding(accountId)?.status, "running");
+    assert.equal((await tickBinding(accountId)).ok, true);
+    assert.equal(intakeItemCount(fx, "m-1"), 1);
+
+    // Emergency pause mid-life: bindings drain, durable rows and operator
+    // wiring survive, and no refresh resurrects polling while disabled.
+    process.env.GATHER_PROACTIVE_DISABLE = "1";
+    const report = await refreshProactiveHost();
+    assert.equal(getProactiveBinding(accountId)?.status, "stopped", "disable drains the running binding");
+    assert.equal(report.accounts.find((entry) => entry.accountId === accountId)?.watching, false);
+    assert.ok(getOperatorDepsFor(accountId), "operator wiring kept so re-enable resumes without re-onboarding");
+    assert.equal(intakeItemCount(fx, "m-1"), 1, "durable intake rows preserved");
+
+    hosted(fx); // a route-triggered ensure under disable must not resurrect
+    const callsBefore = fx.gmail.requests.length;
+    await refreshProactiveHost();
+    await refreshProactiveHost();
+    assert.equal(getProactiveBinding(accountId)?.status, "stopped", "disabled refresh never restarts the timer");
+    assert.equal(fx.gmail.requests.length, callsBefore, "no provider polls while disabled");
+
+    // Re-enable resumes the same binding; the durable cursor keeps working.
+    delete process.env.GATHER_PROACTIVE_DISABLE;
+    await refreshProactiveHost();
+    assert.equal(getProactiveBinding(accountId)?.status, "running", "re-enable resumes the stopped binding");
+    fx.gmail.boxFor("Bearer access-google-sub-a").added.push({ id: "m-1", threadId: "t-1" });
+    assert.equal((await tickBinding(accountId)).ok, true);
+    assert.equal(intakeItemCount(fx, "m-1"), 1, "cursor dedupe survives the pause/resume cycle");
+  } finally {
+    if (hadEnv === undefined) delete process.env.GATHER_PROACTIVE_DISABLE;
+    else process.env.GATHER_PROACTIVE_DISABLE = hadEnv;
+    await stopProactiveHost(1000).catch(() => undefined);
+    cleanupFx(fx);
+  }
+});
+
+test("disable landing inside a deferred pause await blocks the next business's registration", async () => {
+  const fx = fixture();
+  const hadEnv = process.env.GATHER_PROACTIVE_DISABLE;
+  try {
+    // A is PAUSED: its loop branch awaits stopManaged, which is the exact
+    // suspension point where a mid-refresh disable used to slip through to
+    // business B's fresh registration (and its immediate token read).
+    const hallA = fx.store.createBusiness({ name: "Paused Hall", timezone: "UTC" });
+    const hallB = fx.store.createBusiness({ name: "Active Hall", timezone: "UTC" });
+    await connectAccount(fx, hallA.id, "code-a", "google-sub-a");
+    await connectAccount(fx, hallB.id, "code-b", "google-sub-b");
+    hosted(fx);
+    await refreshProactiveHost();
+    const accountA = gmailAccountId(fx, hallA.id);
+    const accountB = gmailAccountId(fx, hallB.id);
+    assert.equal(getProactiveBinding(accountA)?.status, "running");
+    assert.equal(getProactiveBinding(accountB)?.status, "running");
+    // One real sweep so B's binding carries observable history: a fresh
+    // re-registration would reset totalRuns to zero.
+    assert.equal((await tickBinding(accountB)).ok, true);
+    assert.equal(getProactiveBinding(accountB)?.totalRuns, 1);
+
+    fx.store.db.prepare("UPDATE businesses SET status = 'paused' WHERE id = $id").run({ $id: hallA.id });
+    const httpBefore = fx.gmail.requests.length;
+    const tokensBefore = fx.oauth.tokenCalls;
+    // Start the refresh; it suspends inside A's stopManaged await. Set the
+    // kill-switch while suspended — the loop must not advance into B.
+    const refresh = refreshProactiveHost();
+    process.env.GATHER_PROACTIVE_DISABLE = "1";
+    await refresh;
+    assert.equal(getProactiveBinding(accountB)?.status, "stopped", "B drained, never re-registered after mid-refresh disable");
+    assert.equal(getProactiveBinding(accountB)?.totalRuns, 1, "B's binding record untouched — startProactiveAccount never ran under disable");
+    assert.equal(getProactiveBinding(accountA)?.status, "stopped");
+    assert.equal(fx.gmail.requests.length, httpBefore, "no provider poll reached business B");
+    assert.equal(fx.oauth.tokenCalls, tokensBefore, "no fresh token read for B while disabled");
+    // And it stays stopped under repeated ensure/refresh.
+    hosted(fx);
+    await refreshProactiveHost();
+    assert.equal(getProactiveBinding(accountB)?.status, "stopped");
+    assert.equal(fx.gmail.requests.length, httpBefore);
+  } finally {
+    if (hadEnv === undefined) delete process.env.GATHER_PROACTIVE_DISABLE;
+    else process.env.GATHER_PROACTIVE_DISABLE = hadEnv;
+    await stopProactiveHost(1000).catch(() => undefined);
+    cleanupFx(fx);
+  }
+});
+
+test("disable stops all managed timers before awaiting any one drain", async () => {
+  const fx = fixture();
+  const hadEnv = process.env.GATHER_PROACTIVE_DISABLE;
+  try {
+    const hallA = fx.store.createBusiness({ name: "Held Hall", timezone: "UTC" });
+    const hallB = fx.store.createBusiness({ name: "Neighbor Hall", timezone: "UTC" });
+    await connectAccount(fx, hallA.id, "code-a", "google-sub-a");
+    await connectAccount(fx, hallB.id, "code-b", "google-sub-b");
+    hosted(fx);
+    await refreshProactiveHost();
+    const accountA = gmailAccountId(fx, hallA.id);
+    const accountB = gmailAccountId(fx, hallB.id);
+
+    // A's sweep is genuinely in flight, parked inside a held inbox request.
+    fx.gmail.boxFor("Bearer access-google-sub-a").holdInbox = true;
+    const heldTick = tickBinding(accountA);
+    for (let i = 0; i < 50 && !getProactiveBinding(accountA)?.inFlight; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(getProactiveBinding(accountA)?.inFlight, true, "A's sweep is in flight during the disable");
+
+    // With a serial drain, the refresh would park inside A's stop while B's
+    // interval stayed armed and status "running". Initiate-all-stops-first
+    // clears B's timer synchronously — observable before A's sweep releases.
+    process.env.GATHER_PROACTIVE_DISABLE = "1";
+    const refresh = refreshProactiveHost(30_000);
+    assert.equal(getProactiveBinding(accountB)?.status, "stopped", "B's timer cleared while A's drain is still held");
+    assert.equal(getProactiveBinding(accountA)?.status, "stopped");
+
+    const bCalls = () => fx.gmail.requests.filter((req) => req.headers.Authorization === "Bearer access-google-sub-b").length;
+    const bBefore = bCalls();
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    assert.equal(bCalls(), bBefore, "no B poll while A's drain pends");
+    fx.gmail.boxFor("Bearer access-google-sub-a").releaseInbox?.();
+    await refresh;
+    await heldTick.catch(() => undefined);
+    assert.equal(getProactiveBinding(accountB)?.status, "stopped");
+  } finally {
+    if (hadEnv === undefined) delete process.env.GATHER_PROACTIVE_DISABLE;
+    else process.env.GATHER_PROACTIVE_DISABLE = hadEnv;
+    await stopProactiveHost(1000).catch(() => undefined);
     cleanupFx(fx);
   }
 });
