@@ -67,9 +67,17 @@ export interface RuntimeConnectionLike extends GatewayRequestChannel {
   close(opts?: { timeoutMs?: number }): Promise<void>;
 }
 
+/** Narrow structural seam for the MCP boundary; GatherMcpBoundary satisfies it. */
+export interface RuntimeMcpBoundaryLike {
+  readonly toolNames: string[];
+  listen(input: { host?: string; port: number }): Promise<{ url: string; port: number }>;
+  close(): Promise<void>;
+}
+
 export interface GatherRuntimeDeps {
   processFactory?: (options: GatewayProcessOptions) => RuntimeProcessLike;
   connectionFactory?: (options: GatherGatewayClientOptions) => RuntimeConnectionLike;
+  mcpBoundaryFactory?: (options: { tools: readonly GatherTool[]; authToken: string }) => RuntimeMcpBoundaryLike;
 }
 
 export class GatherOpenClawRuntime {
@@ -80,7 +88,7 @@ export class GatherOpenClawRuntime {
   private stopPromise: Promise<void> | null = null;
   private process: RuntimeProcessLike | null = null;
   private connection: RuntimeConnectionLike | null = null;
-  private mcpBoundary: GatherMcpBoundary | null = null;
+  private mcpBoundary: RuntimeMcpBoundaryLike | null = null;
   private mcpRef: GatherMcpServerRef | null = null;
   private mcpToken: string | null = null;
   private provisioned = false;
@@ -156,7 +164,7 @@ export class GatherOpenClawRuntime {
     try {
       if (this.options.mcpTools && this.options.mcpTools.length > 0) {
         this.mcpToken = ensureMcpToken(this.layout);
-        this.mcpBoundary = new GatherMcpBoundary({
+        this.mcpBoundary = (this.deps.mcpBoundaryFactory ?? ((opts) => new GatherMcpBoundary(opts)))({
           tools: this.options.mcpTools,
           authToken: this.mcpToken,
         });
@@ -168,7 +176,7 @@ export class GatherOpenClawRuntime {
           url: bound.url,
           toolInclude: this.mcpBoundary.toolNames,
         };
-        writeGatewayConfig(this.layout, { gatherMcp: this.mcpRef });
+        writeGatewayConfig(this.layout, { gatherMcp: this.mcpRef ?? undefined });
       }
 
       const factory = this.deps.processFactory ?? ((opts) => new OpenClawGatewayProcess(opts));
@@ -198,8 +206,11 @@ export class GatherOpenClawRuntime {
 
   /**
    * Failed-start rollback: close the WS client if any, stop the child if
-   * spawned (keeping the reference when its exit was not observed), and tear
-   * down the MCP listener + rewrite config without the stale MCP ref.
+   * spawned (keeping the reference when its exit was not observed), and
+   * tear down the MCP listener + rewrite config without the stale MCP
+   * ref. A close that FAILS keeps ownership — the boundary reference (and
+   * its token/config ref) is preserved so a later stop() can retry and
+   * state never claims a released listener that is still bound.
    */
   private async rollbackOwnedResources(): Promise<void> {
     if (this.connection) {
@@ -215,12 +226,32 @@ export class GatherOpenClawRuntime {
         // true lifecycle and a later stop() can retry.
       }
     }
-    if (this.mcpBoundary) {
-      await this.mcpBoundary.close().catch(() => {});
+    // Report, don't hide: a failed close keeps the boundary owned and the
+    // error goes to the diagnostic log — the original start error still
+    // propagates to the caller.
+    const mcpError = await this.releaseMcpBoundary();
+    if (mcpError) {
+      this.options.log?.(`[runtime] MCP boundary close failed during rollback (ownership retained): ${mcpError.message}`);
+    }
+  }
+
+  /**
+   * Close the MCP boundary and release its references ONLY on observed
+   * close success. On failure the boundary/token/ref stay owned (the
+   * listener may still be bound) and the error is returned for the caller
+   * to surface — ownership is never silently dropped.
+   */
+  private async releaseMcpBoundary(): Promise<Error | null> {
+    if (!this.mcpBoundary) return null;
+    try {
+      await this.mcpBoundary.close();
       this.mcpBoundary = null;
       this.mcpRef = null;
       this.mcpToken = null;
       writeGatewayConfig(this.layout, {});
+      return null;
+    } catch (error) {
+      return error instanceof Error ? error : new Error(String(error));
     }
   }
 
@@ -260,13 +291,11 @@ export class GatherOpenClawRuntime {
         stopError = error;
       }
     }
-    if (this.mcpBoundary) {
-      await this.mcpBoundary.close().catch(() => {});
-      this.mcpBoundary = null;
-      this.mcpRef = null;
-      this.mcpToken = null;
-    }
+    // An MCP close failure is reported, not swallowed: the boundary stays
+    // owned (listener may still be bound) and the error propagates.
+    const mcpError = await this.releaseMcpBoundary();
     if (stopError) throw stopError;
+    if (mcpError) throw mcpError;
   }
 
   get state(): { process: GatewayProcessState; connection: GatewayConnectionState } {

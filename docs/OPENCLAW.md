@@ -113,12 +113,17 @@ tokens):
   in which case a preflight bind probe fails fast with `FAIL port
   preflight` when the port is occupied — without stopping, connecting to,
   or otherwise touching the foreign listener, and with auth/isolation
-  unchanged (no child spawned).   `allocateLoopbackPort()` /
+  unchanged (no child spawned). A bare `--port` with no value is a usage
+  error (`FAIL port preflight`), never a silent fallback to dynamic
+  allocation. `allocateLoopbackPort()` /
   `checkLoopbackPortOccupied()` (`src/runtime/process.ts`) implement the
-  probes. Both are loopback-only by construction (no host parameter, so
-  they cannot bind or probe a non-loopback address); the occupancy probe
-  also validates the port range. A "free" probe only reduces collision
-  probability: the gateway's
+  probes. The allocator binds `127.0.0.1:0` only; the occupancy probe
+  binds `127.0.0.1` **and** `0.0.0.0` briefly because SO_REUSEADDR lets a
+  loopback-specific bind coexist with a foreign wildcard listener —
+  probing loopback alone would report a wildcard occupant "free" (IPv6
+  `::1`-only occupants are out of scope: the gateway binds IPv4
+  loopback). The probe validates the port range. A "free" probe only
+  reduces collision probability: the gateway's
   own bind is authoritative (TOCTOU remains), and an early-exit child is
   the real collision signal — never the probe result. No earlier
   load-related failure's root cause is claimed proven; the fixed ports
@@ -131,7 +136,12 @@ tokens):
   rejects `start()` immediately — it is never mistaken for a running
   child. Exit `78` (`EX_CONFIG`) triggers one
   `doctor --fix --yes --non-interactive` repair under the same env and one
-  retry. Process survival is not readiness.
+  retry. The repair is a TRACKED child under a bounded deadline
+  (`DOCTOR_REPAIR_TIMEOUT_MS`, 60 s): a hung repair is SIGTERM'd then
+  SIGKILL'd and `start()` rejects only after the repair child's exit is
+  observed; `stop()` during a repair kills the tracked child too, so a
+  repair can never wedge the lifecycle or leak an untracked process.
+  Process survival is not readiness.
 - **Readiness**: `connect()` resolves on `hello-ok` within a caller deadline
   (default 30 s, unchanged — the deadline is the readiness signal, not a
   knob for hiding slow-boot failures). The doctor records it as
@@ -146,8 +156,11 @@ tokens):
   while a `stop()` is in flight; a failed start rolls back only the resources
   that invocation owned and keeps the process reference whenever the child's
   exit was not verifiably observed, so a retry can never orphan a second
-  process. Recovery is allowed only after an observed `stop()` has released
-  every owned reference.
+  process. The same ownership rule covers the MCP boundary: a failed
+  `close()` keeps the boundary/token/refs owned and surfaces the error (via
+  `stop()` rejection or the diagnostic log during rollback) — the reference
+  is dropped only after an observed close. Recovery is allowed only after an
+  observed `stop()` has released every owned reference.
 - **Shutdown**: `stop()` is single-flight (concurrent callers share the
   teardown) and first lets any in-flight startup settle, then closes the WS
   client (`stopAndWait`), SIGTERMs the child and waits for the *observed*
@@ -218,22 +231,26 @@ missing/unknown session ids get `404` per the MCP spec.
 ## Verification
 
 - `npm run typecheck` — clean.
-- `npm test` — all pass. `tests/runtime.test.ts` (37 tests) covers
+- `npm test` — all pass. `tests/runtime.test.ts` (42 tests) covers
   isolation, config materialization, env allowlist rejection, executable
   validation, loopback port probes (free/held/released; invalid ports
-  rejected; two allocations do not collide), collision-proof session keys, mock-transport protocol
+  rejected; wildcard-bound occupants detected; two allocations do not
+  collide), bounded tracked repair (deadline kills a hung `doctor --fix`;
+  `stop()` reaches the in-flight repair child), collision-proof session keys,
+  mock-transport protocol
   (connect/hello-ok, malformed responses, wait-status mapping), spawn-error
   and observed-exit shutdown semantics, facade lifecycle (failed-start MCP
-  rollback with same-port rebind proving release, connect-failure cleanup,
+  rollback with same-port rebind proving release, failed MCP close keeps
+  ownership until an observed close, connect-failure cleanup,
   single-flight concurrent/repeated start, blocked retry after uncertain
   child exit, running-child-with-dropped-WS guard, start-during-stop
   ordering; MCP ports are ephemeral or per-run allocated, never fixed),
   real loopback MCP (auth/Host/Origin, two-session reconnect, simulated
-  labeling), and three real-boot doctor tests (sentinel preservation on an
+  labeling), and four real-boot doctor tests (sentinel preservation on an
   auto-allocated port; SIGTERM mid-run on an explicit per-run port still
   observing child exit and cleaning only its own directory; occupied port
   failing at preflight with the foreign listener untouched and sentinel
-  preserved).
+  preserved; bare `--port` failing preflight).
 - `node scripts/openclaw-doctor.mjs` — actual isolated boot on host
   `openclaw@2026.9.4` (explicit `--openclaw-bin`, e.g.
   `/opt/homebrew/bin/openclaw`): unique `.runtime/openclaw-doctor-*` root

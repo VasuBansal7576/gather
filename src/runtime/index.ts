@@ -11,6 +11,7 @@ export {
   type GatherMcpServerRef,
 } from "./config.ts";
 export {
+  DOCTOR_REPAIR_TIMEOUT_MS,
   OpenClawGatewayProcess,
   allocateLoopbackPort,
   buildGatewayChildEnv,

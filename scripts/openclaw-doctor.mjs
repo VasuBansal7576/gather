@@ -54,20 +54,24 @@ const keep = args.includes("--keep");
 const verbose = args.includes("--verbose");
 const binFlagIndex = args.indexOf("--openclaw-bin");
 const portFlagIndex = args.indexOf("--port");
-// --port <n>: explicit loopback port. Omitted, "0", or "auto": allocate a
-// currently-free loopback port per run (bind 127.0.0.1:0). The allocation is
-// a collision-reduction probe, NOT a guarantee: the gateway's own bind is
+// --port <n>: explicit loopback port. Omitted flag, "0", or "auto":
+// allocate a currently-free loopback port per run (bind 127.0.0.1:0).
+// A bare "--port" with no value is a usage error — it fails the preflight
+// instead of silently ignoring the flag. The allocation is a
+// collision-reduction probe, NOT a guarantee: the gateway's own bind is
 // authoritative (TOCTOU remains — a "free" probe result never proves the
 // port stays free).
 const portRaw = portFlagIndex >= 0 ? args[portFlagIndex + 1] : "auto";
+const barePortFlag = portFlagIndex >= 0 && portRaw === undefined;
 const explicitPort =
   portRaw === undefined || portRaw === "auto" || portRaw === "0"
     ? null
     : Number(portRaw);
 const log = verbose ? (line) => console.error(`  ${line}`) : () => {};
 
-// Loopback-only by construction (no host parameter): these probes can only
-// ever bind 127.0.0.1, never a non-loopback address.
+// The allocator is loopback-only by construction (no host parameter).
+// The occupancy probe binds 127.0.0.1 AND 0.0.0.0 briefly — probe sockets
+// only, never a foreign listener, and never an accepted connection.
 function allocateFreeLoopbackPort() {
   return new Promise((resolvePromise, rejectPromise) => {
     const server = createServer();
@@ -81,22 +85,29 @@ function allocateFreeLoopbackPort() {
 }
 
 /**
- * Preflight occupancy probe: single bind attempt on 127.0.0.1.
- * EADDRINUSE => occupied. Closes its own probe socket immediately; never
- * touches a foreign listener (no connect, no kill). A "free" answer is
- * advisory only.
+ * Preflight occupancy probe for the IPv4 namespace the gateway binds: a
+ * single bind on 127.0.0.1 AND on 0.0.0.0 — SO_REUSEADDR lets a
+ * loopback-only probe coexist with (and therefore miss) a foreign
+ * wildcard listener, so both addresses are probed. EADDRINUSE on either
+ * => occupied. Closes its own probe sockets immediately; never touches a
+ * foreign listener (no connect, no kill). A "free" answer is advisory
+ * only — the gateway bind is authoritative.
  */
-function isPortOccupied(port) {
-  return new Promise((resolvePromise, rejectPromise) => {
-    const probe = createServer();
-    probe.once("error", (error) => {
-      if (error?.code === "EADDRINUSE") resolvePromise(true);
-      else rejectPromise(error);
+async function isPortOccupied(port) {
+  for (const host of ["127.0.0.1", "0.0.0.0"]) {
+    const occupied = await new Promise((resolvePromise, rejectPromise) => {
+      const probe = createServer();
+      probe.once("error", (error) => {
+        if (error?.code === "EADDRINUSE") resolvePromise(true);
+        else rejectPromise(error);
+      });
+      probe.listen(port, host, () => {
+        probe.close(() => resolvePromise(false));
+      });
     });
-    probe.listen(port, "127.0.0.1", () => {
-      probe.close(() => resolvePromise(false));
-    });
-  });
+    if (occupied) return true;
+  }
+  return false;
 }
 
 const results = [];
@@ -206,6 +217,11 @@ async function main() {
   // never stops or connects to the foreign listener.
   let port;
   let portOrigin;
+  if (barePortFlag) {
+    record("port preflight", false, `--port requires a value: 1-65535, "0", or "auto"`);
+    cleanupEnabled = true;
+    return;
+  }
   if (explicitPort === null) {
     port = await allocateFreeLoopbackPort();
     portOrigin = "dynamic per-run allocation (bind 127.0.0.1:0 probe; TOCTOU applies — gateway bind is authoritative)";
