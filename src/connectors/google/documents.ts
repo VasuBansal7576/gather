@@ -218,8 +218,13 @@ export class GoogleDocumentRetriever implements DocumentRetriever {
     fileId: string,
     meta: FileMetadata,
   ): Promise<ConnectorResult<RetrieveDocumentResponse>> {
-    // Range-capped: a 206 proves more bytes exist (fail closed over cap);
-    // a 200 carries the whole body for a final length check.
+    // Range-capped: the Range header asks for bytes 0..cap-1. A 206 is a
+    // COMPLETE body only when Content-Range proves it — `bytes 0-(total-1)/total`
+    // with the total inside the cap, the declared span matching the actual
+    // body bytes, and Content-Length (when present) agreeing. Some providers
+    // honor Range even for in-bounds files, so a fully-covered 206 must be
+    // accepted; every other 206 — partial span, unknown total, malformed or
+    // missing header, truncated body — still fails closed.
     const cap = this.byteCap();
     const response = await authorized(this.options, {
       method: "GET",
@@ -227,11 +232,25 @@ export class GoogleDocumentRetriever implements DocumentRetriever {
       headers: { Range: `bytes=0-${cap - 1}` },
     });
     if (response.status === 206) {
-      return {
-        status: "failed",
-        metadata: liveMetadata(request.operationKey, []),
-        error: transportError(`Drive file exceeds the ${cap}-byte retrieval bound; request a narrower document instead of a truncated one`),
-      };
+      const range = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(response.headers["content-range"] ?? "");
+      const start = range ? Number(range[1]) : NaN;
+      const end = range ? Number(range[2]) : NaN;
+      const total = range ? Number(range[3]) : NaN;
+      const declared = end - start + 1;
+      const actual = Buffer.byteLength(response.text, "utf-8");
+      const contentLength = response.headers["content-length"];
+      const complete =
+        start === 0 && Number.isSafeInteger(total) && total > 0 && total <= cap &&
+        end === total - 1 && declared === actual &&
+        (contentLength === undefined || Number(contentLength) === declared);
+      if (!complete) {
+        return {
+          status: "failed",
+          metadata: liveMetadata(request.operationKey, []),
+          error: transportError(`Drive file exceeds the ${cap}-byte retrieval bound or returned an incomplete range; request a narrower document instead of a truncated one`),
+        };
+      }
+      return this.toRecord(request, meta, meta.mimeType ?? "text/plain", response.text);
     }
     if (response.status !== 200) {
       const error = mapGoogleHttpError(response.status, safeParseJson(response.text), "retrieveDocument");

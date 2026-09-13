@@ -150,3 +150,93 @@ test("validation rejects empty ids before any HTTP call", async () => {
   assert.equal(result.error.kind, "invalid_request");
   assert.equal(log.length, 0);
 });
+
+// ---------- 206 Content-Range acceptance: complete-only, fail-closed ----------
+
+const BLOB_META = { id: "blob-1", name: "venue-policy.md", mimeType: "text/plain", capabilities: { canDownload: true } };
+
+function blobRetriever(media: (req: GoogleHttpRequest) => GoogleHttpResponse, byteCap = 1024) {
+  return retriever((req) => (req.url.includes("alt=media") ? media(req) : json(200, BLOB_META)), byteCap);
+}
+
+test("a complete-range 206 is accepted — the reported venue-policy.md case", async () => {
+  const body = "x".repeat(817);
+  const { connector, log } = blobRetriever(() => ({
+    status: 206,
+    headers: { "content-range": "bytes 0-816/817", "content-length": "817" },
+    text: body,
+  }));
+  const result = await connector.retrieveDocument({ operationKey: "op-206-ok", documentId: "blob-1" });
+  assert.equal(result.status, "succeeded", "a 206 covering the whole file is the complete body, not over-cap");
+  if (result.status !== "succeeded") return;
+  assert.equal(result.data.document.text, body);
+  assert.ok(log.every((entry) => entry.headers.Range === "bytes=0-1023" || !entry.url.includes("alt=media")),
+    "the bounded Range request is preserved — no unbounded refetch");
+});
+
+test("206 without provable full coverage fails closed", async () => {
+  const cases: Array<{ name: string; headers: Record<string, string>; body?: string }> = [
+    { name: "partial range", headers: { "content-range": "bytes 0-99/5000" }, body: "x".repeat(100) },
+    { name: "unknown total", headers: { "content-range": "bytes 0-816/*" }, body: "x".repeat(817) },
+    { name: "malformed range", headers: { "content-range": "0-816/817" }, body: "x".repeat(817) },
+    { name: "missing header", headers: {}, body: "x".repeat(817) },
+    { name: "nonzero start", headers: { "content-range": "bytes 100-816/817" }, body: "x".repeat(717) },
+    { name: "truncated body", headers: { "content-range": "bytes 0-816/817", "content-length": "817" }, body: "x".repeat(100) },
+    { name: "content-length mismatch", headers: { "content-range": "bytes 0-816/817", "content-length": "50" }, body: "x".repeat(817) },
+  ];
+  for (const testCase of cases) {
+    const { connector } = blobRetriever(() => ({ status: 206, headers: testCase.headers, text: testCase.body ?? "" }));
+    const result = await connector.retrieveDocument({ operationKey: `op-206-${testCase.name}`, documentId: "blob-1" });
+    assert.equal(result.status, "failed", `206 with ${testCase.name} must not be treated as complete`);
+  }
+  // Complete range but the file itself exceeds the cap: still refused.
+  const big = blobRetriever(() => ({
+    status: 206,
+    headers: { "content-range": "bytes 0-1999/2000", "content-length": "2000" },
+    text: "x".repeat(2000),
+  }), 1024);
+  const over = await big.connector.retrieveDocument({ operationKey: "op-206-big", documentId: "blob-1" });
+  assert.equal(over.status, "failed", "a fully-covered 206 over the byte cap still fails closed");
+});
+
+test("real loopback HTTP 206 with complete range succeeds through the fetch transport", async () => {
+  const { createServer } = await import("node:http");
+  const { createFetchTransport } = await import("../src/connectors/google/transport.ts");
+  const body = "x".repeat(817);
+  const server = createServer((req, res) => {
+    if ((req.url ?? "").includes("alt=media")) {
+      res.writeHead(206, { "Content-Range": "bytes 0-816/817", "Content-Length": "817", "Content-Type": "text/plain" });
+      res.end(body);
+      return;
+    }
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(BLOB_META));
+  });
+  const baseUrl = await new Promise<string>((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address() as import("node:net").AddressInfo;
+      resolve(`http://127.0.0.1:${address.port}`);
+    });
+  });
+  try {
+    const connector = new GoogleDocumentRetriever({
+      transport: createFetchTransport({
+        fetchImpl: async (url, init) => {
+          const response = await fetch(url.replace("https://www.googleapis.com", baseUrl), init);
+          const headers: Record<string, string> = {};
+          response.headers.forEach((value, key) => { headers[key] = value; });
+          return { status: response.status, headers, text: () => response.text() };
+        },
+        timeoutMs: 5000,
+      }),
+      tokens: () => Promise.resolve("t"),
+    });
+    const result = await connector.retrieveDocument({ operationKey: "op-206-loopback", documentId: "blob-1" });
+    assert.equal(result.status, "succeeded", "a real HTTP 206 proving complete coverage is accepted");
+    if (result.status !== "succeeded") return;
+    assert.equal(result.data.document.text, body);
+    assert.equal(Buffer.byteLength(result.data.document.text, "utf-8"), 817);
+  } finally {
+    server.close();
+  }
+});
