@@ -7,16 +7,22 @@
  */
 import { GoogleCalendarConnector, type GoogleCalendarOptions, type HoldScopeResolver } from "./calendar.ts";
 import { GoogleGmailConnector, type GoogleGmailOptions, type SentExpectationResolver } from "./gmail.ts";
+import { GoogleDocumentRetriever, type GoogleDocumentsOptions } from "./documents.ts";
+import { GmailInboxPoller } from "./incremental.ts";
 import type { GoogleAdapterOptions } from "./transport.ts";
 
 export * from "./transport.ts";
 export * from "./errors.ts";
 export { GoogleCalendarConnector, googleEventIdFor, type GoogleCalendarOptions, type HoldScope, type HoldScopeResolver } from "./calendar.ts";
 export { GoogleGmailConnector, gmailMessageIdFor, escapeGmailQuery, type GoogleGmailOptions, type SentExpectation, type SentExpectationResolver } from "./gmail.ts";
+export { GoogleDocumentRetriever, DEFAULT_DOCUMENT_BYTE_CAP, type GoogleDocumentsOptions } from "./documents.ts";
+export { GmailInboxPoller, encodeCursor, type InboxChange, type InboxDelta, type PollInboxOptions } from "./incremental.ts";
 
 export interface GoogleConnectorSet {
   calendar: GoogleCalendarConnector;
   gmail: GoogleGmailConnector;
+  documents: GoogleDocumentRetriever;
+  inbox: GmailInboxPoller;
 }
 
 export interface GoogleConnectorFactoryOptions extends GoogleAdapterOptions {
@@ -57,8 +63,15 @@ export function createGoogleConnectors(options: GoogleConnectorFactoryOptions): 
     ...(options.userId === undefined ? {} : { userId: options.userId }),
     ...(options.resolveSentExpectation === undefined ? {} : { resolveSentExpectation: options.resolveSentExpectation }),
   };
+  const shared = {
+    transport: options.transport,
+    tokens: options.tokens,
+    ...(options.userId === undefined ? {} : { userId: options.userId }),
+  };
   return {
     calendar: new GoogleCalendarConnector(calendarOptions),
     gmail: new GoogleGmailConnector(gmailOptions),
+    documents: new GoogleDocumentRetriever(shared),
+    inbox: new GmailInboxPoller(shared),
   };
 }

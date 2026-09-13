@@ -73,6 +73,7 @@ export interface GoogleAdapterOptions {
 
 export const CALENDAR_BASE_URL = "https://www.googleapis.com/calendar/v3";
 export const GMAIL_BASE_URL = "https://gmail.googleapis.com/gmail/v1";
+export const DRIVE_BASE_URL = "https://www.googleapis.com";
 
 /** Thrown when no approved token is available; adapters map it to access_revoked. */
 export class TokenUnavailableError extends Error {
@@ -88,6 +89,8 @@ export interface AuthorizedRequest {
   url: string;
   body?: string;
   contentType?: string;
+  /** Extra headers (e.g. Range for capped downloads). Never Authorization. */
+  headers?: Record<string, string>;
 }
 
 /**
@@ -108,7 +111,7 @@ export async function authorized(
   if (token.trim().length === 0) {
     throw new TokenUnavailableError("Token supplier returned an empty token");
   }
-  const headers: Record<string, string> = { Authorization: `Bearer ${token}`, Accept: "application/json" };
+  const headers: Record<string, string> = { Authorization: `Bearer ${token}`, Accept: "application/json", ...(req.headers ?? {}) };
   if (req.body !== undefined) {
     headers["Content-Type"] = req.contentType ?? "application/json";
   }
@@ -135,6 +138,8 @@ export type { ConnectorMetadata };
 
 /** Least-privilege scopes required by each adapter surface. */
 export const GOOGLE_SCOPES = {
+  /** Document content retrieval (explicit IDs only, never account scan). */
+  driveReadonly: "https://www.googleapis.com/auth/drive.readonly",
   /** Event reads (reconcile/409 verification). */
   calendarRead: "https://www.googleapis.com/auth/calendar.readonly",
   /** Availability reads via freeBusy.query (least privilege for busy intervals). */
