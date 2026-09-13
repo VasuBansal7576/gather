@@ -9,7 +9,7 @@ Connect business apps, give the operator a goal, and review the decisions that n
 
 ## Demo video
 
-[Watch the narrated Gather demo on YouTube](https://youtu.be/KsG9-CyNeLU) — under two minutes, with the creator's narration and actual application screens. The video distinguishes simulated actions and the target workflow from verified live capabilities.
+The previous narrated overview has been withdrawn: it did not demonstrate the application executing a complete workflow. A replacement screen recording will be linked only after the actual workflow and its results are verified.
 
 ## What the product does
 
