@@ -1,9 +1,12 @@
-# Booking approval API (DEMO ONLY)
+# Booking approval API
 
-Local, durable booking-approval service backed by SQLite and deterministic
-demo connectors. Every response is explicitly marked
-`{ "demo": true, "mode": { "kind": "demo", "label": "DEMO ONLY", ... } }`.
-Nothing here calls a live provider; receipts are simulated.
+Local, durable booking-approval service backed by SQLite and injectable
+connectors. Every response carries an evidence-derived marker:
+`{ "demo": true, "mode": { "kind": "demo" } }` only when the booking's
+sources are all explicit fixtures; `kind: "live"` when every succeeded step
+carries positive provider proof; and `kind: "unknown"` (`demo: false`) for
+real bookings whose receipts are unproven — never a blanket demo claim over
+real records.
 
 Typed contract: `src/server/dto.ts` (UI should import these types).
 Service functions (injectable clock/connectors): `src/server/booking-service.ts`.
@@ -121,6 +124,56 @@ payment/confirmation step.
   `uncertain`/`partial` step keeps the booking `uncertain` (including an
   uncertain email after a succeeded hold); reconciliation refreshes the
   aggregate back to `provisional_hold` once nothing is uncertain.
+
+## Current proposal authority (durable pointer, not ordering)
+
+Each booking has exactly one **current proposal**, resolved through the
+durable `booking_current_proposals` pointer — never by comparing per-action
+`proposalVersion`, wall-clock `createdAt`, or UUID order. The pointer and a
+persisted per-booking `proposal_seq` are assigned atomically at insert;
+pre-pointer databases backfill sequences in legacy creation order and point
+at the last-created action, preserving the old confirmation behavior.
+
+- `GET /api/workspace` exposes the pointer per booking as
+  `currentProposedActionId`. **UI contract (including delivery UI): display,
+  approve, and confirm exactly the proposal named by
+  `currentProposedActionId` — never `proposals.at(-1)`, never
+  max-`proposalVersion`.** When the pointer is absent (pre-pointer
+  payloads), the adapter falls back to version-then-`createdAt` ordering.
+- `proposalVersion` keeps its existing meaning: the in-place revision count
+  *within one action row*. A genuinely new proposal is a *new row* (new id,
+  version reset to 1, next `proposal_seq`) that atomically supersedes the
+  old row (`status: "superseded"`), invalidates live approvals on it, and
+  moves the pointer — all inside one `IMMEDIATE` transaction, so concurrent
+  publishes serialize with no duplicates and no half-moved state. Old
+  receipts, executions, and audit rows are preserved untouched, scoped to
+  their exact action + version.
+- Fingerprint-bound idempotency: republishing an identical proposal reuses
+  the existing row (`reused: true`) without moving the pointer. A replay
+  whose fingerprint matches a *superseded* row never revives that row.
+- Approve, retry, and reconcile all gate on the pointer **before and after
+  every await**: a superseded action (even with a matching version and
+  fingerprint) is refused with `STALE_PROPOSAL`. A proposal published
+  mid-approval halts the pipeline after the await — observed provider
+  evidence is preserved as versioned history on the old action, the email
+  step never runs, and the booking parks as `uncertain`. Confirmation binds
+  the same pointer and revalidates it transactionally at commit.
+
+## Receipt provenance (preserved connector proof)
+
+Every completed step result embeds the serving connector's proof
+(`{ mode, simulated, provenance }`) taken from its response metadata — it is
+read back, never re-derived. A receipt reads as live only on positive proof:
+live mode, explicitly not simulated, and a non-empty provenance list whose
+every entry is a valid non-fixture source ref (supported kind + non-empty
+locator). Missing proof reads as "unverified" — never as simulated — while
+simulated-mode proofs read as simulated, and completion notes name the
+actual proof per step. Fixture receipts are never upgraded to live, at the
+service or at display.
+
+Reconciliation revalidates the durable current-proposal authority AFTER the
+provider call returns and before any state mutation: a proposal superseded
+mid-await keeps its execution uncertain and never moves the booking status.
 
 ## Errors
 

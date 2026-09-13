@@ -58,6 +58,13 @@ Before approving, the owner can inspect the `consequences` list (each step the h
 The approve control stays disabled while the proposal's fingerprint is in `pendingApprovals`, any receipt on the booking is still pending, or a request was just sent and not yet acknowledged — so the same version cannot be approved twice.
 A sent approval only displays "waiting" — the workspace never presents a hold or a sent request as a confirmed booking.
 
+### Offer snapshot
+
+When the host payload carries `payload.offer` — an immutable `OfferCandidate` — the adapter validates it strictly at the boundary: every field must be well-formed, amounts must be finite non-negative integers, the currency must be an explicit ISO-4217 code, `totalKnown` must agree with `totalCents`, a profitability claim is rejected while any cost or price is unknown, and `payload.offerPreparationFingerprint` (when present) must equal the snapshot's own fingerprint.
+A valid snapshot renders exact priced lines (`quantity × unit price · basis`), the total and deposit in the offer's currency, the selected space and guest count, the offer's asserted terms, and explicit unknowns — unknown costs or prices are listed and no profit is ever claimed.
+When the offer is absent the proposal shows the honest "Not priced" state; when it is present but malformed or mismatched the proposal sets `offerInvalid`, shows no pricing, and the approve control is disabled because meaningful review is impossible.
+The approval binding remains the action id + proposal version + proposal fingerprint — the offer snapshot is display evidence only, never approval authority.
+
 The completed "Proposal approved" state requires a succeeded receipt for **every** required executable step the host declares on `proposal.requiredSteps` (e.g. `['hold', 'email']` for a provisional-hold offer), each scoped to the exact displayed action id and proposal version.
 A proposal with missing steps, versionless receipts, receipts on another action or version, or pending/failed/partial/uncertain receipts never reads as approved — it stays approvable or exposes its recovery controls.
 Proposals whose required steps are absent or empty can never prove completeness, so they never show the completed state; the host adapter derives `requiredSteps` from the authoritative `ProposedAction.kind`.
@@ -89,7 +96,7 @@ Proposals whose required steps are absent or empty can never prove completeness,
 | `loading` | Shows the workspace skeleton while the host resolves data. |
 | `blockedState` | Shows a host-controlled blocked banner above the active view. |
 | `initialView` | Opens `today`, `bookings`, or `connections`. |
-| `dataMode` | `'demo'` keeps the simulation label on custom data that is still simulated; `'live'` hides it. Defaults to `'demo'` when fixtures are in use. |
+| `dataMode` | `'demo'` keeps the simulation label on custom data that is still simulated; `'live'` hides it; `'unknown'` shows the `Unverified data` badge and ribbon for real records whose provider evidence is unproven — never collapsed into demo or upgraded to live. Defaults to `'demo'` when fixtures are in use. |
 | `pendingApprovals` | Proposal fingerprints with an in-flight approval; matching approve controls stay disabled. |
 | `onNavigate` | Receives view changes. |
 | `onSelectBooking` | Receives a selected booking ID. |

@@ -137,6 +137,19 @@ export class GatherStore {
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
+      /**
+       * Durable current-proposal pointer: exactly one row per booking names
+       * the single displayed/approvable/confirmable proposed action. Every
+       * surface (adapter, approve/retry/reconcile, confirmation, handoff)
+       * resolves "current" through this pointer — never by comparing
+       * per-action versions, wall-clock timestamps, or UUID order.
+       */
+      CREATE TABLE IF NOT EXISTS booking_current_proposals (
+        booking_id TEXT PRIMARY KEY REFERENCES bookings(id),
+        proposed_action_id TEXT NOT NULL REFERENCES proposed_actions(id),
+        proposal_seq INTEGER NOT NULL,
+        updated_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS approvals (
         id TEXT PRIMARY KEY,
         proposed_action_id TEXT NOT NULL REFERENCES proposed_actions(id),
@@ -197,6 +210,8 @@ export class GatherStore {
     this.ensureColumn("provider_receipts", "calendar_id", "TEXT");
     this.ensureColumn("provider_receipts", "start_at", "TEXT");
     this.ensureColumn("provider_receipts", "end_at", "TEXT");
+    this.ensureColumn("proposed_actions", "proposal_seq", "INTEGER");
+    this.backfillProposalAuthority();
   }
 
   private ensureColumn(table: string, column: string, ddl: string): void {
@@ -204,6 +219,109 @@ export class GatherStore {
     if (!info.some((col) => col.name === column)) {
       this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`);
     }
+  }
+
+  /**
+   * Backcompat migration for databases written before the durable
+   * current-proposal rule existed. Every pre-sequence action row gains a
+   * persisted per-booking sequence in legacy creation order
+   * (created_at, then rowid — the same order the old backend confirmation
+   * used via last-created), and each booking's pointer is set to its
+   * last-created action, preserving the old confirmation behavior exactly.
+   * Idempotent: rows that already carry a sequence are never renumbered, and
+   * existing pointers are never moved.
+   */
+  private backfillProposalAuthority(): void {
+    const unsequenced = this.db.prepare(
+      "SELECT id, booking_id FROM proposed_actions WHERE proposal_seq IS NULL ORDER BY booking_id, created_at, rowid",
+    ).all() as Array<{ id: string; booking_id: string }>;
+    if (unsequenced.length === 0) {
+      // Still ensure pointers exist for bookings whose actions all carry
+      // sequences but predate the pointer table (e.g. a crash mid-migration).
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        this.ensureCurrentPointersLocked();
+        this.db.exec("COMMIT");
+      } catch (error) {
+        try {
+          this.db.exec("ROLLBACK");
+        } catch {
+          // Already rolled back; surface the original failure.
+        }
+        throw error;
+      }
+      return;
+    }
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const nextSeq = new Map<string, number>();
+      for (const item of unsequenced) {
+        let seq = nextSeq.get(item.booking_id);
+        if (seq === undefined) {
+          const peak = this.db.prepare("SELECT MAX(proposal_seq) AS peak FROM proposed_actions WHERE booking_id = $bookingId").get({ $bookingId: item.booking_id }) as { peak: number | null };
+          seq = (typeof peak.peak === "number" ? peak.peak : 0) + 1;
+        }
+        this.db.prepare("UPDATE proposed_actions SET proposal_seq = $seq WHERE id = $id").run({ $seq: seq, $id: item.id });
+        nextSeq.set(item.booking_id, seq + 1);
+      }
+      this.ensureCurrentPointersLocked();
+      this.db.exec("COMMIT");
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        // Already rolled back; surface the original failure.
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Point every booking that has actions but no pointer at its newest
+   * sequenced action. Must run inside a write transaction held by the
+   * caller. Never moves an existing pointer.
+   */
+  private ensureCurrentPointersLocked(): void {
+    const timestamp = now();
+    const bookings = this.db.prepare("SELECT DISTINCT booking_id FROM proposed_actions").all() as Array<{ booking_id: string }>;
+    for (const item of bookings) {
+      const existing = this.db.prepare("SELECT proposed_action_id FROM booking_current_proposals WHERE booking_id = $bookingId").get({ $bookingId: item.booking_id });
+      if (existing) continue;
+      const newest = this.db.prepare(
+        "SELECT id, proposal_seq FROM proposed_actions WHERE booking_id = $bookingId ORDER BY proposal_seq DESC LIMIT 1",
+      ).get({ $bookingId: item.booking_id }) as { id: string; proposal_seq: number } | null;
+      if (!newest) continue;
+      this.db.prepare(`INSERT INTO booking_current_proposals (booking_id, proposed_action_id, proposal_seq, updated_at)
+        VALUES ($bookingId, $actionId, $seq, $timestamp)`).run({
+        $bookingId: item.booking_id, $actionId: newest.id, $seq: newest.proposal_seq, $timestamp: timestamp,
+      });
+    }
+  }
+
+  /**
+   * The booking's single durable current proposal — the only action the
+   * adapter displays and the only one approve/retry/reconcile/confirm bind
+   * to. Undefined when the booking has no proposals.
+   */
+  getCurrentProposalAction(bookingId: string): ProposedAction | undefined {
+    const pointer = this.db.prepare("SELECT proposed_action_id FROM booking_current_proposals WHERE booking_id = $bookingId").get({ $bookingId: bookingId });
+    if (!pointer) return undefined;
+    try {
+      return this.getProposedAction(String(row(pointer).proposed_action_id));
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** True when the action is its booking's durable current proposal. */
+  isCurrentProposalAction(actionId: string): boolean {
+    let action;
+    try {
+      action = this.getProposedAction(actionId);
+    } catch {
+      return false;
+    }
+    return this.getCurrentProposalAction(action.bookingId)?.id === action.id;
   }
 
   close(): void {
@@ -248,17 +366,124 @@ export class GatherStore {
     return { ...input, id, observedAt };
   }
 
+  /**
+   * Insert a genuinely new proposal for a booking and make it current,
+   * atomically: the row gains the next persisted per-booking sequence, every
+   * other action of the booking is marked superseded (receipts and audit
+   * rows are preserved untouched), live approvals on those superseded
+   * actions are invalidated, and the durable current pointer moves to the
+   * new row — all inside one IMMEDIATE transaction, so concurrent publishers
+   * serialize and no duplicate or half-moved state can occur.
+   */
   createProposedAction(input: ProposedActionInput): ProposedAction {
     const id = input.id ?? randomUUID();
     const timestamp = now();
     const fingerprint = proposalFingerprint(input);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const action = this.insertProposalActionLocked({
+        id, bookingId: input.bookingId, kind: input.kind, payload: input.payload,
+        fingerprint, sourceReferences: input.sourceReferences, timestamp,
+      });
+      this.db.exec("COMMIT");
+      return action;
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        // Already rolled back; surface the original failure.
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Locked single-row insert shared by createProposedAction and the
+   * fingerprint-reuse publisher below. Caller must hold the write lock.
+   */
+  private insertProposalActionLocked(input: {
+    id: string;
+    bookingId: string;
+    kind: ActionKind;
+    payload: Record<string, unknown>;
+    fingerprint: string;
+    sourceReferences: SourceReference[];
+    timestamp: string;
+  }): ProposedAction {
+    const peak = this.db.prepare("SELECT MAX(proposal_seq) AS peak FROM proposed_actions WHERE booking_id = $bookingId").get({ $bookingId: input.bookingId }) as { peak: number | null };
+    const seq = (typeof peak.peak === "number" ? peak.peak : 0) + 1;
     this.db.prepare(`INSERT INTO proposed_actions
-      (id, booking_id, kind, payload_json, proposal_version, proposal_fingerprint, source_references_json, status, created_at, updated_at)
-      VALUES ($id, $bookingId, $kind, $payload, 1, $fingerprint, $refs, 'pending_approval', $timestamp, $timestamp)`).run({
-      $id: id, $bookingId: input.bookingId, $kind: input.kind, $payload: JSON.stringify(input.payload),
-      $fingerprint: fingerprint, $refs: JSON.stringify(input.sourceReferences), $timestamp: timestamp,
+      (id, booking_id, kind, payload_json, proposal_version, proposal_fingerprint, source_references_json, status, created_at, updated_at, proposal_seq)
+      VALUES ($id, $bookingId, $kind, $payload, 1, $fingerprint, $refs, 'pending_approval', $timestamp, $timestamp, $seq)`).run({
+      $id: input.id, $bookingId: input.bookingId, $kind: input.kind, $payload: JSON.stringify(input.payload),
+      $fingerprint: input.fingerprint, $refs: JSON.stringify(input.sourceReferences), $timestamp: input.timestamp, $seq: seq,
     });
-    return this.getProposedAction(id);
+    // Supersede every other action of this booking and invalidate their live
+    // approvals: a genuinely new proposal displaces the old terms. Old
+    // receipts, executions, and audit rows are never touched — they stay
+    // scoped to their exact action + version.
+    this.db.prepare(`UPDATE proposed_actions SET status = 'superseded', updated_at = $timestamp
+      WHERE booking_id = $bookingId AND id != $id AND status != 'superseded'`).run({ $timestamp: input.timestamp, $bookingId: input.bookingId, $id: input.id });
+    this.db.prepare(`UPDATE approvals SET status = 'invalidated', invalidated_at = $timestamp
+      WHERE proposed_action_id IN (SELECT id FROM proposed_actions WHERE booking_id = $bookingId AND id != $id)
+      AND status = 'approved'`).run({ $timestamp: input.timestamp, $bookingId: input.bookingId, $id: input.id });
+    this.db.prepare(`INSERT INTO booking_current_proposals (booking_id, proposed_action_id, proposal_seq, updated_at)
+      VALUES ($bookingId, $id, $seq, $timestamp)
+      ON CONFLICT(booking_id) DO UPDATE SET proposed_action_id = excluded.proposed_action_id, proposal_seq = excluded.proposal_seq, updated_at = excluded.updated_at`).run({
+      $bookingId: input.bookingId, $id: input.id, $seq: seq, $timestamp: input.timestamp,
+    });
+    return this.getProposedAction(input.id);
+  }
+
+  /**
+   * Fingerprint-bound publish used by the operator persist path: when an
+   * action with the same canonical fingerprint already exists, that exact
+   * row is reused and the current pointer is never moved — a replay can
+   * neither duplicate the row nor resurrect a superseded action. Otherwise
+   * a new current proposal is published (superseding the old one, see
+   * above). The optional verify hook runs inside the same write lock before
+   * any write, so a concurrent correction aborts the publish instead of
+   * racing it. Returns whether an existing row was reused.
+   */
+  publishProposalAction(input: ProposedActionInput & { fingerprint: string }, opts: { verify?: () => void } = {}): { action: ProposedAction; reused: boolean } {
+    const id = input.id ?? randomUUID();
+    const timestamp = now();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      opts.verify?.();
+      const existing = this.db.prepare("SELECT id FROM proposed_actions WHERE booking_id = $bookingId AND proposal_fingerprint = $fingerprint ORDER BY proposal_seq DESC LIMIT 1").get({
+        $bookingId: input.bookingId, $fingerprint: input.fingerprint,
+      }) as { id: string } | null;
+      if (existing) {
+        const live = this.getProposedAction(String(existing.id));
+        if (live.status === "pending_approval" || live.status === "approved") {
+          // Fingerprint-bound idempotency: the exact row is reused and the
+          // current pointer is never moved by a replay — a superseded row is
+          // therefore never resurrected (its status, approvals, and receipts
+          // stay exactly as they were).
+          this.db.exec("COMMIT");
+          return { action: live, reused: true };
+        }
+        // A fingerprint match on a superseded row is never revived: fall
+        // through and publish it afresh as a new current row. Reaching here
+        // means knowledge changed away and back (a pure replay would have
+        // matched the current row), so the terms are published with fresh
+        // currency instead of resurrecting the displaced row.
+      }
+      const action = this.insertProposalActionLocked({
+        id, bookingId: input.bookingId, kind: input.kind, payload: input.payload,
+        fingerprint: input.fingerprint, sourceReferences: input.sourceReferences, timestamp,
+      });
+      this.db.exec("COMMIT");
+      return { action, reused: false };
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        // Already rolled back; surface the original failure.
+      }
+      throw error;
+    }
   }
 
   replaceProposedAction(id: string, input: Omit<ProposedActionInput, "id" | "bookingId">): ProposedAction {
@@ -287,11 +512,15 @@ export class GatherStore {
     const found = this.db.prepare("SELECT * FROM proposed_actions WHERE id = $id").get({ $id: id });
     if (!found) throw new Error(`Proposed action not found: ${id}`);
     const value = row(found);
+    const bookingId = String(value.booking_id);
+    const seq = typeof value.proposal_seq === "number" ? value.proposal_seq : 0;
+    const pointer = this.db.prepare("SELECT proposed_action_id FROM booking_current_proposals WHERE booking_id = $bookingId").get({ $bookingId: bookingId });
     return {
-      id: String(value.id), bookingId: String(value.booking_id), kind: value.kind as ActionKind,
+      id: String(value.id), bookingId, kind: value.kind as ActionKind,
       payload: parseJson(value.payload_json, {}), proposalVersion: Number(value.proposal_version),
       proposalFingerprint: String(value.proposal_fingerprint), sourceReferences: parseJson(value.source_references_json, []),
       status: value.status as ProposedAction["status"], createdAt: String(value.created_at), updatedAt: String(value.updated_at),
+      proposalSeq: seq, isCurrent: pointer ? String(row(pointer).proposed_action_id) === String(value.id) : false,
     };
   }
 
@@ -541,6 +770,9 @@ export class GatherStore {
     const action = this.getProposedAction(proposedActionId);
     if (action.proposalVersion !== proposalVersion) {
       throw new Error("Stale proposal version: approval refers to a different version");
+    }
+    if (!this.isCurrentProposalAction(proposedActionId)) {
+      throw new Error("Stale proposal version: this action was superseded by the booking's current proposal");
     }
     const approval = this.db.prepare(`SELECT id FROM approvals WHERE proposed_action_id = $actionId
       AND proposal_version = $version AND proposal_fingerprint = $fingerprint AND status = 'approved' LIMIT 1`).get({

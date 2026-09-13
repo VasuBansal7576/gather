@@ -105,6 +105,7 @@
   color: var(--gather-gold); font-size: 10px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase;
 }
 .gather-demo-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--gather-gold); }
+.gather-unverified-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--gather-coral, #e07856); }
 
 /* ============ Column 2: triage list ============ */
 .gather-triage {
@@ -190,6 +191,14 @@
 .gather-total-label { display: block; color: var(--gather-ink-faint); font-size: 10px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; margin-bottom: 2px; }
 .gather-proposal-total strong { font-size: 17px; font-weight: 650; }
 .gather-total-context { display: grid; gap: 2px; text-align: right; color: var(--gather-ink-faint); font-size: 11px; }
+.gather-offer-detail { padding: 8px 0 4px; }
+.gather-offer-scope { display: flex; align-items: center; gap: 6px; color: var(--gather-ink-soft); font-size: 12px; }
+.gather-offer-scope span { color: var(--gather-ink-faint); font-size: 11px; }
+.gather-offer-terms { margin: 6px 0 0; padding: 0; list-style: none; display: grid; gap: 4px; }
+.gather-offer-terms li { position: relative; padding-left: 16px; color: var(--gather-ink-soft); font-size: 12px; }
+.gather-offer-terms li::before { content: ''; position: absolute; left: 2px; top: 7px; width: 5px; height: 5px; border-radius: 50%; background: var(--gather-lavender); }
+.gather-offer-unknown { margin: 6px 0 0; color: var(--gather-gold); font-size: 11.5px; }
+.gather-offer-note { margin: 6px 0 0; color: var(--gather-ink-faint); font-size: 11.5px; }
 .gather-proposal-scope { margin-top: 14px; }
 .gather-scope-label { display: block; color: var(--gather-ink-faint); font-size: 10px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; margin-bottom: 7px; }
 .gather-scope-list { margin: 0 0 10px; padding: 0; list-style: none; display: grid; gap: 5px; }
