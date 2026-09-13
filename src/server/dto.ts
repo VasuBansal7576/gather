@@ -8,7 +8,7 @@ import type {
   SourceReference,
 } from "../domain/contracts.ts";
 
-/** Every workspace payload is explicitly demo-marked. Never render as live. */
+/** Payload marker for fixture/simulated evidence. Never render as live. */
 export interface DemoModeMarker {
   kind: "demo";
   label: "DEMO ONLY";
@@ -16,11 +16,43 @@ export interface DemoModeMarker {
   simulated: true;
 }
 
+/** Payload marker for evidence carrying positive live provider proof. */
+export interface LiveModeMarker {
+  kind: "live";
+  label: "LIVE";
+  fictional: false;
+  simulated: false;
+}
+
+/** Payload marker for real records whose provider evidence is not positively proven. */
+export interface UnknownModeMarker {
+  kind: "unknown";
+  label: "EVIDENCE UNVERIFIED";
+  fictional: false;
+  simulated: false;
+}
+
+export type EvidenceModeMarker = DemoModeMarker | LiveModeMarker | UnknownModeMarker;
+
 export const DEMO_MARKER: DemoModeMarker = {
   kind: "demo",
   label: "DEMO ONLY",
   fictional: true,
   simulated: true,
+};
+
+export const LIVE_MARKER: LiveModeMarker = {
+  kind: "live",
+  label: "LIVE",
+  fictional: false,
+  simulated: false,
+};
+
+export const UNKNOWN_MARKER: UnknownModeMarker = {
+  kind: "unknown",
+  label: "EVIDENCE UNVERIFIED",
+  fictional: false,
+  simulated: false,
 };
 
 export interface WorkspaceBookingDTO {
@@ -37,8 +69,8 @@ export interface WorkspaceBookingDTO {
 }
 
 export interface WorkspaceDTO {
-  mode: DemoModeMarker;
-  demo: true;
+  mode: EvidenceModeMarker;
+  demo: boolean;
   /** Server-derived owner identity that approvals are recorded under. */
   approvalIdentity: string;
   businesses: Business[];
@@ -90,8 +122,8 @@ export interface StepReceiptDTO {
 }
 
 export interface ApproveResponseDTO {
-  demo: true;
-  mode: DemoModeMarker;
+  demo: boolean;
+  mode: EvidenceModeMarker;
   approval: Approval;
   approvedBy: string;
   booking: Booking;
@@ -104,8 +136,8 @@ export interface ApproveResponseDTO {
 }
 
 export interface RetryResponseDTO {
-  demo: true;
-  mode: DemoModeMarker;
+  demo: boolean;
+  mode: EvidenceModeMarker;
   booking: Booking;
   hold: StepReceiptDTO;
   email: StepReceiptDTO | null;
@@ -114,8 +146,8 @@ export interface RetryResponseDTO {
 }
 
 export interface ReconcileResponseDTO {
-  demo: true;
-  mode: DemoModeMarker;
+  demo: boolean;
+  mode: EvidenceModeMarker;
   execution: ActionExecution;
   booking: Booking;
   note: string;

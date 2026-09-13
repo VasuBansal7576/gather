@@ -1,5 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { availabilityOperationKey, stableOperationKey } from "../connectors/contracts.ts";
+import {
+  availabilityOperationKey,
+  stableOperationKey,
+} from "../connectors/contracts.ts";
 import type {
   CalendarAvailabilityReader,
   ConnectorMetadata,
@@ -9,6 +12,12 @@ import type {
 } from "../connectors/contracts.ts";
 import { GatherStore } from "./sqlite-store.ts";
 import type { StepReservation } from "./sqlite-store.ts";
+import {
+  DEMO_MARKER,
+  LIVE_MARKER,
+  UNKNOWN_MARKER,
+  type EvidenceModeMarker,
+} from "./dto.ts";
 
 export type { StepReservation };
 import type {
@@ -19,7 +28,6 @@ import type {
   StepReceiptDTO,
   WorkspaceDTO,
 } from "./dto.ts";
-import { DEMO_MARKER } from "./dto.ts";
 import type { ActionExecution, Booking } from "../domain/contracts.ts";
 
 export type ServiceErrorCode =
@@ -222,29 +230,82 @@ function provenResult(outcome: { metadata: ConnectorMetadata; data: { provenance
   return { ...(outcome.data as Record<string, unknown>), proof: proofOf(outcome.metadata, outcome.data.provenance) };
 }
 
+/** Source kinds a live provider receipt may attest — fixture is never live proof. */
+const LIVE_PROOF_SOURCE_KINDS: ReadonlySet<string> = new Set([
+  "connected_account",
+  "document",
+  "email",
+  "calendar",
+  "manual",
+]);
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Positive structural check for one provenance ref: a supported non-fixture
+ * source kind plus a non-empty locator (and a string label when present).
+ * Anything else — null, strings, missing kind/locator, fictional flags — is
+ * not live evidence.
+ */
+function isValidLiveProvenanceRef(ref: unknown): boolean {
+  if (!isRecord(ref)) return false;
+  if (!LIVE_PROOF_SOURCE_KINDS.has(ref.kind as string)) return false;
+  if (typeof ref.locator !== "string" || ref.locator.trim().length === 0) return false;
+  if (ref.label !== undefined && typeof ref.label !== "string") return false;
+  if (ref.fictional === true) return false;
+  return true;
+}
+
 /**
  * A receipt reads as live only on positive proof: live mode, explicitly not
- * simulated, non-empty provenance, and zero fictional refs. Everything else
- * — missing/malformed proof (legacy rows, unknown connectors), simulated
- * results, empty provenance, or any fictional fixture ref — fails closed to
- * demo. Fixture receipts are therefore never upgraded to live.
+ * simulated, and a non-empty provenance list whose EVERY entry is a valid
+ * non-fixture source reference. Everything else — missing/malformed proof
+ * (legacy rows, unknown connectors), simulated results, empty provenance,
+ * or any fictional/malformed ref — fails closed to non-live. Fixture
+ * receipts are therefore never upgraded to live.
  */
 export function isLiveStepProof(result: unknown): boolean {
-  if (typeof result !== "object" || result === null) return false;
-  const proof = (result as { proof?: unknown }).proof;
-  if (typeof proof !== "object" || proof === null) return false;
-  const candidate = proof as { mode?: unknown; simulated?: unknown; provenance?: unknown };
-  if (candidate.mode !== "live" || candidate.simulated !== false) return false;
-  if (!Array.isArray(candidate.provenance) || candidate.provenance.length === 0) return false;
-  return !candidate.provenance.some(
-    (ref) => typeof ref === "object" && ref !== null && (ref as { fictional?: unknown }).fictional === true,
-  );
+  if (!isRecord(result)) return false;
+  const proof = result.proof;
+  if (!isRecord(proof)) return false;
+  if (proof.mode !== "live" || proof.simulated !== false) return false;
+  if (!Array.isArray(proof.provenance) || proof.provenance.length === 0) return false;
+  return proof.provenance.every(isValidLiveProvenanceRef);
+}
+
+/** True when the stored result carries a well-formed proof object at all. */
+function hasProof(result: unknown): boolean {
+  return isRecord(result) && isRecord(result.proof);
 }
 
 /** Honest per-receipt wording derived from the stored proof, never assumed. */
 export function stepReceiptDetail(execution: ActionExecution): string {
   if (execution.status !== "succeeded") return execution.error ?? execution.status;
+  if (!hasProof(execution.result)) return "Done — provider receipt unverified";
   return isLiveStepProof(execution.result) ? "Done — provider receipt recorded" : "Done — simulated provider receipt";
+}
+
+/** A booking is a fixture only when every source reference is explicitly fictional. */
+function isFixtureBooking(booking: Booking): boolean {
+  const refs = booking.sourceReferences;
+  return refs.length > 0 && refs.every((ref) => ref.fictional === true);
+}
+
+/**
+ * Derive the response marker from actual evidence, never a hardcoded demo
+ * claim: fixture bookings are demo; real bookings are live only when every
+ * succeeded step carries positive live proof; any other real evidence —
+ * simulated, absent, or malformed proof — is honestly "unverified".
+ */
+function evidenceMarkerFor(booking: Booking, executions: ActionExecution[]): { demo: boolean; mode: EvidenceModeMarker } {
+  if (isFixtureBooking(booking)) return { demo: true, mode: DEMO_MARKER };
+  const succeeded = executions.filter((execution) => execution.status === "succeeded");
+  if (succeeded.length > 0 && succeeded.every((execution) => isLiveStepProof(execution.result))) {
+    return { demo: false, mode: LIVE_MARKER };
+  }
+  return { demo: false, mode: UNKNOWN_MARKER };
 }
 
 function toReceipt(execution: ActionExecution): StepReceiptDTO {
@@ -296,14 +357,33 @@ export function getWorkspace(store: GatherStore, deps?: Pick<BookingServiceDeps,
       ...(current ? { currentProposedActionId: current.id } : {}),
     };
   });
+  // The workspace marker reflects what the payload actually contains: demo
+  // only when every booking is an explicit fixture; a workspace containing
+  // real bookings can never claim the fictional/simulated marker, and it
+  // claims live only when every succeeded step carries positive live proof.
+  const everyBookingFixture = bookings.every((item) => isFixtureBooking(item.booking));
+  const allExecutions = bookings.flatMap((item) => item.executions);
+  const workspaceMarker = everyBookingFixture
+    ? { demo: true as const, mode: DEMO_MARKER }
+    : {
+        demo: false as const,
+        mode: allExecutions.some((execution) => execution.status === "succeeded") &&
+          allExecutions.every((execution) => execution.status !== "succeeded" || isLiveStepProof(execution.result))
+          ? LIVE_MARKER
+          : UNKNOWN_MARKER,
+      };
   return {
-    mode: DEMO_MARKER,
-    demo: true,
+    mode: workspaceMarker.mode,
+    demo: workspaceMarker.demo,
     approvalIdentity: deps?.ownerId ?? process.env.GATHER_OWNER_ID ?? "local-owner",
     businesses,
     bookings,
     connections,
-    notice: "DEMO ONLY: all records and receipts are local fixtures/simulated integrations, not live provider state.",
+    notice: everyBookingFixture
+      ? "DEMO ONLY: all records and receipts are local fixtures/simulated integrations, not live provider state."
+      : workspaceMarker.mode === LIVE_MARKER
+        ? "Contains real bookings with provider receipts; holds are provisional, never confirmed bookings."
+        : "Contains real bookings; provider evidence is unverified unless a receipt shows live proof.",
   };
 }
 
@@ -739,8 +819,7 @@ export async function approveAndExecute(deps: BookingServiceDeps, input: Approve
   if (holdExecution.status === "uncertain") {
     const current = store.getBooking(booking.id);
     return {
-      demo: true,
-      mode: DEMO_MARKER,
+      ...evidenceMarkerFor(booking, [holdExecution]),
       approval,
       approvedBy,
       booking: current,
@@ -748,7 +827,7 @@ export async function approveAndExecute(deps: BookingServiceDeps, input: Approve
       email: null,
       availabilityFresh: true as const,
       confirmedBooking: false as const,
-      note: "DEMO ONLY: hold outcome is uncertain; reconcile before retrying. A hold is never a confirmed booking.",
+      note: "Hold outcome is uncertain; reconcile before retrying. A hold is never a confirmed booking.",
     };
   }
 
@@ -760,8 +839,7 @@ export async function approveAndExecute(deps: BookingServiceDeps, input: Approve
   }
   const current = store.getBooking(booking.id);
   return {
-    demo: true,
-    mode: DEMO_MARKER,
+    ...evidenceMarkerFor(booking, [holdExecution, emailExecution]),
     approval,
     approvedBy,
     booking: current,
@@ -782,13 +860,17 @@ export async function approveAndExecute(deps: BookingServiceDeps, input: Approve
  * actually served the step, and never claims live without proof.
  */
 function completionNote(hold: ActionExecution, email: ActionExecution): string {
+  const base = "Provisional hold is not a confirmed booking.";
+  const wording = (execution: ActionExecution): string =>
+    isLiveStepProof(execution.result)
+      ? "provider receipt"
+      : hasProof(execution.result)
+        ? "simulated receipt"
+        : "unverified receipt";
   const liveHold = isLiveStepProof(hold.result);
   const liveEmail = isLiveStepProof(email.result);
-  const base = "Provisional hold is not a confirmed booking.";
   if (liveHold && liveEmail) return `${base} Provider receipts recorded for each step.`;
-  if (liveHold) return `DEMO ONLY: ${base} Hold receipt recorded by the provider; email receipt is simulated.`;
-  if (liveEmail) return `DEMO ONLY: ${base} Email receipt recorded by the provider; hold receipt is simulated.`;
-  return `DEMO ONLY: ${base} Email receipt is simulated.`;
+  return `${base} Hold: ${wording(hold)}; email: ${wording(email)}.`;
 }
 
 /** Retry only failed steps; succeeded steps are never resent. */
@@ -836,13 +918,12 @@ export async function retryFailedSteps(deps: BookingServiceDeps, proposedActionI
     throw new ServiceError("RECONCILE_REQUIRED", email.error ?? "Email retry is uncertain; reconcile before retrying", false);
   }
   return {
-    demo: true,
-    mode: DEMO_MARKER,
+    ...evidenceMarkerFor(store.getBooking(action.bookingId), [hold, email]),
     booking: store.getBooking(action.bookingId),
     hold: toReceipt(hold),
     email: toReceipt(email),
     resentSucceededStep: false as const,
-    note: "DEMO ONLY: retry reused succeeded receipts; no successful provider step was resent.",
+    note: "Retry reused succeeded receipts; no successful provider step was resent.",
   };
 }
 
@@ -884,6 +965,11 @@ export async function reconcileExecution(deps: BookingServiceDeps, executionId: 
       true,
     );
   }
+  // Post-await authority re-check: a proposal superseded while the provider
+  // call was in flight must not have its stale execution healed into
+  // history nor move the booking's status. Throws STALE/UNCERTAIN and marks
+  // the booking uncertain instead of mutating state.
+  assertLiveApprovalAfterWait(store, current.proposedActionId, current.proposalVersion);
   const execution = store.reconcileActionExecution(current.id, { status: "succeeded", result: { ...provenResult(outcome) } });
   const action = store.getProposedAction(execution.proposedActionId);
   const booking = store.getBooking(action.bookingId);
@@ -893,13 +979,14 @@ export async function reconcileExecution(deps: BookingServiceDeps, executionId: 
   }
   refreshBookingAggregate(store, booking.id);
   return {
-    demo: true,
-    mode: DEMO_MARKER,
+    ...evidenceMarkerFor(booking, [execution]),
     execution,
     booking: store.getBooking(booking.id),
     note: isLiveStepProof(execution.result)
       ? "Reconciled against the provider record."
-      : "DEMO ONLY: reconciled against the simulated provider record.",
+      : hasProof(execution.result)
+        ? "DEMO ONLY: reconciled against the simulated provider record."
+        : "Reconciled, but the stored receipt carries no provider proof; evidence is unverified.",
   };
 }
 

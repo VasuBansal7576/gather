@@ -25,6 +25,7 @@ import {
   isLiveStepProof,
   reconcileExecution,
   retryFailedSteps,
+  stepReceiptDetail,
   ServiceError,
 } from "../src/server/booking-service.ts";
 import type { BookingServiceDeps } from "../src/server/booking-service.ts";
@@ -566,7 +567,7 @@ test("proof validation fails closed: unknown, fixture, and malformed proofs neve
   assert.equal(isLiveStepProof({ proof: { mode: "live", simulated: false, provenance: LIVE_SRC } }), true);
 });
 
-test("a legacy execution result without proof adapts as simulated, never live", async () => {
+test("a legacy execution result without proof adapts as unverified, never live or simulated", async () => {
   const w = world();
   try {
     const deps = demoDeps(w.store);
@@ -583,8 +584,146 @@ test("a legacy execution result without proof adapts as simulated, never live", 
     const detail = adapted.bookings.find((item) => item.id === booking.id)?.detail;
     for (const receipt of detail?.receipts ?? []) {
       if (receipt.status === "succeeded") {
-        assert.ok(receipt.detail?.includes("simulated"), `unproven receipt must say simulated, got: ${receipt.detail}`);
+        assert.ok(receipt.detail?.includes("unverified"), `unproven receipt must say unverified, got: ${receipt.detail}`);
       }
+    }
+  } finally {
+    w.cleanup();
+  }
+});
+
+// ---------- Regression: mid-await supersession, proof validation, honest envelopes ----------
+
+/** A booking/action pair with non-fictional sources — real, never fixture. */
+function seedRealBooking(store: GatherStore, businessId: string, bookingId: string, actionId: string, payload: Record<string, unknown> = holdPayload()) {
+  const booking = store.createBooking({
+    id: bookingId, businessId, eventName: "Real guest event", status: "pending_approval",
+    startAt: START, endAt: END, sourceReferences: [{ kind: "document", locator: "doc://real/booking" }],
+  });
+  const action = store.createProposedAction({
+    id: actionId, bookingId: booking.id, kind: "create_provisional_hold", payload,
+    sourceReferences: [{ kind: "document", locator: "doc://real/proposal" }],
+  });
+  return { booking, action };
+}
+
+test("reconcile revalidates current authority after the provider await — supersession mid-await refuses the heal", async () => {
+  const w = world();
+  try {
+    const live = liveConnectors();
+    // Hold lands uncertain and stays that way while reconcile finds nothing.
+    const uncertainCalendar = {
+      ...live.calendar,
+      createProvisionalHold: async (request: CreateProvisionalHoldRequest): Promise<ConnectorResult<CreateProvisionalHoldResponse>> => ({
+        status: "uncertain", metadata: liveMeta(request.operationKey),
+        error: { kind: "timeout_after_success", message: "scripted timeout", retryable: false },
+        reconciliationRequired: true,
+      }),
+    };
+    const deps: BookingServiceDeps = { store: w.store, calendar: uncertainCalendar as never, email: live.email, ownerId: OWNER, now: () => NOW };
+    const { booking, action } = seedBooking(w.store, w.businessId, "b-race", "a-race");
+    const approved = await approveAndExecute(deps, approveIdentity(w.store, action.id, booking.id));
+    assert.equal(approved.hold.execution.status, "uncertain");
+    const uncertainExec = approved.hold.execution;
+
+    // The scripted provider call supersedes the proposal mid-await, then
+    // reports success — the stale execution must NOT heal or move status.
+    const supersedingCalendar = {
+      ...uncertainCalendar,
+      reconcileProvisionalHold: async (request: OperationRequest): Promise<ConnectorResult<CreateProvisionalHoldResponse>> => {
+        w.store.createProposedAction({
+          bookingId: booking.id, kind: "create_provisional_hold",
+          payload: holdPayload({ startAt: "2030-06-20T17:00:00.000Z", endAt: "2030-06-20T23:00:00.000Z" }),
+          sourceReferences: SRC("demo://test/newer"),
+        });
+        return {
+          status: "succeeded", metadata: liveMeta(request.operationKey),
+          data: {
+            hold: { holdId: "h-late", operationKey: request.operationKey, bookingId: booking.id, calendarId: CAL,
+              startAt: START, endAt: END, expiresAt: EXPIRES, status: "provisional_hold", createdAt: NOW, sourceReferences: LIVE_SRC },
+            provenance: LIVE_SRC,
+          },
+        };
+      },
+    };
+    await assertServiceError(
+      reconcileExecution({ ...deps, calendar: supersedingCalendar as never }, uncertainExec.id),
+      "STALE_PROPOSAL",
+    );
+    const after = w.store.getActionExecution(uncertainExec.id);
+    assert.equal(after.status, "uncertain", "a superseded action's execution is never healed");
+    assert.notEqual(w.store.getBooking(booking.id).status, "provisional_hold",
+      "booking status must not claim a hold that belongs to a superseded proposal");
+  } finally {
+    w.cleanup();
+  }
+});
+
+test("live proof requires structurally valid provenance — malformed entries never qualify", async () => {
+  const malformed = [null, {}, "not a source", { fictional: false }, { kind: "fixture", locator: "demo://x" },
+    { kind: "bogus", locator: "x" }, { kind: "calendar", locator: "" }, { kind: "calendar", locator: "x", fictional: true }];
+  for (const ref of malformed) {
+    assert.equal(
+      isLiveStepProof({ proof: { mode: "live", simulated: false, provenance: [ref] } }),
+      false, `malformed provenance ${JSON.stringify(ref)} must not read as live`,
+    );
+  }
+  assert.equal(isLiveStepProof({ proof: { mode: "live", simulated: false, provenance: [{ kind: "calendar", locator: "live://x" }] } }), true);
+  assert.equal(isLiveStepProof({ proof: { mode: "demo", simulated: true, provenance: [{ kind: "calendar", locator: "live://x" }] } }), false);
+  assert.equal(isLiveStepProof({ hold: {} }), false, "proof-absent results are not live");
+});
+
+test("response envelopes reflect actual evidence — live proof, unverified, and fixture markers", async () => {
+  const w = world();
+  try {
+    const live = liveConnectors();
+    const deps: BookingServiceDeps = { store: w.store, calendar: live.calendar as never, email: live.email, ownerId: OWNER, now: () => NOW };
+
+    // Real booking, both steps live-proven: the envelope is LIVE, never demo.
+    const { booking, action } = seedRealBooking(w.store, w.businessId, "b-live", "a-live");
+    const res = await approveAndExecute(deps, approveIdentity(w.store, action.id, booking.id));
+    assert.equal(res.demo, false);
+    assert.equal(res.mode.kind, "live");
+    assert.match(res.note, /Provider receipts recorded/);
+
+    // Fixture booking: demo marker preserved.
+    const { booking: fb, action: fa } = seedBooking(w.store, w.businessId, "b-fx", "a-fx");
+    const fx = await approveAndExecute(demoDeps(w.store), approveIdentity(w.store, fa.id, fb.id));
+    assert.equal(fx.demo, true);
+    assert.equal(fx.mode.kind, "demo");
+
+    // Workspace marker: real bookings present -> never claims fictional demo.
+    const workspace = getWorkspace(w.store, { ownerId: OWNER });
+    assert.equal(workspace.demo, false);
+  } finally {
+    w.cleanup();
+  }
+});
+
+test("a proof-absent succeeded receipt reads unverified — never claims simulated or live", async () => {
+  const w = world();
+  try {
+    const live = liveConnectors();
+    const deps: BookingServiceDeps = { store: w.store, calendar: live.calendar as never, email: live.email, ownerId: OWNER, now: () => NOW };
+    const { booking, action } = seedRealBooking(w.store, w.businessId, "b-legacy", "a-legacy");
+    await approveAndExecute(deps, approveIdentity(w.store, action.id, booking.id));
+    // Strip the proof objects to simulate a pre-proof legacy row.
+    for (const execution of w.store.listActionExecutions(action.id)) {
+      const result = { ...(execution.result as Record<string, unknown>) };
+      delete result.proof;
+      w.store.db.prepare("UPDATE action_executions SET result_json = $json WHERE id = $id").run({ $json: JSON.stringify(result), $id: execution.id });
+    }
+    const detail = stepReceiptDetail(w.store.listActionExecutions(action.id)[0]!);
+    assert.match(detail, /unverified/);
+    const workspace = getWorkspace(w.store, { ownerId: OWNER });
+    assert.equal(workspace.mode.kind, "unknown", "real booking with unproven receipts is unverified, not demo or live");
+    const item = workspace.bookings.find((entry) => entry.booking.id === booking.id);
+    assert.equal(item?.executions[0]?.status, "succeeded");
+    // And the adapter shows unverified, never live or simulated.
+    const adapted = adaptWorkspace(workspace as unknown as Parameters<typeof adaptWorkspace>[0]);
+    const receipts = adapted.bookings.find((entry) => entry.id === booking.id)?.detail.receipts ?? [];
+    for (const receipt of receipts.filter((r) => r.status === "succeeded")) {
+      assert.match(receipt.detail ?? "", /unverified/);
     }
   } finally {
     w.cleanup();

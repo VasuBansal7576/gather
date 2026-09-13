@@ -131,11 +131,18 @@ const REQUIRED_STEPS_BY_ACTION_KIND: Record<string, ("hold" | "email")[]> = {
  * results, and fixture refs fail closed to simulated — a fixture receipt is
  * never upgraded to live at display.
  */
+const LIVE_PROOF_SOURCE_KINDS = new Set(["connected_account", "document", "email", "calendar", "manual"]);
+
 function isLiveProof(proof: ExecutionDTO["proof"]): boolean {
   if (proof === undefined) return false;
   if (proof.mode !== "live" || proof.simulated !== false) return false;
   if (proof.provenance.length === 0) return false;
-  return !proof.provenance.some((ref) => ref.fictional === true);
+  // Positive validation matching the service rule: every ref must be a
+  // supported non-fixture kind with a non-empty locator — malformed or
+  // fictional entries never qualify as live evidence.
+  return proof.provenance.every(
+    (ref) => LIVE_PROOF_SOURCE_KINDS.has(ref.kind) && ref.locator.trim().length > 0 && ref.fictional !== true,
+  );
 }
 
 /**
@@ -184,7 +191,12 @@ function receiptOf(execution: ExecutionDTO, timezone: string | undefined): Actio
   };
   if (execution.error) receipt.detail = execution.error;
   if (execution.status === "succeeded") {
-    receipt.detail = isLiveProof(executionProof(execution)) ? "Done — provider receipt recorded" : "Done — simulated provider receipt";
+    const proof = executionProof(execution);
+    receipt.detail = proof === undefined
+      ? "Done — provider receipt unverified"
+      : isLiveProof(proof)
+        ? "Done — provider receipt recorded"
+        : "Done — simulated provider receipt";
   }
   // Recovery is only ever offered for non-terminal states; pending and
   // succeeded never get a control.
@@ -585,7 +597,9 @@ export function adaptWorkspace(workspace: WorkspaceDTO): AdaptedWorkspace {
       bookingFor(item, index, workspace.businesses.find((business) => business.id === item.booking.businessId) ?? workspace.businesses[0]),
     ),
     connections: workspace.connections.map(connectionFor),
-    dataMode: workspace.mode.kind === "demo" ? "demo" : "live",
+    // Only a positive live marker renders live; "unknown" evidence fails
+    // closed to the demo presentation rather than implying live data.
+    dataMode: workspace.mode.kind === "live" ? "live" : "demo",
     pendingApprovals: [...pendingApprovals],
     approvalIdentity: workspace.approvalIdentity,
     notice: workspace.notice,

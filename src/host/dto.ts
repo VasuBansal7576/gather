@@ -63,7 +63,7 @@ const BOOKING_STATUSES = [
 
 const EXECUTION_STATUSES = ["pending", "succeeded", "failed", "partial", "uncertain"] as const;
 
-const MODE_KINDS = ["demo", "live"] as const;
+const MODE_KINDS = ["demo", "live", "unknown"] as const;
 
 export interface SourceRefDTO {
   kind: string;
@@ -339,13 +339,14 @@ export function parseWorkspaceDTO(value: unknown): WorkspaceDTO {
   const mode = asRecordOf(req(record, "mode"), "workspace.mode");
   const kind = asEnum(req(mode, "kind"), "mode.kind", MODE_KINDS);
   const demo = record.demo === true;
-  // Correlated semantics: a "demo" mode must be flagged demo, and a live
-  // workspace may never claim the demo marker — anything else is corrupt.
+  // Correlated semantics: a "demo" mode must be flagged demo, and a live or
+  // unverified-evidence workspace may never claim the demo marker —
+  // anything else is corrupt.
   if (kind === "demo" && !demo) {
     throw new DtoValidationError('mode.kind is "demo" but workspace.demo is not true');
   }
-  if (kind === "live" && demo) {
-    throw new DtoValidationError('mode.kind is "live" but workspace.demo is true');
+  if (kind !== "demo" && demo) {
+    throw new DtoValidationError(`mode.kind is "${kind}" but workspace.demo is true`);
   }
   return {
     mode: { kind, label: asString(req(mode, "label"), "mode.label") },
