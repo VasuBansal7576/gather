@@ -195,11 +195,9 @@ test("failed-start rollback rewrite preserves the model selection", async () => 
         connectionFactory: () => {
           throw new Error("connection factory must not run after a failed spawn");
         },
-        mcpBoundaryFactory: () => ({
-          toolNames: ["probe"],
-          listen: async () => ({ url: "http://127.0.0.1:9/mcp", port: 9 }),
-          close: async () => {},
-        }),
+        // This tree's facade owns boundary construction directly (no
+        // injected factory): the probe tool binds a real ephemeral
+        // loopback listener, which rollback then tears down.
       },
     );
     await assert.rejects(runtime.start(), /spawn denied/);
