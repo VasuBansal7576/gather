@@ -1,4 +1,4 @@
-import type { KnowledgeCandidate, KnowledgeFact, KnowledgeSourceReference, WithheldFact } from "./types.ts";
+import type { KnowledgeCandidate, KnowledgeFact, KnowledgeSourceReference, WithheldFact, WorkspaceBooking } from "./types.ts";
 
 /**
  * Pure review-shaping helpers for the owner knowledge view. No React, no
@@ -71,6 +71,30 @@ export function conflictingCandidates(
 
 export function withheldForFact(withheld: readonly WithheldFact[], factId: string): WithheldFact | undefined {
   return withheld.find((entry) => entry.factId === factId);
+}
+
+/**
+ * Meaningful label for an exception scope target: the booking event name
+ * when the id matches an owned-business booking, otherwise the raw id.
+ * Never invents a record — unknown ids render as-is.
+ */
+export function scopeTargetLabel(
+  scope: "booking" | "customer" | string,
+  scopeId: string | undefined,
+  bookings: readonly WorkspaceBooking[],
+): string {
+  if (!scopeId) return scope;
+  if (scope !== "booking") return `${scope} ${scopeId}`;
+  const match = bookings.find((booking) => booking.id === scopeId);
+  return match ? `${match.eventName} (${match.id})` : scopeId;
+}
+
+/** Bookings of one business, oldest first, for scope selection. */
+export function bookingsForBusiness(
+  bookings: readonly WorkspaceBooking[],
+  businessId: string,
+): WorkspaceBooking[] {
+  return bookings.filter((booking) => booking.businessId === businessId);
 }
 
 export function scopedFacts(facts: readonly KnowledgeFact[]): KnowledgeFact[] {

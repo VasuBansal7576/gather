@@ -1,24 +1,25 @@
 'use client';
 
-import { useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { createKnowledgeOwnerApi } from "../../knowledge-owner/api.ts";
 import type { ExceptionInput } from "../../knowledge-owner/api.ts";
 import type {
   KnowledgeConfirmedFact,
-  KnowledgeFact,
   KnowledgeSourceReference,
   WithheldFact,
+  WorkspaceBooking,
 } from "../../knowledge-owner/types.ts";
 import {
-  describeCorrectEffect,
-  describeExceptionEffect,
+  bookingsForBusiness,
   formatValue,
   isFixtureOnly,
   keyLabel,
-  parseValueJson,
   policyFacts,
+  scopeTargetLabel,
   sourceKindLabel,
-  subjectLabel,
 } from "../../knowledge-owner/state.ts";
+import { FactCorrectForm } from "./FactCorrectForm.tsx";
+import { ExceptionForm, type ScopeBookingsState } from "./ExceptionForm.tsx";
 
 export interface CorrectSubmission {
   key: string;
@@ -27,6 +28,12 @@ export interface CorrectSubmission {
   value: Record<string, unknown>;
   commandId: string;
 }
+
+// Input bindings preserved for the conflict integration: corrections carry
+// key + subjectId + expectedRevision + value + commandId, exceptions carry
+// policy/effect/scope/scopeId/subjectId/value + commandId. Account fact IDs
+// will arrive with the new account-aware service; nothing here mints or
+// renames revision identity.
 
 interface FactsProps {
   facts: KnowledgeConfirmedFact[];
@@ -54,199 +61,16 @@ function FactSources({ sources }: { sources: KnowledgeSourceReference[] }): Reac
   );
 }
 
-function policyIdOf(fact: KnowledgeFact): string | undefined {
-  const value = fact.value.policyId;
-  return typeof value === "string" && value.trim().length > 0 ? value : undefined;
-}
-
-function CorrectForm({
-  fact,
-  busy,
-  error,
-  onCorrect,
-  newCommandId,
-}: {
-  fact: KnowledgeConfirmedFact;
-  busy: boolean;
-  error?: string;
-  onCorrect: (input: CorrectSubmission) => void;
-  newCommandId: () => string;
-}): React.JSX.Element {
-  const [text, setText] = useState(() => JSON.stringify(fact.value, null, 2));
-  const [localError, setLocalError] = useState<string | undefined>();
-  const effect = describeCorrectEffect(fact.key, fact.subjectId, fact.revision);
-  return (
-    <form
-      className="knowledge-inline-form"
-      aria-label={`Correct ${fact.key} ${fact.subjectId}`}
-      onSubmit={(event) => {
-        event.preventDefault();
-        const parsed = parseValueJson(text);
-        if (!parsed.ok) {
-          setLocalError(parsed.error);
-          return;
-        }
-        setLocalError(undefined);
-        onCorrect({ key: fact.key, subjectId: fact.subjectId, expectedRevision: fact.revision, value: parsed.value, commandId: newCommandId() });
-      }}
-    >
-      <strong>Correct this fact</strong>
-      <div className="knowledge-effect" style={{ marginTop: 8 }}>
-        <strong>{effect.headline}</strong>
-        {effect.detail} If someone else changed it first, your correction is refused and you can review the newer revision — nothing is overwritten blindly.
-      </div>
-      <label className="knowledge-field">
-        <span>Corrected value (JSON object)</span>
-        <textarea
-          className="knowledge-textarea"
-          value={text}
-          disabled={busy}
-          onChange={(event) => setText(event.target.value)}
-          rows={6}
-          spellCheck={false}
-        />
-      </label>
-      {localError ? <div className="knowledge-notice" role="alert"><strong>Check the value. </strong>{localError}</div> : null}
-      {error ? <div className="knowledge-notice" role="alert"><strong>That correction did not apply. </strong>{error}</div> : null}
-      <div className="knowledge-actions">
-        <button type="submit" className="knowledge-approve-button" disabled={busy}>
-          {busy ? "Correcting…" : `Save as revision ${fact.revision + 1}`}
-        </button>
-      </div>
-    </form>
-  );
-}
-
-function ExceptionComposer({
-  policies,
-  busy,
-  error,
-  onException,
-  newCommandId,
-}: {
-  policies: KnowledgeFact[];
-  busy: boolean;
-  error?: string;
-  onException: (input: ExceptionInput) => void;
-  newCommandId: () => string;
-}): React.JSX.Element {
-  const [open, setOpen] = useState(false);
-  const [policyId, setPolicyId] = useState("");
-  const [effect, setEffect] = useState<"allow" | "require_owner_decision">("allow");
-  const [scope, setScope] = useState<"booking" | "customer">("booking");
-  const [scopeId, setScopeId] = useState("");
-  const [detail, setDetail] = useState("{}");
-  const [localError, setLocalError] = useState<string | undefined>();
-  const preview = describeExceptionEffect(scope, scopeId.trim() || "…");
-
-  if (!open) {
-    return (
-      <div className="knowledge-actions">
-        <button type="button" className="knowledge-secondary-button" onClick={() => setOpen(true)}>
-          Add a scoped exception…
-        </button>
-      </div>
-    );
-  }
-  return (
-    <form
-      className="knowledge-inline-form"
-      aria-label="Add a scoped exception"
-      onSubmit={(event) => {
-        event.preventDefault();
-        if (!policyId) {
-          setLocalError("Choose the policy this exception relaxes.");
-          return;
-        }
-        if (!scopeId.trim()) {
-          setLocalError("Name the booking or customer this exception is for — exceptions can never apply business-wide.");
-          return;
-        }
-        const parsed = parseValueJson(detail);
-        if (!parsed.ok) {
-          setLocalError(parsed.error);
-          return;
-        }
-        setLocalError(undefined);
-        onException({
-          policyId,
-          effect,
-          scope,
-          scopeId: scopeId.trim(),
-          subjectId: scopeId.trim(),
-          value: parsed.value,
-          commandId: newCommandId(),
-        });
-      }}
-    >
-      <strong>Add a scoped exception</strong>
-      <p className="knowledge-field-hint">For one customer or booking that needs different treatment than the confirmed policy.</p>
-      <label className="knowledge-field">
-        <span>Policy to relax</span>
-        <select className="knowledge-select" value={policyId} disabled={busy} onChange={(event) => setPolicyId(event.target.value)}>
-          <option value="">Choose a confirmed policy…</option>
-          {policies.map((policy) => {
-            const id = policyIdOf(policy);
-            if (!id) return null;
-            const statement = typeof policy.value.statement === "string" ? policy.value.statement : id;
-            return <option key={policy.id} value={id}>{statement} ({id})</option>;
-          })}
-        </select>
-      </label>
-      <fieldset className="knowledge-field" style={{ border: "none", padding: 0 }}>
-        <legend className="knowledge-field-hint">Effect</legend>
-        <div className="knowledge-radio-row" role="radiogroup" aria-label="Exception effect">
-          <label><input type="radio" name="exception-effect" checked={effect === "allow"} disabled={busy} onChange={() => setEffect("allow")} /> Allow — proceed under this exception</label>
-          <label><input type="radio" name="exception-effect" checked={effect === "require_owner_decision"} disabled={busy} onChange={() => setEffect("require_owner_decision")} /> Still ask me each time</label>
-        </div>
-      </fieldset>
-      <fieldset className="knowledge-field" style={{ border: "none", padding: 0 }}>
-        <legend className="knowledge-field-hint">Applies to</legend>
-        <div className="knowledge-radio-row" role="radiogroup" aria-label="Exception scope">
-          <label><input type="radio" name="exception-scope" checked={scope === "booking"} disabled={busy} onChange={() => setScope("booking")} /> One booking</label>
-          <label><input type="radio" name="exception-scope" checked={scope === "customer"} disabled={busy} onChange={() => setScope("customer")} /> One customer</label>
-        </div>
-      </fieldset>
-      <label className="knowledge-field">
-        <span>{scope === "booking" ? "Booking reference" : "Customer reference"}</span>
-        <input
-          type="text"
-          className="knowledge-input"
-          value={scopeId}
-          disabled={busy}
-          onChange={(event) => setScopeId(event.target.value)}
-          placeholder={scope === "booking" ? "e.g. EVT-024" : "e.g. Acme Co."}
-          maxLength={200}
-        />
-      </label>
-      <label className="knowledge-field">
-        <span>Exception detail (JSON object, e.g. what is permitted)</span>
-        <textarea className="knowledge-textarea" value={detail} disabled={busy} onChange={(event) => setDetail(event.target.value)} rows={3} spellCheck={false} />
-      </label>
-      <div className="knowledge-effect">
-        <strong>{preview.headline}</strong>
-        {preview.detail}
-      </div>
-      {localError ? <div className="knowledge-notice" role="alert"><strong>Check the form. </strong>{localError}</div> : null}
-      {error ? <div className="knowledge-notice" role="alert"><strong>That exception did not apply. </strong>{error}</div> : null}
-      <div className="knowledge-actions">
-        <button type="submit" className="knowledge-approve-button" disabled={busy || policies.length === 0}>
-          {busy ? "Adding…" : "Add scoped exception"}
-        </button>
-        <button type="button" className="knowledge-secondary-button" disabled={busy} onClick={() => setOpen(false)}>
-          Cancel
-        </button>
-      </div>
-      {policies.length === 0 ? (
-        <p className="knowledge-field-hint">No confirmed policies yet — confirm a policy observation first, then scope exceptions to it.</p>
-      ) : null}
-    </form>
-  );
+function boundsCurrency(facts: KnowledgeConfirmedFact[]): string | undefined {
+  const bounds = facts.find((fact) => fact.key === "pricing_bounds");
+  const currency = bounds?.value.currency;
+  return typeof currency === "string" && currency.trim().length > 0 ? currency.trim() : undefined;
 }
 
 /**
- * Confirmed business understanding: global facts (correctable), facts
- * withheld from offers pending reconfirmation, and scoped exceptions.
+ * Confirmed business understanding: global facts (correctable through
+ * guided business-labelled inputs), facts withheld from offers pending
+ * reconfirmation, and scoped exceptions with meaningful scope labels.
  */
 export function ConfirmedFacts({
   facts,
@@ -258,10 +82,34 @@ export function ConfirmedFacts({
   onException,
   newCommandId,
 }: FactsProps): React.JSX.Element {
+  const api = useMemo(() => createKnowledgeOwnerApi((input, init) => fetch(input, init)), []);
   const [correctingId, setCorrectingId] = useState<string | undefined>();
+  const [bookingsState, setBookingsState] = useState<ScopeBookingsState>({ kind: "idle" });
   const policies = policyFacts(facts);
   const scoped = facts.filter((fact) => fact.key === "scoped_exception");
   const global = facts.filter((fact) => fact.key !== "scoped_exception");
+  const businessId = facts.length > 0 ? facts[0]!.businessId : undefined;
+  const currencyHint = boundsCurrency(facts);
+
+  const loadBookings = useCallback(async () => {
+    if (!businessId) return;
+    setBookingsState({ kind: "loading" });
+    try {
+      const all = await api.listWorkspaceBookings();
+      setBookingsState({ kind: "ready", bookings: bookingsForBusiness(all, businessId) });
+    } catch (err) {
+      setBookingsState({
+        kind: "error",
+        message: err instanceof Error ? err.message : "Gather could not load the bookings for this venue.",
+      });
+    }
+  }, [api, businessId]);
+
+  useEffect(() => {
+    void loadBookings();
+  }, [loadBookings]);
+
+  const bookings: WorkspaceBooking[] = bookingsState.kind === "ready" ? bookingsState.bookings : [];
 
   return (
     <div>
@@ -310,8 +158,9 @@ export function ConfirmedFacts({
             </button>
           </div>
           {correctingId === fact.id ? (
-            <CorrectForm
+            <FactCorrectForm
               fact={fact}
+              currencyHint={currencyHint}
               busy={busyKey === `correct:${fact.id}`}
               error={errors[`correct:${fact.id}`]}
               onCorrect={onCorrect}
@@ -332,7 +181,7 @@ export function ConfirmedFacts({
       {scoped.map((fact) => (
         <article className="knowledge-card" key={fact.id} aria-label={`Scoped exception ${fact.id}`}>
           <div className="knowledge-card-head">
-            <h3>{subjectLabel({ subjectId: fact.subjectId, key: fact.key })}</h3>
+            <h3>{scopeTargetLabel(fact.scope, fact.scopeId ?? fact.subjectId, bookings)}</h3>
           </div>
           <div className="knowledge-pill-row">
             <span className="knowledge-pill is-ok"><span className="knowledge-dot" aria-hidden="true" />Scoped · {fact.scope}{fact.scopeId ? ` ${fact.scopeId}` : ""}</span>
@@ -342,8 +191,10 @@ export function ConfirmedFacts({
           <FactSources sources={fact.sourceReferences} />
         </article>
       ))}
-      <ExceptionComposer
+      <ExceptionForm
         policies={policies}
+        bookingsState={bookingsState}
+        onReloadBookings={() => void loadBookings()}
         busy={busyKey === "exception:new"}
         error={errors["exception:new"]}
         onException={onException}

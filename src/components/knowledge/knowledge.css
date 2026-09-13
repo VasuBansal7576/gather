@@ -83,6 +83,11 @@
   color: var(--k-ink); font: inherit; font-size: 13px; padding: 8px 10px;
 }
 .knowledge-select { max-width: 320px; }
+/* Long option labels (venue names, booking event names) size a select by
+   its longest option; without this the control forces its flex/grid parent
+   wider than narrow viewports (measured 33px overflow at 390px). */
+.knowledge-select, .knowledge-input { min-width: 0; max-width: 100%; }
+.knowledge-field > * { min-width: 0; }
 .knowledge-textarea { width: 100%; min-height: 96px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; resize: vertical; }
 .knowledge-field { display: grid; gap: 5px; margin: 10px 0; }
 .knowledge-field > span { color: var(--k-ink-muted); font-size: 12px; }
