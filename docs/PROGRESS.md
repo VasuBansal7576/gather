@@ -14,8 +14,8 @@ The demo connectors and fixture workspace remain explicitly simulated and are no
 
 This checklist has a fixed total of 17 gates.
 
-Thirteen gates currently remain accepted; the combined-test gate is reopened after a recurring isolated Gateway startup timeout.
-Fourteen gates had previously been accepted on the earlier combined milestone.
+Fourteen gates are accepted after the latest combined 343-test run and production build.
+The recurring isolated Gateway startup timeout remains an open reliability issue despite the passing rerun.
 This count describes the local application milestone only, not completion of the product requirements in [PRD.md](PRD.md).
 
 - [x] Next.js application scaffold is present and builds.
@@ -26,8 +26,8 @@ This count describes the local application milestone only, not completion of the
 - [x] Connector fixtures cover provenance, unavailable dates, idempotency, and timeout reconciliation.
 - [x] Local launcher and doctor scripts are present and do not install packages or touch external runtimes.
 - [x] `npm ci` completes without credentials or network provider setup.
-- [ ] Storage, connector, approval, recovery, offers, and runtime checks pass together on the current integration.
-  The earlier 247-test and 314-test runs passed, but `dc07d55` passed 330/331 with the isolated Gateway handshake timeout described below.
+- [x] Storage, connector, approval, recovery, offers, runtime, Google scope, and owner-state checks pass together in the 343-test run on `cb913a9`.
+  The preceding `dc07d55` run passed 330/331 with the isolated Gateway handshake timeout described below; this failure remains recorded.
 - [x] `npm run typecheck` passes.
 - [x] `npm run build` passes.
 - [x] Doctor passes with Node 26.8.2, installed dependencies, supported scripts, and a project-local writable `.runtime` directory.
@@ -143,6 +143,8 @@ Astra reran 17 focused owner-state and host-contract tests and type checking on 
 The combined `dc07d55` run passed 330/331 tests; the production build passed separately.
 The sole failure was the actual isolated doctor not receiving Gateway `hello-ok` within 30 seconds, followed by verified child shutdown.
 The same timeout was observed on an earlier integration under concurrent load; its cause remains under investigation and a passing isolated retry would not erase the reliability gap.
+The unchanged single doctor check subsequently passed in 17 seconds, followed by all 343 combined tests and a production build passing on `cb913a9`.
+Fixed-port contention is a hypothesis from source inspection, not a demonstrated cause; a separate worker is addressing per-run port isolation and clearer startup evidence.
 Astra exercised the exact integrated production build against a disposable database: empty workspace, explicit demo initialization, Today-to-booking navigation, approval, and separately persisted simulated hold and email receipts.
 Desktop 1586×992 and mobile 390×844 checks showed no horizontal overflow, with the mobile action control inside the viewport.
 Removing only the task-owned simulated email execution reproduced a crash between steps: the UI remained incomplete and reapproval recovered the missing step while preserving the original hold execution.
