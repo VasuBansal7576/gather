@@ -98,6 +98,17 @@ function followupDueAt(input: CoordinationEventInput): string {
 const EVENT_COLUMNS =
   "(id, dedupe_key, kind, booking_id, source_id, source_kind, observed_at, received_at, revision, payload_json, stale)";
 
+const MODERN_EVENT_COLS = [
+  "id", "dedupe_key", "kind", "booking_id", "source_id", "source_kind",
+  "observed_at", "received_at", "revision", "payload_json", "stale",
+];
+
+const MODERN_WAITING_COLS = [
+  "id", "booking_id", "kind", "status", "due_at", "detail_json", "source_event_id",
+  "revision", "claimed_by", "claimed_at", "resolution_note", "created_at", "updated_at",
+  "claim_token", "claim_expires_at",
+];
+
 const WAITING_SCHEMA = `
   CREATE TABLE coord_waiting (
     id TEXT PRIMARY KEY,
@@ -336,7 +347,12 @@ export class CoordinationLedger {
    * Repair state left by the previous non-atomic migrator (both event tables
    * present, waiting FK possibly retargeted at the legacy name): merge
    * missing rows, rebuild the waiting table only if its FK targets the
-   * legacy name, drop the legacy table. Same atomicity gates as migration.
+   * legacy name, drop the legacy table. Every waiting column — including
+   * live claim tokens, lease expiries, and resolution metadata — is copied
+   * verbatim (NULL only where the legacy table predates the column), and
+   * merged event rows are verified field-for-field: a same-id conflict
+   * aborts atomically with both original tables preserved. Same atomicity
+   * gates as migration.
    */
   private recoverLegacyLeftover(): void {
     if (!this.tableExists("coord_events_legacy")) return;
@@ -345,26 +361,18 @@ export class CoordinationLedger {
       this.db.exec("BEGIN IMMEDIATE");
       try {
         this.db.exec(`INSERT OR IGNORE INTO coord_events ${EVENT_COLUMNS} SELECT ${EVENT_COLUMNS.slice(1, -1)} FROM coord_events_legacy`);
+        this.verifyEventsMergeExact();
         if (this.waitingReferencesLegacyEvents()) {
           this.db.exec("ALTER TABLE coord_waiting RENAME TO coord_waiting_legacy");
           this.db.exec(WAITING_SCHEMA);
-          // Ancient waiting tables may predate claim columns: copy the
-          // intersection, defaulting the rest to NULL.
+          // Copy every modern column verbatim; only columns the legacy
+          // table predates default to NULL. Claim tokens, lease expiries,
+          // and resolution notes are never silently discarded.
           const legacyInfo = this.db.prepare("PRAGMA table_info(coord_waiting_legacy)").all() as SqlRow[];
           const legacyCols = new Set(legacyInfo.map((row) => String(asRow(row).name)));
-          const coreCols = [
-            "id", "booking_id", "kind", "status", "due_at", "detail_json", "source_event_id",
-            "revision", "claimed_by", "claimed_at", "resolution_note", "created_at", "updated_at",
-          ].filter((column) => legacyCols.has(column));
-          const extraCols = ["claim_token", "claim_expires_at"].filter((column) => !legacyCols.has(column));
-          const targetCols = [...coreCols, ...extraCols];
-          const selectCols = [...coreCols, ...extraCols.map(() => "NULL")];
-          this.db.exec(`INSERT INTO coord_waiting (${targetCols.join(", ")}) SELECT ${selectCols.join(", ")} FROM coord_waiting_legacy`);
-          const before = this.rowCount("coord_waiting_legacy");
-          const after = this.rowCount("coord_waiting");
-          if (before !== after) {
-            throw new Error(`Waiting rebuild row-count mismatch (legacy ${before}, rebuilt ${after}); refusing to drop work`);
-          }
+          const selectCols = MODERN_WAITING_COLS.map((column) => (legacyCols.has(column) ? column : "NULL"));
+          this.db.exec(`INSERT INTO coord_waiting (${MODERN_WAITING_COLS.join(", ")}) SELECT ${selectCols.join(", ")} FROM coord_waiting_legacy`);
+          this.verifyWaitingCopyExact();
           this.db.exec("DROP TABLE coord_waiting_legacy");
         }
         this.db.exec("DROP TABLE coord_events_legacy");
@@ -380,6 +388,46 @@ export class CoordinationLedger {
       }
     } finally {
       this.restoreRebuildPragmas(prior);
+    }
+  }
+
+  /** Every legacy event row must have a field-identical twin after the merge. */
+  private verifyEventsMergeExact(): void {
+    const cols = MODERN_EVENT_COLS.join(", ");
+    const legacyRows = this.db.prepare(`SELECT ${cols} FROM coord_events_legacy ORDER BY id`).all() as SqlRow[];
+    for (const row of legacyRows) {
+      const record = asRow(row);
+      const twin = this.db.prepare(`SELECT ${cols} FROM coord_events WHERE id = $id`).get({ $id: String(record.id) });
+      if (!twin || JSON.stringify(canonicalize(asRow(twin))) !== JSON.stringify(canonicalize(record))) {
+        throw new Error(
+          `Conflicting legacy event row ${String(record.id)}: merge would silently drop it; preserving both original tables`,
+        );
+      }
+    }
+  }
+
+  /** Every rebuilt waiting row must match its legacy source field-for-field. */
+  private verifyWaitingCopyExact(): void {
+    const legacyInfo = this.db.prepare("PRAGMA table_info(coord_waiting_legacy)").all() as SqlRow[];
+    const legacyCols = new Set(legacyInfo.map((row) => String(asRow(row).name)));
+    const selectCols = MODERN_WAITING_COLS.map((column) => (legacyCols.has(column) ? column : "NULL"));
+    const legacyRows = this.db
+      .prepare(`SELECT ${selectCols.join(", ")} FROM coord_waiting_legacy ORDER BY id`)
+      .all() as SqlRow[];
+    const rebuiltRows = this.db
+      .prepare(`SELECT ${MODERN_WAITING_COLS.join(", ")} FROM coord_waiting ORDER BY id`)
+      .all() as SqlRow[];
+    if (legacyRows.length !== rebuiltRows.length) {
+      throw new Error(
+        `Waiting rebuild row-count mismatch (legacy ${legacyRows.length}, rebuilt ${rebuiltRows.length}); refusing to drop work`,
+      );
+    }
+    // NULL and JSON null normalize identically through canonicalization.
+    for (const [index, legacyRow] of legacyRows.entries()) {
+      const rebuilt = rebuiltRows[index] as SqlRow;
+      if (JSON.stringify(canonicalize(asRow(legacyRow))) !== JSON.stringify(canonicalize(rebuilt))) {
+        throw new Error(`Waiting rebuild value mismatch on row ${index}; refusing to drop work`);
+      }
     }
   }
 

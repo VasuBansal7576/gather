@@ -1019,3 +1019,136 @@ test("expired unreleased claims cannot resolve, even with the right token", () =
     cleanup();
   }
 });
+
+test("recovery preserves live claim metadata and the original token still resolves", () => {
+  const { db, cleanup } = tempDb();
+  try {
+    db.exec("PRAGMA foreign_keys = ON");
+    let now = "2030-04-04T10:00:00.000Z";
+    const ledger = new CoordinationLedger(db, { clock: () => now });
+    ledger.ingestEvent(inquiryEvent({ dedupeKey: "evt-live-1", bookingId: "booking-live" }));
+    const [due] = ledger.listDueWork({ nowIso: now, bookingId: "booking-live" });
+    assert.ok(due);
+    const claim = ledger.claimDueWork({ ids: [due.id], claimedBy: "worker-a", nowIso: now, leaseMs: 3_600_000 });
+    const token = claim.claimed[0]?.claimToken;
+    const expiry = claim.claimed[0]?.claimExpiresAt;
+    assert.ok(token);
+    assert.ok(expiry);
+    // Astra's aftermath shape: scoped table recreated empty, legacy holding
+    // the row, waiting FK retargeted at the legacy name.
+    const schemaRow = db.prepare("SELECT sql FROM sqlite_master WHERE name = 'coord_events'").get();
+    const schemaSql = String((schemaRow as Record<string, unknown>).sql);
+    db.exec("ALTER TABLE coord_events RENAME TO coord_events_legacy");
+    db.exec(schemaSql);
+    const recovered = new CoordinationLedger(db, { clock: () => now });
+    const [item] = recovered.listWaitingForBooking("booking-live");
+    assert.equal(item?.status, "claimed");
+    assert.equal(item?.claimToken, token);
+    assert.equal(item?.claimExpiresAt, expiry);
+    assert.equal(item?.claimedBy, "worker-a");
+    const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all()
+      .map((row) => String((row as Record<string, unknown>).name));
+    assert.ok(!tables.includes("coord_events_legacy"));
+    assert.ok(!tables.includes("coord_waiting_legacy"));
+    const refs = db.prepare("PRAGMA foreign_key_list(coord_waiting)").all()
+      .map((row) => String((row as Record<string, unknown>).table));
+    assert.deepEqual(refs, ["coord_events"]);
+    const indexes = db.prepare("PRAGMA index_list(coord_events)").all()
+      .map((row) => String((row as Record<string, unknown>).name));
+    assert.ok(indexes.includes("idx_coord_events_dedupe"));
+    assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(), []);
+    // The original unexpired token resolves the recovered claim.
+    const resolved = recovered.resolveWaiting({ id: due.id, resolution: "done", note: "acted", claimToken: token });
+    assert.equal(resolved.status, "done");
+  } finally {
+    cleanup();
+  }
+});
+
+test("recovered claims expire and reclaim normally on the trusted clock", () => {
+  const { db, cleanup } = tempDb();
+  try {
+    db.exec("PRAGMA foreign_keys = ON");
+    let now = "2030-04-04T10:00:00.000Z";
+    const ledger = new CoordinationLedger(db, { clock: () => now });
+    ledger.ingestEvent(inquiryEvent({ dedupeKey: "evt-live-2", bookingId: "booking-cycle" }));
+    const [due] = ledger.listDueWork({ nowIso: now, bookingId: "booking-cycle" });
+    assert.ok(due);
+    const claim = ledger.claimDueWork({ ids: [due.id], claimedBy: "worker-a", nowIso: now, leaseMs: 1000 });
+    const token = claim.claimed[0]?.claimToken;
+    assert.ok(token);
+    const schemaRow = db.prepare("SELECT sql FROM sqlite_master WHERE name = 'coord_events'").get();
+    db.exec("ALTER TABLE coord_events RENAME TO coord_events_legacy");
+    db.exec(String((schemaRow as Record<string, unknown>).sql));
+    const recovered = new CoordinationLedger(db, { clock: () => now });
+    now = "2030-04-05T10:00:00.000Z";
+    assert.throws(
+      () => recovered.resolveWaiting({ id: due.id, resolution: "done", claimToken: token }),
+      /lease expired/,
+    );
+    assert.deepEqual(recovered.releaseStaleClaims({ nowIso: now }), [due.id]);
+    const fresh = recovered.claimDueWork({ ids: [due.id], claimedBy: "worker-b", nowIso: now });
+    assert.equal(fresh.claimed.length, 1);
+    assert.notEqual(fresh.claimed[0]?.claimToken, token);
+    const resolved = recovered.resolveWaiting({ id: due.id, resolution: "done", claimToken: fresh.claimed[0]?.claimToken });
+    assert.equal(resolved.status, "done");
+  } finally {
+    cleanup();
+  }
+});
+
+test("conflicting legacy event rows abort recovery with both tables preserved", () => {
+  const { db, cleanup } = tempDb();
+  try {
+    db.exec("PRAGMA foreign_keys = ON");
+    db.exec(`CREATE TABLE coord_events (
+      id TEXT PRIMARY KEY, dedupe_key TEXT NOT NULL, kind TEXT NOT NULL,
+      booking_id TEXT NOT NULL, source_id TEXT NOT NULL, source_kind TEXT NOT NULL,
+      observed_at TEXT NOT NULL, received_at TEXT NOT NULL, revision INTEGER,
+      payload_json TEXT NOT NULL, stale INTEGER NOT NULL DEFAULT 0,
+      UNIQUE (booking_id, dedupe_key));
+    CREATE TABLE coord_events_legacy (
+      id TEXT PRIMARY KEY, dedupe_key TEXT NOT NULL UNIQUE, kind TEXT NOT NULL,
+      booking_id TEXT NOT NULL, source_id TEXT NOT NULL, source_kind TEXT NOT NULL,
+      observed_at TEXT NOT NULL, received_at TEXT NOT NULL, revision INTEGER,
+      payload_json TEXT NOT NULL, stale INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE coord_waiting (
+      id TEXT PRIMARY KEY, booking_id TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL,
+      due_at TEXT NOT NULL, detail_json TEXT NOT NULL,
+      source_event_id TEXT NOT NULL REFERENCES coord_events_legacy(id),
+      revision INTEGER, claimed_by TEXT, claimed_at TEXT, resolution_note TEXT,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+      claim_token TEXT, claim_expires_at TEXT);
+    INSERT INTO coord_events
+      (id, dedupe_key, kind, booking_id, source_id, source_kind, observed_at, received_at, revision, payload_json, stale)
+      VALUES ('e1', 'email:m1', 'inquiry', 'b1', 'm1', 'email',
+        '2030-04-01T10:00:00.000Z', '2030-04-01T10:00:00.000Z', NULL, '{"kept":true}', 0);
+    INSERT INTO coord_events_legacy
+      (id, dedupe_key, kind, booking_id, source_id, source_kind, observed_at, received_at, revision, payload_json, stale)
+      VALUES ('e1', 'email:m1', 'inquiry', 'b1', 'm1', 'email',
+        '2030-04-01T10:00:00.000Z', '2030-04-01T10:00:00.000Z', NULL, '{"forged":true}', 0);
+    INSERT INTO coord_waiting
+      (id, booking_id, kind, status, due_at, detail_json, source_event_id, revision, created_at, updated_at, claim_token, claim_expires_at)
+      VALUES ('w1', 'b1', 'followup', 'pending', '2030-04-03T10:00:00.000Z', '{}', 'e1', NULL,
+        '2030-04-01T10:00:00.000Z', '2030-04-01T10:00:00.000Z', NULL, NULL);`);
+    // Same identity, different payload: the merge must fail atomically
+    // instead of silently dropping one side via INSERT OR IGNORE.
+    assert.throws(() => new CoordinationLedger(db), /Conflicting legacy event row/);
+    const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all()
+      .map((row) => String((row as Record<string, unknown>).name));
+    assert.ok(tables.includes("coord_events"));
+    assert.ok(tables.includes("coord_events_legacy"));
+    assert.ok(tables.includes("coord_waiting"));
+    const kept = db.prepare("SELECT payload_json AS p FROM coord_events WHERE id = 'e1'").get();
+    assert.equal(String((kept as Record<string, unknown>).p), '{"kept":true}');
+    const legacy = db.prepare("SELECT payload_json AS p FROM coord_events_legacy WHERE id = 'e1'").get();
+    assert.equal(String((legacy as Record<string, unknown>).p), '{"forged":true}');
+    assert.equal(db.prepare("SELECT COUNT(*) AS n FROM coord_waiting").get() !== null, true);
+    const fk = db.prepare("PRAGMA foreign_keys").get() as Record<string, unknown>;
+    assert.equal(Number(fk.foreign_keys), 1);
+    // Retryable: a second attempt fails identically with nothing half-applied.
+    assert.throws(() => new CoordinationLedger(db), /Conflicting legacy event row/);
+  } finally {
+    cleanup();
+  }
+});
