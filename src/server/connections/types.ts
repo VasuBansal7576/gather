@@ -62,6 +62,7 @@ export type ConnectionErrorCode =
   | "INVALID_REQUEST"
   | "REPLAY"
   | "NOT_FOUND"
+  | "STALE"
   | "CROSS_BUSINESS"
   | "ACCESS_REVOKED"
   | "EXCHANGE_FAILED"
@@ -69,10 +70,20 @@ export type ConnectionErrorCode =
 
 export class ConnectionError extends Error {
   readonly code: ConnectionErrorCode;
-  constructor(code: ConnectionErrorCode, message: string) {
+  /**
+   * Structural provider error code (e.g. 'invalid_grant') when the failure
+   * came from a standards-shaped token endpoint — classification only, never
+   * provider description text that could carry sensitive material.
+   */
+  readonly providerError?: string;
+  /** True when the caller may retry the same operation later. */
+  readonly retryable: boolean;
+  constructor(code: ConnectionErrorCode, message: string, opts: { providerError?: string; retryable?: boolean } = {}) {
     super(message);
     this.name = "ConnectionError";
     this.code = code;
+    this.providerError = opts.providerError;
+    this.retryable = opts.retryable ?? code === "EXCHANGE_FAILED";
   }
 }
 
