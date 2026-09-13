@@ -3,7 +3,7 @@ import { getRuntime, ownerId } from "../../../../src/server/runtime.ts";
 import { decideOperator, type OperatorDecisionKind } from "../../../../src/server/business-operator/index.ts";
 import { assertSameOrigin, readHeaders } from "../../../../src/server/validation.ts";
 import { unknownErrorResponse } from "../../_helpers.ts";
-import { knowledgeErrorResponse } from "../_mapper.ts";
+import { collectSources, deploymentMode, knowledgeErrorResponse } from "../_mapper.ts";
 import { ServiceError } from "../../../../src/server/booking-service.ts";
 
 export const dynamic = "force-dynamic";
@@ -29,11 +29,12 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     const { actor: _ignored, kind: _kind, ...params } = body;
     const runtime = getRuntime();
     const result = decideOperator(
-      { store: runtime.store, booking: runtime.deps, ownerId: ownerId() },
+      { store: runtime.store, booking: runtime.deps, ownerId: ownerId(), availability: runtime.deps.calendar },
       body.kind as OperatorDecisionKind,
       params,
     );
-    return NextResponse.json({ demo: true, kind: body.kind, result });
+    const found: { fictional?: boolean }[] = []; collectSources(result, found);
+    return NextResponse.json({ mode: deploymentMode(found), kind: body.kind, result });
   } catch (error) {
     if (error instanceof ServiceError) return unknownErrorResponse(error);
     try {
