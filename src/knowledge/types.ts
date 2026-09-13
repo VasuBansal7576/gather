@@ -86,6 +86,8 @@ export interface KnowledgeRevision {
 /** A confirmed fact enriched with its versioning/scope metadata. */
 export interface ConfirmedFact extends BusinessFact {
   revision: number;
+  /** Stable identity of the thing the fact is about (mirrors the revision row). */
+  subjectId: string;
   scope: FactScope;
   scopeId?: string;
   reviewState: "none" | "review";
@@ -105,14 +107,31 @@ export interface KnowledgeDecision {
   createdAt: ISODateTime;
 }
 
+/** A confirmed fact withheld from consequential use pending reconfirmation. */
+export interface WithheldFact {
+  factId: string;
+  key: string;
+  subjectId: string;
+  /** Explicit decision reason — review flags are never silently ignorable. */
+  reason: string;
+}
+
 /** Confirmed-fact snapshot shaped for the offers adapter's adaptBusinessFacts input. */
 export interface OffersKnowledgeSnapshot {
   businessId: string;
   timezone: string;
   generatedAt: ISODateTime;
+  /**
+   * Offer-ready facts: verified, attributed, registry-keyed, and NOT under
+   * review. Source-changed facts are withheld here until reconfirmed, so a
+   * consumer feeding facts straight into adaptBusinessFacts cannot use
+   * stale pricing.
+   */
   facts: BusinessFact[];
-  /** Confirmed facts whose source changed since confirmation; callers should gate consequential use. */
+  /** Ids withheld for review (same set as `withheld`, kept for compatibility). */
   reviewFactIds: string[];
+  /** Withheld facts with explicit reasons. */
+  withheld: WithheldFact[];
   /** Count of active scoped (non-global) facts included. */
   scopedFactCount: number;
 }

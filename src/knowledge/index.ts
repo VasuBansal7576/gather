@@ -21,4 +21,5 @@ export type {
   DecisionKind,
   DecisionOutcome,
   OffersKnowledgeSnapshot,
+  WithheldFact,
 } from "./types.ts";

@@ -42,8 +42,25 @@ export class KnowledgeDeniedError extends KnowledgeError {
 }
 
 /** Fresh availability belongs to the evidence path, never to static confirmed knowledge. */
-const RESERVED_KEY = /^(availability|calendar)/i;
+const RESERVED_KEY = /^(availability|calendar|freebusy|slots?|windows?|schedule)/i;
 const DECISION_ACTORS: ReadonlySet<string> = new Set(["owner"]);
+
+/**
+ * Bounded booking-business fact vocabulary shared with the offers adapter
+ * (business/space/policy/scoped_exception/price_line/cost/service/
+ * pricing_bounds). Anything else — including generic wiki-style keys — is
+ * rejected at intake so unmapped content can never mint verified authority.
+ */
+const KNOWN_FACT_KEYS: ReadonlySet<string> = new Set([
+  "business",
+  "space",
+  "policy",
+  "scoped_exception",
+  "price_line",
+  "cost",
+  "service",
+  "pricing_bounds",
+]);
 
 type SqlRow = Record<string, unknown>;
 
@@ -183,6 +200,12 @@ export class KnowledgeService {
         `key "${input.key}" is reserved for fresh availability evidence and cannot enter static confirmed knowledge`,
       );
     }
+    if (!KNOWN_FACT_KEYS.has(input.key)) {
+      throw new KnowledgeError(
+        "unknown_key",
+        `key "${input.key}" is outside the booking-business fact vocabulary; unmapped content cannot mint verified authority`,
+      );
+    }
     if (input.confidence !== "probable" && input.confidence !== "uncertain") {
       throw new KnowledgeError(
         "invalid_confidence",
@@ -198,26 +221,46 @@ export class KnowledgeService {
       throw new KnowledgeError("invalid", "primary source reference needs a locator");
     }
     const subjectId = input.subjectId ?? "";
-    const valueJson = JSON.stringify(input.value);
+    // Canonical form (key-order insensitive) for both storage and every
+    // comparison below: semantically identical values dedupe and never raise
+    // spurious change flags.
+    const valueJson = canonical(input.value);
     const refsJson = JSON.stringify(input.sourceReferences);
     const observedAt = input.observedAt ?? now();
 
-    // Idempotent re-ingest: same business+key+subject+locator+revision+value.
-    const existing = this.store.db.prepare(
-      `SELECT * FROM knowledge_candidates WHERE business_id = $businessId AND key = $key
-         AND subject_id = $subjectId AND source_locator = $locator
-         AND COALESCE(source_revision, '') = $revision AND value_json = $value
-         AND status IN ('pending', 'confirmed') ORDER BY ingested_at LIMIT 1`,
-    ).get({
-      $businessId: business.id, $key: input.key, $subjectId: subjectId,
-      $locator: primary.locator, $revision: input.sourceRevision ?? "", $value: valueJson,
-    });
-    if (existing) return this.readCandidate(row(existing));
-
-    const id = input.intakeId ?? `kc_${randomUUID()}`;
-    const ingestedAt = now();
+    // The transaction covers the dedupe check through commit, so concurrent
+    // connections on the shared store serialize here instead of inserting
+    // duplicate candidates for the same observation.
     this.store.db.exec("BEGIN IMMEDIATE");
+    let insertedId: string | undefined;
     try {
+      // Idempotent re-ingest: same business+key+subject+locator+value. The
+      // source revision is deliberately NOT part of the identity: a revision
+      // bump with identical canonical content is a re-observation, and the
+      // stored revision advances to the newest observation.
+      const existing = this.store.db.prepare(
+        `SELECT * FROM knowledge_candidates WHERE business_id = $businessId AND key = $key
+           AND subject_id = $subjectId AND source_locator = $locator
+           AND value_json = $value
+           AND status IN ('pending', 'confirmed') ORDER BY ingested_at LIMIT 1`,
+      ).get({
+        $businessId: business.id, $key: input.key, $subjectId: subjectId,
+        $locator: primary.locator, $value: valueJson,
+      });
+      if (existing) {
+        const found = row(existing);
+        if (input.sourceRevision !== undefined && found.source_revision !== input.sourceRevision) {
+          this.store.db.prepare("UPDATE knowledge_candidates SET source_revision = $revision WHERE id = $id").run({
+            $revision: input.sourceRevision, $id: String(found.id),
+          });
+        }
+        this.store.db.exec("COMMIT");
+        return this.getCandidate(String(found.id));
+      }
+
+      const id = input.intakeId ?? `kc_${randomUUID()}`;
+      insertedId = id;
+      const ingestedAt = now();
       this.store.db.prepare(
         `INSERT INTO knowledge_candidates
           (id, business_id, key, subject_id, value_json, confidence, source_references_json,
@@ -261,7 +304,7 @@ export class KnowledgeService {
       throw error;
     }
     return this.readCandidate(row(
-      this.store.db.prepare("SELECT * FROM knowledge_candidates WHERE id = $id").get({ $id: id }),
+      this.store.db.prepare("SELECT * FROM knowledge_candidates WHERE id = $id").get({ $id: insertedId }),
     ));
   }
 
@@ -290,19 +333,26 @@ export class KnowledgeService {
   }
 
   rejectCandidate(input: DecisionCommand & { candidateId: string; reason?: string }): KnowledgeCandidate {
+    const fingerprint = this.requestFingerprint("reject_candidate", input, { candidateId: input.candidateId });
+    const replay = this.replayDecision(input, "reject_candidate", fingerprint);
+    if (replay) return this.getCandidate(input.candidateId);
     const candidate = this.getCandidate(input.candidateId);
     this.assertAuthority(input, "reject_candidate", { candidateId: candidate.id });
     try {
       this.assertBusiness(input.businessId, candidate.businessId);
     } catch (error) {
-      this.recordDecision(input, "reject_candidate", "rejected", { candidateId: candidate.id, reason: "cross_business" });
+      this.recordDecision(input, "reject_candidate", "rejected", { requestFingerprint: fingerprint, candidateId: candidate.id, reason: "cross_business" });
       throw error;
     }
     if (candidate.status !== "pending") {
+      this.recordDecision(input, "reject_candidate", "rejected", {
+        requestFingerprint: fingerprint, candidateId: candidate.id, reason: "not_pending", status: candidate.status,
+      });
       throw new KnowledgeError("stale", `candidate ${candidate.id} is ${candidate.status}, not pending`);
     }
     this.store.db.prepare("UPDATE knowledge_candidates SET status = 'rejected' WHERE id = $id").run({ $id: candidate.id });
     this.recordDecision(input, "reject_candidate", "applied", {
+      requestFingerprint: fingerprint,
       candidateId: candidate.id,
       reason: input.reason ?? null,
     });
@@ -312,7 +362,8 @@ export class KnowledgeService {
   // ---------- owner-confirmed side ----------
 
   confirmCandidate(input: DecisionCommand & { candidateId: string }): ConfirmResult {
-    const replay = this.replayDecision(input, "confirm");
+    const fingerprint = this.requestFingerprint("confirm", input, { candidateId: input.candidateId });
+    const replay = this.replayDecision(input, "confirm", fingerprint);
     if (replay) return replay as ConfirmResult;
 
     const candidate = this.getCandidate(input.candidateId);
@@ -320,16 +371,22 @@ export class KnowledgeService {
     try {
       this.assertBusiness(input.businessId, candidate.businessId);
     } catch (error) {
-      this.recordDecision(input, "confirm", "rejected", { candidateId: candidate.id, reason: "cross_business" });
+      this.recordDecision(input, "confirm", "rejected", { requestFingerprint: fingerprint, candidateId: candidate.id, reason: "cross_business" });
       throw error;
     }
     if (candidate.status === "confirmed") {
       const revision = this.activeRevisionFor(candidate.businessId, candidate.key, candidate.subjectId, "global");
-      const fact = this.getFact(candidate.confirmedFactId!);
-      const result: ConfirmResult = { fact, revision: revision!, alreadyConfirmed: true, duplicate: false };
+      if (!revision || !candidate.confirmedFactId) {
+        throw new KnowledgeError("not_found", `confirmed candidate ${candidate.id} has no live revision row`);
+      }
+      const fact = this.getFact(candidate.confirmedFactId);
+      const result: ConfirmResult = { fact, revision, alreadyConfirmed: true, duplicate: false };
       return result;
     }
     if (candidate.status !== "pending") {
+      this.recordDecision(input, "confirm", "rejected", {
+        requestFingerprint: fingerprint, candidateId: candidate.id, reason: "not_pending", status: candidate.status,
+      });
       throw new KnowledgeError("stale", `candidate ${candidate.id} is ${candidate.status}, not pending`);
     }
 
@@ -361,6 +418,7 @@ export class KnowledgeService {
       ).run({ $factId: fact.id, $id: candidate.id });
       const result: ConfirmResult = { fact, revision, alreadyConfirmed: false, duplicate: false };
       this.recordDecision(input, "confirm", "applied", {
+        requestFingerprint: fingerprint,
         candidateId: candidate.id,
         factId: fact.id,
         revisionId: revision.id,
@@ -381,19 +439,35 @@ export class KnowledgeService {
     value: Record<string, unknown>;
     sourceReferences?: SourceReference[];
   }): ConfirmResult {
-    const replay = this.replayDecision(input, "correct");
+    const subjectId = input.subjectId ?? "";
+    const fingerprint = this.requestFingerprint("correct", input, {
+      key: input.key, subjectId, expectedRevision: input.expectedRevision, value: isRecord(input.value) ? input.value : null,
+    });
+    const replay = this.replayDecision(input, "correct", fingerprint);
     if (replay) return replay as ConfirmResult;
 
     this.assertAuthority(input, "correct", { key: input.key });
-    const subjectId = input.subjectId ?? "";
-    if (!isRecord(input.value)) throw new KnowledgeError("invalid", "corrected value must be an object");
+    // Rejected inputs are audited with scalar metadata only — corrected
+    // values themselves are never written to the decision log on failure.
+    if (!KNOWN_FACT_KEYS.has(input.key)) {
+      this.recordDecision(input, "correct", "rejected", { requestFingerprint: fingerprint, reason: "unknown_key", key: input.key, subjectId });
+      throw new KnowledgeError("unknown_key", `key "${input.key}" is outside the booking-business fact vocabulary`);
+    }
+    if (!isRecord(input.value)) {
+      this.recordDecision(input, "correct", "rejected", { requestFingerprint: fingerprint, reason: "invalid", key: input.key, subjectId });
+      throw new KnowledgeError("invalid", "corrected value must be an object");
+    }
     const current = this.activeRevisionFor(input.businessId, input.key, subjectId, "global");
     if (!current) {
+      this.recordDecision(input, "correct", "rejected", { requestFingerprint: fingerprint, reason: "not_found", key: input.key, subjectId });
       throw new KnowledgeError("not_found", `no active confirmed fact ${input.key}/${subjectId} for ${input.businessId}`);
     }
     if (current.revision !== input.expectedRevision) {
       this.recordDecision(input, "correct", "rejected", {
+        requestFingerprint: fingerprint,
         reason: "stale_version",
+        key: input.key,
+        subjectId,
         expectedRevision: input.expectedRevision,
         currentRevision: current.revision,
       });
@@ -428,6 +502,7 @@ export class KnowledgeService {
       });
       const result: ConfirmResult = { fact, revision, alreadyConfirmed: false, duplicate: false };
       this.recordDecision(input, "correct", "applied", {
+        requestFingerprint: fingerprint,
         supersedesRevisionId: current.id,
         factId: fact.id,
         revisionId: revision.id,
@@ -447,17 +522,26 @@ export class KnowledgeService {
     subjectId?: string;
     value: Record<string, unknown>;
   }): ConfirmResult {
-    const replay = this.replayDecision(input, "exception");
+    const subjectPreview = { scope: input.scope, scopeId: input.scopeId, value: isRecord(input.value) ? input.value : null };
+    const fingerprint = this.requestFingerprint("exception", input, subjectPreview);
+    const replay = this.replayDecision(input, "exception", fingerprint);
     if (replay) return replay as ConfirmResult;
 
     this.assertAuthority(input, "exception", { scope: input.scope, scopeId: input.scopeId });
+    // Rejected inputs are audited with scalar metadata only.
+    const rejectInvalid = (reason: string): never => {
+      this.recordDecision(input, "exception", "rejected", {
+        requestFingerprint: fingerprint, reason, scope: String(input.scope), scopeId: String(input.scopeId),
+      });
+      throw new KnowledgeError("invalid", reason);
+    };
     if (input.scope !== "booking" && input.scope !== "customer") {
-      throw new KnowledgeError("invalid", "scoped exceptions must target a booking or customer scope");
+      rejectInvalid("scoped exceptions must target a booking or customer scope");
     }
     if (!isNonEmptyString(input.scopeId)) {
-      throw new KnowledgeError("invalid", "scoped exceptions require a scopeId; they can never silently globalize");
+      rejectInvalid("scoped exceptions require a scopeId; they can never silently globalize");
     }
-    if (!isRecord(input.value)) throw new KnowledgeError("invalid", "exception value must be an object");
+    if (!isRecord(input.value)) rejectInvalid("exception value must be an object");
     // The scope embedded in the value can only ever agree with the command —
     // a contradiction is rejected rather than normalized away.
     for (const [field, expected, actual] of [
@@ -465,7 +549,7 @@ export class KnowledgeService {
       ["scopeId", input.scopeId, input.value.scopeId],
     ] as const) {
       if (actual !== undefined && actual !== expected) {
-        throw new KnowledgeError("invalid", `value.${field} (${String(actual)}) contradicts the command scope (${expected})`);
+        rejectInvalid(`value.${field} contradicts the command scope`);
       }
     }
     const value = { ...input.value, scope: input.scope, scopeId: input.scopeId };
@@ -497,6 +581,7 @@ export class KnowledgeService {
       });
       const result: ConfirmResult = { fact, revision, alreadyConfirmed: false, duplicate: false };
       this.recordDecision(input, "exception", "applied", {
+        requestFingerprint: fingerprint,
         factId: fact.id,
         revisionId: revision.id,
         result,
@@ -519,7 +604,7 @@ export class KnowledgeService {
     return rows.map((value) => {
       const revision = this.readRevision(row(value));
       const fact = this.getFact(revision.factId);
-      return { ...fact, revision: revision.revision, scope: revision.scope, scopeId: revision.scopeId, reviewState: revision.reviewState };
+      return { ...fact, revision: revision.revision, subjectId: revision.subjectId, scope: revision.scope, scopeId: revision.scopeId, reviewState: revision.reviewState };
     });
   }
 
@@ -545,13 +630,17 @@ export class KnowledgeService {
   /**
    * Confirmed-fact snapshot for the offers adapter (adaptBusinessFacts).
    * Includes a synthesized verified `business` fact carrying the owner-
-   * maintained businessId/timezone, every active confirmed fact (verified,
-   * attributed), and the ids of facts flagged for review because their
-   * source changed — callers gate consequential use on reviewFactIds.
+   * maintained businessId/timezone, plus every active confirmed fact that
+   * is verified, attributed, registry-keyed, and NOT under review.
+   * Source-changed facts are withheld (with explicit reasons) until an
+   * owner reconfirms them, so consequential offers cannot use stale
+   * pricing even when the host feeds `facts` straight through.
    */
   snapshotForOffers(businessId: string): OffersKnowledgeSnapshot {
     const business = this.store.getBusiness(businessId);
     const confirmed = this.listFacts(businessId);
+    const current = confirmed.filter((fact) => fact.reviewState === "none" && KNOWN_FACT_KEYS.has(fact.key));
+    const withheld = confirmed.filter((fact) => fact.reviewState !== "none");
     const businessFact: BusinessFact = {
       id: `gather:business:${business.id}`,
       businessId: business.id,
@@ -567,9 +656,15 @@ export class KnowledgeService {
       businessId: business.id,
       timezone: business.timezone,
       generatedAt: now(),
-      facts: [businessFact, ...confirmed.map(({ revision: _r, scope: _s, scopeId: _i, reviewState: _v, ...fact }) => fact)],
-      reviewFactIds: confirmed.filter((fact) => fact.reviewState === "review").map((fact) => fact.id),
-      scopedFactCount: confirmed.filter((fact) => fact.scope !== "global").length,
+      facts: [businessFact, ...current.map(({ revision: _r, subjectId: _j, scope: _s, scopeId: _i, reviewState: _v, ...fact }) => fact)],
+      reviewFactIds: withheld.map((fact) => fact.id),
+      withheld: withheld.map((fact) => ({
+        factId: fact.id,
+        key: fact.key,
+        subjectId: fact.subjectId,
+        reason: "source changed since owner confirmation; reconfirm via correctFact or by confirming the updated candidate",
+      })),
+      scopedFactCount: current.filter((fact) => fact.scope !== "global").length,
     };
   }
 
@@ -660,6 +755,10 @@ export class KnowledgeService {
       );
     }
     if (!isNonEmptyString(input.actor.id)) {
+      this.recordDecision(input, kind, "rejected", {
+        ...detail,
+        reason: "owner actor requires a non-empty id",
+      });
       throw new KnowledgeDeniedError("owner actor requires a non-empty id");
     }
   }
@@ -673,7 +772,22 @@ export class KnowledgeService {
     }
   }
 
-  private replayDecision(input: DecisionCommand, kind: DecisionKind): unknown {
+  /**
+   * Bind a commandId to the full canonical request — kind, business,
+   * subject (candidate/action/scope/value/version), and actor. Replaying
+   * the same commandId with an altered payload is rejected as
+   * command_conflict instead of returning an unrelated recorded outcome.
+   */
+  private requestFingerprint(kind: DecisionKind, input: DecisionCommand, subject: Record<string, unknown>): string {
+    return createHash("sha256").update(canonical({
+      kind,
+      businessId: input.businessId,
+      actor: { kind: input.actor.kind, id: input.actor.id },
+      subject,
+    })).digest("hex");
+  }
+
+  private replayDecision(input: DecisionCommand, kind: DecisionKind, fingerprint: string): unknown {
     if (!input.commandId) return null;
     const found = this.store.db.prepare(
       "SELECT * FROM knowledge_decisions WHERE command_id = $id",
@@ -687,6 +801,13 @@ export class KnowledgeService {
       );
     }
     const detail = parseJson<Record<string, unknown>>(item.detail_json, {});
+    const recorded = detail.requestFingerprint;
+    if (typeof recorded === "string" && recorded !== fingerprint) {
+      throw new KnowledgeError(
+        "command_conflict",
+        `commandId ${input.commandId} was already used for a different payload; altered replays are rejected, never answered from another subject`,
+      );
+    }
     const result = (detail.result ?? detail) as Record<string, unknown>;
     return { ...result, duplicate: true };
   }
