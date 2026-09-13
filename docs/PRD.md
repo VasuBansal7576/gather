@@ -5,23 +5,106 @@
 Gather coordinates event bookings for independent venues, private-dining restaurants, and caterers.
 An owner connects existing business applications and delegates the work from inquiry to a confirmed booking that is ready to deliver.
 The owner should not need to build workflows or manage a generic agent dashboard.
+The owner approved this as the governing product scope, with explicit requirements for proactive operation, business-aware selling, and a seamless product experience.
 
 This document records the owner's intended product, including capabilities that are not implemented yet.
 The acceptance evidence in [PROGRESS.md](PROGRESS.md) determines what has actually been demonstrated.
 Fixture data, simulated connectors, and local component tests do not establish live integration readiness.
 
-## Owner journey
+## 1. Setup and onboarding
 
-1. Launch a separate Gather workspace through a documented local setup command, authenticate a supported model provider, and connect the relevant business applications.
-2. Review Gather's understanding of packages, current prices, capacities, policies, resources, and customer relationships against its sources.
-3. Confirm consequential conflicts and configure the authority Gather may exercise.
-4. Receive an inquiry, extract its requirements, retrieve relevant evidence, and check feasibility.
-5. Review a suitable, versioned offer or alternatives when the requested event is unavailable.
-6. Approve the exact consequential action when the current authority policy requires it.
-7. Recheck critical conditions, perform the authorized actions, and inspect each verified outcome.
-8. Let Gather maintain pending work across days, process replies, and follow up only when appropriate.
-9. Verify acceptance, the required deposit, and resource commitments before confirming the booking.
-10. Deliver the operational handoff and manage later changes, cancellations, or pauses without losing context.
+The initial delivery format is a local application with one documented setup and launch path.
+Onboarding guides the owner through supported model-provider authentication, app connections, business-understanding confirmation, and operating authority.
+Owners choose apps and confirm important business decisions; they do not configure workflows, agents, databases, or technical mappings.
+Hosted delivery remains part of the product direction.
+
+## 2. Connect existing business applications
+
+Support relevant email, calendar, documents, payments, CRM, staffing, equipment, and other business systems without an arbitrary three-connector ceiling.
+Each connection exposes its actual capabilities, permissions, health, and recovery path.
+Connected applications remain authoritative, and consequential time-sensitive information must be fetched fresh.
+Unsupported or disconnected capabilities are stated honestly.
+
+## 3. Understand the business from evidence
+
+Learn packages, menus, services, current prices, optional extras, spaces, capacities, policies, previous agreements, customer history, and resource relationships.
+Keep sources and observation history for consequential facts, distinguishing confirmed facts from inference and uncertainty.
+Let the owner inspect and correct Gather's understanding and resolve consequential conflicts.
+A special customer or booking exception must remain scoped instead of silently changing global policy.
+
+## 4. Recognize a booking across applications
+
+Connect inquiry, conversation, proposal, calendar hold, deposit, and resource records to the same booking.
+Preserve that identity across revisions and resolve ambiguous matches instead of silently merging different customers or events.
+
+## 5. Interpret inquiries and sell within business boundaries
+
+Extract dates, times, guest counts, event types, preferences, budgets, and service requirements from an inquiry.
+Retrieve the relevant business evidence, identify missing information, and check feasibility.
+Seek suitable alternatives when the original request cannot be fulfilled.
+Preserve approved pricing and margin boundaries instead of filling dates at any cost.
+When relevant costs are unknown or incomplete, Gather must not claim that an offer is profitable.
+
+## 6. Prepare a meaningful, versioned offer
+
+Make the proposed event, package, price, terms, deposit requirements, and unresolved assumptions clear and supported by inspectable evidence.
+Version offers so changes to dates, price, recipients, terms, or other consequential details cannot silently reuse an earlier approval.
+
+## 7. Operate within explicit authority
+
+The owner controls which actions Gather may take autonomously and which require approval.
+Scope and version authority and business policy.
+Customer messages, retrieved documents, and generated text cannot grant additional authority.
+Required approval binds to the exact reviewed version, content, and target of the proposed action.
+
+## 8. Recheck, execute, and verify
+
+Recheck critical conditions immediately before consequential actions, then record an individually verified outcome for each authorized action.
+A hold is not a confirmed booking, a payment link is not a paid deposit, and a sent request is not a verified resource commitment.
+A tool call returning without an error is insufficient proof of an external outcome.
+
+## 9. Operate proactively and maintain work across days
+
+After setup, Gather watches for new inquiries, stalled conversations, missing deposits, changes, and other pending booking conditions.
+The owner should not need to prompt Gather for every booking or follow-up.
+Persist pending work and resume it across restarts while observing the current authority policy.
+Process replies before follow-ups so a reply or changed condition suppresses an inappropriate reminder.
+Expose monitoring failures and stale connections rather than silently implying that Gather is watching successfully.
+
+## 10. Recover safely from failure
+
+Handle duplicate events, repeated approvals, unavailable dates, revoked access, network timeouts, and partial success.
+When a hold succeeds and email fails, preserve the hold receipt and recover the email step without creating another hold.
+Reconcile uncertain external outcomes before another write, and show the owner what happened, what remains uncertain, and the available next step.
+
+## 11. Handle revisions, cancellations, and pauses
+
+Identify affected commitments when a booking changes, invalidate obsolete approvals where necessary, and obtain new authority before consequential changes.
+Pausing a business or booking prevents inappropriate pending work.
+Cancellation accounts for applicable policies and existing commitments instead of merely changing a label.
+
+## 12. Confirm only when the booking is ready
+
+Verify customer acceptance, the required deposit, availability, and required resource commitments according to the business's actual conditions.
+Keep missing conditions explicit and mark the booking confirmed only when authoritative evidence supports them.
+
+## 13. Prepare the operations handoff
+
+Provide accepted event details, agreed services, responsibilities, required resources, and outstanding conditions for the people delivering the event.
+Keep the handoff tied to the accepted booking version and update it when authorized revisions change delivery requirements.
+
+## 14. Provide a polished hospitality workspace
+
+Provide a useful Today briefing, booking conversations and requirements, proposal and source inspection, approvals, business knowledge correction, connection health, and contextual chat.
+Support desktop, mobile, keyboard, and accessible interaction with loading, empty, error, uncertain, partial, and recovery states.
+The current interface is an increment subject to rendered review, not the accepted final product design.
+
+## 15. Reuse OpenClaw with clear responsibilities
+
+Reuse a separately isolated OpenClaw runtime through a verified supported adapter without reading or altering personal runtime data.
+Gather owns booking-specific capabilities, business checks, durable records, approvals, receipts, and the owner experience.
+Reuse adequate runtime memory, wiki, and connector capabilities; build separate machinery only for demonstrated requirements.
+Design for hosted, isolated business workspaces later while keeping current delivery claims tied to verified local behavior.
 
 ## Requirements and acceptance evidence
 
@@ -45,6 +128,9 @@ Each row requires observable evidence; a plan or worker summary alone does not s
 | G13 | Produce an operational handoff. | Staff can inspect the accepted event details, responsibilities, resources, and unresolved conditions from the booking. |
 | G14 | Provide a polished, responsive, accessible owner experience. | Rendered desktop and mobile checks cover Today, booking context, proposal review, sources, approvals, knowledge correction, connection health, contextual chat, and loading/error/recovery states. |
 | G15 | Treat external content as evidence, never as authority over the operator. | Adversarial inquiry or document instructions cannot change authority, approve actions, expose private information, or bypass booking checks. |
+| G16 | Operate proactively after setup. | New inquiries, stalled conversations, missing deposits, and changes trigger appropriate persistent work without a fresh owner prompt; monitoring failure is visible. |
+| G17 | Sell within approved business boundaries. | Alternatives preserve approved pricing and margin constraints, and unknown costs prevent profitability claims. |
+| G18 | Keep the owner experience free of infrastructure configuration. | An owner connects apps and confirms business decisions through guided product flows without configuring workflows, agents, databases, or technical mappings. |
 
 ## Architecture responsibilities
 

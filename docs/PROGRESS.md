@@ -48,6 +48,8 @@ The review identified missing UI version/fingerprint binding, attempt-scoped exe
 These findings remain open until the corresponding fixes are verified.
 
 The full product requirements and build ownership are recorded in [PRD.md](PRD.md) and [ORCHESTRATION.md](ORCHESTRATION.md).
+The owner approved the full scope and clarified proactive monitoring, pricing and margin boundaries with honest treatment of unknown costs, and a seamless product experience that does not expose infrastructure configuration.
+The PRD now contains an explicit section 13 for the operations handoff.
 
 Two supervised Codex child launches were attempted with the active managed account metadata and effective model `gpt-5.6-luna`.
 

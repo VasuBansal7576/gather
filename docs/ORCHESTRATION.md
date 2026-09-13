@@ -20,8 +20,10 @@ Public repository documentation must not contain private account addresses, term
 Codex execution uses only the owner's explicitly authorized Orca-managed account.
 Verify the active account through metadata before launch, without opening credential files or falling back to the system account.
 Verify effective models through runtime metadata or the actual agent interface rather than launch arguments alone.
-Use existing authorized allowances, with no purchases, overages, cloud handoffs, or blanket unsafe permission mode.
-Gather-specific project trust and routine reversible project work are authorized.
+Use existing authorized allowances, with no purchases, overages, or cloud handoffs.
+The owner explicitly authorized full permissions for Gather worker sessions to remove routine permission interruptions.
+Use session-level OpenCode auto approval and Devin bypass permissions, or the equivalent full-access setting for authorized Codex workers.
+Full tool permissions do not change task ownership, model/account restrictions, or the prohibition on accessing personal runtime data and credentials.
 
 ## Work allocation
 
