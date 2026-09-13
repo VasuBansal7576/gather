@@ -295,6 +295,11 @@ Generated proposals did not originally match the exact-approval service contract
 The correction was integrated at `877fa30` after 12 tests and type checking passed, including generated proposal, reviewable consequences, exact approval, and separate scripted hold and email receipts.
 Offer text uses venue-local times and does not promise automatic release or treat venue approval alone as confirmation.
 These component checks do not establish actual Google booking execution.
-An actual Luna preparation run against the designated sources is the next verification, and its proposal must remain unapproved for the owner's visible recording.
+The actual Luna preparation run completed successfully against the designated Gmail inquiry, Drive policy, and Calendar on the repaired implementation at `bf3be3c`.
+Astra independently verified the dedicated runtime transcript's `gpt-5.6-luna` identity, the returned proposal identifiers, and four successful persisted tool audit entries.
+The running application's workspace API showed the current pending proposal for 12 guests at GBP 600 on September 18, 18:00 to 20:00 Europe/London, with reviewable exact consequences and no approvals or booking-action executions.
+The proposal was handed to Chief for visible owner-authorized approval during an actual browser recording.
+Its creation does not establish a sent offer, a provisional Calendar hold, customer acceptance, or a confirmed booking.
+An earlier failed Drive-read attempt remains preserved; the successful run does not erase that failure.
 There is no verified complete live inquiry-to-offer journey, confirmed booking, payment outcome, or operational handoff.
 The accepted local milestone count remains 14 of 17, and no whole-product completion percentage is established.
