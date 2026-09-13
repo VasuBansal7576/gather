@@ -163,17 +163,22 @@ export function GatherHostWorkspace() {
     <>
       {empty ? (
         <section
-          aria-label="Empty demo workspace"
+          aria-label="Empty workspace"
           style={{
             position: 'fixed', inset: 0, zIndex: 20, display: 'grid', placeItems: 'center',
             background: 'rgba(11, 11, 14, 0.94)',
           }}
         >
           <div style={{ maxWidth: 420, textAlign: 'center', background: '#111114', border: '1px solid #232329', borderRadius: 16, padding: '28px 24px', color: '#ececf0' }}>
-            <span className="gather-demo-label">Demo data</span>
+            {/* The label follows the server's evidence marker — an empty
+                connected workspace is unverified, never "Demo data". */}
+            {adapted?.dataMode === 'demo' ? <span className="gather-demo-label">Demo data</span> : null}
+            {adapted?.dataMode === 'unknown' ? <span className="gather-demo-label"><span className="gather-unverified-dot" />Unverified data</span> : null}
             <h2 style={{ margin: '10px 0 6px', fontSize: 15 }}>There are no bookings to review yet</h2>
             <p style={{ margin: '0 0 18px', color: '#8a8a95', fontSize: 13 }}>
-              Load a set of fictional demo bookings so you can try the review and approval flow — nothing real is touched.
+              {adapted?.dataMode === 'demo'
+                ? 'Load a set of fictional demo bookings so you can try the review and approval flow — nothing real is touched.'
+                : 'Nothing has arrived from your connected sources yet — new inquiries appear here automatically. You can also load fictional demo bookings to try the review and approval flow.'}
             </p>
             <button type="button" className="gather-approve-button" disabled={seeding} onClick={seedDemo}>
               {seeding ? 'Loading demo bookings…' : 'Load demo bookings'}
