@@ -116,13 +116,30 @@ export interface ConfirmResponse {
   note: string;
 }
 
+/**
+ * One step execution row read back from the workspace, labeled exactly as
+ * the delivery UI may honestly present it.
+ *
+ * - `step` is the KNOWN operation kind only: unknown idempotency keys are
+ *   `"unknown"` and must render as an unsupported step, never guessed as a
+ *   hold or an email.
+ * - `current` is true only when the row is scoped to the exact current
+ *   proposal (action id + version). Older rows are history, never proof.
+ * - `provenance` carries the stored connector proof distinction: `"live"`
+ *   only on positive live proof, `"simulated"` for fixture/demo proof,
+ *   `"unknown"` when no proof was stored and nothing can be claimed.
+ */
 export interface StepReceipt {
   id: string;
-  step: "hold" | "email";
+  step: "hold" | "email" | "unknown";
   status: string;
   startedAt: string;
   completedAt?: string;
   error?: string;
+  proposedActionId: string;
+  proposalVersion: number;
+  current: boolean;
+  provenance: "live" | "simulated" | "unknown";
 }
 
 export interface ProposalIdentity {
@@ -130,6 +147,70 @@ export interface ProposalIdentity {
   proposalVersion: number;
   proposalFingerprint: string;
   kind: string;
+}
+
+/**
+ * Known step identity from an idempotency key. Only the two canonical
+ * operations validate: anything else is `"unknown"`. (Hex digests cannot
+ * contain `s` or `-`, so these markers can only come from the operation
+ * segment — never from a hash collision.)
+ */
+export function receiptStepForKey(idempotencyKey: string): "hold" | "email" | "unknown" {
+  if (idempotencyKey.includes(":send:")) return "email";
+  if (idempotencyKey.includes("create-provisional-hold")) return "hold";
+  return "unknown";
+}
+
+/**
+ * Stored connector-proof distinction for one execution result. `"live"`
+ * requires positive proof (live mode, explicitly not simulated, non-empty
+ * provenance, zero fictional refs). Explicit demo/simulated/fictional proof
+ * reads `"simulated"`. Missing or unrecognizable proof reads `"unknown"` —
+ * never upgraded, never guessed.
+ */
+export function receiptProvenanceForResult(result: unknown): "live" | "simulated" | "unknown" {
+  if (typeof result !== "object" || result === null || Array.isArray(result)) return "unknown";
+  return provenanceForProof((result as Record<string, unknown>).proof);
+}
+
+/**
+ * Evidence-envelope distinction for one execution row. The server's
+ * explicit markers (`mode.kind` live/demo/unknown, `demo` boolean) are
+ * positive authority when present and win over local proof reading; a bare
+ * `demo: false` with nothing else is NOT positive evidence. Otherwise the
+ * stored `result.proof` rule applies. Proof-absent successes always land
+ * `"unknown"` — provider receipt unverified — never live, never simulated.
+ */
+export function receiptProvenanceForExecution(execution: {
+  result?: unknown;
+  demo?: unknown;
+  mode?: unknown;
+}): "live" | "simulated" | "unknown" {
+  const mode = execution.mode;
+  if (typeof mode === "object" && mode !== null && !Array.isArray(mode)) {
+    const kind = (mode as Record<string, unknown>).kind;
+    if (kind === "live") return "live";
+    if (kind === "demo") return "simulated";
+    if (kind === "unknown") return "unknown";
+  }
+  if (execution.demo === true) return "simulated";
+  return receiptProvenanceForResult(execution.result);
+}
+
+function provenanceForProof(proof: unknown): "live" | "simulated" | "unknown" {
+  if (typeof proof !== "object" || proof === null || Array.isArray(proof)) return "unknown";
+  const record = proof as Record<string, unknown>;
+  const provenance = record.provenance;
+  const refs = Array.isArray(provenance) ? provenance : undefined;
+  const hasFictional = refs?.some((ref) =>
+    typeof ref === "object" && ref !== null && !Array.isArray(ref) &&
+    (ref as Record<string, unknown>).fictional === true
+  ) ?? false;
+  if (record.mode === "live" && record.simulated === false && refs !== undefined && refs.length > 0 && !hasFictional) {
+    return "live";
+  }
+  if (record.mode === "demo" || record.simulated === true || hasFictional) return "simulated";
+  return "unknown";
 }
 
 export interface ApiError {

@@ -144,10 +144,13 @@ fabricated.
 The displayed proposal is the host's durable current pointer
 (`currentProposedActionId` on the workspace booking record): the delivery
 client selects exactly that action id — never `proposals.at(-1)`, never
-max version. A pointer naming no listed proposal (or a malformed pointer)
-fails closed to "no current proposal" instead of confirming the wrong one;
-pointer-less payloads from pre-pointer servers keep the legacy last-position
-fallback until integration supplies the pointer. Page lifecycle is guarded
+max version. A missing, malformed, or dangling pointer is honestly no
+authority ("no current proposal") instead of confirming or proving the
+wrong one. Action receipts are labeled the same way: only rows scoped to
+the exact current proposal with a known hold/email step count as proof,
+each carrying its stored live/simulated/unknown provenance; superseded
+rows render as clearly labeled history and unknown keys as unsupported
+steps, never as proof. Page lifecycle is guarded
 by `src/delivery-owner/page-lifecycle.ts`: load generation is separate from
 each operation lifecycle and every commit is booking-scoped, so a
 post-confirm reload settles busy instead of wedging it, the command result
