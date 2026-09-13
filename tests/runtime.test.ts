@@ -31,6 +31,7 @@ import {
   type SpawnLike,
   type RuntimeProcessLike,
   type RuntimeConnectionLike,
+  type RuntimeMcpBoundaryLike,
 } from "../src/runtime/index.ts";
 import type { GatewayClientOptions } from "@openclaw/gateway-client";
 
@@ -61,11 +62,11 @@ async function freeLoopbackPort(): Promise<number> {
 }
 
 /** Hold a loopback port with a real listener (simulates a foreign occupant). */
-async function holdLoopbackPort(port: number): Promise<Server> {
+async function holdLoopbackPort(port: number, host = "127.0.0.1"): Promise<Server> {
   const server = createServer();
   await new Promise<void>((resolvePromise, rejectPromise) => {
     server.once("error", rejectPromise);
-    server.listen(port, "127.0.0.1", () => resolvePromise());
+    server.listen(port, host, () => resolvePromise());
   });
   return server;
 }
@@ -243,6 +244,20 @@ test("occupancy probe rejects non-port inputs instead of probing them", async ()
   for (const bad of [0, -1, 70000, 1.5, Number.NaN]) {
     await assert.rejects(checkLoopbackPortOccupied(bad), /invalid loopback port/);
   }
+});
+
+test("occupancy probe catches a wildcard-bound occupant, not just loopback", async () => {
+  // SO_REUSEADDR lets a 127.0.0.1 probe coexist with a 0.0.0.0 listener —
+  // the probe must check the wildcard address too or it reports FREE for
+  // an occupied port.
+  const port = await freeLoopbackPort();
+  const wildcard = await holdLoopbackPort(port, "0.0.0.0");
+  try {
+    assert.equal(await checkLoopbackPortOccupied(port), true, "0.0.0.0-bound occupant must be detected");
+  } finally {
+    await closeServer(wildcard);
+  }
+  assert.equal(await checkLoopbackPortOccupied(port), false);
 });
 
 test("two per-run allocations do not collide", async () => {
@@ -612,6 +627,71 @@ test("stop() escalates to SIGKILL and never reports stopped without an observed 
   }
 });
 
+/** Gateway child exits 78; the spawned "doctor" child is the repair. */
+function repairSpawn(gateway: () => FakeChild, doctor: FakeChild) {
+  const spawned: string[][] = [];
+  const spawnFn = ((_command: string, args: string[]) => {
+    spawned.push(args);
+    return args.includes("doctor") ? doctor : gateway();
+  }) as unknown as SpawnLike;
+  return { spawnFn, spawned };
+}
+
+test("a hung doctor repair is bounded: deadline kills the tracked repair child and start rejects", async () => {
+  const { layout, cleanup } = fixtureLayout();
+  try {
+    ensureLayoutDirectories(layout);
+    const doctorChild = new FakeChild(true); // exits when killed
+    const { spawnFn } = repairSpawn(() => {
+      const child = new FakeChild(true);
+      queueMicrotask(() => child.emit("exit", 78, null));
+      return child;
+    }, doctorChild);
+    const process = new OpenClawGatewayProcess(
+      { layout, executable: { command: "/bin/sh" } },
+      { spawnFn, skipExecutableVerification: true, repairTimeoutMs: 60 },
+    );
+    const startedAt = Date.now();
+    await assert.rejects(process.start(), /doctor --fix exceeded 60ms/);
+    assert.ok(Date.now() - startedAt < 5000, "repair is bounded, never hangs start()");
+    assert.equal(process.currentState, "failed");
+    assert.ok(doctorChild.killed.includes("SIGTERM"), "hung repair child is terminated at the deadline");
+    await process.stop(500, 200);
+    assert.equal(process.currentState, "stopped");
+  } finally {
+    cleanup();
+  }
+});
+
+test("stop() during an in-flight repair kills the tracked repair child and cannot wedge", async () => {
+  const { layout, cleanup } = fixtureLayout();
+  try {
+    ensureLayoutDirectories(layout);
+    const doctorChild = new FakeChild(true);
+    const { spawnFn } = repairSpawn(() => {
+      const child = new FakeChild(true);
+      queueMicrotask(() => child.emit("exit", 78, null));
+      return child;
+    }, doctorChild);
+    const process = new OpenClawGatewayProcess(
+      { layout, executable: { command: "/bin/sh" } },
+      // 60s real deadline: the stop(), not the timer, must kill the repair.
+      { spawnFn, skipExecutableVerification: true, repairTimeoutMs: 60000 },
+    );
+    const starting = process.start();
+    while (process.currentState !== "repairing") {
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 5));
+    }
+    const stopping = process.stop(500, 200);
+    await assert.rejects(starting, /after doctor repair|after repair retry|exceeded/);
+    await stopping;
+    assert.ok(doctorChild.killed.includes("SIGKILL"), "stop() reached and killed the repair child");
+    assert.ok(["stopped", "failed"].includes(process.currentState));
+  } finally {
+    cleanup();
+  }
+});
+
 // ---------- MCP boundary (real loopback HTTP) ----------
 
 function simulatedAvailabilityTool() {
@@ -925,6 +1005,7 @@ function fakeConnection(behavior: { failConnect?: string } = {}) {
 async function runtimeFixture(overrides: {
   processFactory?: (count: { n: number }) => RuntimeProcessLike;
   connectionFactory?: () => RuntimeConnectionLike;
+  mcpBoundaryFactory?: () => RuntimeMcpBoundaryLike;
   mcpPort?: number;
   gatewayPort?: number;
 } = {}) {
@@ -950,6 +1031,7 @@ async function runtimeFixture(overrides: {
       },
       connectionFactory:
         overrides.connectionFactory ?? (() => fakeConnection().conn),
+      mcpBoundaryFactory: overrides.mcpBoundaryFactory,
     },
   );
   return { runtime, count, cleanup: () => rmSync(directory, { recursive: true, force: true }) };
@@ -977,6 +1059,50 @@ test("failed start rolls back the MCP boundary the invocation created", async ()
     delete behaviors.proc.failStart;
     await runtime.start();
     assert.ok(runtime.mcpUrl);
+    await runtime.stop();
+    assert.equal(runtime.mcpUrl, null);
+  } finally {
+    cleanup();
+  }
+});
+
+test("a failed MCP close keeps ownership: error surfaces, release only after observed close", async () => {
+  const proc = fakeProcess();
+  const connBehavior: { failConnect?: string } = { failConnect: "ws gone" };
+  let closeCalls = 0;
+  let failCloses = 1;
+  const boundary: RuntimeMcpBoundaryLike = {
+    toolNames: ["check_availability"],
+    listen: async () => ({ url: "http://127.0.0.1:0/mcp", port: 1 }),
+    close: async () => {
+      closeCalls += 1;
+      if (closeCalls <= failCloses) throw new Error("mcp close exploded");
+    },
+  };
+  const { runtime, cleanup } = await runtimeFixture({
+    processFactory: () => proc.proc,
+    connectionFactory: () => fakeConnection(connBehavior).conn,
+    mcpBoundaryFactory: () => boundary,
+  });
+  try {
+    // The original start failure propagates; the close failure does NOT
+    // mask it — but ownership is retained, not dropped.
+    await assert.rejects(runtime.start(), /ws gone/);
+    assert.equal(closeCalls, 1);
+    // The runtime still owns the boundary: a new start is refused, not
+    // silently allowed over a possibly-live listener.
+    await assert.rejects(runtime.start(), /still owns resources.*mcp=listening/s);
+    // stop() retries the close; a persistent failure rejects AND keeps
+    // ownership (the ref is never dropped on error).
+    failCloses = 2;
+    await assert.rejects(runtime.stop(), /mcp close exploded/);
+    await assert.rejects(runtime.start(), /still owns resources/);
+    // Once the close is observed, the boundary releases and lifecycle
+    // resumes.
+    await runtime.stop();
+    assert.equal(closeCalls, 3);
+    delete connBehavior.failConnect;
+    await runtime.start();
     await runtime.stop();
     assert.equal(runtime.mcpUrl, null);
   } finally {
@@ -1275,6 +1401,38 @@ test(
       assert.notEqual(exitCode, 0);
     } finally {
       await closeServer(occupant);
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "doctor: bare --port flag fails preflight instead of silently allocating",
+  { timeout: 90000 },
+  async () => {
+    const binary = resolveTestBinary();
+    if (!binary) {
+      console.log("SKIP: no openclaw binary (explicit /opt/homebrew/bin/openclaw or PATH); bare-port run not run");
+      return;
+    }
+    const projectDir = mkdtempSync(join(tmpdir(), "gather-doctor-bareport-"));
+    try {
+      let output = "";
+      try {
+        output = execFileSync(
+          process.execPath,
+          [join(process.cwd(), "scripts", "openclaw-doctor.mjs"), "--openclaw-bin", binary, "--port"],
+          { cwd: projectDir, encoding: "utf8", timeout: 80000, env: { ...process.env, GATHER_OPENCLAW_BIN: binary } },
+        );
+      } catch (error) {
+        const err = error as { stdout?: string };
+        output = typeof err.stdout === "string" ? err.stdout : String(error);
+      }
+      assert.match(output, /FAIL port preflight/);
+      assert.match(output, /--port requires a value/);
+      assert.doesNotMatch(output, /PASS child spawned/);
+      assert.deepEqual(doctorLeftovers(projectDir), [], "doctor-owned dir must be removed after preflight failure");
+    } finally {
       rmSync(projectDir, { recursive: true, force: true });
     }
   },

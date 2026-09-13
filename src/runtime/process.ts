@@ -31,6 +31,9 @@ import type { GatherOpenClawLayout } from "./layout.ts";
 
 export const OPENCLAW_EX_CONFIG_EXIT_CODE = 78;
 
+/** Bounded deadline for the `openclaw doctor --fix` repair child. */
+export const DOCTOR_REPAIR_TIMEOUT_MS = 60_000;
+
 /**
  * Allocates a currently-free loopback port by binding 127.0.0.1:0 and
  * releasing it. Loopback-only by construction: there is no host parameter,
@@ -55,33 +58,41 @@ export async function allocateLoopbackPort(): Promise<number> {
 }
 
 /**
- * Occupancy preflight with an unambiguous occupied/free answer. Single bind
- * attempt on 127.0.0.1: EADDRINUSE => occupied (true); successful listen =>
- * free (false). Loopback-only by construction: there is no host parameter,
- * so this helper cannot probe (or bind) a non-loopback address. The probe
- * socket is closed immediately and no foreign listener is ever touched (no
- * connect flood, no kill, no SO_REUSEPORT takeover).
+ * Occupancy preflight with an unambiguous occupied/free answer for the
+ * IPv4 namespace the gateway binds. Two single-bind probes — 127.0.0.1
+ * then 0.0.0.0 — because SO_REUSEADDR lets a loopback-specific bind
+ * coexist with a foreign wildcard (0.0.0.0) listener on the same port:
+ * probing loopback alone would report a wildcard occupant "free". A
+ * wildcard probe fails against ANY held v4 binding (loopback or
+ * wildcard), and the loopback probe catches loopback-only listeners.
+ * Each probe socket is closed immediately and no foreign listener is
+ * ever touched (no connect flood, no kill, no SO_REUSEPORT takeover).
  *
- * Same TOCTOU caveat as allocateLoopbackPort: a "free" answer is advisory
- * only — the gateway's own bind is authoritative.
+ * Advisory only (TOCTOU): a "free" answer never guarantees the port
+ * stays free — the gateway's own bind is authoritative. An IPv6-only
+ * (::1) occupant is out of scope: the gateway binds IPv4 loopback.
  */
 export async function checkLoopbackPortOccupied(port: number): Promise<boolean> {
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     throw new Error(`invalid loopback port for occupancy probe: ${port}`);
   }
-  return await new Promise<boolean>((resolvePromise, rejectPromise) => {
-    const probe = createServer();
-    probe.once("error", (error: NodeJS.ErrnoException) => {
-      if (error?.code === "EADDRINUSE") {
-        resolvePromise(true);
-      } else {
-        rejectPromise(error);
-      }
+  for (const host of ["127.0.0.1", "0.0.0.0"]) {
+    const occupied = await new Promise<boolean>((resolvePromise, rejectPromise) => {
+      const probe = createServer();
+      probe.once("error", (error: NodeJS.ErrnoException) => {
+        if (error?.code === "EADDRINUSE") {
+          resolvePromise(true);
+        } else {
+          rejectPromise(error);
+        }
+      });
+      probe.listen(port, host, () => {
+        probe.close(() => resolvePromise(false));
+      });
     });
-    probe.listen(port, "127.0.0.1", () => {
-      probe.close(() => resolvePromise(false));
-    });
-  });
+    if (occupied) return true;
+  }
+  return false;
 }
 
 export interface OpenClawExecutable {
@@ -352,10 +363,14 @@ export class OpenClawGatewayProcess {
   private lastExit: ChildExit | null = null;
   private stderrTail: string[] = [];
   private repairAttempted = false;
+  /** Tracked repair child: a hung `doctor --fix` is reachable by stop(). */
+  private repairChild: ChildProcess | null = null;
+  private repairExitPromise: Promise<ChildExit> | null = null;
+  private readonly repairTimeoutMs: number;
 
   constructor(
     options: GatewayProcessOptions,
-    deps: { spawnFn?: SpawnLike; skipExecutableVerification?: boolean } = {},
+    deps: { spawnFn?: SpawnLike; skipExecutableVerification?: boolean; repairTimeoutMs?: number } = {},
   ) {
     this.layout = options.layout;
     this.gatewayToken = options.gatewayToken ?? ensureGatewayToken(options.layout);
@@ -367,6 +382,7 @@ export class OpenClawGatewayProcess {
     this.log = options.log ?? (() => {});
     this.spawnFn = deps.spawnFn ?? (spawn as unknown as SpawnLike);
     this.verify = deps.skipExecutableVerification !== true;
+    this.repairTimeoutMs = deps.repairTimeoutMs ?? DOCTOR_REPAIR_TIMEOUT_MS;
   }
 
   get currentState(): GatewayProcessState {
@@ -486,7 +502,12 @@ export class OpenClawGatewayProcess {
     }
     this.repairAttempted = true;
     this.state = "repairing";
-    await this.runDoctorRepair();
+    try {
+      await this.runDoctorRepair(this.repairTimeoutMs);
+    } catch (error) {
+      this.state = "failed";
+      throw error;
+    }
     this.state = "starting";
     this.child = this.spawnGateway();
     const retriedPid = this.child.pid ?? null;
@@ -525,7 +546,15 @@ export class OpenClawGatewayProcess {
     return Promise.race([exit, error, alive]);
   }
 
-  private runDoctorRepair(): Promise<void> {
+  /**
+   * Runs `doctor --fix` under a bounded deadline. The repair child is
+   * TRACKED (repairChild/repairExitPromise) so stop() can reach it, and a
+   * repair that exceeds DOCTOR_REPAIR_TIMEOUT_MS is SIGTERM'd then
+   * SIGKILL'd, with start() rejecting only after the repair child's exit
+   * is observed — a hung repair can never stall start() forever or leak
+   * an untracked process.
+   */
+  private runDoctorRepair(timeoutMs = DOCTOR_REPAIR_TIMEOUT_MS): Promise<void> {
     const args = [
       ...(this.resolvedExecutable.executable.args ?? []),
       "doctor",
@@ -538,20 +567,45 @@ export class OpenClawGatewayProcess {
         env: this.env,
         stdio: ["ignore", "pipe", "pipe"],
       });
+      this.repairChild = doctor;
+      const exited = new Promise<ChildExit>((res) => {
+        doctor.once("exit", (code, signal) => res({ code, signal }));
+      });
+      this.repairExitPromise = exited;
       let stderr = "";
+      let timedOut = false;
       doctor.stderr?.on("data", (chunk: Buffer) => {
         stderr += chunk.toString("utf8");
       });
+      const finish = (error?: Error) => {
+        clearTimeout(timer);
+        this.repairChild = null;
+        this.repairExitPromise = null;
+        if (error) rejectPromise(error);
+        else resolvePromise();
+      };
+      const timer = setTimeout(() => {
+        timedOut = true;
+        // Deadline exceeded: kill the tracked repair child and reject only
+        // after its exit is observed — ownership preserved to the end.
+        doctor.kill("SIGTERM");
+        const killTimer = setTimeout(() => doctor.kill("SIGKILL"), 5000);
+        void exited.then(() => clearTimeout(killTimer));
+      }, timeoutMs);
       doctor.on("exit", (code) => {
-        if (code === 0) {
-          resolvePromise();
-        } else {
-          rejectPromise(
-            new Error(`openclaw doctor --fix failed with code ${code}: ${stderr.slice(-2000)}`),
+        if (timedOut) {
+          finish(
+            new Error(
+              `openclaw doctor --fix exceeded ${timeoutMs}ms and was terminated: ${stderr.slice(-2000)}`,
+            ),
           );
+        } else if (code === 0) {
+          finish();
+        } else {
+          finish(new Error(`openclaw doctor --fix failed with code ${code}: ${stderr.slice(-2000)}`));
         }
       });
-      doctor.on("error", (error) => rejectPromise(error));
+      doctor.on("error", (error) => finish(error));
     });
   }
 
@@ -562,6 +616,16 @@ export class OpenClawGatewayProcess {
    * even after SIGKILL the state becomes "failed" and stop() rejects.
    */
   async stop(exitTimeoutMs = 10000, killGraceMs = 5000): Promise<void> {
+    // A repair child in flight is owned by this process too: kill it and
+    // await its observed exit so a hung `doctor --fix` cannot wedge stop()
+    // or leak past the owning lifecycle.
+    const repair = this.repairChild;
+    if (repair && this.repairExitPromise) {
+      repair.kill("SIGKILL");
+      await this.repairExitPromise;
+      this.repairChild = null;
+      this.repairExitPromise = null;
+    }
     const child = this.child;
     const exitPromise = this.exitPromise;
     this.state = "stopping";
