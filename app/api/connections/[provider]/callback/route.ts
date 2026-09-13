@@ -21,13 +21,21 @@ export async function GET(req: Request, ctx: { params: Promise<{ provider: strin
     if (!code || !state) throw new ValidationError("Callback requires code and state");
     const result = await getConnectionService().completeAuthorization({ code, state });
     if (url.searchParams.get("format") === "json") return NextResponse.json(result);
-    return NextResponse.redirect(new URL(`/?connected=${provider}`, url.origin));
+    const target = new URL("/setup", url.origin);
+    target.searchParams.set("businessId", result.businessId);
+    target.searchParams.set("connected", provider);
+    return NextResponse.redirect(target);
   } catch (error) {
     const codeOut = error instanceof ConnectionError ? error.code : "INVALID_REQUEST";
     if (url.searchParams.get("format") === "json") {
       const { connectionErrorResponse } = await import("../../_helpers.ts");
       return connectionErrorResponse(error);
     }
-    return NextResponse.redirect(new URL(`/?connectionError=${codeOut}`, url.origin));
+    const target = new URL("/setup", url.origin);
+    const state = url.searchParams.get("state");
+    const businessId = state ? getConnectionService().peekSessionBusinessId(state) : undefined;
+    if (businessId) target.searchParams.set("businessId", businessId);
+    target.searchParams.set("connectionError", codeOut);
+    return NextResponse.redirect(target);
   }
 }

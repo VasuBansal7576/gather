@@ -117,6 +117,7 @@ test("missing provider app yields explicit unavailable status, never fake connec
     const google = summary.providers.find((p) => p.provider === "google");
     assert.equal(google?.status, "unavailable");
     assert.match(google?.unavailableReason ?? "", /not configured/i);
+    assert.equal(svc.providerReadiness()[0]?.status, "unavailable");
     assert.throws(() => svc.startAuthorization({ businessId: fx.businessId, provider: "google" }), (e: unknown) => {
       assert.ok(e instanceof ConnectionError && e.code === "UNAVAILABLE");
       return true;
@@ -161,6 +162,7 @@ test("authorization completes once; replay, expired, and unknown states are reje
     assert.equal(url.searchParams.get("code_challenge_method"), "S256");
     assert.ok(url.searchParams.get("code_challenge"), "PKCE challenge present");
     const state = stateOf(start.authorizationUrl);
+    assert.equal(svc.peekSessionBusinessId(state), fx.businessId, "session carries business context for the redirect");
 
     const done = await svc.completeAuthorization({ code: "code-1", state });
     assert.equal(done.provider, "google");
