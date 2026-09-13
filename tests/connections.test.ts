@@ -540,23 +540,24 @@ test("keychain adapter never puts secrets in argv, errors, or logs", async () =>
     namespace: "test-workspace",
     runner: (spec) => {
       calls.push(spec);
-      const [tool, ...rest] = spec.argv;
-      if (tool === "swift") {
-        backing.set(spec.argv[spec.argv.length - 1]!, spec.stdin ?? "");
+      const [tool, , program] = spec.argv;
+      if (tool !== "swift") throw new Error(`unexpected tool ${tool}`);
+      const key = spec.argv[spec.argv.length - 1]!;
+      if (program.includes("SecItemAdd")) {
+        backing.set(key, spec.stdin ?? "");
         return "";
       }
-      if (rest[0] === "find-generic-password") {
-        const key = spec.argv[spec.argv.length - 2]!;
+      if (program.includes("SecItemCopyMatching")) {
         const value = backing.get(key);
         if (value === undefined) {
           const e = new Error("fail") as Error & { stderr?: string };
-          e.stderr = "security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain.";
+          e.stderr = "The specified item could not be found";
           throw e;
         }
         return value;
       }
-      if (rest[0] === "delete-generic-password") {
-        backing.delete(spec.argv[spec.argv.length - 1]!);
+      if (program.includes("SecItemDelete")) {
+        backing.delete(key);
         return "";
       }
       throw new Error(`unexpected argv ${spec.argv.join(" ")}`);

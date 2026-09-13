@@ -28,45 +28,84 @@ const defaultRunner: KeychainRunner = (spec) => {
       stdio: ["pipe", "pipe", "pipe"],
     }).trim();
   } catch (error) {
-    // Never surface stderr: tool output may echo material the caller wrote.
+    // Never surface stderr in the message: tool output may echo material the
+    // caller wrote. The raw text stays attached for internal classification
+    // (not-found detection) but is never part of the thrown message.
     const detail = error instanceof Error && "stderr" in error ? String((error as { stderr?: unknown }).stderr ?? "") : "";
-    const wrapped = new Error(detail ? `keychain operation failed: ${detail.split("\n")[0]}` : "keychain operation failed");
+    const wrapped = new Error("keychain operation failed");
     (wrapped as { stderr?: string }).stderr = detail;
     throw wrapped;
   }
 };
 
-// Native keychain write via the Security framework: the value arrives on
-// stdin and the SecItem API does the store — nothing secret in argv.
-const SWIFT_SET_PROGRAM = `
+// Native keychain operations via the Security framework: every op runs under
+// the SAME `swift` SecItem boundary so the item's access identity matches its
+// writer. Mixing tools (SecItemAdd via swift for writes, `security` for
+// reads) breaks reads: a generic-password item's default ACL trusts only its
+// creating application, so a different binary gets a user prompt or a denial
+// (errSecInteractionNotAllowed) instead of the value. The secret value still
+// arrives on stdin — nothing secret ever appears in argv. stderr carries
+// only constant strings — never keychain or secret content.
+const SWIFT_QUERY_PREAMBLE = `
 import Foundation
 import Security
 let args = Array(CommandLine.arguments.dropFirst())
 let service = args[0], account = args[1]
-let secret = FileHandle.standardInput.readDataToEndOfFile()
-let query: [String: Any] = [
+var query: [String: Any] = [
   kSecClass as String: kSecClassGenericPassword,
   kSecAttrService as String: service,
   kSecAttrAccount as String: account,
 ]
+`;
+
+const SWIFT_SET_PROGRAM = `${SWIFT_QUERY_PREAMBLE}
+let secret = FileHandle.standardInput.readDataToEndOfFile()
 SecItemDelete(query as CFDictionary)
-var attrs = query
-attrs[kSecValueData as String] = secret
-let status = SecItemAdd(attrs as CFDictionary, nil)
+query[kSecValueData as String] = secret
+let status = SecItemAdd(query as CFDictionary, nil)
 if status != errSecSuccess {
   FileHandle.standardError.write("SecItemAdd failed".data(using: .utf8)!)
+  exit(2)
+}
+`;
+
+const SWIFT_GET_PROGRAM = `${SWIFT_QUERY_PREAMBLE}
+query[kSecReturnData as String] = true
+var item: CFTypeRef?
+let status = SecItemCopyMatching(query as CFDictionary, &item)
+if status == errSecItemNotFound {
+  FileHandle.standardError.write("The specified item could not be found".data(using: .utf8)!)
   exit(1)
+}
+if status != errSecSuccess || item == nil {
+  FileHandle.standardError.write("SecItemCopyMatching failed".data(using: .utf8)!)
+  exit(2)
+}
+FileHandle.standardOutput.write(item as! Data)
+`;
+
+const SWIFT_DELETE_PROGRAM = `${SWIFT_QUERY_PREAMBLE}
+let status = SecItemDelete(query as CFDictionary)
+if status == errSecItemNotFound {
+  FileHandle.standardError.write("The specified item could not be found".data(using: .utf8)!)
+  exit(1)
+}
+if status != errSecSuccess {
+  FileHandle.standardError.write("SecItemDelete failed".data(using: .utf8)!)
+  exit(2)
 }
 `;
 
 /**
  * macOS keychain adapter. Every operation is namespaced to
  * `service = gather-connections[-<namespace hash>]`, so entries belonging
- * to the user, other apps, or other tooling are unreachable. Writes go
- * through a SecItem boundary with the secret on stdin — never argv —
- * because `security add-generic-password -w` would expose it to `ps`.
- * Reads/deletes use `security` (their argv carries only the service name
- * and account key, no secret material).
+ * to the user, other apps, or other tooling are unreachable. ALL operations
+ * go through the same `swift` SecItem boundary: an item's default ACL
+ * trusts only its creating application, so reads/deletes must run under the
+ * same tool identity that wrote them — splitting writes (SecItem) from
+ * reads (`security` CLI) makes own entries unreadable. The secret value
+ * still never appears in argv (`security add-generic-password -w` would
+ * expose it to `ps`); argv carries only the service name and account key.
  */
 export class KeychainSecretStore implements SecretStore {
   private readonly service: string;
@@ -94,7 +133,7 @@ export class KeychainSecretStore implements SecretStore {
   get(key: string): string | undefined {
     return this.try(
       () => {
-        const out = this.run({ argv: ["security", "find-generic-password", "-s", this.service, "-a", key, "-w"] });
+        const out = this.run({ argv: ["swift", "-e", SWIFT_GET_PROGRAM, this.service, key] });
         return out.length > 0 ? out : undefined;
       },
       () => undefined,
@@ -115,7 +154,7 @@ export class KeychainSecretStore implements SecretStore {
   delete(key: string): void {
     this.try(
       () => {
-        this.run({ argv: ["security", "delete-generic-password", "-s", this.service, "-a", key] });
+        this.run({ argv: ["swift", "-e", SWIFT_DELETE_PROGRAM, this.service, key] });
       },
       () => undefined,
     );
