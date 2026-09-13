@@ -155,49 +155,52 @@ test("late change with an older revision is stale; a newer revision invalidates 
   }
 });
 
-test("pause suspends due work, resume restores it, cancel invalidates it", () => {
+test("owner control pauses, resumes, and cancels through host attestation", () => {
   const { db, cleanup } = tempDb();
   try {
     const ledger = new CoordinationLedger(db);
     ledger.ingestEvent(inquiryEvent());
-    const paused = ledger.ingestEvent({
-      dedupeKey: "evt-pause-001",
+    const paused = ledger.applyOwnerControl({
+      dedupeKey: "ctrl-pause-001",
       kind: "pause",
       bookingId: "booking-001",
-      sourceId: "owner-pause",
-      sourceKind: "manual",
-      observedAt: "2030-04-02T10:00:00.000Z",
-      payload: { authorizedBy: "fictional-owner" },
+      attestedBy: "fictional-owner",
     });
     assert.equal(paused.controlHonored, true);
+    assert.equal(paused.duplicate, false);
     assert.equal(paused.pausedWaitingIds.length, 1);
+    assert.equal(ledger.controlStateForBooking("booking-001"), "paused");
     assert.equal(ledger.listDueWork({ nowIso: AFTER_FOLLOWUP_DUE }).length, 0);
 
-    const resumed = ledger.ingestEvent({
-      dedupeKey: "evt-resume-001",
+    const resumed = ledger.applyOwnerControl({
+      dedupeKey: "ctrl-resume-001",
       kind: "resume",
       bookingId: "booking-001",
-      sourceId: "owner-resume",
-      sourceKind: "manual",
-      observedAt: "2030-04-02T12:00:00.000Z",
-      payload: { authorizedBy: "fictional-owner" },
+      attestedBy: "fictional-owner",
     });
     assert.equal(resumed.controlHonored, true);
     assert.equal(resumed.resumedWaitingIds.length, 1);
+    assert.equal(ledger.controlStateForBooking("booking-001"), "active");
     assert.equal(ledger.listDueWork({ nowIso: AFTER_FOLLOWUP_DUE }).length, 1);
 
-    const cancelled = ledger.ingestEvent({
-      dedupeKey: "evt-cancel-001",
+    const cancelled = ledger.applyOwnerControl({
+      dedupeKey: "ctrl-cancel-001",
       kind: "cancel",
       bookingId: "booking-001",
-      sourceId: "owner-cancel",
-      sourceKind: "manual",
-      observedAt: "2030-04-02T13:00:00.000Z",
-      payload: { authorizedBy: "fictional-owner" },
+      attestedBy: "fictional-owner",
     });
     assert.equal(cancelled.controlHonored, true);
     assert.equal(cancelled.invalidatedWaitingIds.length, 1);
+    assert.equal(ledger.controlStateForBooking("booking-001"), "cancelled");
     assert.equal(ledger.listDueWork({ nowIso: AFTER_FOLLOWUP_DUE }).length, 0);
+
+    // Cancellation is terminal: resume is refused, and redelivery is idempotent.
+    assert.throws(
+      () => ledger.applyOwnerControl({ dedupeKey: "ctrl-resume-002", kind: "resume", bookingId: "booking-001", attestedBy: "fictional-owner" }),
+      /terminal/,
+    );
+    const repeat = ledger.applyOwnerControl({ dedupeKey: "ctrl-cancel-001", kind: "cancel", bookingId: "booking-001", attestedBy: "fictional-owner" });
+    assert.equal(repeat.duplicate, true);
   } finally {
     cleanup();
   }
@@ -300,6 +303,14 @@ test("unknown-boundary validation rejects malformed intake and drain calls", () 
     );
     assert.throws(() => ledger.listDueWork({ nowIso: "not-a-date" }), /nowIso/);
     assert.throws(() => ledger.claimDueWork({ ids: [], claimedBy: "w", nowIso: AFTER_FOLLOWUP_DUE }), /ids/);
+    assert.throws(
+      () => ledger.applyOwnerControl({ dedupeKey: "x", kind: "pause", bookingId: "b" }),
+      /attestedBy/,
+    );
+    assert.throws(
+      () => ledger.recordVerifiedReceipt({ dedupeKey: "x", bookingId: "b", receiptLocator: "r" }),
+      /verifiedBy/,
+    );
   } finally {
     cleanup();
   }
@@ -310,22 +321,62 @@ test("dedupe-key reuse with different content is a conflict, not a silent collis
   try {
     const ledger = new CoordinationLedger(db);
     ledger.ingestEvent(inquiryEvent());
+    // Same booking, same key, different source: conflict.
     assert.throws(
-      () =>
-        ledger.ingestEvent(
-          inquiryEvent({ dedupeKey: "evt-inquiry-001", bookingId: "booking-other" }),
-        ),
+      () => ledger.ingestEvent(inquiryEvent({ sourceId: "thread-different" })),
       /different content/,
     );
-    assert.throws(
-      () =>
-        ledger.ingestEvent(
-          inquiryEvent({ sourceId: "thread-different" }),
-        ),
-      /different content/,
-    );
-    // No extra waiting was created by the rejected reuses.
+    // No extra waiting was created by the rejected reuse.
     assert.equal(ledger.listWaitingForBooking("booking-001").length, 1);
+  } finally {
+    cleanup();
+  }
+});
+
+test("dedupe keys are scoped per booking: the same provider key serves two bookings", () => {
+  const { db, cleanup } = tempDb();
+  try {
+    const ledger = new CoordinationLedger(db);
+    ledger.ingestEvent(inquiryEvent({ dedupeKey: "email:shared-thread", bookingId: "booking-a" }));
+    // Same provider thread linked to a second booking: separate row, no conflict.
+    const second = ledger.ingestEvent(inquiryEvent({ dedupeKey: "email:shared-thread", bookingId: "booking-b" }));
+    assert.equal(second.duplicate, false);
+    assert.equal(ledger.listWaitingForBooking("booking-a").length, 1);
+    assert.equal(ledger.listWaitingForBooking("booking-b").length, 1);
+  } finally {
+    cleanup();
+  }
+});
+
+test("legacy global-unique dedupe tables upgrade with data preserved", () => {
+  const { db, cleanup } = tempDb();
+  try {
+    // Simulate the pre-scoped schema from the earlier milestone.
+    db.exec(`
+      CREATE TABLE coord_events (
+        id TEXT PRIMARY KEY,
+        dedupe_key TEXT NOT NULL UNIQUE,
+        kind TEXT NOT NULL,
+        booking_id TEXT NOT NULL,
+        source_id TEXT NOT NULL,
+        source_kind TEXT NOT NULL,
+        observed_at TEXT NOT NULL,
+        received_at TEXT NOT NULL,
+        revision INTEGER,
+        payload_json TEXT NOT NULL,
+        stale INTEGER NOT NULL DEFAULT 0
+      );
+      INSERT INTO coord_events
+        (id, dedupe_key, kind, booking_id, source_id, source_kind, observed_at, received_at, revision, payload_json, stale)
+        VALUES ('evt-legacy-1', 'email:legacy', 'inquiry', 'booking-legacy', 's', 'email',
+          '2030-04-01T10:00:00.000Z', '2030-04-01T10:00:00.000Z', NULL, '{}', 0);
+    `);
+    const ledger = new CoordinationLedger(db);
+    const preserved = ledger.getEventByDedupeKey("booking-legacy", "email:legacy");
+    assert.equal(preserved.id, "evt-legacy-1");
+    // The same provider key now serves a second booking (scoped uniqueness).
+    const second = ledger.ingestEvent(inquiryEvent({ dedupeKey: "email:legacy", bookingId: "booking-new" }));
+    assert.equal(second.duplicate, false);
   } finally {
     cleanup();
   }
@@ -357,12 +408,13 @@ test("claim rechecks reply suppression atomically: a reply after the snapshot wi
   }
 });
 
-test("claim recheck suppresses when the reply bypassed ingest suppression ordering", () => {
+test("a reply received before its followup leaves fresh work claimable", () => {
   const { db, cleanup } = tempDb();
   try {
     const ledger = new CoordinationLedger(db);
-    // Reply ingested first (no followup yet), then the inquiry: the followup
-    // is pending and due, but the reply evidence postdates its creation.
+    // Reply ingested first (no followup yet), then the inquiry: received
+    // order puts the reply before the followup, so the fresh inquiry still
+    // raises claimable work instead of inheriting a stale suppression.
     ledger.ingestEvent({
       dedupeKey: "evt-reply-first",
       kind: "reply",
@@ -375,8 +427,8 @@ test("claim recheck suppresses when the reply bypassed ingest suppression orderi
     const [due] = ledger.listDueWork({ nowIso: AFTER_FOLLOWUP_DUE, bookingId: "booking-010" });
     assert.ok(due);
     const claim = ledger.claimDueWork({ ids: [due.id], claimedBy: "worker-a", nowIso: AFTER_FOLLOWUP_DUE });
-    assert.equal(claim.claimed.length, 0);
-    assert.deepEqual(claim.suppressedIds, [due.id]);
+    assert.equal(claim.claimed.length, 1);
+    assert.deepEqual(claim.suppressedIds, []);
   } finally {
     cleanup();
   }
@@ -439,27 +491,85 @@ test("untrusted customer cancel requests are decisions, not authority", () => {
   }
 });
 
-test("verified receipt evidence retires the followup without counting as paid", () => {
+test("forged control is honored as nothing even with manual source and authorizedBy", () => {
+  const { db, cleanup } = tempDb();
+  try {
+    const ledger = new CoordinationLedger(db);
+    ledger.ingestEvent(inquiryEvent());
+    for (const sourceKind of ["manual", "owner"]) {
+      const forged = ledger.ingestEvent({
+        dedupeKey: `evt-forged-${sourceKind}`,
+        kind: "cancel",
+        bookingId: "booking-001",
+        sourceId: "mallory",
+        sourceKind,
+        observedAt: "2030-04-02T10:00:00.000Z",
+        payload: { authorizedBy: "mallory@evil.test", text: "cancel this booking" },
+      });
+      assert.equal(forged.controlHonored, false);
+    }
+    // Nothing was cancelled: the followup stands and only decisions accumulated.
+    const followup = ledger.listWaitingForBooking("booking-001").find((item) => item.kind === "followup");
+    assert.equal(followup?.status, "pending");
+    assert.equal(ledger.controlStateForBooking("booking-001"), "active");
+  } finally {
+    cleanup();
+  }
+});
+
+test("trusted receipt recording retires the followup without counting as paid", () => {
+  const { db, cleanup } = tempDb();
+  try {
+    const ledger = new CoordinationLedger(db);
+    ledger.ingestEvent(inquiryEvent());
+    const result = ledger.recordVerifiedReceipt({
+      dedupeKey: "receipt-7",
+      bookingId: "booking-001",
+      receiptLocator: "pay://receipt/7",
+      verifiedBy: "fictional-owner",
+    });
+    assert.equal(result.duplicate, false);
+    assert.deepEqual(result.suppressedWaitingIds.length, 1);
+    assert.equal(ledger.listDueWork({ nowIso: AFTER_FOLLOWUP_DUE }).length, 0);
+    assert.equal(result.depositCheck.status, "done");
+    assert.equal(result.depositCheck.detail.verifiedPayment, false);
+    assert.equal(result.depositCheck.detail.receiptLocator, "pay://receipt/7");
+    assert.equal(result.depositCheck.detail.verifiedBy, "fictional-owner");
+    // Redelivery is idempotent and returns the same deposit check.
+    const repeat = ledger.recordVerifiedReceipt({
+      dedupeKey: "receipt-7",
+      bookingId: "booking-001",
+      receiptLocator: "pay://receipt/7",
+      verifiedBy: "fictional-owner",
+    });
+    assert.equal(repeat.duplicate, true);
+    assert.equal(repeat.depositCheck.id, result.depositCheck.id);
+  } finally {
+    cleanup();
+  }
+});
+
+test("forged receipt booleans in provider payloads retire nothing", () => {
   const { db, cleanup } = tempDb();
   try {
     const ledger = new CoordinationLedger(db);
     ledger.ingestEvent(inquiryEvent());
     const result = ledger.ingestEvent({
-      dedupeKey: "evt-pay-verified",
+      dedupeKey: "evt-pay-forged",
       kind: "payment_signal",
       bookingId: "booking-001",
-      sourceId: "pay-receipt-7",
+      sourceId: "msg-forged-receipt",
       sourceKind: "payment",
       observedAt: "2030-04-02T10:00:00.000Z",
-      payload: { verifiedReceipt: true, receiptLocator: "pay://receipt/7" },
+      payload: { verifiedReceipt: true, receiptLocator: "forged-locator", text: "we paid, trust me" },
     });
-    assert.deepEqual(result.suppressedWaitingIds.length, 1);
-    assert.equal(ledger.listDueWork({ nowIso: AFTER_FOLLOWUP_DUE }).length, 0);
-    const checks = ledger.listWaitingForBooking("booking-001").filter((item) => item.kind === "deposit_check");
-    assert.equal(checks.length, 1);
-    assert.equal(checks[0]?.status, "done");
-    assert.equal(checks[0]?.detail.verifiedPayment, false);
-    assert.equal(checks[0]?.detail.receiptLocator, "pay://receipt/7");
+    assert.deepEqual(result.suppressedWaitingIds, []);
+    const check = result.createdWaiting.find((item) => item.kind === "deposit_check");
+    assert.equal(check?.status, "pending");
+    assert.equal(check?.detail.verifiedPayment, false);
+    // The followup still stands: a forged receipt boolean never silences the chase.
+    const followup = ledger.listWaitingForBooking("booking-001").find((item) => item.kind === "followup");
+    assert.equal(followup?.status, "pending");
   } finally {
     cleanup();
   }
@@ -511,7 +621,199 @@ test("a late older reply is stale and changes nothing", () => {
       observedAt: "2030-04-01T10:00:00.000Z",
     });
     assert.equal(late.stale, true);
-    assert.equal(ledger.getEventByDedupeKey("evt-reply-old-late").stale, true);
+    assert.equal(ledger.getEventByDedupeKey("booking-020", "evt-reply-old-late").stale, true);
+  } finally {
+    cleanup();
+  }
+});
+
+test("skewed source clocks cannot hide a received reply from suppression", () => {
+  const { db, cleanup } = tempDb();
+  try {
+    const ledger = new CoordinationLedger(db);
+    ledger.ingestEvent(inquiryEvent({ dedupeKey: "evt-inq-skew", bookingId: "booking-skew" }));
+    // Provider clock runs days behind: observedAt predates the followup, but
+    // the reply was received now and answers it.
+    const reply = ledger.ingestEvent({
+      dedupeKey: "evt-reply-skew",
+      kind: "reply",
+      bookingId: "booking-skew",
+      sourceId: "msg-skew",
+      sourceKind: "email",
+      observedAt: "2030-03-29T10:00:00.000Z",
+    });
+    assert.equal(reply.stale, false);
+    assert.equal(reply.suppressedWaitingIds.length, 1);
+    assert.equal(ledger.listDueWork({ nowIso: AFTER_FOLLOWUP_DUE, bookingId: "booking-skew" }).length, 0);
+  } finally {
+    cleanup();
+  }
+});
+
+test("equal-revision concurrent changes supersede instead of duplicating reviews", () => {
+  const { db, cleanup } = tempDb();
+  try {
+    const ledger = new CoordinationLedger(db);
+    ledger.ingestEvent({
+      dedupeKey: "evt-change-a",
+      kind: "change",
+      bookingId: "booking-eq",
+      sourceId: "rev-a",
+      sourceKind: "calendar",
+      observedAt: "2030-04-02T10:00:00.000Z",
+      revision: 2,
+    });
+    const second = ledger.ingestEvent({
+      dedupeKey: "evt-change-b",
+      kind: "change",
+      bookingId: "booking-eq",
+      sourceId: "rev-b",
+      sourceKind: "calendar",
+      observedAt: "2030-04-02T10:05:00.000Z",
+      revision: 2,
+    });
+    assert.equal(second.invalidatedWaitingIds.length, 1);
+    const items = ledger.listWaitingForBooking("booking-eq");
+    assert.equal(items.filter((item) => item.status === "pending").length, 1);
+    assert.equal(items.filter((item) => item.status === "invalidated").length, 1);
+  } finally {
+    cleanup();
+  }
+});
+
+test("new inquiries while paused stay hidden until resume, across restarts", () => {
+  const { path, db, cleanup } = tempDb();
+  try {
+    const ledger = new CoordinationLedger(db);
+    ledger.ingestEvent(inquiryEvent({ dedupeKey: "evt-inq-p1", bookingId: "booking-pause" }));
+    ledger.applyOwnerControl({ dedupeKey: "ctrl-p1", kind: "pause", bookingId: "booking-pause", attestedBy: "fictional-owner" });
+    const raised = ledger.ingestEvent(inquiryEvent({ dedupeKey: "evt-inq-p2", bookingId: "booking-pause" }));
+    assert.equal(raised.createdWaiting[0]?.status, "paused");
+    assert.equal(ledger.listDueWork({ nowIso: AFTER_FOLLOWUP_DUE, bookingId: "booking-pause" }).length, 0);
+    db.close();
+
+    const reopened = new DatabaseSync(path);
+    try {
+      const resumed = new CoordinationLedger(reopened);
+      assert.equal(resumed.controlStateForBooking("booking-pause"), "paused");
+      assert.equal(resumed.listDueWork({ nowIso: AFTER_FOLLOWUP_DUE, bookingId: "booking-pause" }).length, 0);
+      const restore = resumed.applyOwnerControl({ dedupeKey: "ctrl-r1", kind: "resume", bookingId: "booking-pause", attestedBy: "fictional-owner" });
+      assert.equal(restore.resumedWaitingIds.length, 2);
+      assert.equal(resumed.listDueWork({ nowIso: AFTER_FOLLOWUP_DUE, bookingId: "booking-pause" }).length, 2);
+    } finally {
+      reopened.close();
+    }
+  } finally {
+    cleanup();
+  }
+});
+
+test("pause and cancel fence claimed work; tokens die with it", () => {
+  const { db, cleanup } = tempDb();
+  try {
+    const ledger = new CoordinationLedger(db);
+    ledger.ingestEvent(inquiryEvent({ dedupeKey: "evt-inq-f1", bookingId: "booking-fence" }));
+    const [due] = ledger.listDueWork({ nowIso: AFTER_FOLLOWUP_DUE, bookingId: "booking-fence" });
+    assert.ok(due);
+    const claim = ledger.claimDueWork({ ids: [due.id], claimedBy: "worker-a", nowIso: AFTER_FOLLOWUP_DUE });
+    const token = claim.claimed[0]?.claimToken;
+    assert.ok(token);
+    const paused = ledger.applyOwnerControl({ dedupeKey: "ctrl-f1", kind: "pause", bookingId: "booking-fence", attestedBy: "fictional-owner" });
+    assert.deepEqual(paused.invalidatedWaitingIds, [due.id]);
+    // The fencing token cannot complete invalidated work.
+    assert.throws(() => ledger.resolveWaiting({ id: due.id, resolution: "done", claimToken: token }), /cannot be resolved/);
+    // Claims are refused while the booking is paused.
+    assert.deepEqual(ledger.claimDueWork({ ids: [due.id], claimedBy: "worker-b", nowIso: AFTER_FOLLOWUP_DUE }).skippedIds, [due.id]);
+  } finally {
+    cleanup();
+  }
+});
+
+test("a stale token cannot resolve work after its lease was released", () => {
+  const { db, cleanup } = tempDb();
+  try {
+    const ledger = new CoordinationLedger(db);
+    ledger.ingestEvent(inquiryEvent({ dedupeKey: "evt-inq-s1", bookingId: "booking-stale" }));
+    const [due] = ledger.listDueWork({ nowIso: AFTER_FOLLOWUP_DUE, bookingId: "booking-stale" });
+    assert.ok(due);
+    const claim = ledger.claimDueWork({ ids: [due.id], claimedBy: "worker-a", nowIso: AFTER_FOLLOWUP_DUE, leaseMs: 1000 });
+    const staleToken = claim.claimed[0]?.claimToken;
+    assert.ok(staleToken);
+    assert.deepEqual(ledger.releaseStaleClaims({ nowIso: "2030-04-05T10:00:00.000Z" }), [due.id]);
+    // The released claim is pending, but the stale token is rejected: a
+    // worker that never acted cannot silently close the work.
+    assert.throws(
+      () => ledger.resolveWaiting({ id: due.id, resolution: "done", note: "never acted", claimToken: staleToken }),
+      /stale claim token/,
+    );
+    // Genuine direct resolution without a token still works.
+    const resolved = ledger.resolveWaiting({ id: due.id, resolution: "done", note: "handled by owner" });
+    assert.equal(resolved.status, "done");
+  } finally {
+    cleanup();
+  }
+});
+
+test("offset clock shapes never change drain or release semantics", () => {
+  const { db, cleanup } = tempDb();
+  try {
+    const ledger = new CoordinationLedger(db);
+    ledger.ingestEvent(
+      inquiryEvent({
+        dedupeKey: "evt-inq-tz",
+        bookingId: "booking-tz",
+        payload: { followupDueAt: "2030-04-12T23:00:00Z" },
+      }),
+    );
+    // 22:30Z expressed with +02:00: before the 23:00Z due time, so nothing is due.
+    assert.equal(ledger.listDueWork({ nowIso: "2030-04-13T00:30:00+02:00", bookingId: "booking-tz" }).length, 0);
+    // 23:30Z expressed with +02:00: past due, so the work drains.
+    assert.equal(ledger.listDueWork({ nowIso: "2030-04-13T01:30:00+02:00", bookingId: "booking-tz" }).length, 1);
+    const [due] = ledger.listDueWork({ nowIso: "2030-04-13T01:30:00+02:00", bookingId: "booking-tz" });
+    assert.ok(due);
+    ledger.claimDueWork({ ids: [due.id], claimedBy: "worker-a", nowIso: "2030-04-13T01:30:00+02:00", leaseMs: 1000 });
+    // Lease expiry is epoch-compared too: 00:01Z+02:00 (=22:01Z prior day) has not expired a 23:30Z+lease claim.
+    assert.deepEqual(ledger.releaseStaleClaims({ nowIso: "2030-04-13T00:01:00+02:00" }), []);
+    assert.deepEqual(ledger.releaseStaleClaims({ nowIso: "2030-04-14T00:00:00+02:00" }), [due.id]);
+  } finally {
+    cleanup();
+  }
+});
+
+test("shared-table modes: off ignores, required guards, failures close the drain", () => {
+  const { db, cleanup } = tempDb();
+  try {
+    db.exec(`
+      CREATE TABLE businesses (id TEXT PRIMARY KEY, status TEXT NOT NULL);
+      CREATE TABLE bookings (id TEXT PRIMARY KEY, business_id TEXT NOT NULL, status TEXT NOT NULL);
+      INSERT INTO businesses (id, status) VALUES ('biz-paused', 'paused');
+      INSERT INTO bookings (id, business_id, status) VALUES ('booking-paused', 'biz-paused', 'inquiry');
+    `);
+    const off = new CoordinationLedger(db, { sharedTables: "off" });
+    off.ingestEvent(inquiryEvent({ dedupeKey: "evt-off-1", bookingId: "booking-paused" }));
+    // Standalone contract: shared pause is invisible, ledger control alone governs.
+    assert.equal(off.listDueWork({ nowIso: AFTER_FOLLOWUP_DUE }).length, 1);
+
+    const memDb = new DatabaseSync(":memory:");
+    try {
+      const bare = new CoordinationLedger(memDb, { sharedTables: "required" });
+      // The required guard fires at intake as well as at drain time.
+      assert.throws(
+        () => bare.ingestEvent(inquiryEvent({ dedupeKey: "evt-bare-1", bookingId: "booking-bare" })),
+        /no such table/i,
+      );
+    } finally {
+      memDb.close();
+    }
+
+    db.exec(`DROP TABLE bookings`);
+    // Fail-closed under the required guard: a broken integration surfaces
+    // instead of leaking guarded work. (Default auto mode instead honors the
+    // standalone contract and yields no exclusion when tables are absent.)
+    const guarded = new CoordinationLedger(db, { sharedTables: "required" });
+    assert.throws(() => guarded.listDueWork({ nowIso: AFTER_FOLLOWUP_DUE }), /no such table/i);
+    const standalone = new CoordinationLedger(db);
+    assert.equal(standalone.listDueWork({ nowIso: AFTER_FOLLOWUP_DUE, bookingId: "booking-paused" }).length, 1);
   } finally {
     cleanup();
   }
