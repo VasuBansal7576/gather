@@ -410,7 +410,10 @@ export class CoordinationLedger {
   private verifyWaitingCopyExact(): void {
     const legacyInfo = this.db.prepare("PRAGMA table_info(coord_waiting_legacy)").all() as SqlRow[];
     const legacyCols = new Set(legacyInfo.map((row) => String(asRow(row).name)));
-    const selectCols = MODERN_WAITING_COLS.map((column) => (legacyCols.has(column) ? column : "NULL"));
+    // Projected defaults must alias to authoritative column names: bare
+    // NULL selects carry the key "NULL", which can never match the modern
+    // keys on ancient tables predating claim columns.
+    const selectCols = MODERN_WAITING_COLS.map((column) => (legacyCols.has(column) ? column : `NULL AS ${column}`));
     const legacyRows = this.db
       .prepare(`SELECT ${selectCols.join(", ")} FROM coord_waiting_legacy ORDER BY id`)
       .all() as SqlRow[];
