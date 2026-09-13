@@ -69,4 +69,5 @@ export {
   type GatherRuntimeDeps,
   type RuntimeProcessLike,
   type RuntimeConnectionLike,
+  type RuntimeMcpBoundaryLike,
 } from "./openclaw-runtime.ts";

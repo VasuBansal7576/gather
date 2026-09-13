@@ -363,6 +363,8 @@ export class OpenClawGatewayProcess {
   private lastExit: ChildExit | null = null;
   private stderrTail: string[] = [];
   private repairAttempted = false;
+  /** Set by stop(): a start() that observes it after repair aborts instead of respawning. */
+  private stopRequested = false;
   /** Tracked repair child: a hung `doctor --fix` is reachable by stop(). */
   private repairChild: ChildProcess | null = null;
   private repairExitPromise: Promise<ChildExit> | null = null;
@@ -463,6 +465,7 @@ export class OpenClawGatewayProcess {
     if (this.state === "running" || this.state === "starting") {
       throw new Error(`gateway process already ${this.state}`);
     }
+    this.stopRequested = false;
     this.state = "starting";
 
     if (this.verify) {
@@ -508,6 +511,14 @@ export class OpenClawGatewayProcess {
       this.state = "failed";
       throw error;
     }
+    if (this.stopRequested) {
+      // stop() ran while the repair was in flight and already tore down.
+      // Do not respawn after cancellation.
+      this.state = "failed";
+      throw new Error(
+        "openclaw gateway stop requested during doctor repair; retry aborted after doctor repair without respawn",
+      );
+    }
     this.state = "starting";
     this.child = this.spawnGateway();
     const retriedPid = this.child.pid ?? null;
@@ -549,12 +560,15 @@ export class OpenClawGatewayProcess {
   /**
    * Runs `doctor --fix` under a bounded deadline. The repair child is
    * TRACKED (repairChild/repairExitPromise) so stop() can reach it, and a
-   * repair that exceeds DOCTOR_REPAIR_TIMEOUT_MS is SIGTERM'd then
-   * SIGKILL'd, with start() rejecting only after the repair child's exit
-   * is observed — a hung repair can never stall start() forever or leak
-   * an untracked process.
+   * repair that exceeds the deadline is SIGTERM'd then SIGKILL'd. Every wait
+   * is bounded: if no exit is observed even after SIGKILL the promise
+   * rejects — but ownership is PRESERVED (the child stays tracked) so a
+   * later stop() can still reap it. A delivery failure on any signal rejects
+   * the same way without dropping a possibly-live child, and an error event
+   * never clears tracking for a child whose exit was not observed ('close'
+   * releases tracking left behind by an already-settled rejection).
    */
-  private runDoctorRepair(timeoutMs = DOCTOR_REPAIR_TIMEOUT_MS): Promise<void> {
+  private runDoctorRepair(timeoutMs = DOCTOR_REPAIR_TIMEOUT_MS, killGraceMs = 5000): Promise<void> {
     const args = [
       ...(this.resolvedExecutable.executable.args ?? []),
       "doctor",
@@ -574,25 +588,84 @@ export class OpenClawGatewayProcess {
       this.repairExitPromise = exited;
       let stderr = "";
       let timedOut = false;
+      let settled = false;
+      let killTimer: NodeJS.Timeout | undefined;
+      let reapTimer: NodeJS.Timeout | undefined;
       doctor.stderr?.on("data", (chunk: Buffer) => {
         stderr += chunk.toString("utf8");
       });
-      const finish = (error?: Error) => {
+      const clearTimers = (): void => {
         clearTimeout(timer);
+        if (killTimer !== undefined) clearTimeout(killTimer);
+        if (reapTimer !== undefined) clearTimeout(reapTimer);
+      };
+      const releaseTracking = (): void => {
         this.repairChild = null;
         this.repairExitPromise = null;
+      };
+      const finish = (error?: Error): void => {
+        clearTimers();
+        releaseTracking();
+        if (settled) return;
+        settled = true;
         if (error) rejectPromise(error);
         else resolvePromise();
+      };
+      // Reject, but PRESERVE tracking: the child may still be alive and
+      // stop() remains responsible for reaping it.
+      const finishKeep = (error: Error): void => {
+        clearTimers();
+        if (settled) return;
+        settled = true;
+        rejectPromise(error);
+      };
+      const signal = (sig: "SIGTERM" | "SIGKILL"): boolean => {
+        try {
+          doctor.kill(sig);
+          return true;
+        } catch {
+          return false;
+        }
       };
       const timer = setTimeout(() => {
         timedOut = true;
         // Deadline exceeded: kill the tracked repair child and reject only
-        // after its exit is observed — ownership preserved to the end.
-        doctor.kill("SIGTERM");
-        const killTimer = setTimeout(() => doctor.kill("SIGKILL"), 5000);
-        void exited.then(() => clearTimeout(killTimer));
+        // after its exit is observed — ownership preserved to the end — but
+        // never wait forever: an unobserved exit after SIGKILL rejects while
+        // keeping the child tracked for stop().
+        if (!signal("SIGTERM")) {
+          finishKeep(
+            new Error(
+              `openclaw doctor --fix exceeded ${timeoutMs}ms and SIGTERM could not be delivered; repair child remains tracked for stop()`,
+            ),
+          );
+          return;
+        }
+        killTimer = setTimeout(() => {
+          if (!signal("SIGKILL")) {
+            finishKeep(
+              new Error(
+                `openclaw doctor --fix exceeded ${timeoutMs}ms and SIGKILL could not be delivered; repair child remains tracked for stop()`,
+              ),
+            );
+            return;
+          }
+          reapTimer = setTimeout(() => {
+            finishKeep(
+              new Error(
+                `openclaw doctor --fix exceeded ${timeoutMs}ms and did not exit after SIGKILL within ${killGraceMs}ms; repair child remains tracked for stop()`,
+              ),
+            );
+          }, killGraceMs);
+        }, 5000);
       }, timeoutMs);
       doctor.on("exit", (code) => {
+        if (settled) {
+          // Late exit after a kept-ownership rejection: the child is now
+          // observably gone, so release it.
+          releaseTracking();
+          return;
+        }
         if (timedOut) {
           finish(
             new Error(
@@ -605,7 +678,18 @@ export class OpenClawGatewayProcess {
           finish(new Error(`openclaw doctor --fix failed with code ${code}: ${stderr.slice(-2000)}`));
         }
       });
-      doctor.on("error", (error) => finish(error));
+      doctor.on("error", (error) => {
+        // Spawn or signal-delivery failure: reject, but keep tracking unless
+        // the child is observably gone — 'close' below releases tracking
+        // left behind by this already-settled rejection.
+        clearTimers();
+        if (settled) return;
+        settled = true;
+        rejectPromise(error);
+      });
+      doctor.on("close", () => {
+        if (settled) releaseTracking();
+      });
     });
   }
 
@@ -616,13 +700,31 @@ export class OpenClawGatewayProcess {
    * even after SIGKILL the state becomes "failed" and stop() rejects.
    */
   async stop(exitTimeoutMs = 10000, killGraceMs = 5000): Promise<void> {
-    // A repair child in flight is owned by this process too: kill it and
-    // await its observed exit so a hung `doctor --fix` cannot wedge stop()
-    // or leak past the owning lifecycle.
+    // A repair child in flight is owned by this process too: signal it and
+    // await its observed exit under the same bound as the main child. The
+    // wait is never unbounded: on timeout the tracked child is KEPT (never
+    // released without an observed exit) and stop() rejects so a later
+    // stop() can retry the reap.
+    this.stopRequested = true;
     const repair = this.repairChild;
     if (repair && this.repairExitPromise) {
-      repair.kill("SIGKILL");
-      await this.repairExitPromise;
+      try {
+        repair.kill("SIGKILL");
+      } catch {
+        // Delivery failure: the bounded wait below still applies.
+      }
+      const reaped = await Promise.race([
+        this.repairExitPromise.then(() => "exited" as const),
+        new Promise<"timeout">((resolvePromise) =>
+          setTimeout(() => resolvePromise("timeout"), killGraceMs),
+        ),
+      ]);
+      if (reaped === "timeout") {
+        this.state = "failed";
+        throw new Error(
+          `openclaw doctor --fix child did not exit after SIGKILL within ${killGraceMs}ms; ownership retained for a later stop()`,
+        );
+      }
       this.repairChild = null;
       this.repairExitPromise = null;
     }

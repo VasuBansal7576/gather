@@ -138,10 +138,15 @@ tokens):
   `doctor --fix --yes --non-interactive` repair under the same env and one
   retry. The repair is a TRACKED child under a bounded deadline
   (`DOCTOR_REPAIR_TIMEOUT_MS`, 60 s): a hung repair is SIGTERM'd then
-  SIGKILL'd and `start()` rejects only after the repair child's exit is
-  observed; `stop()` during a repair kills the tracked child too, so a
-  repair can never wedge the lifecycle or leak an untracked process.
-  Process survival is not readiness.
+  SIGKILL'd, and every wait is bounded — if no exit is observed even after
+  SIGKILL, `start()` rejects while KEEPING the child tracked (never released
+  unseen) so a later `stop()` can still reap it. A signal-delivery failure
+  or repair error event likewise rejects without dropping a possibly-live
+  child; a late exit afterwards still releases tracking. `stop()` reaps a
+  tracked repair under its own bound and likewise never claims stopped
+  without an observed exit. `stop()` during a repair additionally cancels
+  the post-repair respawn: the pending `start()` aborts instead of spawning
+  after teardown. Process survival is not readiness.
 - **Readiness**: `connect()` resolves on `hello-ok` within a caller deadline
   (default 30 s, unchanged — the deadline is the readiness signal, not a
   knob for hiding slow-boot failures). The doctor records it as
