@@ -95,6 +95,33 @@ function followupDueAt(input: CoordinationEventInput): string {
   return plusHours(input.observedAt, 48);
 }
 
+const EVENT_COLUMNS =
+  "(id, dedupe_key, kind, booking_id, source_id, source_kind, observed_at, received_at, revision, payload_json, stale)";
+
+const WAITING_SCHEMA = `
+  CREATE TABLE coord_waiting (
+    id TEXT PRIMARY KEY,
+    booking_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    status TEXT NOT NULL,
+    due_at TEXT NOT NULL,
+    detail_json TEXT NOT NULL,
+    source_event_id TEXT NOT NULL REFERENCES coord_events(id),
+    revision INTEGER,
+    claimed_by TEXT,
+    claimed_at TEXT,
+    resolution_note TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    claim_token TEXT,
+    claim_expires_at TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_coord_waiting_booking_status_due
+    ON coord_waiting(booking_id, status, due_at);
+  CREATE INDEX IF NOT EXISTS idx_coord_waiting_status_due
+    ON coord_waiting(status, due_at);
+`;
+
 const SCHEMA = `
   CREATE TABLE IF NOT EXISTS coord_events (
     id TEXT PRIMARY KEY,
@@ -160,16 +187,27 @@ const SCHEMA = `
 export class CoordinationLedger {
   private readonly db: DatabaseSync;
   private readonly sharedTables: "auto" | "required" | "off";
+  private readonly clock: () => string;
 
   constructor(db: DatabaseSync, options?: unknown) {
     assertValidLedgerOptions(options);
     const opts: LedgerOptions = (options ?? {}) as LedgerOptions;
     this.db = db;
     this.sharedTables = opts.sharedTables ?? "auto";
+    this.clock = opts.clock ?? nowIso;
     this.upgradeLegacyDedupeScope();
     this.db.exec(SCHEMA);
     this.ensureColumn("coord_waiting", "claim_token", "TEXT");
     this.ensureColumn("coord_waiting", "claim_expires_at", "TEXT");
+  }
+
+  /** Trusted clock for lease-expiry enforcement (injectable for tests). */
+  private now(): string {
+    const value = this.clock();
+    if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) {
+      throw new Error("Ledger clock returned an invalid ISO-8601 timestamp");
+    }
+    return value;
   }
 
   private ensureColumn(table: string, column: string, type: string): void {
@@ -180,59 +218,175 @@ export class CoordinationLedger {
     }
   }
 
+  private tableExists(name: string): boolean {
+    const found = this.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = $name").get({ $name: name });
+    return found !== null && found !== undefined;
+  }
+
+  private pragmaState(): { foreignKeys: boolean; legacyAlterTable: boolean } {
+    const fk = this.db.prepare("PRAGMA foreign_keys").get();
+    const legacy = this.db.prepare("PRAGMA legacy_alter_table").get();
+    return {
+      foreignKeys: fk !== null && fk !== undefined && Number(asRow(fk).foreign_keys) === 1,
+      legacyAlterTable: legacy !== null && legacy !== undefined && Number(asRow(legacy).legacy_alter_table) === 1,
+    };
+  }
+
   /**
-   * Upgrade pre-scoped databases: the original schema enforced a GLOBAL
-   * dedupe_key UNIQUE, contradicting the documented per-booking scope.
-   * Migrates rows into the scoped schema, preserving all data.
+   * Freeze schema-rewriting behavior for a rebuild: enforcement off (so
+   * intermediate states never fail) and legacy rename semantics on (so
+   * RENAME never retargets other tables' REFERENCES clauses at the new
+   * table). Both settings are always restored; see the finally blocks.
    */
-  private upgradeLegacyDedupeScope(): void {
-    let definition: unknown;
-    try {
-      const found = this.db.prepare("SELECT sql FROM sqlite_master WHERE name = 'coord_events'").get();
-      definition = found ? asRow(found).sql : null;
-    } catch {
-      return;
-    }
-    if (typeof definition !== "string") return;
-    const scoped = this.db.prepare("PRAGMA index_list(coord_events)").all() as SqlRow[];
-    for (const entry of scoped) {
+  private freezeRebuildPragmas(): { foreignKeys: boolean; legacyAlterTable: boolean } {
+    const prior = this.pragmaState();
+    this.db.exec("PRAGMA foreign_keys = OFF");
+    this.db.exec("PRAGMA legacy_alter_table = ON");
+    return prior;
+  }
+
+  private restoreRebuildPragmas(prior: { foreignKeys: boolean; legacyAlterTable: boolean }): void {
+    this.db.exec(`PRAGMA foreign_keys = ${prior.foreignKeys ? "ON" : "OFF"}`);
+    this.db.exec(`PRAGMA legacy_alter_table = ${prior.legacyAlterTable ? "ON" : "OFF"}`);
+  }
+
+  /** True when coord_events already carries the scoped UNIQUE(booking_id, dedupe_key). */
+  private hasScopedDedupe(): boolean {
+    if (!this.tableExists("coord_events")) return false;
+    const indexes = this.db.prepare("PRAGMA index_list(coord_events)").all() as SqlRow[];
+    for (const entry of indexes) {
       const row = asRow(entry);
       if (row.origin !== "u" && row.origin !== "pk") continue;
       const columns = this.db.prepare(`PRAGMA index_info(${String(row.name)})`).all() as SqlRow[];
       const names = columns
         .map((column) => asRow(column))
         .sort((left, right) => Number(left.seqno) - Number(right.seqno))
-        .map((column) => this.columnNameForIndex(Number(column.cid)));
-      if (names.length === 2 && names[0] === "booking_id" && names[1] === "dedupe_key") return;
+        .map((column) => this.eventsColumnName(Number(column.cid)));
+      if (names.length === 2 && names[0] === "booking_id" && names[1] === "dedupe_key") return true;
     }
-    // Legacy global-unique schema: migrate rows into the scoped shape.
-    this.db.exec("ALTER TABLE coord_events RENAME TO coord_events_legacy");
-    try {
-      this.db.exec(SCHEMA);
-      this.db.exec(`
-        INSERT INTO coord_events
-          (id, dedupe_key, kind, booking_id, source_id, source_kind, observed_at, received_at, revision, payload_json, stale)
-        SELECT id, dedupe_key, kind, booking_id, source_id, source_kind, observed_at, received_at, revision, payload_json, stale
-        FROM coord_events_legacy
-      `);
-      this.db.exec("DROP TABLE coord_events_legacy");
-    } catch (error) {
-      try {
-        this.db.exec("ALTER TABLE coord_events_legacy RENAME TO coord_events");
-      } catch {
-        // Surface the original migration failure below.
-      }
-      throw error;
-    }
+    return false;
   }
 
-  private columnNameForIndex(cid: number): string {
+  private eventsColumnName(cid: number): string {
     const info = this.db.prepare("PRAGMA table_info(coord_events)").all() as SqlRow[];
     for (const row of info) {
       const record = asRow(row);
       if (Number(record.cid) === cid) return String(record.name);
     }
     return "";
+  }
+
+  private foreignKeyCheckEmpty(): void {
+    const violations = this.db.prepare("PRAGMA foreign_key_check").all() as SqlRow[];
+    if (violations.length > 0) {
+      throw new Error(`Migration left ${violations.length} foreign-key violation(s); refusing to commit a half-migration`);
+    }
+  }
+
+  private rowCount(table: string): number {
+    const found = this.db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get();
+    return found ? Number(asRow(found).n) : 0;
+  }
+
+  /**
+   * Upgrade pre-scoped databases: the original schema enforced a GLOBAL
+   * dedupe_key UNIQUE, contradicting the documented per-booking scope.
+   *
+   * Appropriate SQLite table-rebuild procedure: foreign keys are disabled
+   * only for the duration of the rebuild (never permanently — the prior
+   * setting is always restored), the rebuild runs inside one transaction
+   * with row-count and foreign_key_check gates before commit, and any
+   * failure rolls back to the original schema intact and retryable.
+   */
+  private upgradeLegacyDedupeScope(): void {
+    if (this.hasScopedDedupe()) {
+      this.recoverLegacyLeftover();
+      return;
+    }
+    if (!this.tableExists("coord_events")) return; // Fresh database: SCHEMA creates.
+    const prior = this.freezeRebuildPragmas();
+    try {
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        this.db.exec("ALTER TABLE coord_events RENAME TO coord_events_legacy");
+        this.db.exec(SCHEMA);
+        const before = this.rowCount("coord_events_legacy");
+        this.db.exec(`INSERT INTO coord_events ${EVENT_COLUMNS} SELECT ${EVENT_COLUMNS.slice(1, -1)} FROM coord_events_legacy`);
+        const after = this.rowCount("coord_events");
+        if (before !== after) {
+          throw new Error(`Migration row-count mismatch (legacy ${before}, rebuilt ${after}); refusing to drop work`);
+        }
+        this.foreignKeyCheckEmpty();
+        this.db.exec("DROP TABLE coord_events_legacy");
+        this.db.exec("COMMIT");
+      } catch (error) {
+        try {
+          this.db.exec("ROLLBACK");
+        } catch {
+          // Surface the original migration failure below.
+        }
+        throw error;
+      }
+    } finally {
+      this.restoreRebuildPragmas(prior);
+    }
+  }
+
+  /**
+   * Repair state left by the previous non-atomic migrator (both event tables
+   * present, waiting FK possibly retargeted at the legacy name): merge
+   * missing rows, rebuild the waiting table only if its FK targets the
+   * legacy name, drop the legacy table. Same atomicity gates as migration.
+   */
+  private recoverLegacyLeftover(): void {
+    if (!this.tableExists("coord_events_legacy")) return;
+    const prior = this.freezeRebuildPragmas();
+    try {
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        this.db.exec(`INSERT OR IGNORE INTO coord_events ${EVENT_COLUMNS} SELECT ${EVENT_COLUMNS.slice(1, -1)} FROM coord_events_legacy`);
+        if (this.waitingReferencesLegacyEvents()) {
+          this.db.exec("ALTER TABLE coord_waiting RENAME TO coord_waiting_legacy");
+          this.db.exec(WAITING_SCHEMA);
+          // Ancient waiting tables may predate claim columns: copy the
+          // intersection, defaulting the rest to NULL.
+          const legacyInfo = this.db.prepare("PRAGMA table_info(coord_waiting_legacy)").all() as SqlRow[];
+          const legacyCols = new Set(legacyInfo.map((row) => String(asRow(row).name)));
+          const coreCols = [
+            "id", "booking_id", "kind", "status", "due_at", "detail_json", "source_event_id",
+            "revision", "claimed_by", "claimed_at", "resolution_note", "created_at", "updated_at",
+          ].filter((column) => legacyCols.has(column));
+          const extraCols = ["claim_token", "claim_expires_at"].filter((column) => !legacyCols.has(column));
+          const targetCols = [...coreCols, ...extraCols];
+          const selectCols = [...coreCols, ...extraCols.map(() => "NULL")];
+          this.db.exec(`INSERT INTO coord_waiting (${targetCols.join(", ")}) SELECT ${selectCols.join(", ")} FROM coord_waiting_legacy`);
+          const before = this.rowCount("coord_waiting_legacy");
+          const after = this.rowCount("coord_waiting");
+          if (before !== after) {
+            throw new Error(`Waiting rebuild row-count mismatch (legacy ${before}, rebuilt ${after}); refusing to drop work`);
+          }
+          this.db.exec("DROP TABLE coord_waiting_legacy");
+        }
+        this.db.exec("DROP TABLE coord_events_legacy");
+        this.foreignKeyCheckEmpty();
+        this.db.exec("COMMIT");
+      } catch (error) {
+        try {
+          this.db.exec("ROLLBACK");
+        } catch {
+          // Surface the original failure below.
+        }
+        throw error;
+      }
+    } finally {
+      this.restoreRebuildPragmas(prior);
+    }
+  }
+
+  private waitingReferencesLegacyEvents(): boolean {
+    if (!this.tableExists("coord_waiting")) return false;
+    const refs = this.db.prepare("PRAGMA foreign_key_list(coord_waiting)").all() as SqlRow[];
+    return refs.some((row) => String(asRow(row).table) === "coord_events_legacy");
   }
 
   /** Durable, idempotent intake. Safe to retry; concurrent duplicates collapse on (booking, dedupe_key). */
@@ -304,7 +458,7 @@ export class CoordinationLedger {
   applyOwnerControl(raw: unknown): OwnerControlResult {
     assertValidOwnerControlInput(raw);
     const input: OwnerControlInput = raw;
-    const timestamp = nowIso();
+    const timestamp = this.now();
     const observedAt = storedIso(input.observedAt ?? timestamp);
     const empty: { pausedWaitingIds: string[]; resumedWaitingIds: string[]; invalidatedWaitingIds: string[] } = {
       pausedWaitingIds: [],
@@ -386,7 +540,7 @@ export class CoordinationLedger {
   recordVerifiedReceipt(raw: unknown): VerifiedReceiptResult {
     assertValidVerifiedReceiptInput(raw);
     const input: VerifiedReceiptInput = raw;
-    const timestamp = nowIso();
+    const timestamp = this.now();
     const observedAt = storedIso(input.observedAt ?? timestamp);
     this.db.exec("BEGIN IMMEDIATE");
     try {
@@ -514,7 +668,7 @@ export class CoordinationLedger {
   releaseStaleClaims(raw: unknown): string[] {
     assertValidReleaseInput(raw);
     const input: ReleaseStaleClaimsInput = raw;
-    const timestamp = nowIso();
+    const timestamp = this.now();
     // Epoch comparison: caller clocks in any valid ISO shape behave identically.
     const nowMs = epochOf(input.nowIso);
     this.db.exec("BEGIN IMMEDIATE");
@@ -555,23 +709,33 @@ export class CoordinationLedger {
   /**
    * Guarded services mark work finished (or superseded) after they act.
    * Claimed work requires its fencing token, which must be present and
-   * match: a stale worker holding an expired or superseded claim cannot
-   * complete someone else's work. Pending work resolves without a token —
+   * match, AND the claim lease must still hold on the trusted clock: an
+   * expired unreleased claim cannot resolve even with the right token —
+   * release it and re-claim first. Pending work resolves without a token —
    * but presenting any token against pending work throws, so a stale token
-   * can never silently complete a released claim. No external effect is
+   * can never silently close a released claim. No external effect is
    * duplicated after uncertainty by this ledger alone; services must still
    * use stable operation keys and reconcile.
    */
   resolveWaiting(raw: unknown): WaitingItem {
     assertValidResolveInput(raw);
     const input: ResolveWaitingInput = raw;
-    const timestamp = nowIso();
+    const timestamp = this.now();
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const current = this.getWaiting(input.id);
       if (current.status === "claimed") {
         if (!current.claimToken || input.claimToken !== current.claimToken) {
           throw new Error(`Waiting ${input.id} was claimed by another worker (stale claim token)`);
+        }
+        if (
+          current.claimExpiresAt !== undefined &&
+          Number.isFinite(Date.parse(current.claimExpiresAt)) &&
+          Date.parse(current.claimExpiresAt) <= epochOf(this.now())
+        ) {
+          throw new Error(
+            `Waiting ${input.id} claim lease expired at ${current.claimExpiresAt}; release it and re-claim before resolving`,
+          );
         }
       } else if (current.status === "pending") {
         if (input.claimToken !== undefined) {
@@ -638,7 +802,7 @@ export class CoordinationLedger {
         .prepare(`UPDATE coord_waiting SET status = 'suppressed', resolution_note = $note, updated_at = $at WHERE id = $id`)
         .run({
           $note: "Suppressed at claim time: reply received after the drain snapshot",
-          $at: nowIso(),
+          $at: this.now(),
           $id: id,
         });
       return "suppressed";
@@ -655,7 +819,7 @@ export class CoordinationLedger {
         .prepare(
           `UPDATE coord_waiting SET status = 'invalidated', resolution_note = $note, updated_at = $at WHERE id = $id`,
         )
-        .run({ $note: "Invalidated at claim time: newer revision received", $at: nowIso(), $id: id });
+        .run({ $note: "Invalidated at claim time: newer revision received", $at: this.now(), $id: id });
       return "invalidated";
     }
     const token = randomUUID();
@@ -765,7 +929,7 @@ export class CoordinationLedger {
         $sourceId: input.sourceId,
         $sourceKind: input.sourceKind,
         $observed: storedIso(input.observedAt),
-        $received: nowIso(),
+        $received: this.now(),
         $revision: input.revision ?? null,
         $payload: JSON.stringify(input.payload ?? {}),
         $stale: stale ? 1 : 0,
@@ -798,7 +962,7 @@ export class CoordinationLedger {
         $sourceId: input.sourceId,
         $sourceKind: input.sourceKind,
         $observed: input.observedAt,
-        $received: nowIso(),
+        $received: this.now(),
         $revision: input.revision ?? null,
         $payload: JSON.stringify(input.payload),
       });
@@ -862,7 +1026,7 @@ export class CoordinationLedger {
     const pausedWaitingIds: string[] = [];
     const resumedWaitingIds: string[] = [];
     let controlHonored: boolean | undefined;
-    const timestamp = nowIso();
+    const timestamp = this.now();
     const shared = this.sharedBlockReason(input.bookingId);
 
     switch (input.kind) {
@@ -1031,7 +1195,7 @@ export class CoordinationLedger {
     detail: Record<string, unknown>,
   ): WaitingItem {
     const id = randomUUID();
-    const timestamp = nowIso();
+    const timestamp = this.now();
     const recommendation = recommendedFor(kind);
     const stored: Record<string, unknown> = {
       ...detail,

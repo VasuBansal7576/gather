@@ -411,7 +411,10 @@ test("claim rechecks reply suppression atomically: a reply after the snapshot wi
 test("a reply received before its followup leaves fresh work claimable", () => {
   const { db, cleanup } = tempDb();
   try {
-    const ledger = new CoordinationLedger(db);
+    // Deterministic received order via injected clock: reply received at T1,
+    // followup created at T2. Same-millisecond wall clocks must not decide.
+    let now = "2030-04-02T09:00:00.000Z";
+    const ledger = new CoordinationLedger(db, { clock: () => now });
     // Reply ingested first (no followup yet), then the inquiry: received
     // order puts the reply before the followup, so the fresh inquiry still
     // raises claimable work instead of inheriting a stale suppression.
@@ -423,6 +426,7 @@ test("a reply received before its followup leaves fresh work claimable", () => {
       sourceKind: "email",
       observedAt: "2030-04-02T09:00:00.000Z",
     });
+    now = "2030-04-02T09:00:00.001Z";
     ledger.ingestEvent(inquiryEvent({ dedupeKey: "evt-inquiry-010", bookingId: "booking-010" }));
     const [due] = ledger.listDueWork({ nowIso: AFTER_FOLLOWUP_DUE, bookingId: "booking-010" });
     assert.ok(due);
@@ -814,6 +818,203 @@ test("shared-table modes: off ignores, required guards, failures close the drain
     assert.throws(() => guarded.listDueWork({ nowIso: AFTER_FOLLOWUP_DUE }), /no such table/i);
     const standalone = new CoordinationLedger(db);
     assert.equal(standalone.listDueWork({ nowIso: AFTER_FOLLOWUP_DUE, bookingId: "booking-paused" }).length, 1);
+  } finally {
+    cleanup();
+  }
+});
+
+test("migration preserves populated FK databases with foreign keys on", () => {
+  const { path, db, cleanup } = tempDb();
+  try {
+    db.exec("PRAGMA foreign_keys = ON");
+    db.exec(`CREATE TABLE coord_events (
+      id TEXT PRIMARY KEY, dedupe_key TEXT NOT NULL UNIQUE, kind TEXT NOT NULL,
+      booking_id TEXT NOT NULL, source_id TEXT NOT NULL, source_kind TEXT NOT NULL,
+      observed_at TEXT NOT NULL, received_at TEXT NOT NULL, revision INTEGER,
+      payload_json TEXT NOT NULL, stale INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE coord_waiting (
+      id TEXT PRIMARY KEY, booking_id TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL,
+      due_at TEXT NOT NULL, detail_json TEXT NOT NULL,
+      source_event_id TEXT NOT NULL REFERENCES coord_events(id),
+      revision INTEGER, claimed_by TEXT, claimed_at TEXT, resolution_note TEXT,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+    INSERT INTO coord_events
+      (id, dedupe_key, kind, booking_id, source_id, source_kind, observed_at, received_at, revision, payload_json, stale)
+      VALUES ('e1', 'email:m1', 'inquiry', 'b1', 'm1', 'email',
+        '2030-04-01T10:00:00.000Z', '2030-04-01T10:00:00.000Z', NULL, '{}', 0);
+    INSERT INTO coord_waiting
+      (id, booking_id, kind, status, due_at, detail_json, source_event_id, revision, created_at, updated_at)
+      VALUES ('w1', 'b1', 'followup', 'pending', '2030-04-03T10:00:00.000Z', '{}', 'e1', NULL,
+        '2030-04-01T10:00:00.000Z', '2030-04-01T10:00:00.000Z');`);
+    const ledger = new CoordinationLedger(db);
+    // Rows, indexes, and FKs preserved; foreign keys still enforced.
+    assert.equal(ledger.getEventByDedupeKey("b1", "email:m1").id, "e1");
+    assert.equal(ledger.listWaitingForBooking("b1").length, 1);
+    const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all()
+      .map((row) => String((row as Record<string, unknown>).name));
+    assert.ok(!tables.includes("coord_events_legacy"));
+    const fk = db.prepare("PRAGMA foreign_keys").get() as Record<string, unknown>;
+    assert.equal(Number(fk.foreign_keys), 1);
+    const violations = db.prepare("PRAGMA foreign_key_check").all();
+    assert.deepEqual(violations, []);
+    // Reopen: new ingest and claim work against the migrated schema.
+    db.close();
+    const reopened = new DatabaseSync(path);
+    try {
+      const second = new CoordinationLedger(reopened);
+      const ingested = second.ingestEvent({
+        dedupeKey: "email:m2",
+        kind: "reply",
+        bookingId: "b1",
+        sourceId: "m2",
+        sourceKind: "email",
+        observedAt: "2030-04-02T10:00:00.000Z",
+      });
+      assert.equal(ingested.stale, false);
+      assert.deepEqual(second.releaseStaleClaims({ nowIso: "2030-04-04T10:00:00.000Z" }), []);
+      const repeat = second.ingestEvent({
+        dedupeKey: "email:m2",
+        kind: "reply",
+        bookingId: "b1",
+        sourceId: "m2",
+        sourceKind: "email",
+        observedAt: "2030-04-02T10:00:00.000Z",
+      });
+      assert.equal(repeat.duplicate, true);
+      const empty = reopened.prepare("PRAGMA foreign_key_check").all();
+      assert.deepEqual(empty, []);
+    } finally {
+      reopened.close();
+    }
+  } finally {
+    cleanup();
+  }
+});
+
+test("injected migration failure rolls back with the original schema intact and retryable", () => {
+  const { db, cleanup } = tempDb();
+  try {
+    db.exec("PRAGMA foreign_keys = ON");
+    // Legacy shape missing the stale column: the rebuild copy must fail.
+    db.exec(`CREATE TABLE coord_events (
+      id TEXT PRIMARY KEY, dedupe_key TEXT NOT NULL UNIQUE, kind TEXT NOT NULL,
+      booking_id TEXT NOT NULL, source_id TEXT NOT NULL, source_kind TEXT NOT NULL,
+      observed_at TEXT NOT NULL, received_at TEXT NOT NULL, revision INTEGER,
+      payload_json TEXT NOT NULL);
+    CREATE TABLE coord_waiting (
+      id TEXT PRIMARY KEY, booking_id TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL,
+      due_at TEXT NOT NULL, detail_json TEXT NOT NULL,
+      source_event_id TEXT NOT NULL REFERENCES coord_events(id),
+      revision INTEGER, claimed_by TEXT, claimed_at TEXT, resolution_note TEXT,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+    INSERT INTO coord_events
+      (id, dedupe_key, kind, booking_id, source_id, source_kind, observed_at, received_at, revision, payload_json)
+      VALUES ('e1', 'email:m1', 'inquiry', 'b1', 'm1', 'email',
+        '2030-04-01T10:00:00.000Z', '2030-04-01T10:00:00.000Z', NULL, '{}');
+    INSERT INTO coord_waiting
+      (id, booking_id, kind, status, due_at, detail_json, source_event_id, revision, created_at, updated_at)
+      VALUES ('w1', 'b1', 'followup', 'pending', '2030-04-03T10:00:00.000Z', '{}', 'e1', NULL,
+        '2030-04-01T10:00:00.000Z', '2030-04-01T10:00:00.000Z');`);
+    assert.throws(() => new CoordinationLedger(db), /stale/i);
+    // Original schema intact, no half-migration, FK enforcement restored.
+    const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all()
+      .map((row) => String((row as Record<string, unknown>).name));
+    assert.ok(tables.includes("coord_events"));
+    assert.ok(!tables.includes("coord_events_legacy"));
+    const events = db.prepare("SELECT id FROM coord_events").all();
+    assert.equal(events.length, 1);
+    const waiting = db.prepare("SELECT id, status FROM coord_waiting").all();
+    assert.equal(waiting.length, 1);
+    const fk = db.prepare("PRAGMA foreign_keys").get() as Record<string, unknown>;
+    assert.equal(Number(fk.foreign_keys), 1);
+    assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(), []);
+    // Retryable: a second attempt fails identically instead of half-applying.
+    assert.throws(() => new CoordinationLedger(db), /stale/i);
+    assert.equal(db.prepare("SELECT COUNT(*) AS n FROM coord_events").get() !== null, true);
+  } finally {
+    cleanup();
+  }
+});
+
+test("damaged half-migration state recovers with rows and FKs intact", () => {
+  const { db, cleanup } = tempDb();
+  try {
+    db.exec("PRAGMA foreign_keys = ON");
+    // Simulate the previous non-atomic migrator's aftermath: scoped table
+    // present but empty, legacy table holding the row, waiting FK retargeted.
+    db.exec(`CREATE TABLE coord_events (
+      id TEXT PRIMARY KEY, dedupe_key TEXT NOT NULL, kind TEXT NOT NULL,
+      booking_id TEXT NOT NULL, source_id TEXT NOT NULL, source_kind TEXT NOT NULL,
+      observed_at TEXT NOT NULL, received_at TEXT NOT NULL, revision INTEGER,
+      payload_json TEXT NOT NULL, stale INTEGER NOT NULL DEFAULT 0,
+      UNIQUE (booking_id, dedupe_key));
+    CREATE TABLE coord_events_legacy (
+      id TEXT PRIMARY KEY, dedupe_key TEXT NOT NULL UNIQUE, kind TEXT NOT NULL,
+      booking_id TEXT NOT NULL, source_id TEXT NOT NULL, source_kind TEXT NOT NULL,
+      observed_at TEXT NOT NULL, received_at TEXT NOT NULL, revision INTEGER,
+      payload_json TEXT NOT NULL, stale INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE coord_waiting (
+      id TEXT PRIMARY KEY, booking_id TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL,
+      due_at TEXT NOT NULL, detail_json TEXT NOT NULL,
+      source_event_id TEXT NOT NULL REFERENCES coord_events_legacy(id),
+      revision INTEGER, claimed_by TEXT, claimed_at TEXT, resolution_note TEXT,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+      claim_token TEXT, claim_expires_at TEXT);
+    INSERT INTO coord_events_legacy
+      (id, dedupe_key, kind, booking_id, source_id, source_kind, observed_at, received_at, revision, payload_json, stale)
+      VALUES ('e1', 'email:m1', 'inquiry', 'b1', 'm1', 'email',
+        '2030-04-01T10:00:00.000Z', '2030-04-01T10:00:00.000Z', NULL, '{}', 0);
+    INSERT INTO coord_waiting
+      (id, booking_id, kind, status, due_at, detail_json, source_event_id, revision, created_at, updated_at, claim_token, claim_expires_at)
+      VALUES ('w1', 'b1', 'followup', 'pending', '2030-04-03T10:00:00.000Z', '{}', 'e1', NULL,
+        '2030-04-01T10:00:00.000Z', '2030-04-01T10:00:00.000Z', NULL, NULL);`);
+    const ledger = new CoordinationLedger(db);
+    assert.equal(ledger.getEventByDedupeKey("b1", "email:m1").id, "e1");
+    assert.equal(ledger.listWaitingForBooking("b1").length, 1);
+    const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all()
+      .map((row) => String((row as Record<string, unknown>).name));
+    assert.ok(!tables.includes("coord_events_legacy"));
+    assert.ok(!tables.includes("coord_waiting_legacy"));
+    const refs = db.prepare("PRAGMA foreign_key_list(coord_waiting)").all()
+      .map((row) => String((row as Record<string, unknown>).table));
+    assert.deepEqual(refs, ["coord_events"]);
+    assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(), []);
+    const fk = db.prepare("PRAGMA foreign_keys").get() as Record<string, unknown>;
+    assert.equal(Number(fk.foreign_keys), 1);
+  } finally {
+    cleanup();
+  }
+});
+
+test("expired unreleased claims cannot resolve, even with the right token", () => {
+  const { db, cleanup } = tempDb();
+  try {
+    let now = "2030-04-04T10:00:00.000Z";
+    const ledger = new CoordinationLedger(db, { clock: () => now });
+    ledger.ingestEvent(inquiryEvent({ dedupeKey: "evt-inq-x1", bookingId: "booking-expiry" }));
+    const [due] = ledger.listDueWork({ nowIso: now, bookingId: "booking-expiry" });
+    assert.ok(due);
+    const claim = ledger.claimDueWork({ ids: [due.id], claimedBy: "worker-a", nowIso: now, leaseMs: 1000 });
+    const token = claim.claimed[0]?.claimToken;
+    assert.ok(token);
+    // Past expiry but before release: the right token is refused with a
+    // meaningful lease error instead of silently completing stale work.
+    now = "2030-04-05T10:00:00.000Z";
+    assert.throws(
+      () => ledger.resolveWaiting({ id: due.id, resolution: "done", claimToken: token }),
+      /lease expired/,
+    );
+    // After release the old token is a stale token, not a pass.
+    assert.deepEqual(ledger.releaseStaleClaims({ nowIso: now }), [due.id]);
+    assert.throws(
+      () => ledger.resolveWaiting({ id: due.id, resolution: "done", claimToken: token }),
+      /stale claim token/,
+    );
+    // Re-claim on the trusted clock and resolve cleanly.
+    const fresh = ledger.claimDueWork({ ids: [due.id], claimedBy: "worker-b", nowIso: now });
+    assert.equal(fresh.claimed.length, 1);
+    const resolved = ledger.resolveWaiting({ id: due.id, resolution: "done", claimToken: fresh.claimed[0]?.claimToken });
+    assert.equal(resolved.status, "done");
   } finally {
     cleanup();
   }
