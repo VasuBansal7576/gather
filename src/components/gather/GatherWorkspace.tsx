@@ -154,6 +154,10 @@ const RECEIPT_STATUS_META: Record<ActionReceiptStatus, { label: string; classNam
   uncertain: { label: 'Outcome uncertain', className: 'is-slate', icon: 'clock' },
 };
 
+function guestsLabel(booking: BookingSummary): string {
+  return booking.guestCount === undefined ? 'Guests not specified' : `${booking.guestCount} guests`;
+}
+
 function proposalIdentityOf(booking: BookingSummary): ProposalIdentity {
   const proposal = booking.detail.proposal;
   return {
@@ -172,6 +176,8 @@ function connectionIcon(provider: ConnectionProvider): IconName {
       return 'drive';
     case 'calendar':
       return 'calendar';
+    case 'unsupported':
+      return 'warning';
     default: {
       const exhaustive: never = provider;
       return exhaustive;
@@ -354,7 +360,7 @@ function TriageRow({
         <time>{booking.eventDate}</time>
       </span>
       <span className="gather-triage-row-sub">{booking.statusLabel}</span>
-      <span className="gather-triage-row-meta">{booking.eventType} · {booking.eventDate} · {booking.guestCount} guests</span>
+      <span className="gather-triage-row-meta">{booking.eventType} · {booking.eventDate} · {guestsLabel(booking)}</span>
     </button>
   );
 }
@@ -375,14 +381,14 @@ function BookingRow({
         <span className="gather-booking-row-name">{booking.clientName}</span>
         <span className="gather-booking-row-event">{booking.eventType} · {booking.eventDate}</span>
       </span>
-      <span className="gather-booking-row-meta"><StatusPill booking={booking} /><span>{booking.guestCount} guests</span></span>
+      <span className="gather-booking-row-meta"><StatusPill booking={booking} /><span>{guestsLabel(booking)}</span></span>
       <Icon name="chevron-right" size={17} />
     </button>
   );
 }
 
 function SourceIcon({ kind }: { kind: ProposalSource['kind'] }) {
-  return <span className={`gather-source-icon gather-source-${kind}`}><Icon name={kind} size={15} /></span>;
+  return <span className={`gather-source-icon gather-source-${kind}`}><Icon name={kind === 'unsupported' ? 'warning' : kind} size={15} /></span>;
 }
 
 function ProposalPanel({
@@ -419,6 +425,16 @@ function ProposalPanel({
           Approves proposal <strong>{proposal.id}</strong> · version <strong>{proposal.version}</strong> · fingerprint <code>{proposal.fingerprint}</code>
         </p>
       </div>
+      {proposal.emailPreview ? (
+        <div className="gather-email-preview">
+          <span className="gather-scope-label">The exact email this would send</span>
+          <div className="gather-email-preview-head">
+            <span><small>To</small>{proposal.emailPreview.to}</span>
+            <span><small>Subject</small>{proposal.emailPreview.subject}</span>
+          </div>
+          <p className="gather-email-preview-body">{proposal.emailPreview.body}</p>
+        </div>
+      ) : null}
     </section>
   );
 }
@@ -594,10 +610,10 @@ function BookingMeta({ booking }: { booking: BookingSummary }) {
   const proposal = booking.detail.proposal;
   return (
     <aside className="gather-triage-meta" aria-label="Booking details">
-      <MetaRow label="Customer" value={booking.clientName} sub={booking.detail.source} />
+      <MetaRow label="Customer" value={booking.customerName ?? 'Not recorded'} sub={booking.detail.source} />
       <MetaRow label="Event date" icon="calendar" value={booking.eventDate} />
       <MetaRow label="Venue" icon="pin" value={booking.venue} />
-      <MetaRow label="Attendance" icon="users" value={`${booking.guestCount} guests`} />
+      <MetaRow label="Attendance" icon="users" value={guestsLabel(booking)} />
       <MetaRow label="Budget" value={booking.budget} />
       <div className="gather-meta-row">
         <span className="gather-meta-label">Status</span>
@@ -672,7 +688,7 @@ function BookingDetailPanel({
       <div className="gather-review-scroll">
         <h2 className="gather-review-title">{booking.clientName}</h2>
         <div className="gather-review-chips">
-          <span><Icon name="users" size={14} />{booking.guestCount} guests</span>
+          <span><Icon name="users" size={14} />{guestsLabel(booking)}</span>
           <span><Icon name="calendar" size={14} />{booking.eventDate}</span>
           <span><Icon name="pin" size={14} />{booking.venue}</span>
         </div>
@@ -738,7 +754,7 @@ function TodayView({
       </PageIntro>
       <div className="gather-briefing-grid">
         <BriefingCard eyebrow="Needs your eye" title={`${reviewCount} ${reviewCount === 1 ? 'proposal' : 'proposals'} to review`} detail="The details are assembled. You decide what feels right for your room." icon="sparkle" tone="coral"><button type="button" className="gather-card-link" onClick={() => onNavigate('bookings')}>Open review queue <Icon name="arrow-up-right" size={14} /></button></BriefingCard>
-        <BriefingCard eyebrow="Coming up" title={nextBooking ? nextBooking.eventDate : 'A clear horizon'} detail={nextBooking ? `${nextBooking.clientName} · ${nextBooking.eventType} · ${nextBooking.guestCount} guests` : 'No upcoming events need your attention today.'} icon="calendar" tone="sage"><span className="gather-card-detail">{nextBooking?.eventTime ?? 'You are all caught up'}</span></BriefingCard>
+        <BriefingCard eyebrow="Coming up" title={nextBooking ? nextBooking.eventDate : 'A clear horizon'} detail={nextBooking ? `${nextBooking.clientName} · ${nextBooking.eventType} · ${guestsLabel(nextBooking)}` : 'No upcoming events need your attention today.'} icon="calendar" tone="sage"><span className="gather-card-detail">{nextBooking?.eventTime ?? 'You are all caught up'}</span></BriefingCard>
         <BriefingCard eyebrow="Business context" title={`${connectedSourceCount} ${connectedSourceCount === 1 ? 'source' : 'sources'} connected`} detail="Gather can draw from your inbox, your files, and your calendar." icon="link" tone="gold"><button type="button" className="gather-card-link" onClick={() => onNavigate('connections')}>Manage connections <Icon name="arrow-up-right" size={14} /></button></BriefingCard>
       </div>
       <div className="gather-section-heading"><div><span className="gather-eyebrow">Your queue</span><h2>Bookings worth a look</h2></div><button type="button" className="gather-text-button" onClick={() => onNavigate('bookings')}>View all <Icon name="arrow-up-right" size={14} /></button></div>

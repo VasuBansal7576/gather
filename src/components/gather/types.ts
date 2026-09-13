@@ -16,15 +16,23 @@ export type BookingStatus =
   | 'uncertain'
   | 'partial';
 
-export type ConnectionProvider = 'gmail' | 'drive' | 'calendar';
+/**
+ * `'unsupported'` marks a host provider this UI does not model — it renders
+ * honestly as unsupported instead of being mislabeled as a known provider.
+ */
+export type ConnectionProvider = 'gmail' | 'drive' | 'calendar' | 'unsupported';
 
 export interface BookingSummary {
   id: string;
+  /** Display title for the booking — the event/inquiry name, not a person. */
   clientName: string;
+  /** The actual customer/contact name when the host knows it. */
+  customerName?: string;
   eventType: string;
   eventDate: string;
   eventTime: string;
-  guestCount: number;
+  /** Undefined when the host did not record a guest count — never shown as 0. */
+  guestCount?: number;
   venue: string;
   budget: string;
   status: BookingStatus;
@@ -83,6 +91,15 @@ export interface Proposal {
   consequences: string[];
   lines: ProposalLine[];
   sources: ProposalSource[];
+  /**
+   * The exact offer email this proposal would send — recipients, subject and
+   * full body — so the owner can review the message itself before approving.
+   */
+  emailPreview?: {
+    to: string;
+    subject: string;
+    body: string;
+  };
 }
 
 export interface ProposalLine {
@@ -94,7 +111,8 @@ export interface ProposalLine {
 export interface ProposalSource {
   title: string;
   detail: string;
-  kind: 'drive' | 'calendar' | 'email';
+  /** `'unsupported'` marks a source kind the UI does not model — never silently shown as a known type. */
+  kind: 'drive' | 'calendar' | 'email' | 'unsupported';
 }
 
 export interface ActivityItem {
