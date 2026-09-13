@@ -112,7 +112,11 @@ moved mid-flight (approval invalidated, new proposal or action, booking
 paused or cancelled, evidence changed) turns the call explicitly
 `blocked` with nothing built or persisted: an older view is never
 inserted under a newer action, and `ready` never claims an obsolete
-approval or status.
+approval or status. The POST evidence re-read runs inside the persist
+transaction itself, so even a writer landing between evaluation and
+commit is refused. Exported handoff views carry exactly the DTO fields
+(`demo`, `booking`, `revision`, `state`, `reason?`, `handoff`) — the
+internal binding stays server-side.
 
 Both paths report `state`:
 

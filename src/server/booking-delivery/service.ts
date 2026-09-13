@@ -472,7 +472,7 @@ function describeBindingDrift(before: HandoffBinding, after: HandoffBinding, dri
 async function evaluateHandoff(
   deps: BookingDeliveryDeps,
   bookingId: string,
-): Promise<Omit<HandoffResponseDTO, "revision"> & { binding: HandoffBinding }> {
+): Promise<Omit<HandoffResponseDTO, "revision"> & { binding: HandoffBinding; collecting?: CollectingVerifiers }> {
   const { store } = deps;
   const before = readHandoffBinding(deps, bookingId);
   if (!before.binding.approvalLive) {
@@ -498,6 +498,7 @@ async function evaluateHandoff(
       reason: `Handoff evaluation unavailable: ${error instanceof Error ? error.message : "unknown error"}`,
       handoff: null,
       binding: before.binding,
+      collecting,
     };
   }
   const after = readHandoffBinding(deps, bookingId);
@@ -510,6 +511,7 @@ async function evaluateHandoff(
       reason: `Handoff evaluation went stale while proofs were verified (${describeBindingDrift(before.binding, after.binding, driftedEvidence)}); nothing was built or persisted — retry`,
       handoff: null,
       binding: after.binding,
+      collecting,
     };
   }
   // The binding did not move, so the decision's binding matches the fresh
@@ -520,14 +522,14 @@ async function evaluateHandoff(
     proposal: snapshotProposal(after.action, after.booking),
   });
   if (decision.ready && decision.liveReady && after.booking.status === "confirmed") {
-    return { demo: demoOf(decision.provenance), booking: after.booking, state: "ready", handoff, binding: after.binding };
+    return { demo: demoOf(decision.provenance), booking: after.booking, state: "ready", handoff, binding: after.binding, collecting };
   }
   const reason = !decision.ready
     ? `Handoff is preliminary: the proposal is approved but readiness is blocked (${decision.blockedBy.join("; ") || "conditions unmet"})`
     : !decision.liveReady
       ? "Handoff is preliminary: the proposal is approved and ready on demo evidence, but live provenance has not been verified"
       : "Handoff is preliminary: the proposal is approved and live-ready, but the booking is not confirmed yet";
-  return { demo: demoOf(decision.provenance), booking: after.booking, state: "preliminary", reason, handoff, binding: after.binding };
+  return { demo: demoOf(decision.provenance), booking: after.booking, state: "preliminary", reason, handoff, binding: after.binding, collecting };
 }
 
 /**
@@ -540,7 +542,8 @@ async function evaluateHandoff(
  */
 export async function handoffForBooking(deps: BookingDeliveryDeps, bookingId: string): Promise<HandoffResponseDTO> {
   const view = await evaluateHandoff(deps, bookingId);
-  if (view.handoff === null) return { ...view, revision: null };
+  const { binding: _binding, collecting: _collecting, ...response } = view;
+  if (view.handoff === null) return { ...response, handoff: null, revision: null };
   const latest = deps.delivery.latestHandoff(view.binding.actionId);
   const matches =
     latest !== undefined &&
@@ -548,7 +551,7 @@ export async function handoffForBooking(deps: BookingDeliveryDeps, bookingId: st
     latest.proposalVersion === view.binding.actionVersion &&
     latest.proposalFingerprint === view.binding.actionFingerprint &&
     canonicalHash(latest.handoff) === canonicalHash(view.handoff);
-  return { ...view, revision: matches ? latest.revision : null };
+  return { ...response, handoff: view.handoff, revision: matches ? latest.revision : null };
 }
 
 /**
@@ -560,8 +563,10 @@ export async function handoffForBooking(deps: BookingDeliveryDeps, bookingId: st
  */
 export async function recordHandoff(deps: BookingDeliveryDeps, bookingId: string): Promise<HandoffResponseDTO> {
   const view = await evaluateHandoff(deps, bookingId);
-  if (view.handoff === null) {
-    return { ...view, revision: null };
+  const { binding: _binding, collecting, ...response } = view;
+  const handoff = view.handoff;
+  if (handoff === null) {
+    return { ...response, handoff: null, revision: null };
   }
   const evaluated = view.binding;
   try {
@@ -574,8 +579,19 @@ export async function recordHandoff(deps: BookingDeliveryDeps, bookingId: string
           true,
         );
       }
-      const revision = deps.delivery.insertHandoffRevision(evaluated.actionId, view.handoff as NonNullable<typeof view.handoff>);
-      return { ...view, revision: revision.revision };
+      // Evidence is re-read inside the same transaction: anything that
+      // changed after evaluation — however it interleaved — blocks the
+      // persist instead of storing a stale view.
+      const drifted = collecting?.driftedStoreFetches() ?? [];
+      if (drifted.length > 0) {
+        throw new ServiceError(
+          "STALE_PROPOSAL",
+          `Handoff evidence changed before persist (${drifted.join(", ")}); nothing was persisted — retry`,
+          true,
+        );
+      }
+      const revision = deps.delivery.insertHandoffRevision(evaluated.actionId, handoff);
+      return { ...response, handoff, revision: revision.revision };
     });
   } catch (error) {
     if (error instanceof ServiceError && error.code === "STALE_PROPOSAL") {

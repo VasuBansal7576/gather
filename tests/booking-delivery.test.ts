@@ -904,3 +904,89 @@ test("GET pairs a revision only with byte-identical persisted content, never an 
     s.cleanup();
   }
 });
+
+test("exported handoff views carry exactly the DTO fields, never internal binding", async () => {
+  const s = await readySetup();
+  try {
+    for (const view of [await handoffForBooking(s.deps, s.bookingId), await recordHandoff(s.deps, s.bookingId)]) {
+      assert.ok(!("binding" in view), "internal binding must not leak into exported DTOs");
+      assert.ok(!("collecting" in view), "verifier internals must not leak into exported DTOs");
+      assert.ok(view.handoff !== null);
+    }
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("microtask-scheduled evidence mutation from verifier completion blocks POST", async () => {
+  const s = await readySetup();
+  try {
+    await recordHandoff(s.deps, s.bookingId);
+    const inner = coveringCalendar(false);
+    let fired = false;
+    s.deps.calendar = {
+      async checkAvailability(request: CheckAvailabilityRequest): Promise<ConnectorResult<CheckAvailabilityResponse>> {
+        const result = await inner.checkAvailability(request);
+        if (!fired) {
+          fired = true;
+          // Land just after this collection returns: the mutation runs on
+          // the microtask queue before evaluation finishes, so the drift
+          // revalidation must catch it.
+          queueMicrotask(() => {
+            s.delivery.recordAcceptance({
+              businessId: s.businessId,
+              bookingId: s.bookingId,
+              proposalVersion: s.version,
+              proposalFingerprint: s.fingerprint,
+              acceptedAt: "2030-04-30T12:00:00.000Z",
+              acceptedBy: "customer@example.test",
+              sourceRefs: [liveRef("acceptance://microtask")],
+            });
+          });
+        }
+        return result;
+      },
+    };
+    const drifted = await recordHandoff(s.deps, s.bookingId);
+    assert.equal(drifted.state, "blocked");
+    assert.equal(drifted.handoff, null);
+    assert.equal(drifted.revision, null);
+    assert.match(drifted.reason ?? "", /evidence changed/);
+    assert.equal(handoffRowCount(s), 1, "nothing new persisted");
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("evidence mutation at the transaction boundary blocks persist inside the transaction", async () => {
+  const s = await readySetup();
+  try {
+    await recordHandoff(s.deps, s.bookingId);
+    const original = s.delivery.transaction.bind(s.delivery);
+    s.delivery.transaction = (<T>(work: () => T): T => {
+      // Models a writer landing exactly between evaluation and commit
+      // (cross-process or a future await): the in-transaction evidence
+      // revalidation must refuse before insert.
+      s.delivery.savePolicy({
+        businessId: s.businessId,
+        conditions: [
+          { kind: "customer_acceptance", required: true },
+          { kind: "deposit", required: true, deposit: { requiredAmountCents: 99999, currency: "USD" } },
+        ],
+      });
+      return original(work);
+    }) as typeof s.delivery.transaction;
+    try {
+      const drifted = await recordHandoff(s.deps, s.bookingId);
+      assert.equal(drifted.state, "blocked");
+      assert.equal(drifted.handoff, null);
+      assert.equal(drifted.revision, null);
+      assert.match(drifted.reason ?? "", /evidence changed/);
+      assert.equal(handoffRowCount(s), 1, "nothing new persisted");
+    } finally {
+      s.delivery.transaction = original;
+    }
+  } finally {
+    s.cleanup();
+  }
+});
