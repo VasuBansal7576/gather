@@ -25,11 +25,26 @@ contract below.
   refresh — so in-flight refreshes can never resurrect deleted secrets or
   return a token for a binding that changed mid-exchange (also makes
   cross-process refreshes fail closed rather than double-commit).
+  Revocation itself is fenced too: it lands only when the binding is still
+  the exact captured revision, business, owner, and connected status, so a
+  stale `invalid_grant` after disconnect/reconnect reports `STALE` instead
+  of revoking the fresh binding. Each row carries the configured local
+  `owner_id` (single local owner; not a multi-user auth claim): resolution,
+  reauthorization, status, and every mutation only ever see rows owned by
+  the configured owner. The public DTO account list stays business-scoped
+  over the shared `connected_accounts` table, which demo fixtures also
+  write directly.
 - `connection_token_meta`: token *references* — versioned secret-store
-  keys and the access-token expiry; never token material. New secrets are
-  staged under fresh refs and published only on DB commit; superseded
-  refs are deleted after commit, and a reauthorization that omits a new
-  refresh token preserves the previously granted one.
+  keys and the access-token expiry; never token material. A missing expiry
+  means the provider issued a non-expiring token: the cached value is
+  served indefinitely and never triggers a refresh or a revocation on its
+  own (a lost secret with no refresh token to recover from is still
+  honestly revoked). New secrets are staged under fresh refs inside a
+  cleanup boundary — a failure between the access and refresh writes
+  removes the half-staged refs and surfaces only a typed, redacted
+  `ConnectionError` — and published only on DB commit; superseded refs are
+  deleted after commit, and a reauthorization that omits a new refresh
+  token preserves the previously granted one.
 
 All state lives in the injected GatherStore SQLite database. No second
 database, no credential form, no assumed hardcoded account.
