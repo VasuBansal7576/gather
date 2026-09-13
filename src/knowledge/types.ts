@@ -103,7 +103,50 @@ export interface ConfirmedFact extends BusinessFact {
   reviewState: "none" | "review";
 }
 
-export type DecisionKind = "confirm" | "correct" | "exception" | "reject_candidate";
+export type DecisionKind = "confirm" | "correct" | "exception" | "reject_candidate" | "resolve_conflict";
+
+/**
+ * One account line's live revision inside a business-wide conflict group.
+ * Lineage stays account-distinct: rows are never merged, only compared.
+ */
+export interface ConflictRevision {
+  revisionId: string;
+  factId: string;
+  accountId: string;
+  revision: number;
+  value: Record<string, unknown>;
+  reviewState: "none" | "review";
+  approvedBy: string;
+  approvedAt: ISODateTime;
+}
+
+/**
+ * A business-wide conflict: active revisions for the same applicable fact
+ * (key + subject + scope) carry different values on different account
+ * lines. Status is derived, never stored: "conflicted" until an owner
+ * resolution pins a winner for exactly the current revision set, and back
+ * to "conflicted" the moment any line moves (new revision id set).
+ */
+export interface BusinessConflict {
+  key: string;
+  subjectId: string;
+  scope: FactScope;
+  scopeId?: string;
+  revisions: ConflictRevision[];
+  status: "conflicted" | "resolved";
+  /** Governing resolution id when status is resolved. */
+  resolutionId?: string;
+  /** Winning revision id when status is resolved. */
+  winningRevisionId?: string;
+}
+
+/** Same value confirmed on several account lines: presented once, provenance kept. */
+export interface AgreementGroup {
+  key: string;
+  subjectId: string;
+  keptFactId: string;
+  agreedFactIds: string[];
+}
 export type DecisionOutcome = "applied" | "duplicate" | "rejected";
 
 export interface KnowledgeDecision {
@@ -144,4 +187,10 @@ export interface OffersKnowledgeSnapshot {
   withheld: WithheldFact[];
   /** Count of active scoped (non-global) facts included. */
   scopedFactCount: number;
+  /**
+   * Agreement groups deduped for presentation: one kept fact per identical
+   * value across account lines. Provenance is NOT erased — every line's
+   * revision row remains readable via listFacts/listConflicts.
+   */
+  agreements: AgreementGroup[];
 }
