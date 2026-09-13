@@ -444,6 +444,15 @@ export class OpenClawGatewayProcess {
     });
     child.on("error", () => {
       if (this.child !== child) return;
+      // Spawn failure (no pid was ever assigned, so no process exists)
+      // releases ownership immediately: a later start() can recover, and a
+      // later stop() returns at once instead of burning bounded waits on a
+      // child that was never born. Any error on a spawned child — pid
+      // assigned, possibly live — keeps the reference (fail-closed): only
+      // an observed exit releases it. No blanket error===exit assumption.
+      if (child.pid === undefined) {
+        this.child = null;
+      }
       if (this.state !== "stopping") this.state = "failed";
     });
     return child;
