@@ -102,7 +102,8 @@ test("owner resolution pins an exact winner; revision updates reopen the conflic
   const fx = fixture();
   try {
     const won = confirmPrice(fx.service, fx.businessId, "acct-A", 9500, "fixture://fictional/menus/a");
-    confirmPrice(fx.service, fx.businessId, "acct-B", 12500, "fixture://fictional/menus/b");
+    const lost = confirmPrice(fx.service, fx.businessId, "acct-B", 12500, "fixture://fictional/menus/b");
+    const viewed = [won.revision.id, lost.revision.id];
 
     const resolved = fx.service.resolveConflict({
       businessId: fx.businessId,
@@ -110,6 +111,7 @@ test("owner resolution pins an exact winner; revision updates reopen the conflic
       key: "price_line",
       subjectId: "plated-dinner",
       winningRevisionId: won.revision.id,
+      consideredRevisionIds: viewed,
       commandId: "resolve-1",
     });
     assert.equal(resolved.winningRevisionId, won.revision.id);
@@ -130,6 +132,7 @@ test("owner resolution pins an exact winner; revision updates reopen the conflic
       key: "price_line",
       subjectId: "plated-dinner",
       winningRevisionId: won.revision.id,
+      consideredRevisionIds: viewed,
       commandId: "resolve-1",
     });
     assert.equal(replay.duplicate, true);
@@ -152,12 +155,14 @@ test("resolution rejects non-owners, unknown revisions, and altered replays", ()
   const fx = fixture();
   try {
     const won = confirmPrice(fx.service, fx.businessId, "acct-A", 9500, "fixture://fictional/menus/a");
-    confirmPrice(fx.service, fx.businessId, "acct-B", 12500, "fixture://fictional/menus/b");
+    const lost = confirmPrice(fx.service, fx.businessId, "acct-B", 12500, "fixture://fictional/menus/b");
+    const viewed = [won.revision.id, lost.revision.id];
 
     assert.throws(
       () => fx.service.resolveConflict({
         businessId: fx.businessId, actor: NON_OWNER, key: "price_line",
         subjectId: "plated-dinner", winningRevisionId: won.revision.id,
+        consideredRevisionIds: viewed,
       }),
       (error: unknown) => (error as { code?: string }).code === "denied",
     );
@@ -165,6 +170,7 @@ test("resolution rejects non-owners, unknown revisions, and altered replays", ()
       () => fx.service.resolveConflict({
         businessId: fx.businessId, actor: OWNER, key: "price_line",
         subjectId: "plated-dinner", winningRevisionId: "kr_missing",
+        consideredRevisionIds: [...viewed, "kr_missing"],
       }),
       (error: unknown) => (error as { code?: string }).code === "not_found",
     );
@@ -174,12 +180,14 @@ test("resolution rejects non-owners, unknown revisions, and altered replays", ()
 
     fx.service.resolveConflict({
       businessId: fx.businessId, actor: OWNER, key: "price_line",
-      subjectId: "plated-dinner", winningRevisionId: won.revision.id, commandId: "resolve-x",
+      subjectId: "plated-dinner", winningRevisionId: won.revision.id,
+      consideredRevisionIds: viewed, commandId: "resolve-x",
     });
     assert.throws(
       () => fx.service.resolveConflict({
         businessId: fx.businessId, actor: OWNER, key: "price_line",
-        subjectId: "other-subject", winningRevisionId: won.revision.id, commandId: "resolve-x",
+        subjectId: "other-subject", winningRevisionId: won.revision.id,
+        consideredRevisionIds: viewed, commandId: "resolve-x",
       }),
       (error: unknown) => (error as { code?: string }).code === "command_conflict",
     );
@@ -229,14 +237,177 @@ test("stale-source revisions neither trigger conflicts nor reach offers", () => 
   }
 });
 
-test("conflicts and resolutions persist across restart; rollback stays atomic", () => {
+test("stale view rejects when a new rival arrives before submit", () => {
+  const fx = fixture();
+  try {
+    const won = confirmPrice(fx.service, fx.businessId, "acct-A", 9500, "fixture://fictional/menus/a");
+    const seen = confirmPrice(fx.service, fx.businessId, "acct-B", 12500, "fixture://fictional/menus/b");
+    const viewed = [won.revision.id, seen.revision.id];
+
+    // Owner reviewed A/B; rival C from a third account arrives before submit.
+    confirmPrice(fx.service, fx.businessId, "acct-C", 14000, "fixture://fictional/menus/c");
+    assert.throws(
+      () => fx.service.resolveConflict({
+        businessId: fx.businessId, actor: OWNER, key: "price_line",
+        subjectId: "plated-dinner", winningRevisionId: won.revision.id,
+        consideredRevisionIds: viewed, commandId: "resolve-stale-new",
+      }),
+      (error: unknown) => (error as { code?: string }).code === "stale",
+    );
+    // No resolution row governs anything: the unseen rival is not resolved.
+    assert.deepEqual(fx.service.listConflicts(fx.businessId).map((c) => c.status), ["conflicted"]);
+    assert.equal(fx.service.snapshotForOffers(fx.businessId).facts.filter((f) => f.key === "price_line").length, 0);
+
+    // Re-reviewing the true current set and resubmitting under a fresh
+    // command succeeds and governs exactly the three revisions.
+    const current = fx.service.listConflicts(fx.businessId)[0]!.revisions.map((r) => r.revisionId);
+    assert.equal(current.length, 3);
+    const resolved = fx.service.resolveConflict({
+      businessId: fx.businessId, actor: OWNER, key: "price_line",
+      subjectId: "plated-dinner", winningRevisionId: won.revision.id,
+      consideredRevisionIds: current, commandId: "resolve-stale-new-retry",
+    });
+    assert.equal(resolved.duplicate, false);
+    assert.deepEqual([...resolved.consideredRevisionIds].sort(), [...current].sort());
+    assert.deepEqual(fx.service.listConflicts(fx.businessId).map((c) => c.status), ["resolved"]);
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test("stale view rejects when a rival is corrected before submit while winner unchanged", () => {
   const fx = fixture();
   try {
     const won = confirmPrice(fx.service, fx.businessId, "acct-A", 9500, "fixture://fictional/menus/a");
     confirmPrice(fx.service, fx.businessId, "acct-B", 12500, "fixture://fictional/menus/b");
+    const viewed = fx.service.listConflicts(fx.businessId)[0]!.revisions.map((r) => r.revisionId);
+
+    // Losing line B is corrected (new revision id); winner A untouched.
+    fx.service.correctFact({
+      businessId: fx.businessId, actor: OWNER, key: "price_line", subjectId: "plated-dinner",
+      accountId: "acct-B", expectedRevision: 1, value: { unitCents: 11000 },
+    });
+    assert.throws(
+      () => fx.service.resolveConflict({
+        businessId: fx.businessId, actor: OWNER, key: "price_line",
+        subjectId: "plated-dinner", winningRevisionId: won.revision.id,
+        consideredRevisionIds: viewed, commandId: "resolve-stale-corrected",
+      }),
+      (error: unknown) => (error as { code?: string }).code === "stale",
+    );
+    assert.deepEqual(fx.service.listConflicts(fx.businessId).map((c) => c.status), ["conflicted"]);
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test("stale view rejects when a rival source goes stale before submit", () => {
+  const fx = fixture();
+  try {
+    const won = confirmPrice(fx.service, fx.businessId, "acct-A", 9500, "fixture://fictional/menus/a");
+    confirmPrice(fx.service, fx.businessId, "acct-B", 12500, "fixture://fictional/menus/b");
+    const viewed = fx.service.listConflicts(fx.businessId)[0]!.revisions.map((r) => r.revisionId);
+
+    // B's source changes (same locator, different value): B's revision is
+    // flagged for review before the owner submits.
+    fx.service.intakeCandidate({
+      businessId: fx.businessId, key: "price_line", subjectId: "plated-dinner", accountId: "acct-B",
+      value: { unitCents: 13000 }, confidence: "probable",
+      sourceReferences: [{ ...DOC, locator: "fixture://fictional/menus/b" }],
+    });
+    assert.throws(
+      () => fx.service.resolveConflict({
+        businessId: fx.businessId, actor: OWNER, key: "price_line",
+        subjectId: "plated-dinner", winningRevisionId: won.revision.id,
+        consideredRevisionIds: viewed, commandId: "resolve-stale-source",
+      }),
+      (error: unknown) => (error as { code?: string }).code === "stale",
+    );
+    assert.deepEqual(fx.service.listConflicts(fx.businessId), []);
+    // B is withheld through the review path instead: nothing conflicted,
+    // nothing silently resolved, and only A's uncontested value reaches offers.
+    const snapshot = fx.service.snapshotForOffers(fx.businessId);
+    assert.ok(snapshot.reviewFactIds.length >= 1);
+    const lines = snapshot.facts.filter((f) => f.key === "price_line");
+    assert.equal(lines.length, 1);
+    assert.deepEqual(lines[0]!.value, { unitCents: 9500 });
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test("racing correction through a second handle rejects the first handle's stale submit", () => {
+  const fx = fixture();
+  try {
+    const won = confirmPrice(fx.service, fx.businessId, "acct-A", 9500, "fixture://fictional/menus/a");
+    confirmPrice(fx.service, fx.businessId, "acct-B", 12500, "fixture://fictional/menus/b");
+    const viewed = fx.service.listConflicts(fx.businessId)[0]!.revisions.map((r) => r.revisionId);
+
+    // A concurrent owner session on the same database corrects the rival
+    // between the first session's review and submit.
+    const second = new KnowledgeService(fx.store);
+    second.correctFact({
+      businessId: fx.businessId, actor: OWNER, key: "price_line", subjectId: "plated-dinner",
+      accountId: "acct-B", expectedRevision: 1, value: { unitCents: 11000 },
+    });
+    assert.throws(
+      () => fx.service.resolveConflict({
+        businessId: fx.businessId, actor: OWNER, key: "price_line",
+        subjectId: "plated-dinner", winningRevisionId: won.revision.id,
+        consideredRevisionIds: viewed, commandId: "resolve-raced",
+      }),
+      (error: unknown) => (error as { code?: string }).code === "stale",
+    );
+    assert.deepEqual(fx.service.listConflicts(fx.businessId).map((c) => c.status), ["conflicted"]);
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test("resolution validates the commanded set and rejects altered replays", () => {
+  const fx = fixture();
+  try {
+    const won = confirmPrice(fx.service, fx.businessId, "acct-A", 9500, "fixture://fictional/menus/a");
+    const lost = confirmPrice(fx.service, fx.businessId, "acct-B", 12500, "fixture://fictional/menus/b");
+    const viewed = [won.revision.id, lost.revision.id];
+    const base = {
+      businessId: fx.businessId, actor: OWNER, key: "price_line",
+      subjectId: "plated-dinner", winningRevisionId: won.revision.id,
+    } as const;
+
+    for (const bad of [[], [won.revision.id, won.revision.id], ["  "], "not-an-array"]) {
+      assert.throws(
+        // @ts-expect-error intentionally malformed commanded set
+        () => fx.service.resolveConflict({ ...base, consideredRevisionIds: bad }),
+        (error: unknown) => (error as { code?: string }).code === "invalid",
+      );
+    }
+    assert.throws(
+      () => fx.service.resolveConflict({ ...base, consideredRevisionIds: [lost.revision.id] }),
+      (error: unknown) => (error as { code?: string }).code === "invalid",
+    );
+
+    fx.service.resolveConflict({ ...base, consideredRevisionIds: viewed, commandId: "resolve-altered" });
+    // Same commandId with a different commanded set is an altered replay:
+    // command_conflict, never a duplicate of the unrelated recorded outcome.
+    assert.throws(
+      () => fx.service.resolveConflict({ ...base, consideredRevisionIds: [won.revision.id], commandId: "resolve-altered" }),
+      (error: unknown) => (error as { code?: string }).code === "command_conflict",
+    );
+    assert.deepEqual(fx.service.listConflicts(fx.businessId).map((c) => c.status), ["resolved"]);
+  } finally {
+    fx.cleanup();
+  }
+});
+test("conflicts and resolutions persist across restart; rollback stays atomic", () => {
+  const fx = fixture();
+  try {
+    const won = confirmPrice(fx.service, fx.businessId, "acct-A", 9500, "fixture://fictional/menus/a");
+    const lost = confirmPrice(fx.service, fx.businessId, "acct-B", 12500, "fixture://fictional/menus/b");
     fx.service.resolveConflict({
       businessId: fx.businessId, actor: OWNER, key: "price_line",
-      subjectId: "plated-dinner", winningRevisionId: won.revision.id, commandId: "resolve-restart",
+      subjectId: "plated-dinner", winningRevisionId: won.revision.id,
+      consideredRevisionIds: [won.revision.id, lost.revision.id], commandId: "resolve-restart",
     });
     fx.store.close();
     // Reopen on the same database file: lineage, conflict, and resolution survive.

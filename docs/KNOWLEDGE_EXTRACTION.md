@@ -114,7 +114,11 @@ Confirmed conflicts withhold every involved consequential fact
 (price/policy/capacity terms) from `snapshotForOffers` until an owner
 resolution pins an exact winning revision id (`resolveConflict`, owner-only,
 idempotent under `commandId`, replay-safe like every other decision). The
-resolution governs exactly the commanded revision set: any later correction
+resolution governs exactly the commanded revision set — the exact ids the
+owner reviewed, carried on the command and compared to the active set
+atomically before writing: a new rival, a missing rival, a revision
+change, or a newly stale source since the owner's review rejects the
+command as stale instead of silently resolving an unseen conflict. Any later correction
 mints a new revision id and the conflict reopens automatically. Losing lines
 keep their rows and lineage — they are withheld, never erased or merged —
 and resolved snapshots name the winning revision and resolution in each

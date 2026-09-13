@@ -856,12 +856,17 @@ export class KnowledgeService {
   /**
    * Owner-only conflict resolution pinned to exact revisions: the winner is
    * a revision id, never a value match, and the resolution governs exactly
-   * the commanded revision set. Any later correction mints a new revision
-   * id, the set changes, and the conflict reopens — nothing silently
-   * carries forward. Losing lines keep their rows and lineage; they are
-   * withheld from offer preparation, never erased or merged. Resolution
-   * synthesizes nothing, so unknown costs can never gain a profit figure
-   * and scoped exceptions keep their commanded scope.
+   * the commanded revision set — the exact ids the owner reviewed, carried
+   * on the command. The submitted set must equal the active applicable set
+   * atomically inside the write transaction: a new rival, a missing rival,
+   * a revision change, or a newly stale source since the owner's review
+   * rejects the command as stale instead of silently resolving an unseen
+   * conflict. Any later correction mints a new revision id, the set
+   * changes, and the conflict reopens — nothing silently carries forward.
+   * Losing lines keep their rows and lineage; they are withheld from offer
+   * preparation, never erased or merged. Resolution synthesizes nothing, so
+   * unknown costs can never gain a profit figure and scoped exceptions keep
+   * their commanded scope.
    */
   resolveConflict(
     input: DecisionCommand & {
@@ -870,13 +875,18 @@ export class KnowledgeService {
       scope?: FactScope;
       scopeId?: string;
       winningRevisionId: string;
+      consideredRevisionIds: string[];
     },
   ): ResolveConflictResult {
     const subjectId = input.subjectId ?? "";
     const scope = input.scope ?? "global";
     const scopeId = input.scopeId;
+    const commanded = Array.isArray(input.consideredRevisionIds)
+      ? [...input.consideredRevisionIds].sort()
+      : [];
     const fingerprint = this.requestFingerprint("resolve_conflict", input, {
       key: input.key, subjectId, scope, scopeId: scopeId ?? null, winningRevisionId: input.winningRevisionId,
+      consideredRevisionIds: commanded,
     });
     const replay = this.replayDecision(input, "resolve_conflict", fingerprint);
     if (replay) {
@@ -895,6 +905,17 @@ export class KnowledgeService {
     if (!isNonEmptyString(input.winningRevisionId)) {
       rejectInvalid("resolution requires an exact winningRevisionId; values are never matched");
     }
+    if (
+      !Array.isArray(input.consideredRevisionIds) ||
+      input.consideredRevisionIds.length === 0 ||
+      !input.consideredRevisionIds.every(isNonEmptyString) ||
+      new Set(input.consideredRevisionIds).size !== input.consideredRevisionIds.length
+    ) {
+      rejectInvalid("resolution requires the exact non-empty unique consideredRevisionIds shown to the owner");
+    }
+    if (!commanded.includes(input.winningRevisionId)) {
+      rejectInvalid("winningRevisionId must be a member of the commanded consideredRevisionIds");
+    }
     try {
       return this.transact(() => {
         const fresh = this.requireFreshCommand(input, "resolve_conflict", fingerprint);
@@ -905,18 +926,29 @@ export class KnowledgeService {
              ORDER BY approved_at, id`,
         ).all({ $b: input.businessId, $k: input.key, $s: subjectId, $scope: scope, $scopeId: scopeId ?? "" })
           .map((value) => this.readRevision(row(value)));
+        const active = group.map((revision) => revision.id).sort();
         const winner = group.find((revision) => revision.id === input.winningRevisionId) ?? null;
         if (!winner) {
           throw new KnowledgeError("not_found", `winning revision ${input.winningRevisionId} is not an active revision of ${input.key}/${subjectId}`);
         }
-        if (winner.reviewState !== "none") {
-          throw new KnowledgeError("invalid", `winning revision ${winner.id} is under review (stale source); reconfirm it before resolving`);
+        if (active.join(",") !== commanded.join(",")) {
+          throw new KnowledgeError(
+            "stale",
+            `conflict revision set changed since owner review for ${input.key}/${subjectId}: owner considered [${commanded.join(", ")}], active set is [${active.join(", ")}]; re-review before resolving`,
+          );
+        }
+        const staleSource = group.find((revision) => revision.reviewState !== "none") ?? null;
+        if (staleSource) {
+          throw new KnowledgeError(
+            "stale",
+            `revision ${staleSource.id} is under review (stale source) since owner review; reconfirm it before resolving ${input.key}/${subjectId}`,
+          );
         }
         const usable = group.filter((revision) => revision.reviewState === "none");
         if (new Set(usable.map((revision) => canonical(revision.value))).size < 2) {
           throw new KnowledgeError("invalid", `no cross-account value conflict to resolve for ${input.key}/${subjectId}`);
         }
-        const considered = group.map((revision) => revision.id).sort();
+        const considered = commanded;
         const resolutionId = input.commandId ?? `kd_${createHash("sha256").update(canonical({ kind: "resolve_conflict", at: randomUUID() })).digest("hex").slice(0, 24)}`;
         this.store.db.prepare(
           `INSERT INTO knowledge_conflict_resolutions
@@ -947,7 +979,7 @@ export class KnowledgeService {
         return result;
       });
     } catch (error) {
-      if (error instanceof KnowledgeError && (error.code === "not_found" || error.code === "invalid")) {
+      if (error instanceof KnowledgeError && (error.code === "not_found" || error.code === "invalid" || error.code === "stale")) {
         this.recordDecision(input, "resolve_conflict", "rejected", {
           requestFingerprint: fingerprint, reason: error.code, key: input.key, subjectId,
         });
