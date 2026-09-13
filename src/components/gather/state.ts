@@ -32,23 +32,33 @@ export function isApprovalInFlight(
 }
 
 /**
- * Whether the exact displayed proposal version has fully executed — every
- * receipt scoped to this action id + version succeeded. Only then does the
- * approve control show a completed state; a newer proposal (new action id or
- * version) has no scoped receipts and stays approvable, while failed,
- * partial, or uncertain receipts keep their recovery paths instead of
- * reading as "approved".
+ * Whether the exact displayed proposal version has fully executed. Completion
+ * requires a succeeded receipt for EVERY required executable step the host
+ * contract declares (`proposal.requiredSteps`), each scoped to this action id
+ * + version — a proposal whose email step never ran must not read as approved
+ * just because the hold receipt succeeded. Receipts must carry the exact
+ * proposal version: a versionless receipt cannot complete any version. A
+ * proposal with no declared required steps can never prove completeness, so
+ * it never shows a completed state. Pending, failed, partial, or uncertain
+ * receipts keep their recovery paths instead of reading as "approved", and a
+ * newer proposal (new action id or version) has no scoped receipts and stays
+ * approvable.
  */
 export function proposalApprovalComplete(
-  proposal: Pick<Proposal, 'id' | 'version'>,
+  proposal: Pick<Proposal, 'id' | 'version' | 'requiredSteps'>,
   receipts: readonly ActionReceipt[] | undefined,
 ): boolean {
+  const required = proposal.requiredSteps;
+  if (required === undefined || required.length === 0) return false;
   const scoped = (receipts ?? []).filter(
     (receipt) =>
       receipt.actionId === proposal.id &&
-      (receipt.proposalVersion === undefined || receipt.proposalVersion === proposal.version),
+      receipt.proposalVersion === proposal.version,
   );
-  return scoped.length > 0 && scoped.every((receipt) => receipt.status === 'succeeded');
+  if (scoped.length === 0 || !scoped.every((receipt) => receipt.status === 'succeeded')) {
+    return false;
+  }
+  return required.every((step) => scoped.some((receipt) => receipt.step === step));
 }
 
 /**

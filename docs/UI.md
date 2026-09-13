@@ -58,6 +58,10 @@ Before approving, the owner can inspect the `consequences` list (each step the h
 The approve control stays disabled while the proposal's fingerprint is in `pendingApprovals`, any receipt on the booking is still pending, or a request was just sent and not yet acknowledged — so the same version cannot be approved twice.
 A sent approval only displays "waiting" — the workspace never presents a hold or a sent request as a confirmed booking.
 
+The completed "Proposal approved" state requires a succeeded receipt for **every** required executable step the host declares on `proposal.requiredSteps` (e.g. `['hold', 'email']` for a provisional-hold offer), each scoped to the exact displayed action id and proposal version.
+A proposal with missing steps, versionless receipts, receipts on another action or version, or pending/failed/partial/uncertain receipts never reads as approved — it stays approvable or exposes its recovery controls.
+Proposals whose required steps are absent or empty can never prove completeness, so they never show the completed state; the host adapter derives `requiredSteps` from the authoritative `ProposedAction.kind`.
+
 ### Approval request lifecycle
 
 `onApproveProposal` may return a promise:

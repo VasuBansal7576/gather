@@ -89,6 +89,14 @@ export interface Proposal {
    * is already done here.
    */
   consequences: string[];
+  /**
+   * The executable steps the host contract requires for this proposal to be
+   * fully done (e.g. `['hold', 'email']` for a provisional-hold offer). The
+   * completed state is only shown when every listed step has a succeeded
+   * receipt for this exact action id + version; when absent or empty the
+   * proposal can never read as complete.
+   */
+  requiredSteps?: NonNullable<ActionReceipt['step']>[];
   lines: ProposalLine[];
   sources: ProposalSource[];
   /**
