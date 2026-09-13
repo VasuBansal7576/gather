@@ -709,3 +709,40 @@ test("receipt labels: missing or malformed proof reads unverified, never simulat
   assert.equal(byId.get("ex-2"), "Done — provider receipt unverified", "malformed/unknown-mode proof never claims simulated");
   assert.equal(byId.get("ex-3"), "Done — simulated provider receipt", "positive simulated proof stays labeled simulated");
 });
+
+test("chain: empty connected workspace is 'unknown', never demo — awaiting inquiries", () => {
+  const w = realWorld();
+  try {
+    // The reported repro: a genuinely connected business with zero bookings
+    // must not claim the fictional/demo marker (Array.every on [] is true).
+    w.store.upsertConnectedAccount({
+      id: "acct-1", businessId: w.businessId, provider: "gmail",
+      displayName: "venue@gmail.com", status: "connected",
+    });
+    const server = getWorkspace(w.store, { ownerId: "test-owner" });
+    assert.equal(server.mode.kind, "unknown", "empty workspace has no fixture evidence to prove demo");
+    assert.equal(server.demo, false, "zero bookings can never claim the simulated marker");
+    assert.match(server.notice, /No bookings yet/);
+    const parsed = parseWorkspaceDTO(JSON.parse(JSON.stringify(server)));
+    const view = adaptWorkspace(parsed);
+    assert.equal(view.dataMode, "unknown", "UI shows the unverified banner, not 'Demo data'");
+    assert.equal(view.bookings.length, 0);
+    assert.equal(view.connections.length, 1, "the real connected account still renders");
+  } finally {
+    w.cleanup();
+  }
+});
+
+test("chain: explicit demo seed still lands demo — Try Demo is preserved", () => {
+  const w = realWorld();
+  try {
+    seedDemoFixtures(w.store);
+    const server = getWorkspace(w.store, { ownerId: "test-owner" });
+    assert.equal(server.mode.kind, "demo");
+    assert.equal(server.demo, true);
+    const view = adaptWorkspace(parseWorkspaceDTO(JSON.parse(JSON.stringify(server))));
+    assert.equal(view.dataMode, "demo", "explicit fixture workspace stays labeled demo");
+  } finally {
+    w.cleanup();
+  }
+});
