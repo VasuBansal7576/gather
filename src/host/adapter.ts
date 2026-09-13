@@ -4,8 +4,10 @@ import type {
   BookingSummary,
   Connection,
   ConnectionProvider,
+  OfferView,
   ProposalSource,
 } from "../components/gather/types.ts";
+import type { OfferCandidate, OfferLine, PricingBasis } from "../offers/types.ts";
 import type {
   ApprovalDTO,
   BusinessDTO,
@@ -76,7 +78,18 @@ function initialsOf(name: string): string {
 
 /** Latest proposal by numeric version — the one displayed and approvable. */
 function latestProposal(proposals: WorkspaceProposalDTO[]): WorkspaceProposalDTO | undefined {
-  return [...proposals].sort((left, right) => right.action.proposalVersion - left.action.proposalVersion)[0];
+  return [...proposals].sort((left, right) => {
+    if (right.action.proposalVersion !== left.action.proposalVersion) {
+      return right.action.proposalVersion - left.action.proposalVersion;
+    }
+    // Version ties (a changed persist creates a new row at version 1, never
+    // a bump): newest created wins so a repriced proposal displaces the
+    // stale one it supersedes instead of hiding behind it.
+    if (right.action.createdAt !== left.action.createdAt) {
+      return right.action.createdAt < left.action.createdAt ? -1 : 1;
+    }
+    return right.action.id < left.action.id ? -1 : 1;
+  })[0];
 }
 
 function stepOf(key: string): "hold" | "email" {
@@ -129,8 +142,150 @@ function sourceKind(kind: string): ProposalSource["kind"] {
   return "unsupported";
 }
 
+// ---------- Authoritative offer snapshot (payload.offer) ----------
+
+const PRICING_BASES: readonly PricingBasis[] = ["per_event", "per_guest", "per_hour"];
+const PRICING_BASIS_LABEL: Record<PricingBasis, string> = {
+  per_event: "per event",
+  per_guest: "per guest",
+  per_hour: "per hour",
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function isIso(value: unknown): value is string {
+  return typeof value === "string" && Number.isFinite(Date.parse(value));
+}
+
+function isCents(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function isNullableCents(value: unknown): value is number | null {
+  return value === null || isCents(value);
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every(isNonEmptyString);
+}
+
+/** Display money in proper currency units; never amountCents glued to a code. */
+function formatMoney(amountCents: number, currency: string): string {
+  try {
+    return new Intl.NumberFormat("en-US", { style: "currency", currency }).format(amountCents / 100);
+  } catch {
+    return `${(amountCents / 100).toFixed(2)} ${currency}`;
+  }
+}
+
+function parseOfferLine(value: unknown): OfferLine | null {
+  if (!isRecord(value)) return null;
+  if (!isNonEmptyString(value.lineId) || !isNonEmptyString(value.label)) return null;
+  if (typeof value.pricingBasis !== "string" || !PRICING_BASES.includes(value.pricingBasis as PricingBasis)) return null;
+  if (typeof value.quantity !== "number" || !Number.isFinite(value.quantity) || value.quantity <= 0) return null;
+  if (!isNullableCents(value.unitCents) || !isNullableCents(value.lineTotalCents)) return null;
+  if (value.unknownUnit !== true && value.unknownUnit !== false) return null;
+  // Consistency: a known unit price can never carry the unknown marker.
+  if (value.unknownUnit && value.unitCents !== null) return null;
+  return {
+    lineId: value.lineId,
+    label: value.label,
+    pricingBasis: value.pricingBasis as PricingBasis,
+    quantity: value.quantity,
+    unitCents: value.unitCents,
+    lineTotalCents: value.lineTotalCents,
+    unknownUnit: value.unknownUnit,
+  };
+}
+
+type ParsedOffer =
+  | { kind: "absent" }
+  | { kind: "invalid"; reason: string }
+  | { kind: "valid"; offer: OfferCandidate };
+
+/**
+ * Strict boundary validation of the complete immutable OfferCandidate
+ * persisted on `action.payload.offer`. Any malformed field, non-finite or
+ * out-of-range amount, bad currency, empty required list, or internal
+ * contradiction marks the offer invalid — it can never render as priced.
+ * The snapshot fingerprint and `payload.offerPreparationFingerprint` are
+ * validated as separate non-empty hashes, never compared: binding the exact
+ * version is the canonical action.proposalFingerprint's job, enforced at
+ * approval, not the adapter's.
+ */
+function parseOfferSnapshot(payload: Record<string, unknown>): ParsedOffer {
+  const raw = payload.offer;
+  if (raw === undefined || raw === null) return { kind: "absent" };
+  const invalid = (reason: string): ParsedOffer => ({ kind: "invalid", reason });
+  if (!isRecord(raw)) return invalid("offer is not an object");
+  if (!isNonEmptyString(raw.offerId)) return invalid("offerId missing");
+  if (typeof raw.version !== "number" || !Number.isInteger(raw.version) || raw.version < 1) return invalid("version malformed");
+  if (raw.rank !== "primary" && raw.rank !== "alternative") return invalid("rank malformed");
+  if (!isIso(raw.startAt) || !isIso(raw.endAt)) return invalid("window malformed");
+  if (!isNonEmptyString(raw.spaceId) || !isNonEmptyString(raw.spaceName)) return invalid("space missing");
+  if (typeof raw.guestCount !== "number" || !Number.isSafeInteger(raw.guestCount) || raw.guestCount < 0) return invalid("guestCount malformed");
+  if (typeof raw.currency !== "string" || !/^[A-Z]{3}$/.test(raw.currency)) return invalid("currency malformed");
+  if (!Array.isArray(raw.lines) || raw.lines.length === 0) return invalid("lines missing or empty");
+  const lines: OfferLine[] = [];
+  for (const entry of raw.lines) {
+    const line = parseOfferLine(entry);
+    if (!line) return invalid("a priced line is malformed");
+    lines.push(line);
+  }
+  if (!isNullableCents(raw.totalCents) || !isNullableCents(raw.depositCents)) return invalid("amounts malformed");
+  if (raw.totalKnown !== true && raw.totalKnown !== false) return invalid("totalKnown missing");
+  // A claimed-known total can never be null, and a stored total can never
+  // carry the not-known flag.
+  if (raw.totalKnown !== (raw.totalCents !== null)) return invalid("total/totalKnown contradiction");
+  if (!isStringArray(raw.unknownCostIds) || !isStringArray(raw.unknownPriceIds)) return invalid("unknown id lists malformed");
+  if (raw.profitabilityClaimed !== true && raw.profitabilityClaimed !== false) return invalid("profitabilityClaimed missing");
+  // Unknown costs or prices can never carry a profitability claim.
+  if (raw.profitabilityClaimed && (raw.unknownCostIds.length > 0 || raw.unknownPriceIds.length > 0)) {
+    return invalid("profitability claimed with unknown costs or prices");
+  }
+  if (!isStringArray(raw.consequences) || raw.consequences.length === 0) return invalid("consequences malformed or empty");
+  if (!Array.isArray(raw.sources) || raw.sources.length === 0 || !raw.sources.every((ref) => isRecord(ref) && isNonEmptyString(ref.kind) && isNonEmptyString(ref.locator))) {
+    return invalid("sources malformed or empty");
+  }
+  if (!isNonEmptyString(raw.fingerprint)) return invalid("fingerprint missing");
+  if (raw.supersedesFingerprint !== undefined && !isNonEmptyString(raw.supersedesFingerprint)) return invalid("supersedesFingerprint malformed");
+  if (raw.note !== undefined && typeof raw.note !== "string") return invalid("note malformed");
+  // The snapshot fingerprint and the result-level preparation fingerprint
+  // are separate hashes validated independently below — never equated. The
+  // canonical action.proposalFingerprint already binds the entire payload,
+  // and approval binds that exact version, so no cross-digest comparison
+  // can add authority here.
+  const preparationFingerprint = payload.offerPreparationFingerprint;
+  if (preparationFingerprint !== undefined && !isNonEmptyString(preparationFingerprint)) {
+    return invalid("preparation fingerprint malformed");
+  }
+  return { kind: "valid", offer: raw as unknown as OfferCandidate };
+}
+
+function offerViewFor(offer: OfferCandidate, payload: Record<string, unknown>): OfferView {
+  return {
+    spaceName: offer.spaceName,
+    guestCount: offer.guestCount,
+    currency: offer.currency,
+    terms: offer.consequences,
+    unknownCosts: offer.unknownCostIds,
+    unknownPrices: offer.unknownPriceIds,
+    profitabilityClaimed: offer.profitabilityClaimed,
+    preparationFingerprint: isNonEmptyString(payload.offerPreparationFingerprint) ? payload.offerPreparationFingerprint : undefined,
+    note: offer.note,
+  };
+}
+
 function proposalFor(item: WorkspaceProposalDTO, timezone: string | undefined): BookingSummary["detail"]["proposal"] {
   const { action, consequences, consequencesError } = item;
+  const parsedOffer = parseOfferSnapshot(action.payload);
+  const offer = parsedOffer.kind === "valid" ? parsedOffer.offer : undefined;
   const consequenceSteps = consequences
     ? [
         `Recheck availability on ${consequences.calendarId} for ${formatDate(consequences.startAt, timezone)} ${formatTime(consequences.startAt, consequences.endAt, timezone)}`,
@@ -146,16 +301,32 @@ function proposalFor(item: WorkspaceProposalDTO, timezone: string | undefined): 
     versionLabel: `Version ${action.proposalVersion} · prepared ${formatTimestamp(action.createdAt, timezone)}`,
     fingerprint: action.proposalFingerprint,
     requiredSteps: REQUIRED_STEPS_BY_ACTION_KIND[action.kind] ?? [],
-    total: "Not priced",
-    deposit: "Not priced",
+    total: offer
+      ? offer.totalCents !== null
+        ? formatMoney(offer.totalCents, offer.currency)
+        : "Total unknown"
+      : "Not priced",
+    deposit: offer
+      ? offer.depositCents !== null
+        ? `Deposit ${formatMoney(offer.depositCents, offer.currency)}`
+        : "Deposit not specified"
+      : "Not priced",
     validUntil: consequences ? `Hold would expire ${formatTimestamp(consequences.expiresAt, timezone)}` : "Not specified",
+    offer: offer ? offerViewFor(offer, action.payload) : undefined,
+    offerInvalid: parsedOffer.kind === "invalid" || undefined,
     consequences: consequenceSteps,
-    lines: consequences
-      ? [
-          { label: "Provisional hold", detail: `${formatTime(consequences.startAt, consequences.endAt, timezone)} on ${consequences.calendarId}`, amount: "—" },
-          { label: "Offer email", detail: `to ${consequences.emailTo.join(", ")}`, amount: "—" },
-        ]
-      : [],
+    lines: offer
+      ? offer.lines.map((line) => ({
+          label: line.label,
+          detail: `${line.quantity} × ${line.unitCents !== null ? formatMoney(line.unitCents, offer.currency) : "unit price unknown"} ${PRICING_BASIS_LABEL[line.pricingBasis]}`,
+          amount: line.lineTotalCents !== null ? formatMoney(line.lineTotalCents, offer.currency) : "Unknown",
+        }))
+      : consequences
+        ? [
+            { label: "Provisional hold", detail: `${formatTime(consequences.startAt, consequences.endAt, timezone)} on ${consequences.calendarId}`, amount: "—" },
+            { label: "Offer email", detail: `to ${consequences.emailTo.join(", ")}`, amount: "—" },
+          ]
+        : [],
     sources: action.sourceReferences.map((source) => ({
       title: source.label ?? source.locator,
       detail: source.kind === "fixture" ? `${source.locator} (fixture source)` : source.locator,
