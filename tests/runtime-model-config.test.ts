@@ -24,13 +24,13 @@ import {
   type GatherModelSelection,
 } from "../src/runtime/index.ts";
 
-const MODEL = "openai-codex/gpt-5.6-luna";
-const PROFILE = "gather-codex-subscription";
+const MODEL = "openai/gpt-5.6-luna";
+const PROFILE = "openai:bansalv8198@gmail.com";
 
 function selection(overrides: Record<string, unknown> = {}): GatherModelSelection {
   return {
     model: MODEL,
-    auth: { profileId: PROFILE, provider: "openai-codex", mode: "oauth", email: "bansalv8198@gmail.com" },
+    auth: { profileId: PROFILE, provider: "openai", mode: "oauth", email: "bansalv8198@gmail.com" },
     ...overrides,
   } as GatherModelSelection;
 }
@@ -56,9 +56,9 @@ test("emits the exact model string with subscription profile selection/order", (
     assert.equal(JSON.stringify(config).includes("fallbacks"), false, "no alternate-model fallback may be configured");
     assert.deepEqual(config.auth, {
       profiles: {
-        [PROFILE]: { provider: "openai-codex", mode: "oauth", email: "bansalv8198@gmail.com" },
+        [PROFILE]: { provider: "openai", mode: "oauth", email: "bansalv8198@gmail.com" },
       },
-      order: { "openai-codex": [PROFILE] },
+      order: { "openai": [PROFILE] },
     });
   } finally {
     cleanup();
@@ -69,7 +69,7 @@ test("unsupported, malformed, mismatched, and key-based selections fail closed",
   const { layout: lay, cleanup } = layout();
   try {
     assert.throws(
-      () => buildGatewayConfig(lay, { model: selection({ model: "openai-codex/gpt-9-other" }) }),
+      () => buildGatewayConfig(lay, { model: selection({ model: "openai/gpt-9-other" }) }),
       (error: unknown) => error instanceof ModelConfigError && error.code === "UNSUPPORTED_MODEL",
     );
     assert.throws(
@@ -81,12 +81,12 @@ test("unsupported, malformed, mismatched, and key-based selections fail closed",
       (error: unknown) => error instanceof ModelConfigError && error.code === "INVALID_AUTH",
     );
     assert.throws(
-      () => buildGatewayConfig(lay, { model: selection({ auth: { profileId: PROFILE, provider: "openai-codex", mode: "api_key" } }) }),
+      () => buildGatewayConfig(lay, { model: selection({ auth: { profileId: PROFILE, provider: "openai", mode: "api_key" } }) }),
       (error: unknown) => error instanceof ModelConfigError && error.code === "INVALID_AUTH",
       "API-key auth must be rejected: subscription-only",
     );
     assert.throws(
-      () => buildGatewayConfig(lay, { model: selection({ auth: { profileId: "  ", provider: "openai-codex", mode: "oauth" } }) }),
+      () => buildGatewayConfig(lay, { model: selection({ auth: { profileId: "  ", provider: "openai", mode: "oauth" } }) }),
       (error: unknown) => error instanceof ModelConfigError && error.code === "INVALID_AUTH",
     );
     assert.ok(GATHER_SUPPORTED_MODELS.includes(MODEL));
@@ -128,7 +128,7 @@ test("runtime provision passes the model through and gates readiness", () => {
     const { configPath } = runtime.provision();
     const config = JSON.parse(readFileSync(configPath, "utf8"));
     assert.equal(config.agents.defaults.model, MODEL);
-    assert.equal(config.auth.order["openai-codex"][0], PROFILE);
+    assert.equal(config.auth.order["openai"][0], PROFILE);
     // Invalid selections report not-ready through the gate instead of throwing.
     const bad = new GatherOpenClawRuntime({ rootDir: lay.rootDir, gatewayPort: lay.port, model: selection({ model: "other/model" }) });
     const badStatus = bad.modelStatus();
