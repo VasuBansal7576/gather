@@ -1,6 +1,7 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { accessSync, chmodSync, constants, existsSync, statSync, writeFileSync } from "node:fs";
+import { createServer } from "node:net";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { GatherOpenClawLayout } from "./layout.ts";
@@ -29,6 +30,59 @@ import type { GatherOpenClawLayout } from "./layout.ts";
  */
 
 export const OPENCLAW_EX_CONFIG_EXIT_CODE = 78;
+
+/**
+ * Allocates a currently-free loopback port by binding 127.0.0.1:0 and
+ * releasing it. Loopback-only by construction: there is no host parameter,
+ * so this helper cannot be pointed at a non-loopback address. This REDUCES
+ * collision probability versus fixed ports but does NOT eliminate the bind
+ * race (TOCTOU): another process may claim the port between release and
+ * the gateway's own bind. The gateway's bind is authoritative — callers
+ * must treat a later EADDRINUSE / early-exit as the real signal, never the
+ * probe result.
+ */
+export async function allocateLoopbackPort(): Promise<number> {
+  const server = createServer();
+  await new Promise<void>((resolvePromise, rejectPromise) => {
+    server.once("error", rejectPromise);
+    server.listen(0, "127.0.0.1", () => resolvePromise());
+  });
+  const address = server.address();
+  const port = typeof address === "object" && address !== null ? address.port : 0;
+  await new Promise<void>((resolvePromise) => server.close(() => resolvePromise()));
+  if (!port) throw new Error("failed to allocate a loopback port");
+  return port;
+}
+
+/**
+ * Occupancy preflight with an unambiguous occupied/free answer. Single bind
+ * attempt on 127.0.0.1: EADDRINUSE => occupied (true); successful listen =>
+ * free (false). Loopback-only by construction: there is no host parameter,
+ * so this helper cannot probe (or bind) a non-loopback address. The probe
+ * socket is closed immediately and no foreign listener is ever touched (no
+ * connect flood, no kill, no SO_REUSEPORT takeover).
+ *
+ * Same TOCTOU caveat as allocateLoopbackPort: a "free" answer is advisory
+ * only — the gateway's own bind is authoritative.
+ */
+export async function checkLoopbackPortOccupied(port: number): Promise<boolean> {
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error(`invalid loopback port for occupancy probe: ${port}`);
+  }
+  return await new Promise<boolean>((resolvePromise, rejectPromise) => {
+    const probe = createServer();
+    probe.once("error", (error: NodeJS.ErrnoException) => {
+      if (error?.code === "EADDRINUSE") {
+        resolvePromise(true);
+      } else {
+        rejectPromise(error);
+      }
+    });
+    probe.listen(port, "127.0.0.1", () => {
+      probe.close(() => resolvePromise(false));
+    });
+  });
+}
 
 export interface OpenClawExecutable {
   /**
@@ -376,12 +430,18 @@ export class OpenClawGatewayProcess {
   /**
    * Verifies the executable (one `--version` probe under the minimal env),
    * then starts the gateway. Resolves once the process survives the early
-   * window; callers wait for protocol readiness (hello-ok) via the client —
-   * never for a log substring.
+   * window — that means the CHILD WAS SPAWNED AND IS ALIVE, not that the
+   * gateway is protocol-ready. Callers wait for protocol readiness
+   * (hello-ok) via the client — never for a log substring, never for this
+   * return. The 1.5 s window only filters fast crashes (bad binary, bad
+   * config, occupied port); a slow boot that passes the window but never
+   * reaches hello-ok is still a startup failure at the hello-ok deadline
+   * (default 30 s, unchanged).
    *
    * A spawn-level error (missing/permission-denied executable) rejects
    * immediately instead of being mistaken for a running child. A child that
-   * exits 78 (EX_CONFIG) triggers one `doctor --fix` repair and one retry.
+   * exits 78 (EX_CONFIG) triggers one `doctor --fix` repair under the same
+   * minimal env and one retry.
    */
   async start(): Promise<void> {
     if (this.state === "running" || this.state === "starting") {
@@ -395,9 +455,14 @@ export class OpenClawGatewayProcess {
     }
 
     this.child = this.spawnGateway();
+    const spawnedPid = this.child.pid ?? null;
     const first = await this.waitForEarlyExitOrError(1500);
     if (first === null) {
       this.state = "running";
+      this.log(
+        `[adapter] child spawned (pid ${spawnedPid}) and alive past the 1.5s early-exit window ` +
+          `— NOT protocol-ready; awaiting hello-ok on loopback port ${this.layout.port}`,
+      );
       return;
     }
     if (first.kind === "error") {
@@ -424,9 +489,14 @@ export class OpenClawGatewayProcess {
     await this.runDoctorRepair();
     this.state = "starting";
     this.child = this.spawnGateway();
+    const retriedPid = this.child.pid ?? null;
     const second = await this.waitForEarlyExitOrError(1500);
     if (second === null) {
       this.state = "running";
+      this.log(
+        `[adapter] child spawned after repair (pid ${retriedPid}) and alive past the 1.5s early-exit window ` +
+          `— NOT protocol-ready; awaiting hello-ok on loopback port ${this.layout.port}`,
+      );
       return;
     }
     this.state = "failed";

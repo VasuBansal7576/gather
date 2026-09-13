@@ -12,7 +12,9 @@ export {
 } from "./config.ts";
 export {
   OpenClawGatewayProcess,
+  allocateLoopbackPort,
   buildGatewayChildEnv,
+  checkLoopbackPortOccupied,
   ensureGatewayToken,
   ensureMcpToken,
   tokenFilePath,
