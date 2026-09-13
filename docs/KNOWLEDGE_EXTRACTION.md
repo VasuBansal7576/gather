@@ -155,19 +155,24 @@ facts; partial batches name every rejection.
 registered by default — the host constructs it with a validated
 `{businessId, accountId}` scope and the runtime's task channel.
 
-- One deterministic session per scope (`bookingSessionKey` over
-  `extraction:<businessId>:<accountId>`); the caller's persisted
-  idempotency key folds into a scope-bound gateway key via
-  `stableTaskIdempotencyKey`, so retries dedupe and no foreign scope's run
-  can be adopted.
+- One isolated stable session per task (`bookingSessionKey` over
+  `extraction:<businessId>:<accountId>:<idempotencyKey>:<sourceDigest>`);
+  the caller's persisted idempotency key plus the pinned digest fold into a
+  scope-bound gateway key via `stableTaskIdempotencyKey`, so retries dedupe
+  and no foreign scope/task/digest run can be adopted. A resubmitted caller
+  key supersedes its older run ids explicitly instead of aliasing.
 - The instruction pins the source digest, carries an in-text task marker
-  (`gather-extraction:<idempotencyKey>`), fences source text as untrusted
-  content, and grants the model no approval/spend/send authority.
+  (`gather-extraction:<idempotencyKey>`) matched as an exact marker line,
+  fences source text as untrusted content, and grants the model no
+  approval/spend/send authority. Model text and echoed markers are never
+  identity authority — the session binding and trusted envelope are.
 - `awaitExtraction` only accepts run ids this scope submitted, maps wait
   statuses 1:1 (`timeout` stays wait-only, `error` covers cancellation),
-  and on `ok` reads the scoped history for the first assistant text after
-  the marker message — parsed strictly to `unknown` under a byte bound.
-  Channel failures throw `BackendUnavailableError` → `backend_unavailable`.
+  and on `ok` reads the task's own session history for the first assistant
+  text after the marker message — parsed strictly to `unknown` under a byte
+  bound. Channel failures throw `BackendUnavailableError` →
+  `backend_unavailable`. The submitted-run map is in-memory: pre-restart run
+  ids await as `unknown` until the caller re-submits.
 
 Tests fake only the gateway channel with explicit simulated fixtures
 (`simulated: true`). No live model, provider, gateway, or credentials were
