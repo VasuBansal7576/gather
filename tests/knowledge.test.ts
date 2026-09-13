@@ -250,20 +250,35 @@ test("scoped exceptions stay versioned under their scope and never globalize", (
   try {
     const exception = service.addScopedException({
       businessId, scope: "booking", scopeId: "booking-42",
-      value: { exceptionId: "ex-1", allowUnderMinimum: true },
+      policyId: "amplified-music", effect: "allow",
+      value: { allowUnderMinimum: true },
       actor: OWNER,
     });
     assert.equal(exception.fact.key, "scoped_exception");
     assert.equal(exception.revision.scope, "booking");
     assert.equal(exception.revision.scopeId, "booking-42");
-    assert.equal((exception.fact.value as Record<string, unknown>).scopeId, "booking-42");
+    assert.equal((exception.fact.value as Record<string, unknown>).scopeId, undefined);
+    assert.deepEqual((exception.fact.value as Record<string, unknown>).scope, { bookingId: "booking-42" });
+    assert.equal((exception.fact.value as Record<string, unknown>).policyId, "amplified-music");
+    assert.equal((exception.fact.value as Record<string, unknown>).effect, "allow");
+    assert.equal((exception.fact.value as Record<string, unknown>).approvedBy, "fictional-owner-1");
     // A value that contradicts the command scope is rejected.
     assert.throws(
       () => service.addScopedException({
         businessId, scope: "customer", scopeId: "cust-1",
-        value: { scopeId: "cust-OTHER" }, actor: OWNER,
+        policyId: "amplified-music", effect: "allow",
+        value: { scope: { customerId: "cust-OTHER" } }, actor: OWNER,
       }),
       /contradicts the command scope/,
+    );
+    // Client-supplied authority is rejected, never normalized.
+    assert.throws(
+      () => service.addScopedException({
+        businessId, scope: "booking", scopeId: "booking-43",
+        policyId: "amplified-music", effect: "allow",
+        value: { approvedBy: "mallory" }, actor: OWNER,
+      }),
+      /authority/,
     );
     const snapshot = service.snapshotForOffers(businessId);
     assert.equal(snapshot.scopedFactCount, 1);
