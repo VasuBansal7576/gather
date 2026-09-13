@@ -91,7 +91,7 @@ function fakeVerifiers(log: CallLog, overrides: Partial<{
     { resolver: "calendar_provider", calendarId: "cal-1", startAt: "2030-06-01T17:00:00.000Z", endAt: "2030-06-01T23:00:00.000Z", available: true, observedAt: "2030-05-01T11:58:00.000Z", sourceRefs: [liveRef("cal://att")] },
   ];
   const resources: ResourceCommitment[] = overrides.resources ?? [
-    { resolver: "resource_registry", bookingId: "booking-1", resourceId: "room-a", status: "committed", observedAt: "2030-05-01T11:00:00.000Z", sourceRefs: [liveRef("registry://room-a")] },
+    { resolver: "resource_registry", bookingId: "booking-1", resourceId: "room-a", proposalVersion: 2, proposalFingerprint: "fp-abc", status: "committed", startAt: "2030-06-01T17:00:00.000Z", endAt: "2030-06-01T23:00:00.000Z", observedAt: "2030-05-01T11:00:00.000Z", sourceRefs: [liveRef("registry://room-a")] },
   ];
   return {
     loadPolicy: async (query) => { log.policy.push(query); return overrides.policy ?? policy(); },
@@ -122,7 +122,7 @@ test("verifiers are called with the exact binding and readiness confirms", async
   assert.deepEqual(log.acceptance, [{ businessId: "biz-1", bookingId: "booking-1", proposalVersion: 2, proposalFingerprint: "fp-abc" }]);
   assert.deepEqual(log.deposits, [{ businessId: "biz-1", bookingId: "booking-1" }]);
   assert.deepEqual(log.availability, [{ businessId: "biz-1", calendarId: "cal-1", startAt: WIN_START, endAt: WIN_END }]);
-  assert.deepEqual(log.resources, [{ businessId: "biz-1", bookingId: "booking-1", resourceIds: ["room-a"] }]);
+  assert.deepEqual(log.resources, [{ businessId: "biz-1", bookingId: "booking-1", proposalVersion: 2, proposalFingerprint: "fp-abc", resourceIds: ["room-a"] }]);
 });
 
 test("raw caller input cannot supply policy, evidence, or waivers", async () => {
@@ -198,7 +198,7 @@ test("resource commitments must cover the event window", async () => {
     proposal: proposal(),
     verifiers: fakeVerifiers(log, {
       resources: [
-        { resolver: "resource_registry", bookingId: "booking-1", resourceId: "room-a", status: "committed", validUntil: "2030-06-01T19:00:00.000Z", observedAt: "2030-05-01T11:00:00.000Z", sourceRefs: [liveRef("registry://room-a")] },
+        { resolver: "resource_registry", bookingId: "booking-1", resourceId: "room-a", proposalVersion: 2, proposalFingerprint: "fp-abc", status: "committed", startAt: "2030-06-01T17:00:00.000Z", endAt: "2030-06-01T19:00:00.000Z", observedAt: "2030-05-01T11:00:00.000Z", sourceRefs: [liveRef("registry://room-a")] },
       ],
     }),
   });

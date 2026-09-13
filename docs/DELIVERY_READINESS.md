@@ -44,25 +44,35 @@ const handoff = buildHandoff({ decision, booking, proposal });
 - **Acceptance:** exact-version record verifies; revoked or
   other-version-only records conflict.
 - **Deposit:** net settled receipts (amount minus refunds) in the required
-  currency sum to the required amount (split payments supported). Pending
-  receipts do not verify; rejected/refunded/revoked receipts are excluded;
-  wrong currency conflicts; partial payment is `missing` with net
-  paid-vs-required detail.
+  currency sum to the required amount (split payments supported). Receipts
+  dedupe by receiptId: identical redeliveries collapse to one, while
+  conflicting status/amount/refund snapshots for one id fail closed as
+  `conflicting`. Pending receipts do not verify;
+  rejected/refunded/revoked receipts are excluded; wrong currency
+  conflicts; partial payment is `missing` with net paid-vs-required
+  detail.
 - **Availability:** a current provider attestation must fully cover the
   accepted window. Unknown windows are `missing`, old proofs and expired
   holds are `stale`, unavailable slots conflict. A hold alone — without a
   current available attestation — never verifies.
 - **Resources:** every required resource needs an explicit, current
-  `committed` status whose time window covers the event.
-  `requested` is `missing`, expired evidence is `stale`, rejected/revoked
-  evidence conflicts, and committed-plus-revoked ambiguity conflicts.
+  `committed` status bound to the exact proposal version/fingerprint,
+  whose start/end commitment window covers the event window. Stale
+  revisions and short windows are rejected as evidence; `requested` is
+  `missing`, expired evidence is `stale`, rejected/revoked evidence
+  conflicts, and committed-plus-revoked ambiguity conflicts.
+- **Window consistency:** the booking snapshot and accepted proposal must
+  describe the same event window (availability reads the proposal, handoff
+  and lifecycle guards read the booking); mismatches throw instead of
+  averaging.
 - **Trusted resolver boundary:** only `acceptance_record`,
   `deposit_ledger`, `calendar_provider`, `resource_registry`, and
   `owner_authority` outputs count. Malformed shapes, unknown resolvers, and
   arbitrary `verified: true` flags are rejected as evidence (listed in
   `rejectedEvidence`), never verifying.
 - **Waivers:** only persisted waivers scoped to business, booking,
-  condition, and proposal version under an owner identity verify.
+  condition, proposal version **and** fingerprint under an owner identity
+  verify. Version alone never scopes a waiver.
 - **Provenance:** `live` (all binding evidence live), `demo` (all
   fictional — ready but never `liveReady`), `mixed` (blocks confirmation),
   `none`. Fixture evidence cannot produce live-ready status.
@@ -83,9 +93,13 @@ or services are fabricated. Provenance travels with the handoff.
 - `tests/delivery.verifiers.test.ts` — 6 tests (host boundary: exact
   binding queries, hostile input rejection, cancelled/past blocks, net
   refunds, window coverage, fail-closed verifiers).
-- Full suite: 83 tests pass; `npm run typecheck` clean (see commit).
+- `tests/delivery.defects.test.ts` — 5 regression tests (duplicate
+  receiptId collapse, conflicting snapshot fail-closed, resource
+  revision/window binding, waiver fingerprint scope, window-mismatch
+  rejection).
+- Full suite: 88 tests pass; `npm run typecheck` clean (see commit).
   These are module tests with injected fakes; they do not establish live
-  provider integration acceptance.
+  provider integration acceptance and do not prove live confirmation.
 
 ## Integration left (not claimed)
 

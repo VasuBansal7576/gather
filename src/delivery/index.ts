@@ -1,7 +1,7 @@
 export { evaluateReadiness } from "./readiness.ts";
 export { buildHandoff } from "./handoff.ts";
 export { evaluateBookingReadiness } from "./verifiers.ts";
-export { assertValidEvaluateInput, assertValidHandoffInput, assertConditionConfig } from "./contracts.ts";
+export { assertValidEvaluateInput, assertValidHandoffInput, assertConditionConfig, requireConsistentWindows } from "./contracts.ts";
 export type {
   AcceptedProposal,
   AcceptanceRecord,

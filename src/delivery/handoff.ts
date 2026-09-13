@@ -1,4 +1,4 @@
-import { assertValidHandoffInput } from "./contracts.ts";
+import { assertValidHandoffInput, requireConsistentWindows } from "./contracts.ts";
 import type {
   BuildHandoffInput,
   ConditionResult,
@@ -39,6 +39,7 @@ export function buildHandoff(raw: unknown): OperationalHandoff {
   ) {
     throw new Error("Handoff binding mismatch: decision, booking, and proposal must share the accepted version identity");
   }
+  requireConsistentWindows(booking, proposal.payload);
 
   const outstanding: string[] = [];
   for (const condition of decision.conditions as ConditionResult[]) {

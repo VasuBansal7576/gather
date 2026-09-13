@@ -1,4 +1,4 @@
-import { assertValidEvaluateInput } from "./contracts.ts";
+import { assertValidEvaluateInput, requireConsistentWindows } from "./contracts.ts";
 import type { SourceReference } from "../domain/contracts.ts";
 import type {
   AcceptanceRecord,
@@ -130,11 +130,17 @@ function classifyAvailability(item: Record<string, unknown>): AvailabilityAttest
 function classifyResource(item: Record<string, unknown>): ResourceCommitment | string {
   if (!isNonEmptyString(item.bookingId)) return "resource_registry output without bookingId";
   if (!isNonEmptyString(item.resourceId)) return "resource_registry output without resourceId";
+  if (typeof item.proposalVersion !== "number" || !Number.isInteger(item.proposalVersion)) {
+    return "resource_registry output without integer proposalVersion";
+  }
+  if (!isNonEmptyString(item.proposalFingerprint)) return "resource_registry output without proposalFingerprint";
   const statuses = ["committed", "requested", "rejected", "revoked", "expired"] as const;
   if (typeof item.status !== "string" || !(statuses as readonly string[]).includes(item.status)) {
     return "resource_registry output without a known commitment status";
   }
-  if (item.validUntil !== undefined && !isIso(item.validUntil)) return "resource_registry output with invalid validUntil";
+  if (!isIso(item.startAt) || !isIso(item.endAt) || Date.parse(item.startAt as string) >= Date.parse(item.endAt as string)) {
+    return "resource_registry output without a valid start/end commitment window";
+  }
   if (item.responsible !== undefined && typeof item.responsible !== "string") {
     return "resource_registry output with invalid responsible";
   }
@@ -144,8 +150,11 @@ function classifyResource(item: Record<string, unknown>): ResourceCommitment | s
     resolver: "resource_registry",
     bookingId: item.bookingId,
     resourceId: item.resourceId,
+    proposalVersion: item.proposalVersion,
+    proposalFingerprint: item.proposalFingerprint,
     status: item.status as ResourceCommitment["status"],
-    validUntil: isIso(item.validUntil) ? (item.validUntil as string) : undefined,
+    startAt: item.startAt as string,
+    endAt: item.endAt as string,
     responsible: typeof item.responsible === "string" && item.responsible.length > 0 ? item.responsible : undefined,
     observedAt: item.observedAt,
     sourceRefs: item.sourceRefs,
@@ -164,6 +173,7 @@ function classifyWaiver(item: unknown): OwnerWaiver | string {
   if (typeof item.proposalVersion !== "number" || !Number.isInteger(item.proposalVersion)) {
     return "waiver without integer proposalVersion";
   }
+  if (!isNonEmptyString(item.proposalFingerprint)) return "waiver without proposalFingerprint";
   if (!isNonEmptyString(item.waivedBy)) return "waiver without owner identity (waivedBy)";
   if (!isIso(item.waivedAt)) return "waiver without waivedAt timestamp";
   if (!isNonEmptyString(item.reason)) return "waiver without reason";
@@ -174,6 +184,7 @@ function classifyWaiver(item: unknown): OwnerWaiver | string {
     bookingId: item.bookingId,
     condition: item.condition as OwnerWaiver["condition"],
     proposalVersion: item.proposalVersion,
+    proposalFingerprint: item.proposalFingerprint,
     waivedBy: item.waivedBy,
     waivedAt: item.waivedAt,
     reason: item.reason,
@@ -206,7 +217,8 @@ function matchWaiver(ctx: EvalContext, kind: ConditionConfig["kind"]): OwnerWaiv
       waiver.businessId === ctx.input.businessId &&
       waiver.bookingId === ctx.input.booking.id &&
       waiver.condition === kind &&
-      waiver.proposalVersion === ctx.input.proposal.proposalVersion
+      waiver.proposalVersion === ctx.input.proposal.proposalVersion &&
+      waiver.proposalFingerprint === ctx.input.proposal.proposalFingerprint
     ) {
       return waiver;
     }
@@ -265,9 +277,34 @@ function evaluateDeposit(ctx: EvalContext, cfg: ConditionConfig): ConditionResul
   if (receipts.length === 0) {
     return { ...base, status: "missing", detail: `No deposit receipts: required ${requirement.requiredAmountCents} ${requirement.currency}` };
   }
-  const freshReceipts = receipts.filter((receipt) => fresh(receipt.observedAt, ctx.nowMs, cfg.maxAgeMs));
+  // Identity dedupe: repeated rows for the same receiptId are one receipt.
+  // Snapshots that disagree on status, amount, currency, or refunds fail
+  // closed instead of summing twice.
+  const byReceipt = new Map<string, DepositReceipt[]>();
+  for (const receipt of receipts) {
+    const group = byReceipt.get(receipt.receiptId) ?? [];
+    group.push(receipt);
+    byReceipt.set(receipt.receiptId, group);
+  }
+  const canonical: DepositReceipt[] = [];
+  for (const [receiptId, snapshots] of byReceipt) {
+    const first = snapshots[0];
+    if (!first) continue;
+    const divergent = snapshots.some(
+      (snapshot) =>
+        snapshot.status !== first.status ||
+        snapshot.amountCents !== first.amountCents ||
+        snapshot.currency !== first.currency ||
+        (snapshot.refundedCents ?? 0) !== (first.refundedCents ?? 0),
+    );
+    if (divergent) {
+      return { ...base, status: "conflicting", detail: `Conflicting ledger snapshots for receipt ${receiptId}; deposit cannot be verified until the ledger agrees`, evidence: snapshots.flatMap((snapshot) => snapshot.sourceRefs) };
+    }
+    canonical.push(first);
+  }
+  const freshReceipts = canonical.filter((receipt) => fresh(receipt.observedAt, ctx.nowMs, cfg.maxAgeMs));
   if (freshReceipts.length === 0) {
-    return { ...base, status: "stale", detail: "Deposit evidence is older than the allowed evidence age; re-verify the deposit", evidence: receipts.flatMap((receipt) => receipt.sourceRefs) };
+    return { ...base, status: "stale", detail: "Deposit evidence is older than the allowed evidence age; re-verify the deposit", evidence: canonical.flatMap((receipt) => receipt.sourceRefs) };
   }
   const inCurrency = freshReceipts.filter((receipt) => receipt.currency === requirement.currency);
   if (inCurrency.length === 0) {
@@ -343,22 +380,36 @@ function evaluateResources(ctx: EvalContext, cfg: ConditionConfig): ConditionRes
   if (waiver) return waivedResult(cfg.kind, cfg.required, waiver);
   const requiredIds = cfg.resources?.requiredResourceIds ?? [];
   const maxAge = cfg.maxAgeMs ?? DEFAULT_RESOURCE_MAX_AGE_MS;
+  // Exact-revision binding: commitments for another proposal version or
+  // fingerprint are rejected as evidence, never verified.
+  const bound: ResourceCommitment[] = [];
+  for (const commit of ctx.classified.resources) {
+    if (
+      commit.proposalVersion !== ctx.input.proposal.proposalVersion ||
+      commit.proposalFingerprint !== ctx.input.proposal.proposalFingerprint
+    ) {
+      ctx.rejectedEvidence.push(
+        `rejected resource_registry output for ${commit.resourceId}: binds v${commit.proposalVersion}, accepted proposal is v${ctx.input.proposal.proposalVersion}`,
+      );
+    } else {
+      bound.push(commit);
+    }
+  }
+  const eventStart = eventStartIso(ctx.input);
   const eventEnd = eventEndIso(ctx.input);
-  const coversEvent = (validUntil: string | undefined): boolean => {
-    if (!validUntil) return true;
-    if (Date.parse(validUntil) <= ctx.nowMs) return false;
-    if (eventEnd) return Date.parse(validUntil) >= Date.parse(eventEnd);
-    return true;
+  const coversEvent = (commit: ResourceCommitment): boolean => {
+    if (!eventStart || !eventEnd) return false;
+    return Date.parse(commit.startAt) <= Date.parse(eventStart) && Date.parse(commit.endAt) >= Date.parse(eventEnd);
   };
   const breakdown: ResourceResult[] = requiredIds.map((resourceId) => {
-    const commits = ctx.classified.resources.filter((commit) => commit.resourceId === resourceId);
-    if (commits.length === 0) return { resourceId, status: "missing" as const, detail: "No commitment evidence" };
+    const commits = bound.filter((commit) => commit.resourceId === resourceId);
+    if (commits.length === 0) return { resourceId, status: "missing" as const, detail: "No commitment evidence for the accepted version" };
     const current = commits.filter((commit) => fresh(commit.observedAt, ctx.nowMs, maxAge));
     if (current.length === 0) {
       return { resourceId, status: "stale" as const, detail: "Commitment evidence is older than the allowed evidence age; re-verify" };
     }
-    const committed = current.filter((commit) => commit.status === "committed" && coversEvent(commit.validUntil));
-    const shortWindow = current.filter((commit) => commit.status === "committed" && !coversEvent(commit.validUntil));
+    const committed = current.filter((commit) => commit.status === "committed" && coversEvent(commit));
+    const shortWindow = current.filter((commit) => commit.status === "committed" && !coversEvent(commit));
     const bad = current.filter((commit) => commit.status === "rejected" || commit.status === "revoked");
     if (committed.length > 0 && bad.length > 0) {
       return { resourceId, status: "conflicting" as const, detail: "Conflicting commitment and rejection/revocation evidence" };
@@ -371,15 +422,15 @@ function evaluateResources(ctx: EvalContext, cfg: ConditionConfig): ConditionRes
       return { resourceId, status: "conflicting" as const, detail: `Resource ${bad[0]?.status}; commitment required` };
     }
     if (shortWindow.length > 0) {
-      return { resourceId, status: "missing" as const, detail: `Commitment does not cover the event window (valid until ${shortWindow[0]?.validUntil})` };
+      return { resourceId, status: "missing" as const, detail: `Commitment window ${shortWindow[0]?.startAt}..${shortWindow[0]?.endAt} does not cover the event window` };
     }
-    if (current.some((commit) => commit.status === "expired" || (commit.validUntil && Date.parse(commit.validUntil) <= ctx.nowMs))) {
+    if (current.some((commit) => commit.status === "expired")) {
       return { resourceId, status: "stale" as const, detail: "Commitment expired; re-verify" };
     }
     return { resourceId, status: "missing" as const, detail: "Requested but not committed; explicit commitment required" };
   });
   const evidence = breakdown.flatMap((item) =>
-    ctx.classified.resources.filter((commit) => commit.resourceId === item.resourceId).flatMap((commit) => commit.sourceRefs),
+    bound.filter((commit) => commit.resourceId === item.resourceId).flatMap((commit) => commit.sourceRefs),
   );
   if (breakdown.some((item) => item.status === "conflicting")) {
     return { ...base, status: "conflicting", detail: "Conflicting resource evidence; see per-resource breakdown", evidence, resources: breakdown };
@@ -393,11 +444,22 @@ function evaluateResources(ctx: EvalContext, cfg: ConditionConfig): ConditionRes
   return { ...base, status: "verified", detail: `All ${breakdown.length} required resources explicitly committed`, evidence, resources: breakdown };
 }
 
+function eventStartIso(input: EvaluateReadinessInput): string | null {
+  if (isIso(input.booking.startAt)) return input.booking.startAt;
+  const payloadStart: unknown = input.proposal.payload.startAt;
+  if (isIso(payloadStart)) return payloadStart;
+  return null;
+}
+
 function eventEndIso(input: EvaluateReadinessInput): string | null {
   if (isIso(input.booking.endAt)) return input.booking.endAt;
   const payloadEnd: unknown = input.proposal.payload.endAt;
   if (isIso(payloadEnd)) return payloadEnd;
   return null;
+}
+
+function normalizeIso(value: string): string {
+  return new Date(Date.parse(value)).toISOString();
 }
 
 /**
@@ -427,6 +489,7 @@ export function evaluateReadiness(raw: unknown): ReadinessDecision {
   if (input.policy.businessId !== input.businessId) {
     throw new Error("Binding mismatch: confirmation policy belongs to a different business");
   }
+  requireConsistentWindows(input.booking, input.proposal.payload);
 
   const ctx: EvalContext = {
     input,
