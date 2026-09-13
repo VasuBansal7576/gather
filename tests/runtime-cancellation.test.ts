@@ -197,6 +197,11 @@ test("facade stop() during a hung repair settles bounded with no respawn", async
     );
     const starting = runtime.start();
     starting.catch(() => {});
+    // Wait until the repair child is actually in flight: prompt cancellation
+    // before it spawns would abort startup earlier, which is NOT this test.
+    while (runtime.state.process !== "repairing") {
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 5));
+    }
     const startedAt = Date.now();
     await assert.rejects(runtime.stop(), /did not exit after SIGKILL/);
     assert.ok(Date.now() - startedAt < 45000, "facade cancellation settles bounded");
@@ -207,5 +212,166 @@ test("facade stop() during a hung repair settles bounded with no respawn", async
     await assert.rejects(runtime.stop(), /did not exit after SIGKILL/);
   } finally {
     rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+// ---------- R1-R3: ownership/cancellation gap regressions ----------
+
+test("facade stop() during a SUCCEEDING repair aborts the respawn promptly (R1)", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "gather-cancel-r1-"));
+  try {
+    const port = await allocateLoopbackPort();
+    let gatewaySpawns = 0;
+    const spawnFn = ((command: string, args: string[]) => {
+      if (args.includes("doctor")) {
+        const doctor = new StubbornChild({});
+        // Repair SUCCEEDS after 150ms — under the old code the facade
+        // waited for startPromise first, so the gateway respawned before
+        // stop() ever ran. Now stop() must reach the tracked repair
+        // promptly and prevent the respawn.
+        setTimeout(() => doctor.emit("exit", 0, null), 150);
+        return doctor;
+      }
+      gatewaySpawns += 1;
+      const gateway = new StubbornChild({});
+      queueMicrotask(() => gateway.emit("exit", 78, null));
+      return gateway;
+    }) as unknown as SpawnLike;
+    const runtime = new GatherOpenClawRuntime(
+      { rootDir: join(directory, "openclaw"), gatewayPort: port },
+      {
+        processFactory: (opts) =>
+          new OpenClawGatewayProcess(
+            { layout: opts.layout, executable: { command: "/bin/sh" }, log: opts.log },
+            { spawnFn, skipExecutableVerification: true, repairTimeoutMs: 60000 },
+          ),
+        connectionFactory: () => {
+          throw new Error("must never connect after cancellation");
+        },
+      },
+    );
+    const starting = runtime.start();
+    starting.catch(() => {});
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 50)); // repair in flight
+    const startedAt = Date.now();
+    await runtime.stop();
+    assert.ok(Date.now() - startedAt < 10000, "stop cancelled promptly, not after the repair deadline");
+    await assert.rejects(starting, /stop requested during doctor repair|doctor --fix failed/);
+    assert.equal(gatewaySpawns, 1, "no respawn after cancellation — public facade path");
+    assert.equal(runtime.state.process, "stopped");
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("facade stop() kills a hung repair promptly instead of waiting its deadline (R1)", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "gather-cancel-r1b-"));
+  try {
+    const port = await allocateLoopbackPort();
+    const spawnFn = ((command: string, args: string[]) => {
+      if (args.includes("doctor")) return new StubbornChild({}); // exits on SIGKILL
+      const gateway = new StubbornChild({});
+      queueMicrotask(() => gateway.emit("exit", 78, null));
+      return gateway;
+    }) as unknown as SpawnLike;
+    const runtime = new GatherOpenClawRuntime(
+      { rootDir: join(directory, "openclaw"), gatewayPort: port },
+      {
+        processFactory: (opts) =>
+          new OpenClawGatewayProcess(
+            { layout: opts.layout, executable: { command: "/bin/sh" }, log: opts.log },
+            { spawnFn, skipExecutableVerification: true, repairTimeoutMs: 60000 },
+          ),
+        connectionFactory: () => {
+          throw new Error("must never connect while repair is cancelled");
+        },
+      },
+    );
+    const starting = runtime.start();
+    starting.catch(() => {});
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 50));
+    const startedAt = Date.now();
+    await runtime.stop();
+    const elapsed = Date.now() - startedAt;
+    assert.ok(elapsed < 10000, `stop settled in ${elapsed}ms — the repair child was killed promptly, not after 60s+grace`);
+    await assert.rejects(starting);
+    assert.equal(runtime.state.process, "stopped");
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("concurrent start() during repair is rejected and cannot overwrite the owned child (R2)", async () => {
+  const { layout, cleanup } = fixtureLayout();
+  try {
+    ensureLayoutDirectories(layout);
+    const doctor = new StubbornChild({});
+    let gatewaySpawns = 0;
+    const spawnFn = ((command: string, args: string[]) => {
+      if (args.includes("doctor")) return doctor;
+      gatewaySpawns += 1;
+      const gateway = new StubbornChild({});
+      queueMicrotask(() => gateway.emit("exit", 78, null));
+      return gateway;
+    }) as unknown as SpawnLike;
+    const proc = new OpenClawGatewayProcess(
+      { layout, executable: { command: "/bin/sh" } },
+      { spawnFn, skipExecutableVerification: true, repairTimeoutMs: 60000 },
+    );
+    const starting = proc.start();
+    starting.catch(() => {});
+    while (proc.currentState !== "repairing") {
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 5));
+    }
+    await assert.rejects(proc.start(), /already repairing/);
+    await proc.stop(500, 200);
+    await assert.rejects(starting, /doctor --fix failed|stop requested/);
+    assert.equal(gatewaySpawns, 1, "no second spawn, no clobbered child tracking");
+  } finally {
+    cleanup();
+  }
+});
+
+test("start() after a failed stop refuses until the owned child exits; late exit frees it (R3)", async () => {
+  const { layout, cleanup } = fixtureLayout();
+  try {
+    ensureLayoutDirectories(layout);
+    const gateways: StubbornChild[] = [];
+    const spawnFn = (() => {
+      const gateway = new StubbornChild({ exitOnSignal: false });
+      gateways.push(gateway);
+      return gateway;
+    }) as unknown as SpawnLike;
+    const proc = new OpenClawGatewayProcess(
+      { layout, executable: { command: "/bin/sh" } },
+      { spawnFn, skipExecutableVerification: true },
+    );
+    const starting = proc.start();
+    starting.catch(() => {});
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 1700)); // past early-exit window -> running
+    await starting;
+    assert.equal(proc.currentState, "running");
+    // stop() cannot reap a child that never exits: failed, ownership kept.
+    await assert.rejects(proc.stop(100, 100), /did not exit after SIGKILL/);
+    assert.equal(proc.currentState, "failed");
+    // Restart must REFUSE while the possibly-live child is still owned —
+    // never overwrite the tracked reference into an orphan.
+    await assert.rejects(proc.start(), /still owned without an observed exit/);
+    assert.equal(gateways.length, 1, "no respawn while the old child is owned");
+    // The observed exit releases ownership; a new start is then allowed.
+    gateways[0].emit("exit", 137, "SIGKILL");
+    const restarted = proc.start();
+    await restarted;
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 1700));
+    assert.equal(proc.currentState, "running");
+    assert.equal(gateways.length, 2);
+    // A redundant late 'exit' on the old generation cannot clear the new
+    // child's ownership (generational guard).
+    gateways[0].emit("exit", 0, null);
+    assert.equal(proc.currentState, "running", "stale generation exit cannot disturb the new child");
+    gateways[1].emit("exit", 0, "cleanup");
+    await proc.stop(200, 200);
+  } finally {
+    cleanup();
   }
 });
