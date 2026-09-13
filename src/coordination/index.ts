@@ -3,6 +3,7 @@ export {
   assertValidClaimInput,
   assertValidEventInput,
   assertValidListDueWorkInput,
+  assertValidReleaseInput,
   assertValidResolveInput,
   recommendedFor,
 } from "./contracts.ts";
@@ -15,6 +16,7 @@ export type {
   IngestResult,
   ListDueWorkInput,
   RecommendedAction,
+  ReleaseStaleClaimsInput,
   ResolveWaitingInput,
   WaitingItem,
   WaitingKind,

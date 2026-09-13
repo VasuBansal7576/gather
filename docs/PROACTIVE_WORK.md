@@ -38,8 +38,9 @@ ledger.ingestEvent({       // idempotent intake; safe to retry
 });
 
 ledger.listDueWork({ nowIso, limit?, bookingId? }); // pending + due, drain-guarded
-ledger.claimDueWork({ ids, claimedBy, nowIso });    // BEGIN IMMEDIATE; losers get skippedIds
-ledger.resolveWaiting({ id, resolution: "done" | "suppressed" | "invalidated", note? });
+ledger.claimDueWork({ ids, claimedBy, nowIso, leaseMs? }); // atomic rechecks + fencing token
+ledger.releaseStaleClaims({ nowIso }); // recover expired claims to pending
+ledger.resolveWaiting({ id, resolution: "done" | "suppressed" | "invalidated", note?, claimToken? });
 ledger.listWaitingForBooking(bookingId);
 ```
 
@@ -48,40 +49,63 @@ there is no `any` in the module.
 
 ## Semantics
 
-- **Idempotency:** `dedupeKey` is unique. Re-ingest returns
-  `{ duplicate: true }` with no side effects, so restarts and redeliveries
-  collapse safely.
+- **Idempotency with conflict detection:** `dedupeKey` is unique per
+  booking/source scope. Exact redelivery returns `{ duplicate: true }` with
+  no side effects, so restarts and redeliveries collapse safely. Reusing a
+  key with *different* content (different booking, source, timestamps, or
+  payload) throws a conflict instead of silently colliding.
 - **Stale revisions:** intake tracks the max non-stale revision per booking.
   An event with a lower revision is stored with `stale: true` and causes no
   side effects. A `change` with a higher revision invalidates prior pending
-  `change_review` items and raises a fresh one.
+  `change_review` items and raises a fresh one. Late replies older than the
+  latest processed reply are likewise stale. Ordering follows received
+  (monotonic insert) order plus revisions — observed timestamps are
+  preserved as evidence but never decide ordering alone.
 - **Reply-before-followup:** a `reply` suppresses pending `followup` items
   created before the reply's `observedAt`, so an answered inquiry never gets
   an inappropriate reminder. The host must still recheck for newer replies
   immediately before any send (`requiresFreshCheck`).
-- **Pause / cancel:** `pause` moves pending items to `paused` (drain-hidden);
-  `resume` restores them; `cancel` invalidates pending and paused items. The
-  drain additionally hides work when the shared `bookings` row is
-  `cancelled` or its `businesses` row is `paused` (read-only; tolerant of a
-  bare connection without those tables).
-- **Evidence, not authority:** `payment_signal` (e.g. a customer writing
-  "we already paid") creates a `deposit_check` with
+- **Claim-time rechecks:** `claimDueWork` revalidates every id inside the
+  claim transaction — still pending, still due, booking not paused or
+  cancelled, no newer revision, no reply arrived since the drain snapshot.
+  A stale snapshot alone can never hand out obsolete work; replies found at
+  claim time suppress, superseded reviews invalidate.
+- **Claim leases and fencing:** each claim issues an opaque `claimToken`
+  with a lease expiry (default 5 minutes, configurable per claim).
+  `resolveWaiting` on claimed work requires the matching token, so a stale
+  worker cannot complete another worker's claim and duplicate an external
+  effect after uncertainty. `releaseStaleClaims` returns expired,
+  unresolved claims to `pending` for recovery.
+- **Control authority:** `pause`/`resume`/`cancel` are honored only from
+  trusted owner controls (`sourceKind` manual/owner plus an explicit
+  `payload.authorizedBy` owner identity) and reported via `controlHonored`.
+  Customer or provider messages requesting control are recorded but honored
+  as nothing: they raise a `change_review` owner decision instead.
+  `pause` moves pending items to `paused` (drain-hidden); `resume` restores
+  them; trusted `cancel` invalidates pending and paused items. The drain
+  additionally hides work when the shared `bookings` row is `cancelled` or
+  its `businesses` row is `paused` (read-only; tolerant of a bare
+  connection without those tables).
+- **Evidence, not authority:** `payment_signal` message text claiming
+  payment creates a pending `deposit_check` with
   `detail.verifiedPayment: false` and
-  `recommendedAction: verify_deposit_against_authoritative_receipt`. Message
-  text alone never verifies payment, availability, or approval.
-- **Concurrency:** `claimDueWork` flips only rows still `pending` inside
-  `BEGIN IMMEDIATE`; a racing duplicate worker receives those ids in
-  `skippedIds`.
+  `recommendedAction: verify_deposit_against_authoritative_receipt`. Only
+  receipt evidence with `verifiedReceipt: true` plus a receipt locator from
+  a payment-provider or trusted owner/manual source retires the followup —
+  and even then the deposit is recorded as unverified evidence for the
+  confirmation worker (G12), never counted as paid.
 
 ## Verified (module scope only)
 
-`tests/coordination.ledger.test.ts` — 9 tests against real temporary
+`tests/coordination.ledger.test.ts` — 17 tests against real temporary
 SQLite files: restart survival across close/reopen, duplicate collapse,
-reply-before-due suppression, late/stale revisions plus superseding
-changes, pause/resume/cancel, paused-business and cancelled-booking drain
-exclusion, payment-as-evidence-only, single-winner claims, and boundary
-validation. These are module tests; they do **not** establish integration
-acceptance.
+dedupe-content conflicts, reply-before-due suppression, late/stale
+revisions plus superseding changes, trusted pause/resume/cancel,
+untrusted control-as-decision, paused-business and cancelled-booking drain
+exclusion, payment-as-evidence-only, verified-receipt followup retirement,
+single-winner claims, claim-time reply/revision rechecks, claim
+expiry/release with token fencing, and boundary validation. These are
+module tests; they do **not** establish integration acceptance.
 
 ## Wiring that remains (not claimed)
 
