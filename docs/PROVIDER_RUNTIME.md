@@ -29,19 +29,22 @@ provider-runtime -> connections leaves, index -> runtime stays one-way.
 ## Selection rules
 
 - **Fixture/demo**: a booking whose source references are all `fictional`
-  stays on the demo adapters. Fixture calendars (`demo-calendar-001`) also
-  resolve to demo when no action references them.
-- **Real bookings** resolve business -> capability account
-  (`google_calendar` for holds/availability, `gmail` for sends). Only
-  accounts durably bound by an owned `connection_accounts` row qualify —
-  unbound `connected_accounts` rows (fixtures, legacy data, other owners'
-  bindings) never serve real bookings.
-- **Holds and sends** resolve through the durable execution row
-  (`idempotency_key` -> action -> booking), so tenant scope comes from the
-  approved record, not the request.
-- **Availability** has no booking on the request: the owning business is
-  derived from proposal payloads naming the `calendarId`. Zero referents on
-  a non-fixture calendar, or referents in more than one business, fail.
+  stays on the demo adapters; fixture calendars (`demo-calendar-001`)
+  always resolve to demo.
+- **Calendar scope is a durable, host-validated binding** — never inferred
+  from proposals or payloads. `provider_calendar_bindings` records
+  `calendar_id -> business_id + pinned connection_account_id`; the host
+  writes it via `providers.bindCalendar({businessId, calendarId, accountId?})`
+  (verifies a bound, connected `google_calendar` account; one calendar
+  claims one owner — a foreign business's claim conflicts). A request's
+  `calendarId` on a real booking must be bound to that booking's business:
+  unbound -> `not_found`, foreign -> `conflict`, bound-account revoked ->
+  `access_revoked`.
+- **Email sends** resolve through the durable execution row
+  (`idempotency_key` -> action -> booking) to the business's unique
+  connected `gmail` account.
+- **Availability** resolves through the binding alone — it works before any
+  proposal exists.
 
 ## Failure semantics (no silent demo fallback)
 
@@ -52,8 +55,9 @@ All dispatch failures are typed `ConnectorResult` failures, never thrown:
 | Provider app not configured | `unsupported` |
 | No bound account for the capability | `not_found` |
 | Binding revoked/errored | `access_revoked` |
-| More than one connected binding | `conflict` |
-| Calendar unbound or cross-business | `not_found` / `conflict` |
+| More than one connected account (unpinned bind) | `conflict` |
+| Calendar unbound or bound to another business | `not_found` / `conflict` |
+| Real booking routed at a fixture calendar | `conflict` |
 | Unknown operation key | `not_found` |
 
 ## Credential boundary
@@ -66,10 +70,13 @@ account. Tokens never appear in results, DTOs, or errors.
 ## Composition hooks
 
 `createProviderConnectors(options)` returns `{ calendar, email,
-connectionService, resolveAccountPorts }`. `resolveAccountPorts({businessId,
+connectionService, resolveAccountPorts, resolveCalendarPorts, bindCalendar,
+unbindCalendar, listCalendarBindings }`. `resolveAccountPorts({businessId,
 capability})` hands the verified account's Google read ports (`inbox`,
-`threads` for `gmail`; `documents` for `google_drive`) to later
-intake/operator assembly — one resolver, no parallel registry.
+`threads` for `gmail`; `documents` for `google_drive`); `resolveCalendarPorts`
+(`{businessId, calendarId}`) resolves one bound calendar into its live
+connector for offer/intake composition — usable before any proposal exists.
+One resolver, no parallel registry.
 
 ## Limitations
 

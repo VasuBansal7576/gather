@@ -40,8 +40,10 @@ import type { ConnectedAccountDTO } from "../connections/types.ts";
  *   ConnectionService (the same shared instance the routes use). Only
  *   accounts durably bound by an owned, connected connection row qualify —
  *   an unbound account row (fixture or legacy) can never serve a real
- *   booking. Calendar work is bound to the request's explicit calendar id;
- *   email work resolves the booking behind the durable operation key.
+ *   booking. Email work resolves the booking behind the durable operation
+ *   key; calendar work resolves through `provider_calendar_bindings`, a
+ *   durable host-validated calendar -> business+account record — tenant
+ *   scope is never inferred from proposals or model payloads.
  * - Disconnected, revoked, ambiguous, or missing capability bindings produce
  *   typed connector failures — never a silent fall back to demo.
  *
@@ -116,6 +118,17 @@ export class ProviderResolver {
     this.connectionService = options.connectionService;
     this.transport = options.transport ?? createFetchTransport();
     this.userId = options.userId;
+    this.store.db.exec(`
+      CREATE TABLE IF NOT EXISTS provider_calendar_bindings (
+        calendar_id TEXT PRIMARY KEY,
+        business_id TEXT NOT NULL,
+        owner_id TEXT NOT NULL,
+        connection_account_id TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_provider_calendar_bindings_business
+        ON provider_calendar_bindings(business_id);
+    `);
   }
 
   /** The durable execution row binds every operation key to its exact action. */
@@ -173,57 +186,126 @@ export class ProviderResolver {
     return fail("not_found", `No connected ${capability} account for business ${businessId}`);
   }
 
-  /** Fixture or live dispatch for a booking scoped operation. */
-  resolveBooking(bookingId: string, capability: CapabilityProvider): Resolution {
-    let booking: Booking;
+  // ---------------------------------------------------- calendar bindings
+
+  /**
+   * A durable, host-validated calendar binding: exactly one business +
+   * verified calendar-capability account owns a calendar id, and no other
+   * business may claim it. Tenant scope for calendar work comes from THIS
+   * record — never inferred from proposals, payloads, or model output.
+   */
+  private bindingFor(calendarId: string):
+    | { calendarId: string; businessId: string; accountId: string }
+    | undefined {
+    const row = this.store.db
+      .prepare(
+        "SELECT calendar_id, business_id, connection_account_id FROM provider_calendar_bindings WHERE calendar_id = $c AND owner_id = $o",
+      )
+      .get({ $c: calendarId, $o: this.ownerId }) as
+      | { calendar_id: string; business_id: string; connection_account_id: string }
+      | undefined;
+    if (!row) return undefined;
+    return { calendarId: String(row.calendar_id), businessId: String(row.business_id), accountId: String(row.connection_account_id) };
+  }
+
+  /** The DTO for a binding's pinned account, resolved owner-scoped. */
+  private boundAccountFor(businessId: string, accountId: string): ConnectedAccountDTO | undefined {
+    let accounts: ConnectedAccountDTO[];
     try {
-      booking = this.store.getBooking(bookingId);
+      const google = this.connectionService.getConnections(businessId).providers.find((p) => p.provider === "google");
+      if (!google || google.status === "unavailable") return undefined;
+      accounts = google.accounts;
     } catch {
-      return fail("not_found", `Unknown booking ${bookingId}`);
+      return undefined;
     }
-    if (isFixtureBooking(booking)) return { kind: "demo" };
-    return this.resolveCapabilityAccount(booking.businessId, capability);
+    if (!this.boundAccountIds(businessId).has(accountId)) return undefined;
+    return accounts.find((account) => account.id === accountId && account.provider === "google_calendar");
   }
 
-  /** The businesses whose approved proposal payloads name this calendar. */
-  private calendarReferents(calendarId: string): { businessIds: Set<string>; allFixture: boolean } {
-    const businessIds = new Set<string>();
-    let allFixture = true;
+  /**
+   * Host action: durably bind a calendar id to this business's verified
+   * calendar account. `accountId` may pin a specific connected account;
+   * absent, the business must have exactly one connected calendar account.
+   * A calendar already bound to another business conflicts — a foreign
+   * scope can never claim it.
+   */
+  bindCalendar(input: { businessId: string; calendarId: string; accountId?: string }): { ok: true } | { ok: false; error: ConnectorError } {
+    const existing = this.bindingFor(input.calendarId);
+    if (existing && (existing.businessId !== input.businessId || existing.accountId !== (input.accountId ?? existing.accountId))) {
+      return { ok: false, error: { kind: "conflict", message: `Calendar ${input.calendarId} is already bound to another business or account`, retryable: false } };
+    }
+    if (existing) return { ok: true };
+    let accountId = input.accountId;
+    if (accountId !== undefined) {
+      const account = this.boundAccountFor(input.businessId, accountId);
+      if (!account || account.status !== "connected") {
+        return { ok: false, error: { kind: "access_revoked", message: `Account ${accountId} is not a connected calendar account for business ${input.businessId}`, retryable: false } };
+      }
+    } else {
+      const target = this.resolveCapabilityAccount(input.businessId, "google_calendar");
+      if (target.kind !== "live") {
+        return { ok: false, error: target.kind === "fail" ? target.error : { kind: "not_found", message: "No verified calendar account to bind", retryable: false } };
+      }
+      accountId = target.account.id;
+    }
+    this.store.db
+      .prepare(
+        "INSERT INTO provider_calendar_bindings (calendar_id, business_id, owner_id, connection_account_id, created_at) VALUES ($c, $b, $o, $a, $t)",
+      )
+      .run({ $c: input.calendarId, $b: input.businessId, $o: this.ownerId, $a: accountId, $t: new Date().toISOString() });
+    return { ok: true };
+  }
+
+  /** Host action: remove one of this business's calendar bindings. */
+  unbindCalendar(input: { businessId: string; calendarId: string }): { ok: true } | { ok: false; error: ConnectorError } {
+    const existing = this.bindingFor(input.calendarId);
+    if (!existing || existing.businessId !== input.businessId) {
+      return { ok: false, error: { kind: "not_found", message: `Calendar ${input.calendarId} is not bound to business ${input.businessId}`, retryable: false } };
+    }
+    this.store.db
+      .prepare("DELETE FROM provider_calendar_bindings WHERE calendar_id = $c AND owner_id = $o")
+      .run({ $c: input.calendarId, $o: this.ownerId });
+    return { ok: true };
+  }
+
+  /** Owner-scoped listing for setup/diagnostics. */
+  listCalendarBindings(businessId: string): { calendarId: string; accountId: string }[] {
     const rows = this.store.db
-      .prepare("SELECT booking_id, payload_json FROM proposed_actions")
-      .all() as Array<{ booking_id: string; payload_json: string }>;
-    for (const row of rows) {
-      let payload: Record<string, unknown>;
-      try {
-        payload = JSON.parse(String(row.payload_json)) as Record<string, unknown>;
-      } catch {
-        continue;
-      }
-      if (payload.calendarId !== calendarId) continue;
-      try {
-        const booking = this.store.getBooking(String(row.booking_id));
-        businessIds.add(booking.businessId);
-        if (!isFixtureBooking(booking)) allFixture = false;
-      } catch {
-        allFixture = false;
-      }
-    }
-    return { businessIds, allFixture };
+      .prepare(
+        "SELECT calendar_id, connection_account_id FROM provider_calendar_bindings WHERE business_id = $b AND owner_id = $o ORDER BY calendar_id",
+      )
+      .all({ $b: businessId, $o: this.ownerId }) as Array<{ calendar_id: string; connection_account_id: string }>;
+    return rows.map((row) => ({ calendarId: String(row.calendar_id), accountId: String(row.connection_account_id) }));
   }
 
-  /** Availability scope: fixture calendar -> demo, otherwise exactly one live business must reference it. */
+  /**
+   * The calendar connector for one bound calendar. Resolution order:
+   * fixture calendar -> demo; durable binding -> the pinned verified
+   * account (revocation stays visible); anything else -> not_found. The
+   * proposal/action payload can never establish scope on its own.
+   */
+  /** Booking lookup shared by dispatchers (throws when unknown). */
+  bookingFor(bookingId: string): Booking {
+    return this.store.getBooking(bookingId);
+  }
+
+  resolveBoundCalendar(calendarId: string): Resolution {
+    if (this.fixtureCalendars.has(calendarId)) return { kind: "demo" };
+    const binding = this.bindingFor(calendarId);
+    if (!binding) {
+      return fail("not_found", `Calendar ${calendarId} is not bound to a verified account — bind it via the host before any live operation`);
+    }
+    const account = this.boundAccountFor(binding.businessId, binding.accountId);
+    if (!account) return fail("not_found", `The account bound to calendar ${calendarId} no longer exists`);
+    if (account.status !== "connected") {
+      return fail("access_revoked", `The account bound to calendar ${calendarId} is ${account.status}, not connected`);
+    }
+    return { kind: "live", businessId: binding.businessId, account };
+  }
+
+  /** Availability scope: fixture -> demo; bound -> pinned account; otherwise fail. */
   resolveCalendarScope(calendarId: string): Resolution {
-    const { businessIds, allFixture } = this.calendarReferents(calendarId);
-    if (businessIds.size === 0) {
-      return this.fixtureCalendars.has(calendarId)
-        ? { kind: "demo" }
-        : fail("not_found", `Calendar ${calendarId} is not bound to any verified connection`);
-    }
-    if (businessIds.size > 1) {
-      return fail("conflict", `Calendar ${calendarId} is referenced by proposals in ${businessIds.size} businesses — scope is ambiguous`);
-    }
-    if (allFixture) return { kind: "demo" };
-    return this.resolveCapabilityAccount([...businessIds][0], "google_calendar");
+    return this.resolveBoundCalendar(calendarId);
   }
 
   /**
@@ -248,6 +330,26 @@ export class ProviderResolver {
     }
     if (input.capability === "google_drive") ports.documents = set.documents;
     return { ok: true, ports };
+  }
+
+  /**
+   * The host-facing calendar port for offer/intake composition: resolves
+   * one explicitly bound calendar (host-validated business + durable
+   * binding + verified pinned account) into the live calendar connector.
+   * Unbound, foreign, or fixture calendars fail closed.
+   */
+  resolveCalendarPorts(input: { businessId: string; calendarId: string }): { ok: true; ports: { account: ConnectedAccountDTO; calendar: CalendarConnector } } | { ok: false; error: ConnectorError } {
+    const target = this.resolveBoundCalendar(input.calendarId);
+    if (target.kind !== "live") {
+      return {
+        ok: false,
+        error: target.kind === "fail" ? target.error : { kind: "unsupported", message: "Fixture scope has no live calendar ports", retryable: false },
+      };
+    }
+    if (target.businessId !== input.businessId) {
+      return { ok: false, error: { kind: "conflict", message: `Calendar ${input.calendarId} is bound to a different business`, retryable: false } };
+    }
+    return { ok: true, ports: { account: target.account, calendar: this.googleFor(target.account, input.calendarId).calendar } };
   }
 
   /**
@@ -320,9 +422,29 @@ export class DispatchingCalendar implements CalendarConnector {
   }
 
   async createProvisionalHold(request: CreateProvisionalHoldRequest): Promise<ConnectorResult<CreateProvisionalHoldResponse>> {
-    const target = this.resolver.resolveBooking(request.bookingId, "google_calendar");
-    if (target.kind === "demo") return this.demo.calendar.createProvisionalHold(request);
+    let booking: Booking;
+    try {
+      booking = this.resolver.bookingFor(request.bookingId);
+    } catch {
+      return failure(request.operationKey, { kind: "not_found", message: `Unknown booking ${request.bookingId}`, retryable: false });
+    }
+    if (isFixtureBooking(booking)) return this.demo.calendar.createProvisionalHold(request);
+    const target = this.resolver.resolveBoundCalendar(request.calendarId);
+    if (target.kind === "demo") {
+      return failure(request.operationKey, {
+        kind: "conflict",
+        message: `Booking ${request.bookingId} is a real booking but calendar ${request.calendarId} is a fixture scope`,
+        retryable: false,
+      });
+    }
     if (target.kind === "fail") return failure(request.operationKey, target.error);
+    if (target.businessId !== booking.businessId) {
+      return failure(request.operationKey, {
+        kind: "conflict",
+        message: `Calendar ${request.calendarId} is bound to a different business — the approved payload cannot reroute scope`,
+        retryable: false,
+      });
+    }
     return this.resolver.googleFor(target.account, request.calendarId).calendar.createProvisionalHold(request);
   }
 
@@ -332,9 +454,26 @@ export class DispatchingCalendar implements CalendarConnector {
       return failure(request.operationKey, { kind: "not_found", message: "No durable operation record for this hold key", retryable: false });
     }
     if (isFixtureBooking(context.booking)) return this.demo.calendar.reconcileProvisionalHold(request);
-    const target = this.resolver.resolveCapabilityAccount(context.booking.businessId, "google_calendar");
-    if (target.kind !== "live") return failure(request.operationKey, target.kind === "fail" ? target.error : { kind: "unsupported", message: "unreachable", retryable: false });
     const calendarId = isNonEmpty(context.action.payload.calendarId) ? context.action.payload.calendarId : undefined;
+    if (calendarId === undefined) {
+      return failure(request.operationKey, { kind: "not_found", message: "The durable action payload carries no calendar id", retryable: false });
+    }
+    const target = this.resolver.resolveBoundCalendar(calendarId);
+    if (target.kind !== "live") {
+      return failure(
+        request.operationKey,
+        target.kind === "fail"
+          ? target.error
+          : { kind: "conflict", message: `Hold scope ${calendarId} resolved to a fixture calendar for a real booking`, retryable: false },
+      );
+    }
+    if (target.businessId !== context.booking.businessId) {
+      return failure(request.operationKey, {
+        kind: "conflict",
+        message: `Calendar ${calendarId} is bound to a different business — refusing to reconcile in a foreign scope`,
+        retryable: false,
+      });
+    }
     return this.resolver.googleFor(target.account, calendarId).calendar.reconcileProvisionalHold(request);
   }
 }
@@ -379,6 +518,16 @@ export interface ProviderConnectors {
   connectionService: ConnectionService;
   /** Server-scoped verified account → Google read ports (inbox/threads/documents). */
   resolveAccountPorts(input: { businessId: string; capability: ReadCapability }): { ok: true; ports: GoogleAccountPorts } | { ok: false; error: ConnectorError };
+  /**
+   * Explicit host-validated calendar port for offer/intake composition:
+   * resolves one durably bound calendar into its verified connector. This is
+   * the boundary offer preparation calls BEFORE any proposal exists.
+   */
+  resolveCalendarPorts(input: { businessId: string; calendarId: string }): { ok: true; ports: { account: ConnectedAccountDTO; calendar: CalendarConnector } } | { ok: false; error: ConnectorError };
+  /** Host actions over the durable calendar-binding boundary. */
+  bindCalendar(input: { businessId: string; calendarId: string; accountId?: string }): { ok: true } | { ok: false; error: ConnectorError };
+  unbindCalendar(input: { businessId: string; calendarId: string }): { ok: true } | { ok: false; error: ConnectorError };
+  listCalendarBindings(businessId: string): { calendarId: string; accountId: string }[];
 }
 
 export interface ProviderRuntimeOptions {
