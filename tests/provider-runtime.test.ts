@@ -115,20 +115,33 @@ interface Fx {
   cleanup: () => void;
 }
 
-function fixture(): Fx {
+/** ConnectionService with a scripted async gate in front of token supply. */
+class GatedConnectionService extends ConnectionService {
+  gate: Promise<void> = Promise.resolve();
+  override async accessToken(input: { accountId: string; businessId: string }): Promise<string> {
+    await this.gate;
+    return super.accessToken(input);
+  }
+}
+
+function fixture(
+  makeService?: (init: { store: GatherStore; secrets: MemorySecretStore; oauth: ScriptedOAuth }) => ConnectionService,
+): Fx {
   const dir = mkdtempSync(join(tmpdir(), "gather-provider-runtime-"));
   const store = new GatherStore(join(dir, "gather.sqlite"));
   const business = store.createBusiness({ name: "Fictional Cedar Hall", timezone: "America/New_York" });
   const secrets = new MemorySecretStore();
   const oauth = new ScriptedOAuth();
   const http = new ScriptedGoogle();
-  const service = new ConnectionService({
-    store,
-    secrets,
-    transport: oauth,
-    googleApp: APP,
-    ownerId: "local-owner",
-  });
+  const service = makeService
+    ? makeService({ store, secrets, oauth })
+    : new ConnectionService({
+      store,
+      secrets,
+      transport: oauth,
+      googleApp: APP,
+      ownerId: "local-owner",
+    });
   const demo = createDemoConnectors({ calendarSlots: demoFixtureSlots() });
   const providers = createProviderConnectors({
     store,
@@ -662,6 +675,250 @@ test("unbind compares exact business and account; tombstone preserves rebinding"
     assert.deepEqual(fx.providers.listCalendarBindings(fx.businessId), []);
     assert.deepEqual(fx.providers.bindCalendar({ businessId: fx.businessId, calendarId: LIVE_CALENDAR_ID }), { ok: true });
     assert.deepEqual(fx.providers.listCalendarBindings(fx.businessId).map((b) => b.calendarId), [LIVE_CALENDAR_ID]);
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test("ASTRA async repro: unbind landing while a resolved port awaits its token fails closed with zero HTTP", async () => {
+  const fx = fixture();
+  try {
+    await connectAccount(fx, fx.businessId);
+    assert.deepEqual(fx.providers.bindCalendar({ businessId: fx.businessId, calendarId: LIVE_CALENDAR_ID }), { ok: true });
+    const resolved = fx.providers.resolveCalendarPorts({ businessId: fx.businessId, calendarId: LIVE_CALENDAR_ID });
+    assert.equal(resolved.ok, true);
+    if (!resolved.ok) return;
+    // Start the availability check but do NOT await: the token fetch is still
+    // in flight when the host releases the binding.
+    const pending = resolved.ports.calendar.checkAvailability({
+      operationKey: "op-async-unbind-1",
+      calendarId: LIVE_CALENDAR_ID,
+      startAt: HOLD.startAt,
+      endAt: HOLD.endAt,
+    });
+    assert.deepEqual(fx.providers.unbindCalendar({ businessId: fx.businessId, calendarId: LIVE_CALENDAR_ID }), { ok: true });
+    const httpBefore = fx.http.requests.length;
+    const result = await pending;
+    assert.equal(result.status, "failed");
+    if (result.status === "failed") assert.equal(result.error.kind, "not_found");
+    assert.equal(fx.http.requests.length, httpBefore, "no provider HTTP once the binding lapsed mid-flight");
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test("dispatching calendar: the same mid-flight unbind fails closed with zero HTTP", async () => {
+  const fx = fixture();
+  try {
+    await connectAccount(fx, fx.businessId);
+    assert.deepEqual(fx.providers.bindCalendar({ businessId: fx.businessId, calendarId: LIVE_CALENDAR_ID }), { ok: true });
+    const pending = fx.providers.calendar.checkAvailability({
+      operationKey: "op-async-dispatch-1",
+      calendarId: LIVE_CALENDAR_ID,
+      startAt: HOLD.startAt,
+      endAt: HOLD.endAt,
+    });
+    assert.deepEqual(fx.providers.unbindCalendar({ businessId: fx.businessId, calendarId: LIVE_CALENDAR_ID }), { ok: true });
+    const httpBefore = fx.http.requests.length;
+    const result = await pending;
+    assert.equal(result.status, "failed");
+    if (result.status === "failed") assert.equal(result.error.kind, "not_found");
+    assert.equal(fx.http.requests.length, httpBefore, "no provider HTTP once the binding lapsed mid-flight");
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test("scripted async token gate: nothing dispatches while waiting, unbind during the wait fails closed", async () => {
+  let gated: GatedConnectionService | undefined;
+  const fx = fixture(({ store, secrets, oauth }) => {
+    gated = new GatedConnectionService({ store, secrets, transport: oauth, googleApp: APP, ownerId: "local-owner" });
+    return gated;
+  });
+  try {
+    assert.ok(gated);
+    await connectAccount(fx, fx.businessId);
+    assert.deepEqual(fx.providers.bindCalendar({ businessId: fx.businessId, calendarId: LIVE_CALENDAR_ID }), { ok: true });
+    const resolved = fx.providers.resolveCalendarPorts({ businessId: fx.businessId, calendarId: LIVE_CALENDAR_ID });
+    assert.equal(resolved.ok, true);
+    if (!resolved.ok || !gated) return;
+    let release!: () => void;
+    gated.gate = new Promise<void>((resolve) => { release = resolve; });
+    const pending = resolved.ports.calendar.checkAvailability({
+      operationKey: "op-token-gate-1",
+      calendarId: LIVE_CALENDAR_ID,
+      startAt: HOLD.startAt,
+      endAt: HOLD.endAt,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    // Parked at the token gate: no HTTP has moved yet.
+    assert.equal(fx.http.requests.length, 0);
+    assert.deepEqual(fx.providers.unbindCalendar({ businessId: fx.businessId, calendarId: LIVE_CALENDAR_ID }), { ok: true });
+    release();
+    const result = await pending;
+    assert.equal(result.status, "failed");
+    if (result.status === "failed") assert.equal(result.error.kind, "not_found");
+    assert.equal(fx.http.requests.length, 0, "token arrived too late: zero provider HTTP");
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test("rebind mid-flight invalidates the in-flight dispatch even when the account matches again", async () => {
+  const fx = fixture();
+  try {
+    await connectAccount(fx, fx.businessId);
+    assert.deepEqual(fx.providers.bindCalendar({ businessId: fx.businessId, calendarId: LIVE_CALENDAR_ID }), { ok: true });
+    const resolved = fx.providers.resolveCalendarPorts({ businessId: fx.businessId, calendarId: LIVE_CALENDAR_ID });
+    assert.equal(resolved.ok, true);
+    if (!resolved.ok) return;
+    const { holdKey } = realBooking(fx);
+    const pending = resolved.ports.calendar.createProvisionalHold({
+      operationKey: holdKey,
+      bookingId: "booking-ignored-by-port",
+      calendarId: LIVE_CALENDAR_ID,
+      startAt: HOLD.startAt,
+      endAt: HOLD.endAt,
+      expiresAt: HOLD.expiresAt,
+    });
+    // Release and rebind to the SAME account: the generation bump still
+    // invalidates the in-flight write.
+    assert.deepEqual(fx.providers.unbindCalendar({ businessId: fx.businessId, calendarId: LIVE_CALENDAR_ID }), { ok: true });
+    assert.deepEqual(fx.providers.bindCalendar({ businessId: fx.businessId, calendarId: LIVE_CALENDAR_ID }), { ok: true });
+    const httpBefore = fx.http.requests.length;
+    const result = await pending;
+    assert.equal(result.status, "failed");
+    if (result.status === "failed") assert.equal(result.error.kind, "conflict");
+    assert.equal(fx.http.requests.length, httpBefore, "rebound generation never authorizes the old dispatch");
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test("revocation mid-flight fails the in-flight dispatch closed with zero HTTP", async () => {
+  let gated: GatedConnectionService | undefined;
+  const fx = fixture(({ store, secrets, oauth }) => {
+    gated = new GatedConnectionService({ store, secrets, transport: oauth, googleApp: APP, ownerId: "local-owner" });
+    return gated;
+  });
+  try {
+    assert.ok(gated);
+    await connectAccount(fx, fx.businessId);
+    assert.deepEqual(fx.providers.bindCalendar({ businessId: fx.businessId, calendarId: LIVE_CALENDAR_ID }), { ok: true });
+    const resolved = fx.providers.resolveCalendarPorts({ businessId: fx.businessId, calendarId: LIVE_CALENDAR_ID });
+    assert.equal(resolved.ok, true);
+    if (!resolved.ok || !gated) return;
+    const accountId = resolved.ports.account.id;
+    // Park the dispatch at the token gate: disconnect() itself awaits a
+    // provider round-trip, so without the gate the revocation could not be
+    // forced to land mid-flight deterministically.
+    let release!: () => void;
+    gated.gate = new Promise<void>((resolve) => { release = resolve; });
+    const pending = resolved.ports.calendar.checkAvailability({
+      operationKey: "op-revoke-flight-1",
+      calendarId: LIVE_CALENDAR_ID,
+      startAt: HOLD.startAt,
+      endAt: HOLD.endAt,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(fx.http.requests.length, 0);
+    await fx.service.disconnect({ accountId, businessId: fx.businessId });
+    release();
+    const result = await pending;
+    assert.equal(result.status, "failed");
+    if (result.status === "failed") assert.ok(result.error.kind === "access_revoked" || result.error.kind === "not_found");
+    assert.equal(fx.http.requests.length, 0, "no provider HTTP once revoked mid-flight");
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test("foreign interference mid-flight neither hijacks nor breaks the authorized dispatch", async () => {
+  const fx = fixture();
+  try {
+    await connectAccount(fx, fx.businessId);
+    assert.deepEqual(fx.providers.bindCalendar({ businessId: fx.businessId, calendarId: LIVE_CALENDAR_ID }), { ok: true });
+    const other = fx.store.createBusiness({ name: "Fictional Rival", timezone: "UTC" });
+    const pending = fx.providers.calendar.checkAvailability({
+      operationKey: "op-foreign-flight-1",
+      calendarId: LIVE_CALENDAR_ID,
+      startAt: HOLD.startAt,
+      endAt: HOLD.endAt,
+    });
+    // A foreign scope cannot claim the bound calendar mid-flight.
+    const claim = fx.providers.bindCalendar({ businessId: other.id, calendarId: LIVE_CALENDAR_ID });
+    assert.equal(claim.ok, false);
+    if (!claim.ok) assert.equal(claim.error.kind, "conflict");
+    const result = await pending;
+    assert.equal(result.status, "succeeded", "the authorized dispatch still completes");
+    assert.equal(fx.http.requests.filter((req) => req.url.includes("/freeBusy")).length, 1);
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test("write follow-up is guarded: 409 verify GET after a mid-write unbind fails closed", async () => {
+  const fx = fixture();
+  try {
+    await connectAccount(fx, fx.businessId);
+    assert.deepEqual(fx.providers.bindCalendar({ businessId: fx.businessId, calendarId: LIVE_CALENDAR_ID }), { ok: true });
+    const { booking, holdKey } = realBooking(fx);
+    const eventId = googleEventIdFor(holdKey);
+    fx.http.onRequest = (req) => {
+      if (req.url.includes("/events") && req.method === "POST") {
+        // The insert response races the host change: release the binding
+        // before the adapter's follow-up verify GET dispatches.
+        fx.providers.unbindCalendar({ businessId: fx.businessId, calendarId: LIVE_CALENDAR_ID });
+        return { status: 409, headers: {}, text: "{}" };
+      }
+      return undefined;
+    };
+    const result = await fx.providers.calendar.createProvisionalHold({
+      operationKey: holdKey,
+      bookingId: booking.id,
+      calendarId: LIVE_CALENDAR_ID,
+      startAt: HOLD.startAt,
+      endAt: HOLD.endAt,
+      expiresAt: HOLD.expiresAt,
+    });
+    assert.equal(result.status, "failed");
+    if (result.status === "failed") assert.equal(result.error.kind, "not_found");
+    assert.ok(!fx.http.requests.some((req) => req.method === "GET" && req.url.includes(eventId)), "verify GET never dispatched");
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test("known effects survive a later authority change; reconcile then demands honest re-resolution", async () => {
+  const fx = fixture();
+  try {
+    await connectAccount(fx, fx.businessId);
+    assert.deepEqual(fx.providers.bindCalendar({ businessId: fx.businessId, calendarId: LIVE_CALENDAR_ID }), { ok: true });
+    const resolved = fx.providers.resolveCalendarPorts({ businessId: fx.businessId, calendarId: LIVE_CALENDAR_ID });
+    assert.equal(resolved.ok, true);
+    if (!resolved.ok) return;
+    const { booking, holdKey } = realBooking(fx);
+    const hold = await resolved.ports.calendar.createProvisionalHold({
+      operationKey: holdKey,
+      bookingId: booking.id,
+      calendarId: LIVE_CALENDAR_ID,
+      startAt: HOLD.startAt,
+      endAt: HOLD.endAt,
+      expiresAt: HOLD.expiresAt,
+    });
+    assert.equal(hold.status, "succeeded");
+    const httpAfterWrite = fx.http.requests.length;
+    assert.ok(httpAfterWrite > 0, "the write actually dispatched");
+    // Authority lapses AFTER dispatch: the known effect stands — nothing is
+    // pretended-undone and no DELETE is attempted.
+    assert.deepEqual(fx.providers.unbindCalendar({ businessId: fx.businessId, calendarId: LIVE_CALENDAR_ID }), { ok: true });
+    assert.equal(hold.status, "succeeded");
+    // Reconcile through the stale port fails closed instead of verifying
+    // against a scope it no longer holds; nothing new dispatches.
+    const reconciled = await resolved.ports.calendar.reconcileProvisionalHold({ operationKey: holdKey });
+    assert.equal(reconciled.status, "failed");
+    assert.equal(fx.http.requests.length, httpAfterWrite, "no follow-up IO on stale authority");
+    assert.ok(!fx.http.requests.some((req) => req.method === "DELETE"), "never a pretend undo");
   } finally {
     fx.cleanup();
   }

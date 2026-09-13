@@ -20,13 +20,15 @@ import {
   liveMetadata,
   type GmailInboxPoller,
   type GoogleConnectorSet,
+  type GoogleHttpRequest,
+  type GoogleHttpResponse,
   type GoogleHttpTransport,
 } from "../../connectors/google/index.ts";
 import type { Booking, ProposedAction } from "../../domain/contracts.ts";
 import { demoFixtureSlots } from "../demo-fixtures.ts";
 import type { GatherStore } from "../sqlite-store.ts";
 import type { ConnectionService } from "../connections/service.ts";
-import type { ConnectedAccountDTO } from "../connections/types.ts";
+import { ConnectionError, type ConnectedAccountDTO } from "../connections/types.ts";
 
 /**
  * Per-booking provider dispatch. The booking service holds ONE calendar and
@@ -74,6 +76,125 @@ function fail(kind: ConnectorErrorKind, message: string): { kind: "fail"; error:
 
 function failure(operationKey: string, error: ConnectorError): ConnectorResult<never> {
   return { status: "failed", metadata: liveMetadata(operationKey, []), error };
+}
+
+/**
+ * The exact authority a guarded calendar dispatch is pinned to: the durable
+ * binding's business + account + calendar + generation at resolution time.
+ * Every provider dispatch revalidates all four — an unbind, a rebind (even
+ * same-account, via the generation bump), an account move, or a revocation
+ * that lands after resolution fails the dispatch closed.
+ */
+export interface PinnedCalendarScope {
+  businessId: string;
+  calendarId: string;
+  accountId: string;
+  generation: number;
+}
+
+export interface PinnedScopeReader {
+  bindingRow(calendarId: string):
+    | { calendarId: string; businessId: string; accountId: string; generation: number; status: string }
+    | undefined;
+  boundAccountFor(businessId: string, accountId: string): ConnectedAccountDTO | undefined;
+}
+
+/**
+ * Revalidate a pinned scope against the durable world. Returns the typed
+ * fail-closed error, or undefined when the original authority still holds.
+ * Synchronous by design: it runs inside the transport dispatch, after token
+ * acquisition and any async scope resolution, so nothing can interleave
+ * between this read and the HTTP it guards.
+ */
+export function checkPinnedCalendarScope(reader: PinnedScopeReader, scope: PinnedCalendarScope): ConnectorError | undefined {
+  const current = reader.bindingRow(scope.calendarId);
+  if (!current || current.status !== "bound") {
+    return {
+      kind: "not_found",
+      message: `Calendar ${scope.calendarId} is no longer bound — re-resolve ports after the host change`,
+      retryable: false,
+    };
+  }
+  if (current.businessId !== scope.businessId || current.accountId !== scope.accountId || current.generation !== scope.generation) {
+    return {
+      kind: "conflict",
+      message: `Calendar ${scope.calendarId} binding changed since this port was resolved — re-resolve before use`,
+      retryable: false,
+    };
+  }
+  const account = reader.boundAccountFor(current.businessId, current.accountId);
+  if (!account) {
+    return {
+      kind: "not_found",
+      message: `The account bound to calendar ${scope.calendarId} no longer exists`,
+      retryable: false,
+    };
+  }
+  if (account.status !== "connected") {
+    return {
+      kind: "access_revoked",
+      message: `The account bound to calendar ${scope.calendarId} is ${account.status}, not connected`,
+      retryable: false,
+    };
+  }
+  return undefined;
+}
+
+/**
+ * Thrown by the binding-guarded transport BEFORE any provider IO is
+ * dispatched, when the pinned scope no longer authorizes the call. Adapters
+ * rethrow it untouched (it is neither a timeout, a network failure, nor a
+ * token failure); the dispatch wrappers translate it into the typed
+ * fail-closed result. It can never surface for already-dispatched writes:
+ * once the inner transport sends, its result (or ambiguity) stands.
+ */
+export class BindingAuthorityStaleError extends Error {
+  readonly authorityError: ConnectorError;
+  constructor(error: ConnectorError) {
+    super(error.message);
+    this.name = "BindingAuthorityStaleError";
+    this.authorityError = error;
+  }
+}
+
+/**
+ * The existing transport boundary hosting the per-dispatch guard: after the
+ * adapter acquires its token (and after any async scope resolution), and
+ * before each HTTP dispatch — reads, writes, and reconcile follow-ups alike
+ * — the pinned scope is revalidated. Stale authority throws before unsent
+ * IO, so zero provider bytes move; authority that changes after a write was
+ * actually dispatched is preserved as-is and left to honest reconciliation.
+ */
+export class BindingGuardedTransport implements GoogleHttpTransport {
+  private readonly inner: GoogleHttpTransport;
+  private readonly check: () => ConnectorError | undefined;
+
+  constructor(inner: GoogleHttpTransport, check: () => ConnectorError | undefined) {
+    this.inner = inner;
+    this.check = check;
+  }
+
+  async request(req: GoogleHttpRequest): Promise<GoogleHttpResponse> {
+    const stale = this.check();
+    if (stale) throw new BindingAuthorityStaleError(stale);
+    return this.inner.request(req);
+  }
+}
+
+/** A token-supplier failure escaping an authorized call, mapped to a typed result. */
+function connectionFailure(operationKey: string, error: ConnectionError): ConnectorResult<never> {
+  switch (error.code) {
+    case "ACCESS_REVOKED":
+      return failure(operationKey, { kind: "access_revoked", message: error.message, retryable: false });
+    case "STALE":
+      return failure(operationKey, { kind: "conflict", message: `${error.message} — re-resolve ports before use`, retryable: false });
+    case "NOT_FOUND":
+      return failure(operationKey, { kind: "not_found", message: error.message, retryable: false });
+    case "UNAVAILABLE":
+      return failure(operationKey, { kind: "unsupported", message: error.message, retryable: false });
+    default:
+      return failure(operationKey, { kind: "transport_error", message: error.message, retryable: error.retryable });
+  }
 }
 
 function isNonEmpty(value: unknown): value is string {
@@ -357,6 +478,43 @@ export class ProviderResolver {
   }
 
   /**
+   * The exact pinned scope for a bound calendar, or undefined unless the
+   * row is currently `bound`. Dispatchers pin this at resolution and hand
+   * it to the guarded connector, so every later dispatch revalidates the
+   * same business + account + calendar + generation.
+   */
+  pinnedCalendarScope(calendarId: string): PinnedCalendarScope | undefined {
+    const binding = this.bindingFor(calendarId);
+    if (!binding) return undefined;
+    return {
+      businessId: binding.businessId,
+      calendarId: binding.calendarId,
+      accountId: binding.accountId,
+      generation: binding.generation,
+    };
+  }
+
+  /**
+   * A live connector set whose transport revalidates the pinned scope after
+   * token acquisition and before EVERY HTTP dispatch (reads, writes, and
+   * reconcile follow-ups). Built fresh per pinned scope — never from the
+   * shared account cache — so one port's generation can never authorize
+   * another's. Token supply stays pinned to the original account + business.
+   */
+  guardedCalendarConnector(scope: PinnedCalendarScope): GoogleConnectorSet {
+    const guarded = new BindingGuardedTransport(this.transport, () => checkPinnedCalendarScope(this, scope));
+    return createGoogleConnectors({
+      transport: guarded,
+      tokens: () => this.connectionService.accessToken({ accountId: scope.accountId, businessId: scope.businessId }),
+      ...(this.userId === undefined ? {} : { userId: this.userId }),
+      calendarId: scope.calendarId,
+      resolveHoldScope: (operationKey) => Promise.resolve(this.holdScopeFor(operationKey)),
+      resolveSentExpectation: (operationKey) => Promise.resolve(this.sentExpectationFor(operationKey)),
+      accountId: scope.accountId,
+    });
+  }
+
+  /**
    * Host action: durably bind a calendar id to this business's verified
    * calendar account. `accountId` may pin a specific connected account;
    * absent, the business must have exactly one connected calendar account.
@@ -535,16 +693,17 @@ export class ProviderResolver {
     if (!binding || binding.businessId !== input.businessId || binding.accountId !== target.account.id) {
       return { ok: false, error: { kind: "conflict", message: `Calendar ${input.calendarId} changed during resolution; re-resolve before use`, retryable: false } };
     }
+    const scope: PinnedCalendarScope = {
+      businessId: input.businessId,
+      calendarId: input.calendarId,
+      accountId: target.account.id,
+      generation: binding.generation,
+    };
     return {
       ok: true,
       ports: {
         account: target.account,
-        calendar: new BoundCalendarPort(this, {
-          businessId: input.businessId,
-          calendarId: input.calendarId,
-          accountId: target.account.id,
-          generation: binding.generation,
-        }),
+        calendar: new BoundCalendarPort(this, scope, this.guardedCalendarConnector(scope).calendar),
       },
     };
   }
@@ -615,82 +774,52 @@ export class ProviderResolver {
  */
 export class BoundCalendarPort implements CalendarConnector {
   private readonly resolver: ProviderResolver;
-  private readonly scope: { businessId: string; calendarId: string; accountId: string; generation: number };
+  private readonly scope: PinnedCalendarScope;
+  private readonly calendar: CalendarConnector;
 
-  constructor(
-    resolver: ProviderResolver,
-    scope: { businessId: string; calendarId: string; accountId: string; generation: number },
-  ) {
+  constructor(resolver: ProviderResolver, scope: PinnedCalendarScope, calendar: CalendarConnector) {
     this.resolver = resolver;
     this.scope = scope;
+    this.calendar = calendar;
   }
 
-  private guard(operationKey: string): { ok: true; calendar: CalendarConnector } | { ok: false; result: ConnectorResult<never> } {
-    const current = this.resolver.bindingRow(this.scope.calendarId);
-    if (!current || current.status !== "bound") {
-      return {
-        ok: false,
-        result: failure(operationKey, {
-          kind: "not_found",
-          message: `Calendar ${this.scope.calendarId} is no longer bound — re-resolve ports after the host change`,
-          retryable: false,
-        }),
-      };
+  /**
+   * Pre-dispatch check (fast path): fail before touching tokens when the
+   * binding is already stale. The guarded transport revalidates the same
+   * pinned scope after token acquisition and before each HTTP dispatch, so
+   * authority that lapses mid-flight still fails closed with zero new IO.
+   */
+  private guard(operationKey: string): ConnectorResult<never> | undefined {
+    const stale = checkPinnedCalendarScope(this.resolver, this.scope);
+    return stale === undefined ? undefined : failure(operationKey, stale);
+  }
+
+  private async dispatch<T>(operationKey: string, run: () => Promise<ConnectorResult<T>>): Promise<ConnectorResult<T>> {
+    try {
+      return await run();
+    } catch (error) {
+      if (error instanceof BindingAuthorityStaleError) return failure(operationKey, error.authorityError);
+      if (error instanceof ConnectionError) return connectionFailure(operationKey, error);
+      throw error;
     }
-    if (
-      current.businessId !== this.scope.businessId ||
-      current.accountId !== this.scope.accountId ||
-      current.generation !== this.scope.generation
-    ) {
-      return {
-        ok: false,
-        result: failure(operationKey, {
-          kind: "conflict",
-          message: `Calendar ${this.scope.calendarId} binding changed since this port was resolved — re-resolve before use`,
-          retryable: false,
-        }),
-      };
-    }
-    const account = this.resolver.boundAccountFor(current.businessId, current.accountId);
-    if (!account) {
-      return {
-        ok: false,
-        result: failure(operationKey, {
-          kind: "not_found",
-          message: `The account bound to calendar ${this.scope.calendarId} no longer exists`,
-          retryable: false,
-        }),
-      };
-    }
-    if (account.status !== "connected") {
-      return {
-        ok: false,
-        result: failure(operationKey, {
-          kind: "access_revoked",
-          message: `The account bound to calendar ${this.scope.calendarId} is ${account.status}, not connected`,
-          retryable: false,
-        }),
-      };
-    }
-    return { ok: true, calendar: this.resolver.googleFor(account, this.scope.calendarId).calendar };
   }
 
   async checkAvailability(request: CheckAvailabilityRequest): Promise<ConnectorResult<CheckAvailabilityResponse>> {
-    const guarded = this.guard(request.operationKey);
-    if (!guarded.ok) return guarded.result;
-    return guarded.calendar.checkAvailability(request);
+    const blocked = this.guard(request.operationKey);
+    if (blocked) return blocked;
+    return this.dispatch(request.operationKey, () => this.calendar.checkAvailability(request));
   }
 
   async createProvisionalHold(request: CreateProvisionalHoldRequest): Promise<ConnectorResult<CreateProvisionalHoldResponse>> {
-    const guarded = this.guard(request.operationKey);
-    if (!guarded.ok) return guarded.result;
-    return guarded.calendar.createProvisionalHold(request);
+    const blocked = this.guard(request.operationKey);
+    if (blocked) return blocked;
+    return this.dispatch(request.operationKey, () => this.calendar.createProvisionalHold(request));
   }
 
   async reconcileProvisionalHold(request: OperationRequest): Promise<ConnectorResult<CreateProvisionalHoldResponse>> {
-    const guarded = this.guard(request.operationKey);
-    if (!guarded.ok) return guarded.result;
-    return guarded.calendar.reconcileProvisionalHold(request);
+    const blocked = this.guard(request.operationKey);
+    if (blocked) return blocked;
+    return this.dispatch(request.operationKey, () => this.calendar.reconcileProvisionalHold(request));
   }
 }
 
@@ -703,11 +832,37 @@ export class DispatchingCalendar implements CalendarConnector {
     this.demo = demo;
   }
 
+  /**
+   * Pin the just-resolved binding and dispatch through its guarded
+   * connector: authority that lapses after resolution (mid token-await or
+   * mid scope-resolution) fails each unsent dispatch closed, exactly like
+   * the resolved-port path. Supplier/connection throws map to typed
+   * results; anything else propagates.
+   */
+  private async guarded<T>(operationKey: string, scope: PinnedCalendarScope, run: (calendar: CalendarConnector) => Promise<ConnectorResult<T>>): Promise<ConnectorResult<T>> {
+    const calendar = this.resolver.guardedCalendarConnector(scope).calendar;
+    try {
+      return await run(calendar);
+    } catch (error) {
+      if (error instanceof BindingAuthorityStaleError) return failure(operationKey, error.authorityError);
+      if (error instanceof ConnectionError) return connectionFailure(operationKey, error);
+      throw error;
+    }
+  }
+
   async checkAvailability(request: CheckAvailabilityRequest): Promise<ConnectorResult<CheckAvailabilityResponse>> {
     const target = this.resolver.resolveCalendarScope(request.calendarId);
     if (target.kind === "demo") return this.demo.calendar.checkAvailability(request);
     if (target.kind === "fail") return failure(request.operationKey, target.error);
-    return this.resolver.googleFor(target.account, request.calendarId).calendar.checkAvailability(request);
+    const scope = this.resolver.pinnedCalendarScope(request.calendarId);
+    if (!scope || scope.businessId !== target.businessId || scope.accountId !== target.account.id) {
+      return failure(request.operationKey, {
+        kind: "conflict",
+        message: `Calendar ${request.calendarId} changed during resolution; re-resolve before use`,
+        retryable: false,
+      });
+    }
+    return this.guarded(request.operationKey, scope, (calendar) => calendar.checkAvailability(request));
   }
 
   async createProvisionalHold(request: CreateProvisionalHoldRequest): Promise<ConnectorResult<CreateProvisionalHoldResponse>> {
@@ -734,7 +889,15 @@ export class DispatchingCalendar implements CalendarConnector {
         retryable: false,
       });
     }
-    return this.resolver.googleFor(target.account, request.calendarId).calendar.createProvisionalHold(request);
+    const scope = this.resolver.pinnedCalendarScope(request.calendarId);
+    if (!scope || scope.businessId !== booking.businessId || scope.accountId !== target.account.id) {
+      return failure(request.operationKey, {
+        kind: "conflict",
+        message: `Calendar ${request.calendarId} changed during resolution; re-resolve before use`,
+        retryable: false,
+      });
+    }
+    return this.guarded(request.operationKey, scope, (calendar) => calendar.createProvisionalHold(request));
   }
 
   async reconcileProvisionalHold(request: OperationRequest): Promise<ConnectorResult<CreateProvisionalHoldResponse>> {
@@ -763,7 +926,15 @@ export class DispatchingCalendar implements CalendarConnector {
         retryable: false,
       });
     }
-    return this.resolver.googleFor(target.account, calendarId).calendar.reconcileProvisionalHold(request);
+    const scope = this.resolver.pinnedCalendarScope(calendarId);
+    if (!scope || scope.businessId !== context.booking.businessId || scope.accountId !== target.account.id) {
+      return failure(request.operationKey, {
+        kind: "conflict",
+        message: `Calendar ${calendarId} changed during resolution; re-resolve before use`,
+        retryable: false,
+      });
+    }
+    return this.guarded(request.operationKey, scope, (calendar) => calendar.reconcileProvisionalHold(request));
   }
 }
 

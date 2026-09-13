@@ -52,6 +52,18 @@ provider-runtime -> connections leaves, index -> runtime stays one-way.
   account change, or revocation instead of acting on revoked authority.
   Callers re-resolve after any host change. Bind/unbind run atomically, so
   concurrent handles surface typed `conflict`, never raw constraint errors.
+- **Authority is revalidated per transport dispatch, not just per call.**
+  The pre-call guard alone cannot cover authority that lapses while a call
+  awaits its token or async scope resolution. Every guarded calendar
+  dispatch therefore re-reads the exact pinned business + account +
+  calendar + generation at the transport boundary — after token
+  acquisition, before each HTTP send (reads, writes, and reconcile
+  follow-ups alike, on both resolved ports and the dispatching calendar).
+  Stale authority throws before unsent IO and maps to the typed
+  fail-closed result with zero new provider bytes; authority that changes
+  after a write was actually dispatched is preserved as-is — effects
+  stand, no pretend undo is attempted, and follow-up work must honestly
+  re-resolve and reconcile.
 - **Email sends** resolve through the durable execution row
   (`idempotency_key` -> action -> booking) to the business's unique
   connected `gmail` account.
