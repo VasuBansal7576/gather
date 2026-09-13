@@ -11,18 +11,30 @@ import type { GatherStore } from "../server/sqlite-store.ts";
  * survive process restarts without an explicit init step.
  *
  * Tables:
- * - booking_identity_links: one ACTIVE row per source key at most (UNIQUE on
- *   source_key with a partial index over active rows is emulated by keeping a
- *   single row per source key with a status column). History is never deleted:
- *   unlink/correction flips status and appends audit rows.
- * - booking_identity_decisions: owner-decision requests. One OPEN row per
- *   source key; superseded rows are kept for audit.
+ * - booking_identity_links: one row per source key at most (PRIMARY KEY on
+ *   source_key); history is never deleted — unlink/correction flips status
+ *   and appends audit rows.
+ * - booking_identity_decisions: owner-decision requests. At most one OPEN
+ *   row per source key, enforced by a partial UNIQUE index; superseded rows
+ *   are kept for audit.
  * - booking_identity_audit: append-only transition log.
+ *
+ * All multi-write operations run inside BEGIN IMMEDIATE so link/decision
+ * state is re-read under the write lock and audit can never be orphaned.
  */
 
 export type IdentityLinkOrigin = "verified_receipt" | "owner_resolution";
+
 export type IdentityLinkStatus = "active" | "unlinked";
-export type ProvenanceMode = "demo" | "live";
+
+/**
+ * Where the binding proof comes from:
+ * - "demo": simulated fixture receipt (never presented as a real provider).
+ * - "live": host-verified provider-correlated receipt.
+ * - "owner": explicit owner assertion inside this workspace — authoritative
+ *   for identity but NOT provider-verified and not necessarily fictional.
+ */
+export type ProvenanceMode = "demo" | "live" | "owner";
 
 export interface IdentityLinkRow {
   sourceKey: string;
@@ -65,23 +77,47 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
+const LINK_DDL = `
+  CREATE TABLE IF NOT EXISTS booking_identity_links (
+    source_key TEXT PRIMARY KEY,
+    booking_id TEXT NOT NULL,
+    business_id TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    origin TEXT NOT NULL CHECK (origin IN ('verified_receipt', 'owner_resolution')),
+    provenance_mode TEXT NOT NULL CHECK (provenance_mode IN ('demo', 'live', 'owner')),
+    receipt_operation_key TEXT,
+    status TEXT NOT NULL CHECK (status IN ('active', 'unlinked')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`;
+
+/**
+ * Databases created before the 'owner' provenance mode existed carry a
+ * CHECK constraint that rejects it; rebuild the table in place when the old
+ * constraint is detected. Rows are preserved verbatim.
+ */
+function migrateProvenanceMode(db: DatabaseSync): void {
+  const found = db.prepare(
+    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'booking_identity_links'",
+  ).get();
+  if (!found) return;
+  const ddl = String((found as SqlRow).sql ?? "");
+  if (ddl.includes("'owner'")) return;
+  db.exec(`
+    ALTER TABLE booking_identity_links RENAME TO booking_identity_links_v1;
+    ${LINK_DDL.replace("IF NOT EXISTS ", "")};
+    INSERT INTO booking_identity_links SELECT * FROM booking_identity_links_v1;
+    DROP TABLE booking_identity_links_v1;
+  `);
+}
+
 /** Create identity tables when missing. Idempotent; safe to call per operation. */
 export function ensureBookingIdentityTables(store: GatherStore): void {
   const db: DatabaseSync = store.db;
+  db.exec(LINK_DDL + ";");
+  migrateProvenanceMode(db);
   db.exec(`
-    CREATE TABLE IF NOT EXISTS booking_identity_links (
-      source_key TEXT PRIMARY KEY,
-      booking_id TEXT NOT NULL,
-      business_id TEXT NOT NULL,
-      account_id TEXT NOT NULL,
-      provider TEXT NOT NULL,
-      origin TEXT NOT NULL CHECK (origin IN ('verified_receipt', 'owner_resolution')),
-      provenance_mode TEXT NOT NULL CHECK (provenance_mode IN ('demo', 'live')),
-      receipt_operation_key TEXT,
-      status TEXT NOT NULL CHECK (status IN ('active', 'unlinked')),
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
     CREATE TABLE IF NOT EXISTS booking_identity_decisions (
       id TEXT PRIMARY KEY,
       source_key TEXT NOT NULL,
@@ -106,6 +142,18 @@ export function ensureBookingIdentityTables(store: GatherStore): void {
       created_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_identity_audit_key ON booking_identity_audit(source_key, id);
+  `);
+  // Databases created before the one-open-decision constraint may hold
+  // multiple open rows; keep the newest per source key before indexing.
+  db.prepare(
+    `UPDATE booking_identity_decisions SET status = 'superseded'
+       WHERE status = 'open' AND rowid NOT IN (
+         SELECT MAX(rowid) FROM booking_identity_decisions WHERE status = 'open' GROUP BY source_key
+       )`,
+  ).run();
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_identity_decisions_open
+      ON booking_identity_decisions(source_key) WHERE status = 'open';
   `);
 }
 
@@ -216,9 +264,13 @@ export function listIdentityDecisions(store: GatherStore, sourceKey: string): Id
 }
 
 /**
- * Open (or reuse) the decision for this exact candidate set. A new version is
- * cut only when the fingerprint changes; re-proposing the same set is
- * idempotent and returns the existing open row.
+ * Open (or reuse) the decision for this exact candidate set. Runs inside
+ * BEGIN IMMEDIATE: the open row is re-read under the write lock, a new
+ * version is cut only when the fingerprint changes, and the
+ * decision_opened audit row commits with the insert — a failed audit can
+ * never leave a decision behind. The partial UNIQUE index on open rows
+ * makes concurrent opens for the same source key impossible to interleave
+ * into two open decisions.
  */
 export function openOrReuseIdentityDecision(
   store: GatherStore,
@@ -227,33 +279,52 @@ export function openOrReuseIdentityDecision(
 ): IdentityDecisionRow {
   ensureBookingIdentityTables(store);
   const fingerprint = fingerprintCandidates(sourceKey, candidateIds);
-  const open = getOpenIdentityDecision(store, sourceKey);
-  if (open && open.candidateFingerprint === fingerprint) return open;
-  const timestamp = nowIso();
-  const nextVersion = open ? open.candidateVersion + 1 : nextDecisionVersion(store, sourceKey);
-  if (open) {
-    store.db.prepare("UPDATE booking_identity_decisions SET status = 'superseded' WHERE id = $id").run({ $id: open.id });
+  store.db.exec("BEGIN IMMEDIATE");
+  try {
+    const open = getOpenIdentityDecision(store, sourceKey);
+    if (open && open.candidateFingerprint === fingerprint) {
+      store.db.exec("COMMIT");
+      return open;
+    }
+    const timestamp = nowIso();
+    const nextVersion = open ? open.candidateVersion + 1 : nextDecisionVersion(store, sourceKey);
+    if (open) {
+      const info = store.db.prepare(
+        "UPDATE booking_identity_decisions SET status = 'superseded' WHERE id = $id AND status = 'open'",
+      ).run({ $id: open.id });
+      if (Number(info.changes) !== 1) {
+        throw new Error(`Identity decision ${open.id} changed while being superseded`);
+      }
+    }
+    const id = randomUUID();
+    store.db.prepare(
+      `INSERT INTO booking_identity_decisions
+        (id, source_key, candidate_version, candidate_fingerprint, candidate_ids_json, status, created_at)
+       VALUES ($id, $key, $version, $fingerprint, $ids, 'open', $at)`,
+    ).run({
+      $id: id,
+      $key: sourceKey,
+      $version: nextVersion,
+      $fingerprint: fingerprint,
+      $ids: JSON.stringify([...candidateIds].sort()),
+      $at: timestamp,
+    });
+    appendIdentityAudit(store, {
+      sourceKey,
+      action: "decision_opened",
+      actor: "system",
+      reason: `Candidate set v${nextVersion} (${candidateIds.length} candidate(s), fingerprint ${fingerprint.slice(0, 12)}...) requires owner resolution`,
+    });
+    store.db.exec("COMMIT");
+    return getIdentityDecisionById(store, id);
+  } catch (error) {
+    try {
+      store.db.exec("ROLLBACK");
+    } catch {
+      // Already rolled back; surface the original failure.
+    }
+    throw error;
   }
-  const id = randomUUID();
-  store.db.prepare(
-    `INSERT INTO booking_identity_decisions
-      (id, source_key, candidate_version, candidate_fingerprint, candidate_ids_json, status, created_at)
-     VALUES ($id, $key, $version, $fingerprint, $ids, 'open', $at)`,
-  ).run({
-    $id: id,
-    $key: sourceKey,
-    $version: nextVersion,
-    $fingerprint: fingerprint,
-    $ids: JSON.stringify([...candidateIds].sort()),
-    $at: timestamp,
-  });
-  appendIdentityAudit(store, {
-    sourceKey,
-    action: "decision_opened",
-    actor: "system",
-    reason: `Candidate set v${nextVersion} (${candidateIds.length} candidate(s), fingerprint ${fingerprint.slice(0, 12)}...) requires owner resolution`,
-  });
-  return getIdentityDecisionById(store, id);
 }
 
 function nextDecisionVersion(store: GatherStore, sourceKey: string): number {
@@ -271,17 +342,33 @@ export function getIdentityDecisionById(store: GatherStore, id: string): Identit
   return toDecisionRow(asRow(found));
 }
 
+/**
+ * Resolve a decision only if it is still open (conditional UPDATE under the
+ * caller's transaction). Returns false when another writer already resolved
+ * or superseded it — the caller maps that to a stale-decision error.
+ */
+export function resolveDecisionIfOpen(
+  store: GatherStore,
+  decisionId: string,
+  resolvedBookingId: string,
+  decidedBy: string,
+): boolean {
+  const info = store.db.prepare(
+    `UPDATE booking_identity_decisions
+     SET status = 'resolved', resolved_booking_id = $booking, decided_by = $by, resolved_at = $at
+     WHERE id = $id AND status = 'open'`,
+  ).run({ $booking: resolvedBookingId, $by: decidedBy, $at: nowIso(), $id: decisionId });
+  return Number(info.changes) === 1;
+}
+
 export function markDecisionResolved(
   store: GatherStore,
   decisionId: string,
   resolvedBookingId: string,
   decidedBy: string,
 ): IdentityDecisionRow {
-  const timestamp = nowIso();
-  store.db.prepare(
-    `UPDATE booking_identity_decisions
-     SET status = 'resolved', resolved_booking_id = $booking, decided_by = $by, resolved_at = $at
-     WHERE id = $id`,
-  ).run({ $booking: resolvedBookingId, $by: decidedBy, $at: timestamp, $id: decisionId });
+  if (!resolveDecisionIfOpen(store, decisionId, resolvedBookingId, decidedBy)) {
+    throw new Error(`Identity decision ${decisionId} is no longer open`);
+  }
   return getIdentityDecisionById(store, decisionId);
 }

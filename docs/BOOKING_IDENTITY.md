@@ -58,20 +58,53 @@ database file, no generic graph/wiki:
   and appends audit rows; nothing is deleted. A correction records
   `old -> new` with the actor and reason.
 
-Owner links store `demo` provenance: they are local owner assertions, not
-live provider state. `decidedBy` must be server-derived (e.g.
-`GATHER_OWNER_ID`); request-supplied identities are not accepted — the
-current API takes it as a parameter and the host must pass its configured
-owner identity.
+Owner links store `owner` provenance: an explicit owner assertion inside
+this workspace — authoritative for identity, not provider-verified, and not
+necessarily fictional (a real owner is not demo data). `demo`/`live` remain
+receipt provenance only. The `actor` parameter must be a host-server owner
+actor (`{ kind: "owner", id }`, e.g. the configured `GATHER_OWNER_ID`
+principal); a bare string — including one lifted from message text — cannot
+satisfy it and grants no authority.
+
+### Atomicity and receipt provenance
+
+- Every mutation (`recordVerifiedIdentityLink`,
+  `recordOwnerIdentityDecision`, `unlinkIdentityLink`, decision open)
+  commits link/decision/audit rows in ONE `BEGIN IMMEDIATE` transaction.
+  Link and open-decision state is re-read under the write lock, so a
+  superseded decision or a raced link cannot slip between check and write,
+  and a failed audit write rolls the binding back instead of leaving an
+  un-audited row.
+- A duplicate verified receipt is idempotent ONLY when identical: same
+  booking, same `operationKey`, same `mode`. A replayed receipt for the
+  same booking with a different operation key or mode is `CONFLICT` —
+  mismatched identity, not a duplicate.
+- Any correction to a DIFFERENT booking (owner decision or unlink
+  replacement) clears `receipt_operation_key` and records `owner`
+  provenance: a receipt that proved booking A must never appear to prove
+  booking B.
+- `booking_identity_decisions` has at most one `open` row per source key,
+  enforced by a partial `UNIQUE` index; open-version resolution is a
+  conditional `UPDATE ... WHERE status='open'` inside the transaction.
+
+### Account trust
+
+A source key's account must be resolvable: the store's
+`connected_accounts` row is primary, an optional trusted host
+`IdentityAccountRegistry` port (`accounts` on each API) is the only
+fallback, and an unknown or unreadable account is denied (`CROSS_ACCOUNT`)
+on every binding path — including `propose` on an already-linked key.
 
 ## Service API (`src/identity/index.ts`)
 
-- `proposeBookingIdentity(store, { components, hints? })` → `linked` (exact
-  durable link) or `needs_decision` (deterministic candidates +
-  versioned/fingerprinted open decision).
-- `recordVerifiedIdentityLink(store, { components, bookingId, receipt, actor? })`
-- `recordOwnerIdentityDecision(store, { sourceKey, chosenBookingId, decidedBy, candidateVersion, candidateFingerprint })`
-- `unlinkIdentityLink(store, { sourceKey, actor, reason, replacementBookingId? })`
+- `proposeBookingIdentity(store, { components, hints?, accounts? })` → `linked`
+  (exact durable link, scope re-checked) or `needs_decision` (deterministic
+  candidates + versioned/fingerprinted open decision).
+- `recordVerifiedIdentityLink(store, { components, bookingId, receipt, actor?, accounts? })`
+- `recordOwnerIdentityDecision(store, { sourceKey, chosenBookingId, actor, candidateVersion, candidateFingerprint, accounts? })`
+- `unlinkIdentityLink(store, { sourceKey, actor, reason, expectedBookingId?, replacementBookingId?, accounts? })`
+  — `expectedBookingId` is the reviewed-target guard; it is REQUIRED with
+  `replacementBookingId` and must equal the currently bound booking.
 - Readers: `getIdentityLink`, `getActiveIdentityLink`, `getOpenIdentityDecision`,
   `listIdentityDecisions`, `listIdentityAudit`, `buildSourceKey`,
   `decodeSourceKey`, `fingerprintCandidates`.
@@ -83,8 +116,8 @@ owner identity.
 1. No ingestion hook calls `proposeBookingIdentity` yet — Gmail/calendar
    readers, deposit/resource writers, and proposal creation do not emit
    identity components or receipts.
-2. `decidedBy` is caller-supplied; the host must pass the server-derived
-   owner identity (same rule as approvals) and never a request field.
+2. `actor` must be the host's server-derived owner principal (same rule as
+   approvals) — never a request field or message-claimed identity.
 3. The UI has no "ambiguous match" surface: `needs_decision` candidates and
    the audit trail are API-ready but unrendered.
 4. `findCandidates` matches only same-business bookings on weak
