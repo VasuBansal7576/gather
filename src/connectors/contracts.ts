@@ -51,7 +51,13 @@ export interface DemoSourceReference extends SourceReference {
 export interface ConnectorMetadata {
   operationKey: string;
   mode: ConnectorModeLabel;
-  simulated: true;
+  /**
+   * Discriminated with {@link ConnectorModeLabel}: demo results are
+   * simulated (true) and fictional; live provider receipts are not
+   * simulated (false) and not fictional. Live adapters must set false and
+   * expose provider-issued receipt identifiers distinctly from demo ones.
+   */
+  simulated: boolean;
   sourceReferences: SourceReference[];
 }
 
