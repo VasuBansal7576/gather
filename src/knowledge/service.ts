@@ -2,7 +2,10 @@ import { createHash, randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import type { BusinessFact, SourceReference } from "../domain/contracts.ts";
 import type {
+  AgreementGroup,
+  BusinessConflict,
   CandidateConfidence,
+  ConflictRevision,
   ConfirmedFact,
   DecisionKind,
   FactScope,
@@ -12,6 +15,7 @@ import type {
   KnowledgeRevision,
   KnowledgeStorePort,
   OffersKnowledgeSnapshot,
+  WithheldFact,
 } from "./types.ts";
 
 /**
@@ -176,6 +180,17 @@ export interface ConfirmResult {
   duplicate: boolean;
 }
 
+export interface ResolveConflictResult {
+  /** Owner-pinned winning revision id (exact revision, never a value match). */
+  winningRevisionId: string;
+  /** Exact active revision id set this resolution governs. */
+  consideredRevisionIds: string[];
+  /** Resolution row id (the commandId). */
+  resolutionId: string;
+  /** True when the same commandId was replayed. */
+  duplicate: boolean;
+}
+
 export class KnowledgeService {
   private readonly store: KnowledgeStorePort;
 
@@ -236,6 +251,20 @@ export class KnowledgeService {
         ON knowledge_decisions(business_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_knowledge_candidates_account
         ON knowledge_candidates(business_id, account_id, key, subject_id, status);
+      CREATE TABLE IF NOT EXISTS knowledge_conflict_resolutions (
+        id TEXT PRIMARY KEY,
+        business_id TEXT NOT NULL,
+        key TEXT NOT NULL,
+        subject_id TEXT NOT NULL DEFAULT '',
+        scope TEXT NOT NULL,
+        scope_id TEXT,
+        winning_revision_id TEXT NOT NULL,
+        considered_revision_ids_json TEXT NOT NULL,
+        resolved_by TEXT NOT NULL,
+        resolved_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_knowledge_conflict_resolutions_group
+        ON knowledge_conflict_resolutions(business_id, key, subject_id, scope, COALESCE(scope_id, ''));
     `);
     });
     // Migrate pre-account databases in place: add the columns, then replace
@@ -450,11 +479,14 @@ export class KnowledgeService {
     const candidates = rows.map((value) => this.readCandidate(row(value)));
     const pending = candidates.filter((candidate) => candidate.status === "pending");
     return candidates.map((candidate) => {
+      // Pending conflicts are business-wide: same key+subject with a
+      // different value conflicts across account lines too, so a second
+      // account's observation can never silently agree or override. Account
+      // lineage stays distinct; only the conflict link crosses accounts.
       const conflictsWith = candidate.status !== "pending" ? [] : pending
         .filter(
           (other) =>
             other.id !== candidate.id &&
-            other.accountId === candidate.accountId &&
             other.key === candidate.key &&
             other.subjectId === candidate.subjectId &&
             canonical(other.value) !== canonical(candidate.value),
@@ -739,6 +771,191 @@ export class KnowledgeService {
     }
   }
 
+  // ---------- business-wide conflicts ----------
+
+  /**
+   * Business-wide conflict groups: active revisions for the same applicable
+   * fact (key + subject + scope) carrying different values on different
+   * account lines. Account lineage is never merged — rows stay distinct and
+   * only the comparison crosses accounts. Revisions under review (stale
+   * source) are listed for visibility but never trigger a conflict on their
+   * own; they are already withheld from consequential use.
+   */
+  listConflicts(businessId: string): BusinessConflict[] {
+    this.store.getBusiness(businessId); // throws if unknown
+    const rows = this.store.db.prepare(
+      `SELECT * FROM knowledge_revisions WHERE business_id = $b AND status = 'active'
+         ORDER BY key, subject_id, scope, COALESCE(scope_id, ''), approved_at, id`,
+    ).all({ $b: businessId });
+    const groups = new Map<string, KnowledgeRevision[]>();
+    for (const value of rows) {
+      const revision = this.readRevision(row(value));
+      const group = `${revision.key}	${revision.subjectId}	${revision.scope}	${revision.scopeId ?? ""}`;
+      const list = groups.get(group);
+      if (list) list.push(revision);
+      else groups.set(group, [revision]);
+    }
+    const conflicts: BusinessConflict[] = [];
+    for (const revisions of groups.values()) {
+      const usable = revisions.filter((revision) => revision.reviewState === "none");
+      const distinct = new Set(usable.map((revision) => canonical(revision.value)));
+      if (distinct.size < 2) continue;
+      const first = revisions[0]!;
+      const currentIds = revisions.map((revision) => revision.id).sort();
+      const governing = this.governingResolution(
+        businessId, first.key, first.subjectId, first.scope, first.scopeId, currentIds,
+      );
+      conflicts.push({
+        key: first.key,
+        subjectId: first.subjectId,
+        scope: first.scope,
+        ...(first.scopeId === undefined ? {} : { scopeId: first.scopeId }),
+        revisions: revisions.map((revision) => ({
+          revisionId: revision.id,
+          factId: revision.factId,
+          accountId: revision.accountId,
+          revision: revision.revision,
+          value: revision.value,
+          reviewState: revision.reviewState,
+          approvedBy: revision.approvedBy,
+          approvedAt: revision.approvedAt,
+        })),
+        status: governing ? "resolved" : "conflicted",
+        ...(governing ? { resolutionId: governing.id, winningRevisionId: governing.winningRevisionId } : {}),
+      });
+    }
+    return conflicts;
+  }
+
+  private governingResolution(
+    businessId: string,
+    key: string,
+    subjectId: string,
+    scope: FactScope,
+    scopeId: string | undefined,
+    currentIds: string[],
+  ): { id: string; winningRevisionId: string } | null {
+    const rows = this.store.db.prepare(
+      `SELECT * FROM knowledge_conflict_resolutions
+         WHERE business_id = $b AND key = $k AND subject_id = $s
+           AND scope = $scope AND COALESCE(scope_id, '') = $scopeId
+         ORDER BY rowid DESC`,
+    ).all({ $b: businessId, $k: key, $s: subjectId, $scope: scope, $scopeId: scopeId ?? "" });
+    const wanted = [...currentIds].sort().join(",");
+    for (const value of rows) {
+      const item = row(value);
+      const considered = parseJson<string[]>(item.considered_revision_ids_json, []);
+      if ([...considered].sort().join(",") !== wanted) continue;
+      const winner = String(item.winning_revision_id);
+      if (!currentIds.includes(winner)) continue;
+      return { id: String(item.id), winningRevisionId: winner };
+    }
+    return null;
+  }
+
+  /**
+   * Owner-only conflict resolution pinned to exact revisions: the winner is
+   * a revision id, never a value match, and the resolution governs exactly
+   * the commanded revision set. Any later correction mints a new revision
+   * id, the set changes, and the conflict reopens — nothing silently
+   * carries forward. Losing lines keep their rows and lineage; they are
+   * withheld from offer preparation, never erased or merged. Resolution
+   * synthesizes nothing, so unknown costs can never gain a profit figure
+   * and scoped exceptions keep their commanded scope.
+   */
+  resolveConflict(
+    input: DecisionCommand & {
+      key: string;
+      subjectId?: string;
+      scope?: FactScope;
+      scopeId?: string;
+      winningRevisionId: string;
+    },
+  ): ResolveConflictResult {
+    const subjectId = input.subjectId ?? "";
+    const scope = input.scope ?? "global";
+    const scopeId = input.scopeId;
+    const fingerprint = this.requestFingerprint("resolve_conflict", input, {
+      key: input.key, subjectId, scope, scopeId: scopeId ?? null, winningRevisionId: input.winningRevisionId,
+    });
+    const replay = this.replayDecision(input, "resolve_conflict", fingerprint);
+    if (replay) {
+      return { ...(replay as ResolveConflictResult), duplicate: true };
+    }
+    this.assertAuthority(input, "resolve_conflict", { key: input.key, subjectId });
+    const rejectInvalid = (reason: string): never => {
+      this.recordDecision(input, "resolve_conflict", "rejected", {
+        requestFingerprint: fingerprint, reason, key: input.key, subjectId,
+      });
+      throw new KnowledgeError("invalid", reason);
+    };
+    if (!KNOWN_FACT_KEYS.has(input.key)) {
+      rejectInvalid(`key "${input.key}" is outside the booking-business fact vocabulary`);
+    }
+    if (!isNonEmptyString(input.winningRevisionId)) {
+      rejectInvalid("resolution requires an exact winningRevisionId; values are never matched");
+    }
+    try {
+      return this.transact(() => {
+        const fresh = this.requireFreshCommand(input, "resolve_conflict", fingerprint);
+        if (fresh) return { ...(fresh.recorded as unknown as ResolveConflictResult), duplicate: true };
+        const group = this.store.db.prepare(
+          `SELECT * FROM knowledge_revisions WHERE business_id = $b AND key = $k AND subject_id = $s
+             AND scope = $scope AND COALESCE(scope_id, '') = $scopeId AND status = 'active'
+             ORDER BY approved_at, id`,
+        ).all({ $b: input.businessId, $k: input.key, $s: subjectId, $scope: scope, $scopeId: scopeId ?? "" })
+          .map((value) => this.readRevision(row(value)));
+        const winner = group.find((revision) => revision.id === input.winningRevisionId) ?? null;
+        if (!winner) {
+          throw new KnowledgeError("not_found", `winning revision ${input.winningRevisionId} is not an active revision of ${input.key}/${subjectId}`);
+        }
+        if (winner.reviewState !== "none") {
+          throw new KnowledgeError("invalid", `winning revision ${winner.id} is under review (stale source); reconfirm it before resolving`);
+        }
+        const usable = group.filter((revision) => revision.reviewState === "none");
+        if (new Set(usable.map((revision) => canonical(revision.value))).size < 2) {
+          throw new KnowledgeError("invalid", `no cross-account value conflict to resolve for ${input.key}/${subjectId}`);
+        }
+        const considered = group.map((revision) => revision.id).sort();
+        const resolutionId = input.commandId ?? `kd_${createHash("sha256").update(canonical({ kind: "resolve_conflict", at: randomUUID() })).digest("hex").slice(0, 24)}`;
+        this.store.db.prepare(
+          `INSERT INTO knowledge_conflict_resolutions
+             (id, business_id, key, subject_id, scope, scope_id, winning_revision_id,
+              considered_revision_ids_json, resolved_by, resolved_at)
+           VALUES ($id, $b, $k, $s, $scope, $scopeId, $winner, $considered, $by, $at)`,
+        ).run({
+          $id: resolutionId, $b: input.businessId, $k: input.key, $s: subjectId,
+          $scope: scope, $scopeId: scopeId ?? null, $winner: winner.id,
+          $considered: JSON.stringify(considered), $by: input.actor.id, $at: now(),
+        });
+        const result: ResolveConflictResult = {
+          winningRevisionId: winner.id,
+          consideredRevisionIds: considered,
+          resolutionId,
+          duplicate: false,
+        };
+        this.recordDecision(input, "resolve_conflict", "applied", {
+          requestFingerprint: fingerprint,
+          key: input.key,
+          subjectId,
+          scope,
+          scopeId: scopeId ?? null,
+          winningRevisionId: winner.id,
+          consideredRevisionIds: considered,
+          result,
+        });
+        return result;
+      });
+    } catch (error) {
+      if (error instanceof KnowledgeError && (error.code === "not_found" || error.code === "invalid")) {
+        this.recordDecision(input, "resolve_conflict", "rejected", {
+          requestFingerprint: fingerprint, reason: error.code, key: input.key, subjectId,
+        });
+      }
+      throw error;
+    }
+  }
+
   /**
    * Owner-approved scoped exception with a canonical value shaped exactly
    * for the accepted offers adapter: { exceptionId (server-minted),
@@ -929,8 +1146,83 @@ export class KnowledgeService {
   snapshotForOffers(businessId: string): OffersKnowledgeSnapshot {
     const business = this.store.getBusiness(businessId);
     const confirmed = this.listFacts(businessId);
+    const withheld: WithheldFact[] = confirmed
+      .filter((fact) => fact.reviewState !== "none")
+      .map((fact) => ({
+        factId: fact.id,
+        key: fact.key,
+        subjectId: fact.subjectId,
+        reason: "source changed since owner confirmation; reconfirm via correctFact or by confirming the updated candidate",
+      }));
+    const reviewIds = new Set(withheld.map((fact) => fact.factId));
     const current = confirmed.filter((fact) => fact.reviewState === "none" && KNOWN_FACT_KEYS.has(fact.key));
-    const withheld = confirmed.filter((fact) => fact.reviewState !== "none");
+    // Business-wide conflicts: unresolved groups withhold every involved
+    // consequential fact until an owner resolution pins an exact winning
+    // revision; a resolved group contributes the winner only. Withholding
+    // is by fact id — losing account lines keep their rows and lineage.
+    const kept = new Set(current.map((fact) => fact.id));
+    for (const conflict of this.listConflicts(businessId)) {
+      if (conflict.status === "resolved" && conflict.winningRevisionId) {
+        const winner = conflict.revisions.find((revision) => revision.revisionId === conflict.winningRevisionId)!;
+        for (const revision of conflict.revisions) {
+          if (revision.factId === winner.factId || revision.reviewState !== "none") continue;
+          kept.delete(revision.factId);
+          withheld.push({
+            factId: revision.factId,
+            key: conflict.key,
+            subjectId: conflict.subjectId,
+            reason: `cross-account conflict resolved in favor of revision ${winner.revisionId} (account ${winner.accountId}); resolution ${conflict.resolutionId}`,
+          });
+        }
+      } else {
+        const rivals = conflict.revisions.filter((revision) => revision.reviewState === "none");
+        for (const revision of rivals) {
+          kept.delete(revision.factId);
+          withheld.push({
+            factId: revision.factId,
+            key: conflict.key,
+            subjectId: conflict.subjectId,
+            reason: `unresolved cross-account conflict across revisions ${rivals.map((other) => `${other.revisionId}(account ${other.accountId})`).join(", ")}; owner resolution required`,
+          });
+        }
+      }
+    }
+    // Agreement dedupes presentation only: identical values across account
+    // lines appear once, while every line's revision row (provenance) stays
+    // readable via listFacts/listConflicts.
+    const agreements: AgreementGroup[] = [];
+    const eligible = current.filter((fact) => kept.has(fact.id));
+    const scopeByFactId = new Map(eligible.map((fact) => [fact.id, fact.scope]));
+    const presentation: BusinessFact[] = [];
+    const byGroup = new Map<string, ConfirmedFact[]>();
+    for (const fact of eligible) {
+      const group = `${fact.key}	${fact.subjectId}	${fact.scope}	${fact.scopeId ?? ""}`;
+      const list = byGroup.get(group);
+      if (list) list.push(fact);
+      else byGroup.set(group, [fact]);
+    }
+    const strip = ({ revision: _r, accountId: _a, subjectId: _j, scope: _s, scopeId: _i, reviewState: _v, ...fact }: ConfirmedFact): BusinessFact => fact;
+    for (const group of byGroup.values()) {
+      const byValue = new Map<string, ConfirmedFact[]>();
+      for (const fact of group) {
+        const digest = canonical(fact.value);
+        const list = byValue.get(digest);
+        if (list) list.push(fact);
+        else byValue.set(digest, [fact]);
+      }
+      for (const same of byValue.values()) {
+        same.sort((left, right) => (left.id < right.id ? -1 : left.id > right.id ? 1 : 0));
+        presentation.push(strip(same[0]!));
+        if (same.length > 1) {
+          agreements.push({
+            key: same[0]!.key,
+            subjectId: same[0]!.subjectId,
+            keptFactId: same[0]!.id,
+            agreedFactIds: same.slice(1).map((fact) => fact.id),
+          });
+        }
+      }
+    }
     const businessFact: BusinessFact = {
       id: `gather:business:${business.id}`,
       businessId: business.id,
@@ -946,15 +1238,13 @@ export class KnowledgeService {
       businessId: business.id,
       timezone: business.timezone,
       generatedAt: now(),
-      facts: [businessFact, ...current.map(({ revision: _r, accountId: _a, subjectId: _j, scope: _s, scopeId: _i, reviewState: _v, ...fact }) => fact)],
-      reviewFactIds: withheld.map((fact) => fact.id),
-      withheld: withheld.map((fact) => ({
-        factId: fact.id,
-        key: fact.key,
-        subjectId: fact.subjectId,
-        reason: "source changed since owner confirmation; reconfirm via correctFact or by confirming the updated candidate",
-      })),
-      scopedFactCount: current.filter((fact) => fact.scope !== "global").length,
+      facts: [businessFact, ...presentation],
+      // Compatibility: reviewFactIds names review-withheld facts only;
+      // conflict withholding is explicit in `withheld` with its own reasons.
+      reviewFactIds: [...reviewIds],
+      withheld,
+      scopedFactCount: presentation.filter((fact) => scopeByFactId.get(fact.id) !== "global").length,
+      agreements,
     };
   }
 

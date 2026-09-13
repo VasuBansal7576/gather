@@ -92,12 +92,40 @@ identity row with different content and is rejected deterministically
 instead of leaking a raw `UNIQUE` error.
 
 Account identity is server-fixed and persisted: `knowledge_candidates`
-and `knowledge_revisions` carry `account_id`, content dedupe, supersede
-detection, conflicts, and the active-revision uniqueness are all scoped by
-it, and confirm/correct move one account's line without touching another's
+and `knowledge_revisions` carry `account_id`; content dedupe, supersede
+detection, and the active-revision uniqueness are scoped by it, and
+confirm/correct move one account's line without touching another's
 (`correctFact` takes `accountId`, defaulting to the legacy `""` line).
+Conflict *detection* is business-wide (see below): lineage never merges,
+but disagreement across lines is visible and blocking.
 Two accounts sharing one locator and value therefore mint separate rows,
 facts, and revision lines — the previous cross-account aliasing is closed.
+
+## Business-wide conflicts
+
+Account-distinct lineage does not imply business-wide agreement.
+`listConflicts(businessId)` compares active revisions for the same
+applicable fact (key + subject + scope) across account lines: groups with
+different values are conflicts, identical values are agreements. Pending
+conflicts surface in `conflictsWith` across accounts, so a second account's
+observation can never silently agree with or override the first.
+
+Confirmed conflicts withhold every involved consequential fact
+(price/policy/capacity terms) from `snapshotForOffers` until an owner
+resolution pins an exact winning revision id (`resolveConflict`, owner-only,
+idempotent under `commandId`, replay-safe like every other decision). The
+resolution governs exactly the commanded revision set: any later correction
+mints a new revision id and the conflict reopens automatically. Losing lines
+keep their rows and lineage — they are withheld, never erased or merged —
+and resolved snapshots name the winning revision and resolution in each
+withheld reason. Agreement dedupes presentation (one fact in the snapshot,
+recorded in `agreements`) while every line's revision row stays readable.
+Revisions under review (stale source) never trigger a conflict and stay
+withheld for reconfirmation; resolutions synthesize no values, so unknown
+costs gain no profit figure and scoped exceptions keep their commanded
+scope. First-wins merging is refused: without a resolution, competing
+values are blocked with explicit reasons, not averaged or ordered into
+authority.
 
 `createExtractionLedger(db)` opens two extraction-owned tables on the same
 SQLite handle (never a second database): `extraction_runs` (one row per
