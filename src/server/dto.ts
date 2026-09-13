@@ -28,6 +28,12 @@ export interface WorkspaceBookingDTO {
   proposals: WorkspaceProposalDTO[];
   approvals: Approval[];
   executions: ActionExecution[];
+  /**
+   * Durable current-proposal pointer: id of the booking's single displayed /
+   * approvable / confirmable action. The adapter selects exactly this
+   * proposal and never re-derives "latest" from versions or timestamps.
+   */
+  currentProposedActionId?: string;
 }
 
 export interface WorkspaceDTO {
@@ -74,7 +80,13 @@ export interface WorkspaceProposalDTO {
 export interface StepReceiptDTO {
   execution: ActionExecution;
   step: "hold" | "email";
-  demo: true;
+  /**
+   * True unless the step's stored result carries positive live connector
+   * proof (live mode, not simulated, non-empty non-fictional provenance).
+   * Unknown, simulated, or fixture proofs fail closed to true — a fixture
+   * receipt is never upgraded to live.
+   */
+  demo: boolean;
 }
 
 export interface ApproveResponseDTO {

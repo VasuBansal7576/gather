@@ -76,15 +76,27 @@ function initialsOf(name: string): string {
   return (first + second).toUpperCase();
 }
 
-/** Latest proposal by numeric version — the one displayed and approvable. */
-function latestProposal(proposals: WorkspaceProposalDTO[]): WorkspaceProposalDTO | undefined {
-  return [...proposals].sort((left, right) => {
+/**
+ * The booking's displayed proposal: the server's durable current pointer,
+ * selected by exact action id. This is the same pointer approve, retry,
+ * reconcile, and confirmation bind to — the adapter never re-derives
+ * "latest" from per-action versions, wall-clock timestamps, or UUID order,
+ * so it cannot disagree with the backend (e.g. showing an old v2 while the
+ * backend confirms a newer v1, or ordering equal timestamps by UUID).
+ *
+ * When the pointer is absent (pre-pointer payloads in tests/fixtures) the
+ * legacy version-then-createdAt ordering applies as backcompat; when the
+ * pointer names no listed proposal, nothing is displayed rather than a
+ * wrong proposal.
+ */
+function currentProposal(item: WorkspaceBookingDTO): WorkspaceProposalDTO | undefined {
+  if (item.currentProposedActionId !== undefined) {
+    return item.proposals.find((proposal) => proposal.action.id === item.currentProposedActionId);
+  }
+  return [...item.proposals].sort((left, right) => {
     if (right.action.proposalVersion !== left.action.proposalVersion) {
       return right.action.proposalVersion - left.action.proposalVersion;
     }
-    // Version ties (a changed persist creates a new row at version 1, never
-    // a bump): newest created wins so a repriced proposal displaces the
-    // stale one it supersedes instead of hiding behind it.
     if (right.action.createdAt !== left.action.createdAt) {
       return right.action.createdAt < left.action.createdAt ? -1 : 1;
     }
@@ -112,6 +124,52 @@ const REQUIRED_STEPS_BY_ACTION_KIND: Record<string, ("hold" | "email")[]> = {
   create_provisional_hold: ["hold", "email"],
 };
 
+/**
+ * Display-side mirror of the server's live-proof rule: a succeeded receipt
+ * reads as a provider receipt only on positive proof (live mode, not
+ * simulated, non-empty non-fictional provenance). Missing proof, simulated
+ * results, and fixture refs fail closed to simulated — a fixture receipt is
+ * never upgraded to live at display.
+ */
+function isLiveProof(proof: ExecutionDTO["proof"]): boolean {
+  if (proof === undefined) return false;
+  if (proof.mode !== "live" || proof.simulated !== false) return false;
+  if (proof.provenance.length === 0) return false;
+  return !proof.provenance.some((ref) => ref.fictional === true);
+}
+
+/**
+ * Read the step proof from either execution shape: parsed client DTOs carry
+ * it as top-level `proof` (validated at the DTO boundary), while
+ * server-shape executions passed straight through carry it embedded in
+ * `result.proof`. Both are validated the same strict way; anything
+ * malformed yields undefined so display fails closed to simulated.
+ */
+function executionProof(execution: ExecutionDTO): ExecutionDTO["proof"] {
+  if (execution.proof !== undefined) return execution.proof;
+  const result = (execution as unknown as { result?: unknown }).result;
+  if (typeof result !== "object" || result === null) return undefined;
+  const proof = (result as { proof?: unknown }).proof;
+  if (typeof proof !== "object" || proof === null) return undefined;
+  const candidate = proof as { mode?: unknown; simulated?: unknown; provenance?: unknown };
+  if ((candidate.mode !== "demo" && candidate.mode !== "live") || typeof candidate.simulated !== "boolean") return undefined;
+  if (!Array.isArray(candidate.provenance)) return undefined;
+  const provenance: { kind: string; locator: string; label?: string; fictional?: boolean }[] = [];
+  for (const ref of candidate.provenance) {
+    if (typeof ref !== "object" || ref === null) return undefined;
+    const item = ref as { kind?: unknown; locator?: unknown; label?: unknown; fictional?: unknown };
+    if (typeof item.kind !== "string" || typeof item.locator !== "string") return undefined;
+    if (item.label !== undefined && typeof item.label !== "string") return undefined;
+    provenance.push({
+      kind: item.kind,
+      locator: item.locator,
+      ...(typeof item.label === "string" ? { label: item.label } : {}),
+      ...(item.fictional === true ? { fictional: true as const } : {}),
+    });
+  }
+  return { mode: candidate.mode, simulated: candidate.simulated, provenance };
+}
+
 function receiptOf(execution: ExecutionDTO, timezone: string | undefined): ActionReceipt {
   const step = stepOf(execution.idempotencyKey);
   const receipt: ActionReceipt = {
@@ -125,7 +183,9 @@ function receiptOf(execution: ExecutionDTO, timezone: string | undefined): Actio
     timestamp: formatTimestamp(execution.completedAt ?? execution.reconciledAt ?? execution.startedAt, timezone),
   };
   if (execution.error) receipt.detail = execution.error;
-  if (execution.status === "succeeded") receipt.detail = "Done — simulated provider receipt";
+  if (execution.status === "succeeded") {
+    receipt.detail = isLiveProof(executionProof(execution)) ? "Done — provider receipt recorded" : "Done — simulated provider receipt";
+  }
   // Recovery is only ever offered for non-terminal states; pending and
   // succeeded never get a control.
   if (execution.status === "failed") receipt.recoveryLabel = "Retry failed steps";
@@ -409,7 +469,7 @@ function bookingFor(item: WorkspaceBookingDTO, index: number, business: Business
   const timezone = business?.timezone;
   const venue = business?.name ?? "Venue not specified";
   const mapped = statusFor(booking.status);
-  const proposal = latestProposal(item.proposals);
+  const proposal = currentProposal(item);
   const receipts = item.executions.map((execution) => receiptOf(execution, timezone));
   // A pending step on the CURRENT proposal version means an approval
   // execution is in flight — show waiting, never claim a completed hold.
@@ -508,7 +568,7 @@ export interface AdaptedWorkspace {
 export function adaptWorkspace(workspace: WorkspaceDTO): AdaptedWorkspace {
   const pendingApprovals = new Set<string>();
   for (const item of workspace.bookings) {
-    const proposal = latestProposal(item.proposals);
+    const proposal = currentProposal(item);
     if (!proposal) continue;
     // Scope pending to the exact displayed action + version: a pending
     // execution on an older version must not block the new proposal.
