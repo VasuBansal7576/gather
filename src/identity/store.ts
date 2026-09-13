@@ -46,6 +46,8 @@ export interface IdentityLinkRow {
   provenanceMode: ProvenanceMode;
   receiptOperationKey: string | undefined;
   status: IdentityLinkStatus;
+  /** Monotonic per-row revision: every binding change increments it, so a stale reviewed state can never apply. */
+  linkRevision: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -70,6 +72,8 @@ export interface IdentityAuditRow {
   bookingId: string | undefined;
   actor: string;
   reason: string;
+  /** Link revision the entry transitioned to, when it touched a link row. */
+  linkRevision: number | undefined;
   createdAt: string;
 }
 
@@ -88,35 +92,121 @@ const LINK_DDL = `
     provenance_mode TEXT NOT NULL CHECK (provenance_mode IN ('demo', 'live', 'owner')),
     receipt_operation_key TEXT,
     status TEXT NOT NULL CHECK (status IN ('active', 'unlinked')),
+    link_revision INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   )`;
 
+/** Columns a pre-link_revision table must have, in order, to be a known legacy shape. */
+const LEGACY_LINK_COLUMNS = [
+  "source_key",
+  "booking_id",
+  "business_id",
+  "account_id",
+  "provider",
+  "origin",
+  "provenance_mode",
+  "receipt_operation_key",
+  "status",
+  "created_at",
+  "updated_at",
+] as const;
+
+function tableColumns(db: DatabaseSync, table: string): string[] {
+  const rows = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  return rows.map((row) => String(row.name));
+}
+
 /**
- * Databases created before the 'owner' provenance mode existed carry a
- * CHECK constraint that rejects it; rebuild the table in place when the old
- * constraint is detected. Rows are preserved verbatim.
+ * Failure-atomic schema upgrade for booking_identity_links.
+ *
+ * Two states need work:
+ * - pre-'owner' provenance CHECK constraint: a full table rebuild
+ *   (rename -> create -> copy -> drop -> recreate indexes) inside ONE
+ *   BEGIN IMMEDIATE transaction with PRAGMA foreign_keys held OFF and a
+ *   foreign_key_check before commit — a mid-migration failure rolls the
+ *   rename back too, so the table is never left as *_legacy.
+ * - post-'owner' shape missing link_revision: a plain additive
+ *   ALTER TABLE ADD COLUMN DEFAULT 1.
+ *
+ * The legacy shape is validated column-for-column before anything is
+ * renamed; an unrecognized shape refuses rather than guessing. Running
+ * inside an existing transaction is refused explicitly: entry points call
+ * ensureBookingIdentityTables before BEGIN, so the upgrade always happens
+ * on an autocommit boundary where the FK pragma can be toggled.
  */
-function migrateProvenanceMode(db: DatabaseSync): void {
+export function migrateIdentityLinksTable(db: DatabaseSync, opts: { createSql?: string } = {}): void {
   const found = db.prepare(
     "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'booking_identity_links'",
   ).get();
   if (!found) return;
   const ddl = String((found as SqlRow).sql ?? "");
-  if (ddl.includes("'owner'")) return;
-  db.exec(`
-    ALTER TABLE booking_identity_links RENAME TO booking_identity_links_v1;
-    ${LINK_DDL.replace("IF NOT EXISTS ", "")};
-    INSERT INTO booking_identity_links SELECT * FROM booking_identity_links_v1;
-    DROP TABLE booking_identity_links_v1;
-  `);
+  const columns = tableColumns(db, "booking_identity_links");
+  const hasRevision = columns.includes("link_revision");
+  const hasOwnerMode = ddl.includes("'owner'");
+  if (hasOwnerMode && hasRevision) return;
+  if (hasOwnerMode && !hasRevision) {
+    db.exec("ALTER TABLE booking_identity_links ADD COLUMN link_revision INTEGER NOT NULL DEFAULT 1");
+    return;
+  }
+  // Full rebuild path: the legacy shape must match exactly before touching it.
+  const legacyColumns = hasRevision ? columns.slice(0, columns.indexOf("link_revision")) : columns;
+  if (
+    legacyColumns.length !== LEGACY_LINK_COLUMNS.length ||
+    !LEGACY_LINK_COLUMNS.every((name, index) => legacyColumns[index] === name)
+  ) {
+    throw new Error(
+      `Refusing to migrate booking_identity_links: unexpected column shape [${columns.join(", ")}]; expected the known legacy shape`,
+    );
+  }
+  if (db.isTransaction) {
+    throw new Error(
+      "Refusing to migrate booking_identity_links inside an open transaction; the upgrade needs an autocommit boundary",
+    );
+  }
+  // Preserve any secondary indexes: their definitions are captured before the
+  // rename (SQLite repoints them at the legacy name) and replayed on the new
+  // table once the legacy table — and its indexes — is dropped.
+  const indexRows = db.prepare(
+    "SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'booking_identity_links' AND sql IS NOT NULL",
+  ).all() as SqlRow[];
+  const indexSql = indexRows.map((value) => String(value.sql));
+  const foreignKeysWereOn = Number(
+    (db.prepare("PRAGMA foreign_keys").get() as SqlRow | undefined)?.foreign_keys ?? 0,
+  ) === 1;
+  db.exec("PRAGMA foreign_keys = OFF");
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    db.exec("ALTER TABLE booking_identity_links RENAME TO booking_identity_links_legacy");
+    db.exec(opts.createSql ?? LINK_DDL.replace("IF NOT EXISTS ", "") + ";");
+    db.exec(
+      `INSERT INTO booking_identity_links (${LEGACY_LINK_COLUMNS.join(", ")}, link_revision)
+       SELECT ${LEGACY_LINK_COLUMNS.join(", ")}, 1 FROM booking_identity_links_legacy`,
+    );
+    db.exec("DROP TABLE booking_identity_links_legacy");
+    for (const sql of indexSql) db.exec(sql + ";");
+    const violations = db.prepare("PRAGMA foreign_key_check").all() as SqlRow[];
+    if (violations.length > 0) {
+      throw new Error(`Foreign key check failed after identity links migration (${violations.length} violation(s))`);
+    }
+    db.exec("COMMIT");
+  } catch (error) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      // Already rolled back; surface the original failure.
+    }
+    throw error;
+  } finally {
+    db.exec(`PRAGMA foreign_keys = ${foreignKeysWereOn ? "ON" : "OFF"}`);
+  }
 }
 
 /** Create identity tables when missing. Idempotent; safe to call per operation. */
 export function ensureBookingIdentityTables(store: GatherStore): void {
   const db: DatabaseSync = store.db;
   db.exec(LINK_DDL + ";");
-  migrateProvenanceMode(db);
+  migrateIdentityLinksTable(db);
   db.exec(`
     CREATE TABLE IF NOT EXISTS booking_identity_decisions (
       id TEXT PRIMARY KEY,
@@ -139,10 +229,15 @@ export function ensureBookingIdentityTables(store: GatherStore): void {
       booking_id TEXT,
       actor TEXT NOT NULL,
       reason TEXT NOT NULL,
+      link_revision INTEGER,
       created_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_identity_audit_key ON booking_identity_audit(source_key, id);
   `);
+  // Audit rows predating link revisions gain the column additively.
+  if (!tableColumns(db, "booking_identity_audit").includes("link_revision")) {
+    db.exec("ALTER TABLE booking_identity_audit ADD COLUMN link_revision INTEGER");
+  }
   // Databases created before the one-open-decision constraint may hold
   // multiple open rows; keep the newest per source key before indexing.
   db.prepare(
@@ -181,6 +276,7 @@ function toLinkRow(value: SqlRow): IdentityLinkRow {
     provenanceMode: value.provenance_mode as ProvenanceMode,
     receiptOperationKey: value.receipt_operation_key ? String(value.receipt_operation_key) : undefined,
     status: value.status as IdentityLinkStatus,
+    linkRevision: Number(value.link_revision ?? 1),
     createdAt: String(value.created_at),
     updatedAt: String(value.updated_at),
   };
@@ -224,6 +320,7 @@ export function listIdentityAudit(store: GatherStore, sourceKey: string): Identi
       bookingId: value.booking_id ? String(value.booking_id) : undefined,
       actor: String(value.actor),
       reason: String(value.reason),
+      linkRevision: value.link_revision == null ? undefined : Number(value.link_revision),
       createdAt: String(value.created_at),
     };
   });
@@ -231,18 +328,19 @@ export function listIdentityAudit(store: GatherStore, sourceKey: string): Identi
 
 export function appendIdentityAudit(
   store: GatherStore,
-  entry: { sourceKey: string; action: string; bookingId?: string; actor: string; reason: string },
+  entry: { sourceKey: string; action: string; bookingId?: string; actor: string; reason: string; linkRevision?: number },
 ): void {
   ensureBookingIdentityTables(store);
   store.db.prepare(
-    `INSERT INTO booking_identity_audit (source_key, action, booking_id, actor, reason, created_at)
-     VALUES ($key, $action, $booking, $actor, $reason, $at)`,
+    `INSERT INTO booking_identity_audit (source_key, action, booking_id, actor, reason, link_revision, created_at)
+     VALUES ($key, $action, $booking, $actor, $reason, $rev, $at)`,
   ).run({
     $key: entry.sourceKey,
     $action: entry.action,
     $booking: entry.bookingId ?? null,
     $actor: entry.actor,
     $reason: entry.reason,
+    $rev: entry.linkRevision ?? null,
     $at: nowIso(),
   });
 }
