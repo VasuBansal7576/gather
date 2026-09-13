@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createDemoConnectors } from "../src/connectors/demo.ts";
 import { adaptWorkspace } from "../src/host/adapter.ts";
+import { DtoValidationError, parseWorkspaceDTO, type WorkspaceDTO as ClientWorkspaceDTO } from "../src/host/dto.ts";
 import {
   approveAndExecute,
   emailOperationKey,
@@ -33,6 +34,57 @@ function makeDeps(): BookingServiceDeps {
 function adapted(deps: BookingServiceDeps): ReturnType<typeof adaptWorkspace> {
   const workspace: WorkspaceDTO = getWorkspace(deps.store, { ownerId: deps.ownerId });
   return adaptWorkspace(workspace as unknown as Parameters<typeof adaptWorkspace>[0]);
+}
+
+function baseWorkspace(): ClientWorkspaceDTO {
+  return {
+    mode: { kind: "demo", label: "DEMO ONLY" },
+    demo: true,
+    approvalIdentity: "test-owner",
+    businesses: [
+      { id: "biz-a", name: "Alpha Venue", timezone: "America/New_York" },
+      { id: "biz-b", name: "Beta Venue", timezone: "Asia/Tokyo" },
+    ],
+    bookings: [],
+    connections: [],
+    notice: "test",
+  };
+}
+
+function baseBooking(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    booking: {
+      id: "bk-1",
+      businessId: "biz-a",
+      status: "pending_approval",
+      eventName: "Test event",
+      startAt: "2026-10-18T16:00:00.000Z",
+      endAt: "2026-10-18T20:00:00.000Z",
+      sourceReferences: [{ kind: "fixture", locator: "demo://fixture" }],
+      createdAt: "2026-10-01T00:00:00.000Z",
+      updatedAt: "2026-10-01T00:00:00.000Z",
+      ...overrides,
+    },
+    proposals: [
+      {
+        action: {
+          id: "act-1",
+          bookingId: "bk-1",
+          kind: "create_provisional_hold",
+          payload: {},
+          proposalVersion: 2,
+          proposalFingerprint: "f".repeat(64),
+          sourceReferences: [],
+          status: "proposed",
+          createdAt: "2026-10-01T00:00:00.000Z",
+          updatedAt: "2026-10-01T00:00:00.000Z",
+        },
+        consequences: null,
+      },
+    ],
+    approvals: [],
+    executions: [],
+  };
 }
 
 test("workspace adapts persisted demo bookings with exact proposal identity", () => {
@@ -181,4 +233,140 @@ test("uncertain email exposes reconcile recovery and heals to succeeded", async 
   const healedBooking = healedView.bookings.find((booking) => booking.id === maya.id);
   assert.equal(healedBooking?.status, "provisional-hold");
   assert.ok(healedBooking?.detail.receipts?.every((receipt) => receipt.status === "succeeded"));
+});
+
+test("the exact offer email is reviewable — to, subject, and full body", async () => {
+  const deps = makeDeps();
+  const view = adapted(deps);
+  const clara = view.bookings[0];
+  const preview = clara.detail.proposal.emailPreview;
+  assert.ok(preview, "email preview should be present");
+  assert.equal(preview.to, "clara-guest@example.test");
+  assert.match(preview.subject, /Glasshouse dinner proposal/);
+  assert.ok(preview.body.length > 20, "the full email body must be inspectable");
+});
+
+test("bookings map to their own business and timezone, never businesses[0]", () => {
+  const workspace = baseWorkspace();
+  const booking = baseBooking({ businessId: "biz-b" });
+  (booking.booking as Record<string, unknown>).businessId = "biz-b";
+  workspace.bookings = [booking] as unknown as ClientWorkspaceDTO["bookings"];
+  const view = adaptWorkspace(workspace);
+  assert.equal(view.bookings[0].venue, "Beta Venue");
+  // 16:00Z is 01:00 next day in Tokyo — a wrong timezone would show 12:00 PM.
+  assert.match(view.bookings[0].eventTime, /GMT\+9|JST/);
+  // Every rendered timestamp carries an explicit timezone marker.
+  assert.match(view.bookings[0].eventDate, /GMT\+9|JST/);
+});
+
+test("a pending step on an old version cannot block the new proposal", () => {
+  const workspace = baseWorkspace();
+  const booking = baseBooking();
+  const staleExecution = {
+    id: "exec-old",
+    proposedActionId: "act-1",
+    proposalVersion: 1, // older version than the displayed v2 proposal
+    idempotencyKey: "gather:calendar:create-provisional-hold:old",
+    status: "pending",
+    startedAt: "2026-10-01T00:00:00.000Z",
+  };
+  (booking as Record<string, unknown>).executions = [staleExecution];
+  workspace.bookings = [booking] as unknown as ClientWorkspaceDTO["bookings"];
+  assert.deepEqual(adaptWorkspace(workspace).pendingApprovals, []);
+
+  const currentExecution = { ...staleExecution, id: "exec-new", proposalVersion: 2 };
+  (booking as Record<string, unknown>).executions = [currentExecution];
+  const view = adaptWorkspace(workspace);
+  assert.deepEqual(view.pendingApprovals, ["f".repeat(64)]);
+  assert.equal(view.bookings[0].status, "waiting");
+});
+
+test("missing guest count and customer name stay absent, unknown kinds are unsupported", () => {
+  const workspace = baseWorkspace();
+  workspace.bookings = [baseBooking()] as unknown as ClientWorkspaceDTO["bookings"];
+  workspace.connections = [
+    { id: "conn-x", provider: "notion", displayName: "Notion", status: "connected", updatedAt: "2026-10-01T00:00:00.000Z" },
+  ];
+  const view = adaptWorkspace(workspace);
+  assert.equal(view.bookings[0].guestCount, undefined);
+  assert.equal(view.bookings[0].customerName, undefined);
+  assert.equal(view.bookings[0].detail.proposal.sources.length, 0);
+  const source = (view.bookings[0].detail.proposal.sources ?? [])[0];
+  assert.equal(source, undefined);
+  // Fixture booking source is not dressed up as a known type.
+  const connection = view.connections[0];
+  assert.equal(connection.provider, "unsupported");
+  assert.equal(connection.connected, false);
+  assert.match(connection.detail, /[Uu]nsupported/);
+});
+
+test("boundary validation rejects malformed mode, status, and demo correlation", () => {
+  const workspace = baseWorkspace() as unknown as Record<string, unknown>;
+  const badKind = { ...workspace, mode: { kind: "staging", label: "x" } };
+  assert.throws(() => parseWorkspaceDTO(badKind), DtoValidationError);
+  const liveDemo = { ...workspace, mode: { kind: "live", label: "x" }, demo: true };
+  assert.throws(() => parseWorkspaceDTO(liveDemo), DtoValidationError);
+  const demoFalse = { ...workspace, mode: { kind: "demo", label: "x" }, demo: false };
+  assert.throws(() => parseWorkspaceDTO(demoFalse), DtoValidationError);
+  const badExecution = baseWorkspace() as unknown as Record<string, unknown>;
+  const booking = baseBooking();
+  (booking as Record<string, unknown>).executions = [
+    { id: "e", proposedActionId: "a", proposalVersion: 1, idempotencyKey: "k", status: "mystery", startedAt: "2026-01-01T00:00:00Z" },
+  ];
+  (badExecution as Record<string, unknown>).bookings = [booking];
+  assert.throws(() => parseWorkspaceDTO(badExecution), DtoValidationError);
+  const badBooking = baseBooking({ status: "half_booked" });
+  const badStatus = baseWorkspace() as unknown as Record<string, unknown>;
+  (badStatus as Record<string, unknown>).bookings = [badBooking];
+  assert.throws(() => parseWorkspaceDTO(badStatus), DtoValidationError);
+});
+
+test("a send timeout after the hold still heals via the durable receipt", async () => {
+  const timeoutKey = emailOperationKey("demo-proposal-clara-v1", 1);
+  const store = new GatherStore(":memory:");
+  const connectors = createDemoConnectors({
+    calendarSlots: demoFixtureSlots(),
+    timeoutAfterSuccessOperationKeys: [timeoutKey],
+  });
+  const deps: BookingServiceDeps = {
+    store,
+    calendar: new DurableDemoCalendar(store, connectors.calendar),
+    email: new DurableDemoEmail(store, connectors.email),
+    ownerId: "test-owner",
+  };
+  seedDemoFixtures(store);
+  const view = adapted(deps);
+  const clara = view.bookings[0];
+  const response = await approveAndExecute(deps, {
+    bookingId: clara.id,
+    proposedActionId: clara.detail.proposal.id,
+    proposalVersion: clara.detail.proposal.version,
+    proposalFingerprint: clara.detail.proposal.fingerprint,
+  });
+  // The write completed at the provider before the timeout, so the inline
+  // reconcile heals it — the owner sees an honest succeeded receipt.
+  assert.equal(response.hold.execution.status, "succeeded");
+  assert.equal(response.email?.execution.status, "succeeded");
+  const after = adapted(deps);
+  assert.ok(after.bookings[0].detail.receipts?.every((receipt) => receipt.status === "succeeded"));
+});
+
+test("a failed mutation still re-reads consistent workspace state", async () => {
+  const deps = makeDeps();
+  const view = adapted(deps);
+  const clara = view.bookings[0];
+  await assert.rejects(
+    approveAndExecute(deps, {
+      bookingId: clara.id,
+      proposedActionId: clara.detail.proposal.id,
+      proposalVersion: clara.detail.proposal.version + 9,
+      proposalFingerprint: clara.detail.proposal.fingerprint,
+    }),
+    (error: unknown) => error instanceof ServiceError && error.code === "STALE_PROPOSAL",
+  );
+  // After the rejected mutation the workspace still reports the same state.
+  const after = adapted(deps);
+  assert.equal(after.bookings[0].status, "proposal-ready");
+  assert.equal(after.bookings[0].detail.receipts?.length ?? 0, 0);
+  assert.equal(after.bookings[0].detail.proposal.fingerprint, clara.detail.proposal.fingerprint);
 });

@@ -54,7 +54,7 @@ The host application owns the real mutation, confirmation, failure, and uncertai
 | `proposalFingerprint` | `proposal.fingerprint` — the content fingerprint shown. |
 
 The callback carries the exact displayed identity, so an approval can never silently target a newer version.
-Before approving, the owner can inspect the `consequences` list (each step the host will attempt — recheck, provisional hold, offer send) and the source evidence for the proposal.
+Before approving, the owner can inspect the `consequences` list (each step the host will attempt — recheck, provisional hold, offer send), the source evidence for the proposal, and `proposal.emailPreview` — the exact recipients, subject, and body of the email it would send.
 The approve control stays disabled while the proposal's fingerprint is in `pendingApprovals`, any receipt on the booking is still pending, or a request was just sent and not yet acknowledged — so the same version cannot be approved twice.
 A sent approval only displays "waiting" — the workspace never presents a hold or a sent request as a confirmed booking.
 
@@ -99,9 +99,17 @@ A sent approval only displays "waiting" — the workspace never presents a hold 
 Booking statuses include `needs-review`, `proposal-ready`, `waiting`, `provisional-hold`, `confirmed`, `failed`, `uncertain`, and `partial`; the legacy `hold-pending` value is still accepted as an alias for `waiting`.
 The domain types are exported from the same entry point so the coordinator can map shared contracts into this view without changing the component internals.
 
+## Host adapter (`src/host/`)
+
+`GatherHostWorkspace` wires this UI to the local workspace service:
+
+- `dto.ts` validates every consumed field of `GET /api/workspace` at the boundary — booking status, execution status, and mode kind are checked against enums, and `mode.kind`/`demo` must correlate (`demo` requires `demo: true`; `live` forbids it).
+- `adapter.ts` maps each booking to its own business (`businessId`, not `businesses[0]`) and renders all consequence/expiry timestamps in that business's IANA timezone with an explicit abbreviation. Pending approvals are scoped to the displayed action id + version, so a stale pending execution can never block a newer proposal. Unknown source kinds and connection providers render as `unsupported` rather than being mislabeled; a missing guest count stays absent instead of reading `0`, and the booking's event name is never presented as a customer name. The proposal's `emailPreview` carries the exact recipients, subject, and body the approval would send.
+- Mutations re-fetch the workspace on success AND failure so receipts reflect the durable record; the original error is preserved. A refresh failure on a loaded workspace keeps the data but discloses staleness, and a generation counter drops out-of-order responses.
+
 ## Visual and accessibility notes
 
-The interface uses a warm paper, ink, coral, sage, and gold palette with system sans-serif text and a restrained serif display face.
+The interface uses the Linear-inspired near-black palette (dark panels, fine dividers, compact type) with lavender selection/accent, a purple approve footer, and a right-side booking metadata column.
 There are no external image or paid font dependencies.
 All meaningful actions are native buttons with visible focus rings; controls without a real action behind them — new inquiry, search, filter, settings, manage, add connection, more menus — render disabled with honest product wording rather than pretending to work.
 The active navigation item exposes `aria-current`, loading exposes `role="status"`, blocked notices expose `role="status"`, and receipts update inside an `aria-live="polite"` region.

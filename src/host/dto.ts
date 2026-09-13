@@ -42,6 +42,29 @@ function asArray(value: unknown, field: string): unknown[] {
   return value;
 }
 
+function asEnum<T extends string>(value: unknown, field: string, allowed: readonly T[]): T {
+  const text = asString(value, field);
+  if (!allowed.includes(text as T)) {
+    throw new DtoValidationError(`${field} must be one of ${allowed.join("/")}, got "${text}"`);
+  }
+  return text as T;
+}
+
+const BOOKING_STATUSES = [
+  "inquiry",
+  "proposed",
+  "pending_approval",
+  "provisional_hold",
+  "confirmed",
+  "failed",
+  "uncertain",
+  "cancelled",
+] as const;
+
+const EXECUTION_STATUSES = ["pending", "succeeded", "failed", "partial", "uncertain"] as const;
+
+const MODE_KINDS = ["demo", "live"] as const;
+
 export interface SourceRefDTO {
   kind: string;
   locator: string;
@@ -171,7 +194,7 @@ function parseBooking(value: unknown): BookingDTO {
   const parsed: BookingDTO = {
     id: asString(req(record, "id"), "booking.id"),
     businessId: asString(req(record, "businessId"), "booking.businessId"),
-    status: asString(req(record, "status"), "booking.status"),
+    status: asEnum(req(record, "status"), "booking.status", BOOKING_STATUSES),
     eventName: asString(req(record, "eventName"), "booking.eventName"),
     sourceReferences: parseSourceRefs(record.sourceReferences ?? [], "booking.sourceReferences"),
     createdAt: asString(req(record, "createdAt"), "booking.createdAt"),
@@ -246,7 +269,7 @@ function parseExecution(value: unknown): ExecutionDTO {
     proposedActionId: asString(req(record, "proposedActionId"), "execution.proposedActionId"),
     proposalVersion: asNumber(req(record, "proposalVersion"), "execution.proposalVersion"),
     idempotencyKey: asString(req(record, "idempotencyKey"), "execution.idempotencyKey"),
-    status: asString(req(record, "status"), "execution.status"),
+    status: asEnum(req(record, "status"), "execution.status", EXECUTION_STATUSES),
     error: asOptString(record.error, "execution.error"),
     startedAt: asString(req(record, "startedAt"), "execution.startedAt"),
     completedAt: asOptString(record.completedAt, "execution.completedAt"),
@@ -278,9 +301,19 @@ function parseConnection(value: unknown): ConnectedAccountDTO {
 export function parseWorkspaceDTO(value: unknown): WorkspaceDTO {
   const record = asRecordOf(value, "workspace");
   const mode = asRecordOf(req(record, "mode"), "workspace.mode");
+  const kind = asEnum(req(mode, "kind"), "mode.kind", MODE_KINDS);
+  const demo = record.demo === true;
+  // Correlated semantics: a "demo" mode must be flagged demo, and a live
+  // workspace may never claim the demo marker — anything else is corrupt.
+  if (kind === "demo" && !demo) {
+    throw new DtoValidationError('mode.kind is "demo" but workspace.demo is not true');
+  }
+  if (kind === "live" && demo) {
+    throw new DtoValidationError('mode.kind is "live" but workspace.demo is true');
+  }
   return {
-    mode: { kind: asString(req(mode, "kind"), "mode.kind"), label: asString(req(mode, "label"), "mode.label") },
-    demo: record.demo === true,
+    mode: { kind, label: asString(req(mode, "label"), "mode.label") },
+    demo,
     approvalIdentity: asString(req(record, "approvalIdentity"), "approvalIdentity"),
     businesses: asArray(record.businesses ?? [], "businesses").map((item) => {
       const business = asRecordOf(item, "business");
