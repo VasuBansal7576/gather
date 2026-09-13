@@ -58,13 +58,19 @@ var query: [String: Any] = [
 ]
 `;
 
+// Refresh path: SecItemUpdate mutates the existing record in place, so the
+// item's established access (trusted-application ACL) survives a token
+// rotation — delete+add would recreate the item and reset it. SecItemAdd is
+// used only when no record exists yet; every other status fails closed.
 const SWIFT_SET_PROGRAM = `${SWIFT_QUERY_PREAMBLE}
 let secret = FileHandle.standardInput.readDataToEndOfFile()
-SecItemDelete(query as CFDictionary)
-query[kSecValueData as String] = secret
-let status = SecItemAdd(query as CFDictionary, nil)
+var status = SecItemUpdate(query as CFDictionary, [kSecValueData as String: secret] as CFDictionary)
+if status == errSecItemNotFound {
+  query[kSecValueData as String] = secret
+  status = SecItemAdd(query as CFDictionary, nil)
+}
 if status != errSecSuccess {
-  FileHandle.standardError.write("SecItemAdd failed".data(using: .utf8)!)
+  FileHandle.standardError.write("keychain write failed".data(using: .utf8)!)
   exit(2)
 }
 `;

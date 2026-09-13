@@ -577,6 +577,38 @@ test("keychain adapter never puts secrets in argv, errors, or logs", async () =>
   assert.equal(setCall?.stdin, "top-secret-value", "secret travels on stdin to the native boundary");
 });
 
+test("keychain refresh updates in place — a failed update never clobbers the prior record", () => {
+  const backing = new Map<string, string>([["conn:x:refresh", "prior-value"]]);
+  const store = new KeychainSecretStore({
+    namespace: "test-update-failure",
+    runner: (spec) => {
+      const program = spec.argv[2]!;
+      const key = spec.argv[spec.argv.length - 1]!;
+      if (program.includes("SecItemAdd")) {
+        // The update path failed with a non-not-found status — fail closed
+        // (the item is untouched, mirroring SecItemUpdate semantics).
+        const e = new Error("fail") as Error & { stderr?: string };
+        e.stderr = "keychain write failed";
+        throw e;
+      }
+      if (program.includes("SecItemCopyMatching")) {
+        const value = backing.get(key);
+        if (value === undefined) {
+          const e = new Error("fail") as Error & { stderr?: string };
+          e.stderr = "The specified item could not be found";
+          throw e;
+        }
+        return value;
+      }
+      if (program.includes("SecItemDelete")) { backing.delete(key); return ""; }
+      throw new Error("unexpected program");
+    },
+  });
+  assert.throws(() => store.set("conn:x:refresh", "new-value"), ConnectionError);
+  assert.equal(store.get("conn:x:refresh"), "prior-value",
+    "a failed refresh must leave the existing credential intact — delete+add would have destroyed it before failing");
+});
+
 test("redirect userinfo, query, and hash ambiguities are rejected", () => {
   for (const bad of [
     "http://user:pw@localhost:3000/api/connections/google/callback",
