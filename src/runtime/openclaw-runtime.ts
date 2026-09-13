@@ -3,6 +3,7 @@ import {
   GatherGatewayConnection,
   type GatherGatewayClientOptions,
   type GatewayConnectionState,
+  type GatewayRequestChannel,
 } from "./client.ts";
 import { ensureLayoutDirectories, resolveGatherOpenClawLayout, type GatherOpenClawLayout } from "./layout.ts";
 import { GatherMcpBoundary, type GatherTool } from "./mcp.ts";
@@ -47,12 +48,28 @@ export interface GatherOpenClawRuntimeOptions {
 }
 
 /**
- * Narrow injection seams for lifecycle tests — not a plugin framework. The
- * defaults construct the real supervisor and client.
+ * Narrow structural seams for lifecycle tests — plain objects satisfying the
+ * public surface the facade actually uses; no casts into private-rich
+ * classes. `OpenClawGatewayProcess` and `GatherGatewayConnection` satisfy
+ * these interfaces structurally.
  */
+export interface RuntimeProcessLike {
+  readonly gatewayToken: string;
+  readonly pid: number | null;
+  readonly currentState: GatewayProcessState;
+  start(): Promise<void>;
+  stop(exitTimeoutMs?: number, killGraceMs?: number): Promise<void>;
+}
+
+export interface RuntimeConnectionLike extends GatewayRequestChannel {
+  readonly currentState: GatewayConnectionState;
+  connect(opts?: { timeoutMs?: number }): Promise<unknown>;
+  close(opts?: { timeoutMs?: number }): Promise<void>;
+}
+
 export interface GatherRuntimeDeps {
-  processFactory?: (options: GatewayProcessOptions) => OpenClawGatewayProcess;
-  connectionFactory?: (options: GatherGatewayClientOptions) => GatherGatewayConnection;
+  processFactory?: (options: GatewayProcessOptions) => RuntimeProcessLike;
+  connectionFactory?: (options: GatherGatewayClientOptions) => RuntimeConnectionLike;
 }
 
 export class GatherOpenClawRuntime {
@@ -60,8 +77,9 @@ export class GatherOpenClawRuntime {
   private readonly options: GatherOpenClawRuntimeOptions;
   private readonly deps: GatherRuntimeDeps;
   private startPromise: Promise<void> | null = null;
-  private process: OpenClawGatewayProcess | null = null;
-  private connection: GatherGatewayConnection | null = null;
+  private stopPromise: Promise<void> | null = null;
+  private process: RuntimeProcessLike | null = null;
+  private connection: RuntimeConnectionLike | null = null;
   private mcpBoundary: GatherMcpBoundary | null = null;
   private mcpRef: GatherMcpServerRef | null = null;
   private mcpToken: string | null = null;
@@ -98,23 +116,37 @@ export class GatherOpenClawRuntime {
   }
 
   /**
-   * Single-startup guard: concurrent start() calls share the one in-flight
-   * startup; calling start() on an already-running runtime rejects. A failed
-   * start rolls back only resources this invocation owned and keeps the
-   * process reference whenever the child's exit was not verifiably observed.
+   * Lifecycle guard: concurrent start() calls share the one in-flight
+   * startup, and a new startup is rejected whenever any previously owned
+   * resource remains — a live or unexited child process, a WS connection
+   * (ready OR disconnected), or an MCP boundary — or while a stop() is in
+   * flight. Recovery is allowed only after an observed stop() has released
+   * every owned reference.
    */
   async start(): Promise<void> {
-    if (this.connection?.isReady) {
-      throw new Error("runtime already started");
-    }
     if (this.startPromise) {
       return this.startPromise;
     }
+    this.assertStartAllowed();
     this.startPromise = this.startInternal();
     try {
       await this.startPromise;
     } finally {
       this.startPromise = null;
+    }
+  }
+
+  private assertStartAllowed(): void {
+    if (this.stopPromise) {
+      throw new Error("runtime is stopping; wait for stop() to settle before starting");
+    }
+    if (this.process || this.connection || this.mcpBoundary) {
+      throw new Error(
+        "runtime still owns resources from a previous lifecycle " +
+          `(process=${this.process ? this.process.currentState : "none"}, ` +
+          `connection=${this.connection ? this.connection.currentState : "none"}, ` +
+          `mcp=${this.mcpBoundary ? "listening" : "none"}); call stop() first`,
+      );
     }
   }
 
@@ -192,8 +224,24 @@ export class GatherOpenClawRuntime {
     }
   }
 
-  /** Closes the WS client, then stops the child process and MCP boundary. */
+  /**
+   * Single-flight shutdown: concurrent stop() calls share the one in-flight
+   * teardown. Waits for any in-flight startup to settle first so start/stop
+   * ordering is unambiguous.
+   */
   async stop(): Promise<void> {
+    if (this.stopPromise) {
+      return this.stopPromise;
+    }
+    this.stopPromise = this.stopInternal();
+    try {
+      await this.stopPromise;
+    } finally {
+      this.stopPromise = null;
+    }
+  }
+
+  private async stopInternal(): Promise<void> {
     if (this.startPromise) {
       // Let an in-flight startup settle before tearing down.
       await this.startPromise.catch(() => {});
