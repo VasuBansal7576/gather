@@ -38,6 +38,20 @@ export interface ExtractionRunCandidate {
   evidenceJson: string;
 }
 
+/**
+ * Thrown when a caller key is reused across scopes. A caller idempotency
+ * key names exactly one source identity (business, account, locator,
+ * content digest): reusing it elsewhere fails closed instead of skewing
+ * the run row toward whichever scope wrote first.
+ */
+export class ExtractionScopeConflictError extends Error {
+  readonly code = "extraction_scope_conflict" as const;
+  constructor(message: string) {
+    super(message);
+    this.name = "ExtractionScopeConflictError";
+  }
+}
+
 function nowIso(): string {
   return new Date().toISOString();
 }
@@ -80,6 +94,19 @@ export function recordExtractionRun(
   ledger: ExtractionLedger,
   run: Omit<ExtractionRunRecord, "reason" | "taskId"> & { reason?: string | null; taskId?: string | null },
 ): void {
+  const existing = getExtractionRun(ledger, run.idempotencyKey);
+  if (existing !== undefined) {
+    const sameScope =
+      existing.businessId === run.businessId &&
+      existing.accountId === run.accountId &&
+      existing.locator === run.locator &&
+      existing.contentDigest === run.contentDigest;
+    if (!sameScope) {
+      throw new ExtractionScopeConflictError(
+        `idempotency key ${run.idempotencyKey} already names ${existing.businessId}/${existing.accountId}/${existing.locator}; refusing cross-scope reuse`,
+      );
+    }
+  }
   const timestamp = nowIso();
   ledger.db.prepare(
     `INSERT INTO extraction_runs
@@ -111,6 +138,24 @@ export function recordExtractionCandidate(
   idempotencyKey: string,
   candidate: ExtractionRunCandidate,
 ): void {
+  const prior = ledger.db.prepare(
+    "SELECT candidate_id, intake_id, fact_key, subject_id, confidence, evidence_json FROM extraction_run_candidates WHERE idempotency_key = $key AND candidate_index = $index",
+  ).get({ $key: idempotencyKey, $index: candidate.candidateIndex }) as Record<string, unknown> | undefined;
+  if (prior !== undefined) {
+    const same =
+      String(prior.candidate_id) === candidate.candidateId &&
+      String(prior.intake_id) === candidate.intakeId &&
+      String(prior.fact_key) === candidate.factKey &&
+      String(prior.subject_id) === candidate.subjectId &&
+      String(prior.confidence) === candidate.confidence &&
+      String(prior.evidence_json) === candidate.evidenceJson;
+    if (!same) {
+      throw new ExtractionScopeConflictError(
+        `candidate slot ${candidate.candidateIndex} for ${idempotencyKey} already records different content; refusing to overwrite lineage`,
+      );
+    }
+    return;
+  }
   ledger.db.prepare(
     `INSERT INTO extraction_run_candidates
       (idempotency_key, candidate_index, candidate_id, intake_id, fact_key,

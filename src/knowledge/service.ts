@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import type { DatabaseSync } from "node:sqlite";
 import type { BusinessFact, SourceReference } from "../domain/contracts.ts";
 import type {
   CandidateConfidence,
@@ -128,6 +129,13 @@ function canonical(value: unknown): string {
 export interface IntakeCandidateInput {
   businessId: string;
   key: string;
+  /**
+   * Stable account identity the observation belongs to, fixed by the host
+   * caller (never model-asserted). Canonical dedupe, supersede detection,
+   * and revision lineage are all scoped by it, so two accounts observing
+   * identical content mint separate rows instead of aliasing.
+   */
+  accountId?: string;
   /** Optional identity of the thing the fact describes (spaceId, lineId, ...). */
   subjectId?: string;
   value: Record<string, unknown>;
@@ -138,6 +146,13 @@ export interface IntakeCandidateInput {
   note?: string;
   /** Re-ingest dedupe: repeat calls with the same key return the same candidate. */
   intakeId?: string;
+  /**
+   * Hook executed inside the intake transaction after the candidate row
+   * and supersede updates, before commit. Lets a caller persist
+   * same-connection lineage atomically with intake: if the hook throws,
+   * the whole transaction rolls back and no candidate row survives.
+   */
+  atomically?: (db: DatabaseSync) => void;
 }
 
 export interface CandidateView extends KnowledgeCandidate {
@@ -173,6 +188,7 @@ export class KnowledgeService {
       CREATE TABLE IF NOT EXISTS knowledge_candidates (
         id TEXT PRIMARY KEY,
         business_id TEXT NOT NULL,
+        account_id TEXT NOT NULL DEFAULT '',
         key TEXT NOT NULL,
         subject_id TEXT NOT NULL DEFAULT '',
         value_json TEXT NOT NULL,
@@ -192,6 +208,7 @@ export class KnowledgeService {
         id TEXT PRIMARY KEY,
         fact_id TEXT NOT NULL,
         business_id TEXT NOT NULL,
+        account_id TEXT NOT NULL DEFAULT '',
         key TEXT NOT NULL,
         subject_id TEXT NOT NULL DEFAULT '',
         revision INTEGER NOT NULL,
@@ -205,9 +222,6 @@ export class KnowledgeService {
         candidate_id TEXT,
         source_references_json TEXT NOT NULL
       );
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_active_revision
-        ON knowledge_revisions(business_id, key, subject_id, scope, COALESCE(scope_id, ''))
-        WHERE status = 'active';
       CREATE TABLE IF NOT EXISTS knowledge_decisions (
         command_id TEXT PRIMARY KEY,
         kind TEXT NOT NULL,
@@ -220,8 +234,39 @@ export class KnowledgeService {
       );
       CREATE INDEX IF NOT EXISTS idx_knowledge_decisions_business
         ON knowledge_decisions(business_id, created_at);
+      CREATE INDEX IF NOT EXISTS idx_knowledge_candidates_account
+        ON knowledge_candidates(business_id, account_id, key, subject_id, status);
     `);
     });
+    // Migrate pre-account databases in place: add the columns, then replace
+    // the account-blind active-revision uniqueness with the account-scoped
+    // one (the old index would otherwise forbid two accounts holding the
+    // same key). Legacy rows read back as account ''.
+    this.ensureColumn("knowledge_candidates", "account_id", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("knowledge_revisions", "account_id", "TEXT NOT NULL DEFAULT ''");
+    this.store.db.exec("DROP INDEX IF EXISTS idx_knowledge_active_revision");
+    this.store.db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_active_revision_account
+        ON knowledge_revisions(business_id, account_id, key, subject_id, scope, COALESCE(scope_id, ''))
+        WHERE status = 'active'`);
+  }
+
+  /**
+   * The underlying database handle — the same connection intake
+   * transactions run on. Callers needing same-connection atomicity
+   * (e.g. lineage writes via `IntakeCandidateInput.atomically`) must use
+   * this handle; a different connection cannot join those transactions.
+   */
+  get database(): DatabaseSync {
+    return this.store.db;
+  }
+
+  private ensureColumn(table: string, column: string, type: string): void {
+    const info = this.store.db.prepare(`PRAGMA table_info(${table})`).all() as SqlRow[];
+    const names = new Set(info.map((entry) => String(row(entry).name)));
+    if (!names.has(column)) {
+      this.store.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+    }
   }
 
   /**
@@ -300,6 +345,10 @@ export class KnowledgeService {
       throw new KnowledgeError("invalid", "primary source reference needs a locator");
     }
     const subjectId = input.subjectId ?? "";
+    // Server-fixed account scope: the host caller pins which account the
+    // observation belongs to. Every identity check below includes it, so
+    // identical content from two accounts never aliases one row.
+    const accountId = input.accountId ?? "";
     // Canonical form (key-order insensitive) for both storage and every
     // comparison below: semantically identical values dedupe and never raise
     // spurious change flags.
@@ -314,17 +363,17 @@ export class KnowledgeService {
     let insertedId: string | undefined;
     let dedupedId: string | undefined;
     this.transact(() => {
-      // Idempotent re-ingest: same business+key+subject+locator+value. The
-      // source revision is deliberately NOT part of the identity: a revision
-      // bump with identical canonical content is a re-observation, and the
-      // stored revision advances to the newest observation.
+      // Idempotent re-ingest: same business+account+key+subject+locator+value.
+      // The source revision is deliberately NOT part of the identity: a
+      // revision bump with identical canonical content is a re-observation,
+      // and the stored revision advances to the newest observation.
       const existing = this.store.db.prepare(
-        `SELECT * FROM knowledge_candidates WHERE business_id = $businessId AND key = $key
-           AND subject_id = $subjectId AND source_locator = $locator
+        `SELECT * FROM knowledge_candidates WHERE business_id = $businessId AND account_id = $account
+           AND key = $key AND subject_id = $subjectId AND source_locator = $locator
            AND value_json = $value
            AND status IN ('pending', 'confirmed') ORDER BY ingested_at LIMIT 1`,
       ).get({
-        $businessId: business.id, $key: input.key, $subjectId: subjectId,
+        $businessId: business.id, $account: accountId, $key: input.key, $subjectId: subjectId,
         $locator: primary.locator, $value: valueJson,
       });
       if (existing) {
@@ -343,41 +392,45 @@ export class KnowledgeService {
       const ingestedAt = now();
       this.store.db.prepare(
         `INSERT INTO knowledge_candidates
-          (id, business_id, key, subject_id, value_json, confidence, source_references_json,
+          (id, business_id, account_id, key, subject_id, value_json, confidence, source_references_json,
            source_locator, source_revision, observed_at, ingested_at, status, note)
-         VALUES ($id, $businessId, $key, $subjectId, $value, $confidence, $refs,
+         VALUES ($id, $businessId, $account, $key, $subjectId, $value, $confidence, $refs,
            $locator, $revision, $observedAt, $ingestedAt, 'pending', $note)`,
       ).run({
-        $id: id, $businessId: business.id, $key: input.key, $subjectId: subjectId,
+        $id: id, $businessId: business.id, $account: accountId, $key: input.key, $subjectId: subjectId,
         $value: valueJson, $confidence: input.confidence, $refs: refsJson,
         $locator: primary.locator, $revision: input.sourceRevision ?? null,
         $observedAt: observedAt, $ingestedAt: ingestedAt, $note: input.note ?? null,
       });
-      // Changed source: prior pending candidates from the same locator for
-      // this key+subject carrying a DIFFERENT value are superseded, and
-      // confirmed revisions derived from that locator are flagged for review
-      // rather than silently updated. A revision bump with identical content
-      // is a re-observation, not a change.
+      // Changed source: prior pending candidates from the same account and
+      // locator for this key+subject carrying a DIFFERENT value are
+      // superseded, and confirmed revisions derived from that locator are
+      // flagged for review rather than silently updated. A revision bump
+      // with identical content is a re-observation, not a change.
       this.store.db.prepare(
         `UPDATE knowledge_candidates SET status = 'stale'
-           WHERE business_id = $businessId AND key = $key AND subject_id = $subjectId
+           WHERE business_id = $businessId AND account_id = $account AND key = $key AND subject_id = $subjectId
              AND source_locator = $locator AND status = 'pending' AND id != $id
              AND value_json != $value`,
       ).run({
-        $businessId: business.id, $key: input.key, $subjectId: subjectId,
+        $businessId: business.id, $account: accountId, $key: input.key, $subjectId: subjectId,
         $locator: primary.locator, $value: valueJson, $id: id,
       });
       this.store.db.prepare(
         `UPDATE knowledge_revisions SET review_state = 'review'
-           WHERE status = 'active' AND business_id = $businessId AND key = $key AND subject_id = $subjectId
+           WHERE status = 'active' AND business_id = $businessId AND account_id = $account AND key = $key AND subject_id = $subjectId
               AND candidate_id IN (
                 SELECT id FROM knowledge_candidates
-                  WHERE source_locator = $locator AND value_json != $value
+                  WHERE business_id = $businessId AND account_id = $account AND source_locator = $locator AND value_json != $value
               )`,
       ).run({
-        $businessId: business.id, $key: input.key, $subjectId: subjectId,
+        $businessId: business.id, $account: accountId, $key: input.key, $subjectId: subjectId,
         $locator: primary.locator, $value: valueJson,
       });
+      // Same-connection atomicity for caller lineage: runs inside this
+      // transaction, so a throwing hook rolls back the candidate row,
+      // the supersede updates, and any partial lineage write together.
+      if (input.atomically) input.atomically(this.store.db);
     });
     if (dedupedId !== undefined) return this.getCandidate(dedupedId);
     if (insertedId === undefined) throw new KnowledgeError("not_found", "candidate intake recorded nothing");
@@ -401,6 +454,7 @@ export class KnowledgeService {
         .filter(
           (other) =>
             other.id !== candidate.id &&
+            other.accountId === candidate.accountId &&
             other.key === candidate.key &&
             other.subjectId === candidate.subjectId &&
             canonical(other.value) !== canonical(candidate.value),
@@ -499,7 +553,7 @@ export class KnowledgeService {
           // Always answer with the live revision pair, never by pairing the
           // candidate's original confirmedFactId with a newer unrelated
           // active revision after a correction moved the fact forward.
-          const live = this.activeRevisionFor(current.businessId, current.key, current.subjectId, "global");
+          const live = this.activeRevisionFor(current.businessId, current.accountId, current.key, current.subjectId, "global");
           if (!live) {
             throw new KnowledgeError("not_found", `confirmed candidate ${current.id} has no live revision row`);
           }
@@ -520,6 +574,7 @@ export class KnowledgeService {
         const revision = this.insertRevision({
           factId: fact.id,
           businessId: current.businessId,
+          accountId: current.accountId,
           key: current.key,
           subjectId: current.subjectId,
           value: current.value,
@@ -561,19 +616,24 @@ export class KnowledgeService {
   correctFact(input: DecisionCommand & {
     key: string;
     subjectId?: string;
+    /** Account scope of the revision line being corrected (default ''). */
+    accountId?: string;
     expectedRevision: number;
     value: Record<string, unknown>;
     sourceReferences?: SourceReference[];
   }): ConfirmResult {
     const subjectId = input.subjectId ?? "";
+    const accountId = input.accountId ?? "";
     // The fingerprint binds the effective provenance: explicit sources are
     // named, inherited sources resolve from the live revision (so an altered
-    // provenance can never replay as an identical command).
+    // provenance can never replay as an identical command). The account is
+    // part of the fingerprint so one commandId can never confirm two
+    // accounts' lines interchangeably.
     const inherited = input.sourceReferences === undefined
-      ? this.activeRevisionFor(input.businessId, input.key, subjectId, "global")?.sourceReferences ?? null
+      ? this.activeRevisionFor(input.businessId, accountId, input.key, subjectId, "global")?.sourceReferences ?? null
       : undefined;
     const fingerprint = this.requestFingerprint("correct", input, {
-      key: input.key, subjectId, expectedRevision: input.expectedRevision, value: isRecord(input.value) ? input.value : null,
+      key: input.key, subjectId, accountId, expectedRevision: input.expectedRevision, value: isRecord(input.value) ? input.value : null,
       sourceReferences: input.sourceReferences ?? inherited,
     });
     const replay = this.replayDecision(input, "correct", fingerprint);
@@ -610,7 +670,7 @@ export class KnowledgeService {
       return this.transact(() => {
         const fresh = this.requireFreshCommand(input, "correct", fingerprint);
         if (fresh) return fresh.recorded as unknown as ConfirmResult;
-        const current = this.activeRevisionFor(input.businessId, input.key, subjectId, "global");
+        const current = this.activeRevisionFor(input.businessId, accountId, input.key, subjectId, "global");
         if (!current) {
           throw new KnowledgeError("not_found", `no active confirmed fact ${input.key}/${subjectId} for ${input.businessId}`);
         }
@@ -640,6 +700,7 @@ export class KnowledgeService {
         const revision = this.insertRevision({
           factId: fact.id,
           businessId: input.businessId,
+          accountId,
           key: input.key,
           subjectId,
           revision: current.revision + 1,
@@ -663,11 +724,11 @@ export class KnowledgeService {
       if (error instanceof KnowledgeError && (error.code === "not_found" || error.code === "stale_version")) {
         // Rejection evidence is recorded outside the rolled-back
         // transaction so the audit survives the failure it describes.
-        const detail: Record<string, unknown> = { requestFingerprint: fingerprint, key: input.key, subjectId };
+        const detail: Record<string, unknown> = { requestFingerprint: fingerprint, key: input.key, subjectId, accountId };
         if (error.code === "not_found") {
           detail.reason = "not_found";
         } else {
-          const live = this.activeRevisionFor(input.businessId, input.key, subjectId, "global");
+          const live = this.activeRevisionFor(input.businessId, accountId, input.key, subjectId, "global");
           detail.reason = "stale_version";
           detail.expectedRevision = input.expectedRevision;
           detail.currentRevision = live?.revision;
@@ -790,6 +851,7 @@ export class KnowledgeService {
         const revision = this.insertRevision({
           factId: fact.id,
           businessId: input.businessId,
+          accountId: "",
           key: "scoped_exception",
           subjectId,
           value,
@@ -832,7 +894,7 @@ export class KnowledgeService {
     return rows.map((value) => {
       const revision = this.readRevision(row(value));
       const fact = this.getFact(revision.factId);
-      return { ...fact, revision: revision.revision, subjectId: revision.subjectId, scope: revision.scope, scopeId: revision.scopeId, reviewState: revision.reviewState };
+      return { ...fact, revision: revision.revision, accountId: revision.accountId, subjectId: revision.subjectId, scope: revision.scope, scopeId: revision.scopeId, reviewState: revision.reviewState };
     });
   }
 
@@ -884,7 +946,7 @@ export class KnowledgeService {
       businessId: business.id,
       timezone: business.timezone,
       generatedAt: now(),
-      facts: [businessFact, ...current.map(({ revision: _r, subjectId: _j, scope: _s, scopeId: _i, reviewState: _v, ...fact }) => fact)],
+      facts: [businessFact, ...current.map(({ revision: _r, accountId: _a, subjectId: _j, scope: _s, scopeId: _i, reviewState: _v, ...fact }) => fact)],
       reviewFactIds: withheld.map((fact) => fact.id),
       withheld: withheld.map((fact) => ({
         factId: fact.id,
@@ -921,22 +983,24 @@ export class KnowledgeService {
 
   private activeRevisionFor(
     businessId: string,
+    accountId: string,
     key: string,
     subjectId: string,
     scope: FactScope,
     scopeId?: string,
   ): KnowledgeRevision | null {
     const found = this.store.db.prepare(
-      `SELECT * FROM knowledge_revisions WHERE business_id = $b AND key = $k AND subject_id = $s
+      `SELECT * FROM knowledge_revisions WHERE business_id = $b AND account_id = $account AND key = $k AND subject_id = $s
          AND scope = $scope AND COALESCE(scope_id, '') = $scopeId AND status = 'active'
          ORDER BY revision DESC LIMIT 1`,
-    ).get({ $b: businessId, $k: key, $s: subjectId, $scope: scope, $scopeId: scopeId ?? "" });
+    ).get({ $b: businessId, $account: accountId, $k: key, $s: subjectId, $scope: scope, $scopeId: scopeId ?? "" });
     return found ? this.readRevision(row(found)) : null;
   }
 
   private insertRevision(input: {
     factId: string;
     businessId: string;
+    accountId: string;
     key: string;
     subjectId: string;
     revision?: number;
@@ -948,7 +1012,7 @@ export class KnowledgeService {
     candidateId?: string;
     sourceReferences: SourceReference[];
   }): KnowledgeRevision {
-    const prior = this.activeRevisionFor(input.businessId, input.key, input.subjectId, input.scope, input.scopeId);
+    const prior = this.activeRevisionFor(input.businessId, input.accountId, input.key, input.subjectId, input.scope, input.scopeId);
     const revision = input.revision ?? (prior ? prior.revision + 1 : 1);
     if (prior) {
       this.store.db.prepare("UPDATE knowledge_revisions SET status = 'superseded' WHERE id = $id").run({ $id: prior.id });
@@ -956,12 +1020,12 @@ export class KnowledgeService {
     const id = `kr_${randomUUID()}`;
     this.store.db.prepare(
       `INSERT INTO knowledge_revisions
-        (id, fact_id, business_id, key, subject_id, revision, value_json, scope, scope_id,
+        (id, fact_id, business_id, account_id, key, subject_id, revision, value_json, scope, scope_id,
          status, review_state, approved_by, approved_at, candidate_id, source_references_json)
-       VALUES ($id, $factId, $businessId, $key, $subjectId, $revision, $value, $scope, $scopeId,
+       VALUES ($id, $factId, $businessId, $account, $key, $subjectId, $revision, $value, $scope, $scopeId,
          'active', 'none', $approvedBy, $approvedAt, $candidateId, $refs)`,
     ).run({
-      $id: id, $factId: input.factId, $businessId: input.businessId, $key: input.key,
+      $id: id, $factId: input.factId, $businessId: input.businessId, $account: input.accountId, $key: input.key,
       $subjectId: input.subjectId, $revision: revision, $value: JSON.stringify(input.value),
       $scope: input.scope, $scopeId: input.scopeId ?? null, $approvedBy: input.approvedBy,
       $approvedAt: input.approvedAt, $candidateId: input.candidateId ?? null,
@@ -1121,6 +1185,7 @@ export class KnowledgeService {
     return {
       id: String(item.id),
       businessId: String(item.business_id),
+      accountId: item.account_id == null ? "" : String(item.account_id),
       key: String(item.key),
       subjectId: String(item.subject_id ?? ""),
       value: parseJson(item.value_json, {}),
@@ -1140,6 +1205,7 @@ export class KnowledgeService {
       id: String(item.id),
       factId: String(item.fact_id),
       businessId: String(item.business_id),
+      accountId: item.account_id == null ? "" : String(item.account_id),
       key: String(item.key),
       subjectId: String(item.subject_id ?? ""),
       revision: Number(item.revision),

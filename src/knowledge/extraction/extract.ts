@@ -10,6 +10,7 @@ import {
 } from "./backend.ts";
 import {
   createExtractionLedger,
+  ExtractionScopeConflictError,
   recordExtractionCandidate,
   recordExtractionRun,
   type ExtractionLedger,
@@ -328,6 +329,19 @@ function fail(status: ExtractionStatus, backend: ExtractionBackend, reason: stri
 }
 
 /**
+ * Marks a lineage-write failure inside the intake transaction. The service
+ * rolls the whole transaction back (candidate row, supersede updates, and
+ * partial lineage together), and the per-candidate handler below reports
+ * it explicitly instead of leaking a raw SQLite error.
+ */
+class LineageWriteError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "LineageWriteError";
+  }
+}
+
+/**
  * Run bounded extraction for one pinned source and feed validated
  * candidates through intake as pending content. Never confirms, corrects,
  * links, pays, or actuates anything: the only sink is
@@ -360,6 +374,9 @@ export async function extractSourceCandidates(
   if (input.awaitTimeoutMs !== undefined && (!Number.isInteger(input.awaitTimeoutMs) || input.awaitTimeoutMs <= 0)) {
     return fail("invalid", backend, "awaitTimeoutMs must be a positive integer when present");
   }
+  if (ledger !== undefined && ledger.db !== service.database) {
+    return fail("invalid", backend, "lineage ledger must share the service database connection; refusing split-brain lineage");
+  }
 
   let taskId: string;
   try {
@@ -386,9 +403,40 @@ export async function extractSourceCandidates(
 
   // Every terminal outcome after a validated submission is recorded in the
   // ledger (attempt audit); pre-submit rejections record nothing because no
-  // backend run exists to trace.
+  // backend run exists to trace. Ledger writes here never throw past the
+  // boundary: a dead handle appends an explicit note instead.
   const finish = (outcome: ExtractionOutcome): ExtractionOutcome => {
     if (ledger !== undefined) {
+      try {
+        recordExtractionRun(ledger, {
+          idempotencyKey: input.idempotencyKey,
+          businessId: input.source.businessId,
+          accountId: input.source.accountId,
+          locator: input.source.locator,
+          sourceRevision: input.source.sourceRevision ?? null,
+          contentDigest: digest,
+          backendId: backend.backendId,
+          taskId,
+          simulated: backend.simulated,
+          status: outcome.status,
+          reason: outcome.reason ?? null,
+        });
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        return {
+          ...outcome,
+          reason: `${outcome.reason ?? outcome.status} (lineage audit write failed: ${detail.slice(0, 200)})`,
+        };
+      }
+    }
+    return outcome;
+  };
+
+  // Run-first lineage: the run row (with its scope identity) is written
+  // before any candidate mutation, so a scope conflict or a dead ledger
+  // fails closed here with zero rows fed — never mid-batch, never silent.
+  if (ledger !== undefined) {
+    try {
       recordExtractionRun(ledger, {
         idempotencyKey: input.idempotencyKey,
         businessId: input.source.businessId,
@@ -399,12 +447,17 @@ export async function extractSourceCandidates(
         backendId: backend.backendId,
         taskId,
         simulated: backend.simulated,
-        status: outcome.status,
-        reason: outcome.reason ?? null,
+        status: "started",
+        reason: null,
       });
+    } catch (error) {
+      if (error instanceof ExtractionScopeConflictError) {
+        return fail("invalid", backend, `idempotency key reuse across scopes refused: ${error.message.slice(0, 200)}`, taskId);
+      }
+      const detail = error instanceof Error ? error.message : String(error);
+      return fail("invalid", backend, `lineage ledger unavailable before intake; nothing was stored: ${detail.slice(0, 200)}`, taskId);
     }
-    return outcome;
-  };
+  }
 
   let awaited: AwaitedExtraction;
   try {
@@ -413,7 +466,7 @@ export async function extractSourceCandidates(
     // Every await failure — timeout, transport, or programmer error — is a
     // bounded backend_unavailable outcome with zero rows fed, never a raw
     // throw past the boundary.
-    return fail("backend_unavailable", backend, "extraction await failed before a terminal result", taskId);
+    return finish(fail("backend_unavailable", backend, "extraction await failed before a terminal result", taskId));
   }
   if (awaited.status !== "ok") {
     return finish(fail("backend_unavailable", backend, `backend run ended ${awaited.status}${awaited.error ? `: ${awaited.error.slice(0, 300)}` : ""}`, taskId));
@@ -466,6 +519,7 @@ export async function extractSourceCandidates(
     try {
       const stored: KnowledgeCandidate = service.intakeCandidate({
         businessId: input.source.businessId,
+        accountId: input.source.accountId,
         key: v.key,
         ...(v.subjectId.length > 0 ? { subjectId: v.subjectId } : {}),
         value: v.value,
@@ -476,20 +530,32 @@ export async function extractSourceCandidates(
         ...(input.source.sourceRevision === undefined ? {} : { sourceRevision: input.source.sourceRevision }),
         intakeId,
         note: runNote,
+        // Same-transaction lineage: the candidate row and its lineage row
+        // commit together on the service connection or roll back together.
+        ...(ledger === undefined ? {} : {
+          atomically: () => {
+            try {
+              recordExtractionCandidate(ledger, input.idempotencyKey, {
+                candidateIndex: index,
+                candidateId: intakeId,
+                intakeId,
+                factKey: v.key,
+                subjectId: v.subjectId,
+                confidence: v.confidence,
+                evidenceJson: JSON.stringify(v.evidence),
+              });
+            } catch (error) {
+              throw new LineageWriteError(error instanceof Error ? error.message : String(error));
+            }
+          },
+        }),
       });
       accepted.push({ key: v.key, subjectId: v.subjectId, value: v.value, confidence: v.confidence, candidateId: stored.id, evidence: v.evidence });
-      if (ledger !== undefined) {
-        recordExtractionCandidate(ledger, input.idempotencyKey, {
-          candidateIndex: index,
-          candidateId: stored.id,
-          intakeId,
-          factKey: v.key,
-          subjectId: v.subjectId,
-          confidence: v.confidence,
-          evidenceJson: JSON.stringify(v.evidence),
-        });
-      }
     } catch (error) {
+      if (error instanceof LineageWriteError) {
+        rejected.push({ index, reason: `lineage write failed; candidate rolled back with it: ${error.message.slice(0, 200)}` });
+        return;
+      }
       if (isIntakeIdentityConflict(error)) {
         rejected.push({ index, reason: "intake identity already used for different content; altered replays are rejected, never merged" });
         return;
@@ -508,20 +574,5 @@ export async function extractSourceCandidates(
     }
     return { status: "accepted", backendId: backend.backendId, taskId, simulated: backend.simulated, accepted, rejected };
   })();
-  if (ledger !== undefined) {
-    recordExtractionRun(ledger, {
-      idempotencyKey: input.idempotencyKey,
-      businessId: input.source.businessId,
-      accountId: input.source.accountId,
-      locator: input.source.locator,
-      sourceRevision: input.source.sourceRevision ?? null,
-      contentDigest: digest,
-      backendId: backend.backendId,
-      taskId,
-      simulated: backend.simulated,
-      status: terminal.status,
-      reason: terminal.reason ?? null,
-    });
-  }
-  return terminal;
+  return finish(terminal);
 }
