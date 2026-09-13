@@ -32,17 +32,25 @@ import {
  * 404 the client must perform a full sync. There is no 410 contract here —
  * expiry surfaces as 404 and is verified by test, not assumed.
  *
- * Cursor contract (durable, consumer-owned):
- * - Cursors are opaque (`ghi.` + base64url JSON). Consumers persist the
- *   `nextCursor` ONLY after durably ingesting the returned changes
- *   (acknowledgement); this adapter keeps no second store.
- * - `nextCursor` always comes from the provider's latest `historyId`, so
- *   cursors advance monotonically even when pages repeat or duplicate.
+ * Cursor contract (durable, consumer-owned, at-least-once):
+ * - Cursors are opaque (`ghi.` + base64url JSON, version 2). They bind the
+ *   stable account identity, the query filter, the base watermark, and —
+ *   for an uncompleted page — its continuation token plus the ids already
+ *   emitted from it. A cursor presented for another account or query, or a
+ *   legacy v1 cursor, is rejected before any HTTP call.
+ * - `nextCursor` NEVER advances the base watermark past unvisited pages or
+ *   un-emitted messages: a capped result resumes the exact page (replayed
+ *   server-side, de-duplicated by message id, so repeats are possible but
+ *   silent loss is not). Only a fully consumed result set advances the base
+ *   to the provider's latest `historyId`.
  * - `resetRequired: true` means the cursor is dead: run a cursor-less full
  *   sync and adopt its fresh cursor. No change is reported alongside it.
  * - `truncated: true` means provider bounds cut the result short; the
- *   cursor still advances past what was returned, so a truncated poll must
+ *   returned cursor names the exact resume point, so a truncated poll must
  *   be followed by another poll, never treated as a complete view.
+ * - Consumers persist `nextCursor` ONLY after durably ingesting the returned
+ *   changes (acknowledgement) and de-duplicate replays by message id; this
+ *   adapter keeps no second store.
  */
 
 export interface InboxChange {
@@ -78,20 +86,69 @@ export interface PollInboxOptions {
 }
 
 const CURSOR_PREFIX = "ghi.";
+const CURSOR_VERSION = 2;
 const DEFAULT_MAX_PAGES = 5;
 const DEFAULT_MAX_MESSAGES = 50;
+/** Cap on remembered emitted ids per cursor: overflow repeats (safe), never loss. */
+const MAX_CURSOR_SEEN = 2000;
 
-export function encodeCursor(historyId: string): string {
-  return `${CURSOR_PREFIX}${Buffer.from(JSON.stringify({ v: 1, historyId }), "utf-8").toString("base64url")}`;
+export interface InboxCursorScope {
+  /** Stable account identity the cursor is bound to (the poller's userId). */
+  account?: string;
+  /** Query filter the cursor was minted under (absent = unfiltered). */
+  query?: string;
+  /** Continuation token for the uncompleted page, if any. */
+  pageToken?: string;
+  /** Message ids already emitted from the uncompleted page. */
+  seen?: string[];
 }
 
-function decodeCursor(cursor: string): string | undefined {
+export function encodeCursor(historyId: string, scope: InboxCursorScope = {}): string {
+  const payload: Record<string, unknown> = { v: CURSOR_VERSION, base: historyId };
+  if (scope.account !== undefined) payload.account = scope.account;
+  if (scope.query !== undefined) payload.q = scope.query;
+  if (scope.pageToken !== undefined) payload.pageToken = scope.pageToken;
+  if (scope.seen !== undefined && scope.seen.length > 0) payload.seen = scope.seen.slice(-MAX_CURSOR_SEEN);
+  return `${CURSOR_PREFIX}${Buffer.from(JSON.stringify(payload), "utf-8").toString("base64url")}`;
+}
+
+interface DecodedCursor {
+  base: string;
+  account?: string;
+  query?: string;
+  pageToken?: string;
+  seen: string[];
+}
+
+function decodeCursor(cursor: string): DecodedCursor | undefined {
   if (!cursor.startsWith(CURSOR_PREFIX)) return undefined;
   try {
     const parsed: unknown = JSON.parse(Buffer.from(cursor.slice(CURSOR_PREFIX.length), "base64url").toString("utf-8"));
-    if (!isRecord(parsed) || parsed.v !== 1) return undefined;
-    const historyId = asString(parsed.historyId);
-    return historyId !== undefined && historyId.length > 0 ? historyId : undefined;
+    if (!isRecord(parsed) || parsed.v !== CURSOR_VERSION) return undefined;
+    const base = asString(parsed.base);
+    if (base === undefined || base.length === 0) return undefined;
+    const out: DecodedCursor = { base, seen: [] };
+    const account = asString(parsed.account);
+    const query = asString(parsed.q);
+    const pageToken = asString(parsed.pageToken);
+    if (account !== undefined) {
+      if (account.length === 0) return undefined;
+      out.account = account;
+    }
+    if (query !== undefined) out.query = query;
+    if (pageToken !== undefined) {
+      if (pageToken.length === 0) return undefined;
+      out.pageToken = pageToken;
+    }
+    if (parsed.seen !== undefined) {
+      if (!Array.isArray(parsed.seen)) return undefined;
+      for (const entry of parsed.seen) {
+        if (typeof entry !== "string") return undefined;
+        out.seen.push(entry);
+      }
+      out.seen = out.seen.slice(-MAX_CURSOR_SEEN);
+    }
+    return out;
   } catch {
     return undefined;
   }
@@ -103,6 +160,14 @@ function tokenFailure(operationKey: string): ConnectorResult<never> {
     metadata: liveMetadata(operationKey, []),
     error: { kind: "access_revoked", message: "No approved Google access token is available (live gate BLOCKED until onboarding provides account assets)", retryable: false },
   };
+}
+
+/** Catch-up phase failure: surfaced as a failed poll, never partial progress. */
+class CatchUpFailedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "CatchUpFailedError";
+  }
 }
 
 interface HistoryPage {
@@ -195,30 +260,84 @@ export class GmailInboxPoller {
     if (options.cursor === undefined) {
       return this.fullSync(operationKey, options.query, maxPages, maxMessages);
     }
-    const startHistoryId = decodeCursor(options.cursor);
-    if (startHistoryId === undefined) {
+    const decoded = decodeCursor(options.cursor);
+    if (decoded === undefined) {
       return { status: "failed", metadata: liveMetadata(operationKey, []), error: invalidRequest("Cursor is not a recognized inbox cursor; reset with a cursor-less full sync") };
     }
-    return this.deltaSync(operationKey, startHistoryId, options.query, maxPages, maxMessages);
+    // Binding check before any HTTP: a cursor minted for another account or
+    // query must never poll this mailbox.
+    if (decoded.account !== this.userId() || (decoded.query ?? undefined) !== (options.query ?? undefined)) {
+      return { status: "failed", metadata: liveMetadata(operationKey, []), error: invalidRequest("Cursor is bound to a different account or query; reset with a cursor-less full sync") };
+    }
+    return this.deltaSync(operationKey, decoded, options.query, maxPages, maxMessages);
+  }
+
+  /**
+   * Drain one history page into the shared change set. Returns the page's
+   * next token (undefined when the result set is exhausted here). Items
+   * already emitted from this page in an earlier poll are skipped; items
+   * beyond the message cap set truncated without being marked seen, so a
+   * resume replays them instead of losing them.
+   */
+  private drainHistoryPage(
+    parsed: HistoryPage,
+    seen: Set<string>,
+    changes: InboxChange[],
+    maxMessages: number,
+  ): { nextPageToken: string | undefined; truncated: boolean } {
+    let truncated = false;
+    for (const change of parsed.added) {
+      if (seen.has(change.messageId)) continue;
+      if (changes.length >= maxMessages) {
+        truncated = true;
+        continue;
+      }
+      seen.add(change.messageId);
+      changes.push(change);
+    }
+    if (seen.size > MAX_CURSOR_SEEN * 2) {
+      // Bound memory: drop the oldest remembered ids. Replays may repeat
+      // (the consumer de-duplicates by id); nothing is ever skipped blind.
+      const kept = [...seen].slice(-MAX_CURSOR_SEEN);
+      seen.clear();
+      for (const id of kept) seen.add(id);
+    }
+    return { nextPageToken: parsed.nextPageToken, truncated };
+  }
+
+  private continuationCursor(
+    base: string,
+    account: string,
+    query: string | undefined,
+    pageToken: string | undefined,
+    seen: Set<string>,
+  ): string {
+    return encodeCursor(base, {
+      account,
+      ...(query === undefined ? {} : { query }),
+      ...(pageToken === undefined ? {} : { pageToken }),
+      seen: [...seen].slice(-MAX_CURSOR_SEEN),
+    });
   }
 
   private async deltaSync(
     operationKey: string,
-    startHistoryId: string,
+    cursor: DecodedCursor,
     query: string | undefined,
     maxPages: number,
     maxMessages: number,
   ): Promise<ConnectorResult<InboxDelta>> {
     const provenance = this.provenance();
-    const seen = new Set<string>();
+    const seen = new Set<string>(cursor.seen);
     const changes: InboxChange[] = [];
     let truncated = false;
     let latestHistoryId: string | undefined;
-    let pageToken: string | undefined;
+    let pageToken = cursor.pageToken;
+    let resumeToken = cursor.pageToken;
     try {
       for (let page = 0; page < maxPages; page += 1) {
         const url = withQuery(`${GMAIL_BASE_URL}/users/${encodeURIComponent(this.userId())}/history`, {
-          startHistoryId,
+          startHistoryId: cursor.base,
           historyTypes: "messageAdded",
           ...(query === undefined ? {} : { q: query }),
           maxResults: "500",
@@ -238,17 +357,16 @@ export class GmailInboxPoller {
           return { status: "failed", metadata: liveMetadata(operationKey, []), error: transportError("Gmail history.list returned an unrecognized JSON shape") };
         }
         if (parsed.historyId !== undefined) latestHistoryId = parsed.historyId;
-        for (const change of parsed.added) {
-          if (seen.has(change.messageId)) continue;
-          seen.add(change.messageId);
-          if (changes.length >= maxMessages) {
-            truncated = true;
-            break;
-          }
-          changes.push(change);
+        const drained = this.drainHistoryPage(parsed, seen, changes, maxMessages);
+        if (drained.truncated) {
+          // Resume the exact page that still holds un-emitted messages.
+          truncated = true;
+          resumeToken = pageToken;
+          break;
         }
-        pageToken = parsed.nextPageToken;
-        if (pageToken === undefined || truncated) break;
+        pageToken = drained.nextPageToken;
+        resumeToken = pageToken;
+        if (pageToken === undefined) break;
       }
       if (pageToken !== undefined) truncated = true;
     } catch (error) {
@@ -261,10 +379,19 @@ export class GmailInboxPoller {
     if (latestHistoryId === undefined) {
       return { status: "failed", metadata: liveMetadata(operationKey, []), error: transportError("Gmail history.list omitted the mailbox historyId; no cursor can be committed") };
     }
+    const advanced = !truncated;
     return {
       status: "succeeded",
       metadata: liveMetadata(operationKey, provenance),
-      data: { resetRequired: false, changes, nextCursor: encodeCursor(latestHistoryId), truncated, provenance },
+      data: {
+        resetRequired: false,
+        changes,
+        nextCursor: advanced
+          ? encodeCursor(latestHistoryId, { account: this.userId(), ...(query === undefined ? {} : { query }) })
+          : this.continuationCursor(cursor.base, this.userId(), query, resumeToken, seen),
+        truncated,
+        provenance,
+      },
     };
   }
 
@@ -279,9 +406,37 @@ export class GmailInboxPoller {
     const changes: InboxChange[] = [];
     let truncated = false;
     let latestHistoryId: string | undefined;
-    let pageToken: string | undefined;
+    let pagesLeft = maxPages;
+    const account = this.userId();
+    // Phase 0: pre-list watermark. Arrivals during the snapshot below are
+    // caught by the catch-up delta instead of being skipped by a
+    // post-list-only cursor.
+    let watermark: string | undefined;
     try {
-      for (let page = 0; page < maxPages; page += 1) {
+      const profile = await authorized(this.options, {
+        method: "GET",
+        url: `${GMAIL_BASE_URL}/users/${encodeURIComponent(this.userId())}/profile`,
+      });
+      if (profile.status === 200) {
+        const parsed = safeParseJson(profile.text);
+        if (isRecord(parsed)) {
+          const historyId = asString(parsed.historyId);
+          if (historyId !== undefined) watermark = historyId;
+        }
+      }
+    } catch {
+      watermark = undefined;
+    }
+    const finish = (cursor: string | undefined): ConnectorResult<InboxDelta> => ({
+      status: "succeeded",
+      metadata: liveMetadata(operationKey, provenance),
+      data: { resetRequired: false, changes, nextCursor: cursor, truncated, provenance },
+    });
+    try {
+      // Phase 1: bounded id snapshot.
+      let pageToken: string | undefined;
+      while (pagesLeft > 0) {
+        pagesLeft -= 1;
         const url = withQuery(`${GMAIL_BASE_URL}/users/${encodeURIComponent(this.userId())}/messages`, {
           ...(query === undefined ? {} : { q: query }),
           maxResults: "100",
@@ -299,56 +454,110 @@ export class GmailInboxPoller {
         if (parsed.historyId !== undefined) latestHistoryId = parsed.historyId;
         for (const item of parsed.ids) {
           if (seen.has(item.id)) continue;
-          seen.add(item.id);
           if (changes.length >= maxMessages) {
             truncated = true;
-            break;
+            continue;
           }
+          seen.add(item.id);
           changes.push(item.threadId === undefined ? { messageId: item.id } : { messageId: item.id, threadId: item.threadId });
         }
         pageToken = parsed.nextPageToken;
-        if (pageToken === undefined || truncated) break;
+        if (pageToken === undefined) break;
       }
       if (pageToken !== undefined) truncated = true;
+      // Phase 2: catch-up delta from the pre-list watermark, merging with
+      // the snapshot (already-seen ids dedupe). This closes the
+      // list-then-observe race: arrivals during phase 1 are returned here
+      // instead of being skipped by a post-list cursor.
+      let catchupResume: string | undefined;
+      if (watermark !== undefined && pagesLeft > 0) {
+        const caught = await this.catchUp(operationKey, watermark, query, pagesLeft, maxMessages, seen, changes);
+        if (caught.resetRequired) {
+          return { status: "succeeded", metadata: liveMetadata(operationKey, provenance), data: { resetRequired: true, changes: [], truncated: false, provenance } };
+        }
+        if (caught.latestHistoryId !== undefined) latestHistoryId = caught.latestHistoryId;
+        if (caught.truncated) truncated = true;
+        pagesLeft = caught.pagesLeft;
+        catchupResume = caught.resumePageToken;
+      }
+      if (truncated && watermark !== undefined) {
+        // Resume from the watermark (replaying already-seen ids, which
+        // dedupe) with the catch-up page when known: nothing is committed
+        // past unobserved mail.
+        return finish(encodeCursor(watermark, {
+          account,
+          ...(query === undefined ? {} : { query }),
+          ...(catchupResume === undefined ? {} : { pageToken: catchupResume }),
+          seen: [...seen].slice(-MAX_CURSOR_SEEN),
+        }));
+      }
     } catch (error) {
       if (error instanceof TokenUnavailableError) return tokenFailure(operationKey);
       if (error instanceof TransportTimeoutError || error instanceof TransportNetworkError) {
         return { status: "failed", metadata: liveMetadata(operationKey, []), error: transportError("Gmail full sync timed out; no cursor was advanced so retry is safe") };
       }
+      if (error instanceof CatchUpFailedError) {
+        return { status: "failed", metadata: liveMetadata(operationKey, []), error: transportError(error.message) };
+      }
       throw error;
     }
-    // messages.list carries no cursor: bootstrap it from the mailbox
-    // profile's historyId (documented on users.getProfile). If that fails,
-    // report the changes with no cursor and truncated set — the consumer
-    // must re-poll rather than commit progress it cannot name.
     if (latestHistoryId === undefined) {
-      try {
-        const profile = await authorized(this.options, {
-          method: "GET",
-          url: `${GMAIL_BASE_URL}/users/${encodeURIComponent(this.userId())}/profile`,
-        });
-        if (profile.status === 200) {
-          const parsed = safeParseJson(profile.text);
-          if (isRecord(parsed)) {
-            const historyId = asString(parsed.historyId);
-            if (historyId !== undefined) latestHistoryId = historyId;
-          }
-        }
-      } catch {
-        latestHistoryId = undefined;
+      // No watermark anywhere (profile unreadable and list silent): report
+      // the changes with no cursor and truncated set — the consumer must
+      // re-poll rather than commit progress it cannot name.
+      return finish(undefined);
+    }
+    return finish(encodeCursor(latestHistoryId, { account, ...(query === undefined ? {} : { query }) }));
+  }
+
+  /**
+   * Bounded history delta merged into an in-progress snapshot. Shares the
+   * caller's change cap and page budget; a 404 here means even the fresh
+   * watermark is unusable, so the whole bootstrap must reset rather than
+   * drop data.
+   */
+  private async catchUp(
+    operationKey: string,
+    watermark: string,
+    query: string | undefined,
+    pagesLeft: number,
+    maxMessages: number,
+    seen: Set<string>,
+    changes: InboxChange[],
+  ): Promise<{ resetRequired: boolean; latestHistoryId?: string; truncated: boolean; pagesLeft: number; resumePageToken?: string }> {
+    void operationKey;
+    let truncated = false;
+    let latestHistoryId: string | undefined;
+    let pageToken: string | undefined;
+    while (pagesLeft > 0) {
+      pagesLeft -= 1;
+      const url = withQuery(`${GMAIL_BASE_URL}/users/${encodeURIComponent(this.userId())}/history`, {
+        startHistoryId: watermark,
+        historyTypes: "messageAdded",
+        ...(query === undefined ? {} : { q: query }),
+        maxResults: "500",
+        pageToken,
+      });
+      const response = await authorized(this.options, { method: "GET", url });
+      if (response.status === 404) return { resetRequired: true, truncated: false, pagesLeft };
+      if (response.status !== 200) {
+        const error = mapGoogleHttpError(response.status, safeParseJson(response.text), "pollInbox");
+        throw new CatchUpFailedError(error.message);
       }
+      const parsed = parseHistoryPage(safeParseJson(response.text));
+      if (parsed === undefined) {
+        throw new CatchUpFailedError("Gmail history.list returned an unrecognized JSON shape");
+      }
+      if (parsed.historyId !== undefined) latestHistoryId = parsed.historyId;
+      const drained = this.drainHistoryPage(parsed, seen, changes, maxMessages);
+      if (drained.truncated) {
+        truncated = true;
+        break;
+      }
+      pageToken = drained.nextPageToken;
+      if (pageToken === undefined) break;
     }
-    if (latestHistoryId === undefined) {
-      return {
-        status: "succeeded",
-        metadata: liveMetadata(operationKey, provenance),
-        data: { resetRequired: false, changes, truncated: true, provenance },
-      };
-    }
-    return {
-      status: "succeeded",
-      metadata: liveMetadata(operationKey, provenance),
-      data: { resetRequired: false, changes, nextCursor: encodeCursor(latestHistoryId), truncated, provenance },
-    };
+    if (pageToken !== undefined) truncated = true;
+    return { resetRequired: false, latestHistoryId, truncated, pagesLeft, ...(pageToken === undefined ? {} : { resumePageToken: pageToken }) };
   }
 }

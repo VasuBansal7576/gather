@@ -46,23 +46,36 @@ guide):
 - Drive retrieval: `drive.readonly` (content for explicit IDs; metadata
   scopes alone cannot download).
 
-## Cursor contract (durable, consumer-owned)
+## Cursor contract (durable, consumer-owned, at-least-once)
 
-- Cursors are opaque (`ghi.` + base64url JSON); invalid cursors fail
+- Cursors are opaque (`ghi.` + base64url JSON, version 2) binding the stable
+  account identity, the query filter, the base watermark, and — for an
+  uncompleted page — its continuation token plus already-emitted ids. A
+  cursor presented for another account or query, or a legacy v1 cursor, fails
   `invalid_request` before any HTTP call.
-- `nextCursor` always comes from the provider's latest `historyId`
-  (history response, else profile bootstrap), so cursors advance
-  monotonically across repeated pages and duplicates, which are deduped by
-  message id with first-seen order preserved.
+- `nextCursor` never advances the base watermark past unvisited pages or
+  un-emitted messages: a capped result resumes the exact page (replayed
+  server-side, de-duplicated by message id, so repeats are possible but
+  silent loss is not — including truncation within a page, where the resume
+  replays the page skipping already-emitted ids). Only a fully consumed
+  result set advances the base to the provider's latest `historyId`.
+- Cursor-less bootstrap reads the profile watermark first, snapshots ids,
+  then runs a bounded catch-up delta from that watermark within the same
+  page budget, so arrivals during listing are returned instead of skipped by
+  a post-list cursor. If the budget fills first, the watermark itself is
+  named as the next base (replays dedupe). History earlier than the cursor's
+  validity window still requires reset, not data drop.
 - **Commit only after durable ingestion acknowledgement**: the adapter keeps
   no second store; if the consumer crashes before persisting `nextCursor`,
-  the next poll simply replays.
-- `resetRequired: true` (on history 404) carries no changes and no cursor:
-  run a cursor-less full sync and adopt its fresh cursor.
+  the next poll simply replays. Consumers must de-duplicate replays by
+  message id.
+- `resetRequired: true` (on history 404, including an expired catch-up
+  watermark) carries no changes and no cursor: run a cursor-less full sync
+  and adopt its fresh cursor.
 - `truncated: true` (page/message bounds hit, or cursor unavailable) means
-  "poll again, do not treat this as a complete view." Bounds default to 5
-  pages / 50 messages and are caller-tunable; truncation is surfaced,
-  never a silent claim of full context.
+  "poll again with the returned cursor, do not treat this as a complete
+  view." Bounds default to 5 pages / 50 messages and are caller-tunable;
+  truncation is surfaced, never a silent claim of full context.
 
 ## Thread intake and identity rules
 
@@ -74,15 +87,32 @@ guide):
   receipts label it `LIVE … (provider evidence, not verified authority)`,
   and downstream business facts must enter at reduced confidence.
 
-## MIME audit of the existing thread reader (no code change)
+## MIME audit of the existing thread reader (bounded variant added)
 
 Reviewed `gmail.ts` parsing for intake use: recursive multipart walk
-preferring `text/plain`, base64url validation, header guards, snippet
-fallback. Known limitation (documented, unfixed in this lane): a part
-claiming `text/plain` with undecodable data is skipped toward the snippet
-fallback without an incompleteness flag on the contract shape. Changing
-that would alter reviewed read output; a bounded reader with explicit
-truncation flags is future work, not a silent second abstraction.
+preferring `text/plain`, strict base64url validation, header guards, snippet
+fallback. Two corrections apply since the first audit: undecodable base64 no
+longer decodes to empty/mojibake text (the old lenient decoder stripped
+invalid characters, so a part claiming `text/plain` with undecodable data
+did NOT fall back to the snippet — it presented transformed content as the
+body); such parts are now skipped with an explicit flag. A bounded reader,
+`readThreadBounded`, shares the single fetch+parse path with
+`readInquiryThread` (identical bodies) and adds a per-message completeness
+record with stable codes (`malformed-base64-part`, `unsupported-charset`,
+`attachment-skipped`, `snippet-fallback`, `no-text-content`); non-UTF-8
+charsets are never decoded as UTF-8. Intake must treat `complete: false` as
+"decide, do not assume a full body." Source bodies remain evidence, never
+authority, and nothing here registers a host.
+
+## Memory bounds (honest accounting)
+
+The 2 MiB Drive cap is a correctness bound enforced after buffering by
+default; a server that ignores `Range` still buffers fully before the length
+check. `createFetchTransport({ maxBytes })` adds a true streaming cap that
+counts bytes as chunks arrive and aborts past the cap
+(`TransportBodyTooLargeError`, mapped by the retriever to fail-closed
+over-cap); it is opt-in and backward compatible, and timeout/uncertain-write
+behavior is untouched. Without it, no bounded-memory claim is made.
 
 ## Error mapping (reads never write, so retry is safe)
 

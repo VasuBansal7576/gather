@@ -17,6 +17,7 @@ import {
 import {
   DRIVE_BASE_URL,
   TokenUnavailableError,
+  TransportBodyTooLargeError,
   TransportNetworkError,
   TransportTimeoutError,
   liveMetadata,
@@ -144,6 +145,9 @@ export class GoogleDocumentRetriever implements DocumentRetriever {
       meta = parsed;
     } catch (error) {
       if (error instanceof TokenUnavailableError) return tokenFailure(request.operationKey);
+      if (error instanceof TransportBodyTooLargeError) {
+        return { status: "failed", metadata: liveMetadata(request.operationKey, []), error: transportError(`Drive metadata exceeds the ${error.limitBytes}-byte retrieval bound; request a narrower document instead of a truncated one`) };
+      }
       if (error instanceof TransportTimeoutError || error instanceof TransportNetworkError) {
         return { status: "failed", metadata: liveMetadata(request.operationKey, []), error: transportError("Drive metadata read timed out; no write was attempted so retry is safe") };
       }
@@ -175,6 +179,9 @@ export class GoogleDocumentRetriever implements DocumentRetriever {
       };
     } catch (error) {
       if (error instanceof TokenUnavailableError) return tokenFailure(request.operationKey);
+      if (error instanceof TransportBodyTooLargeError) {
+        return { status: "failed", metadata: liveMetadata(request.operationKey, []), error: transportError(`Drive content exceeds the ${error.limitBytes}-byte retrieval bound; request a narrower document instead of a truncated one`) };
+      }
       if (error instanceof TransportTimeoutError || error instanceof TransportNetworkError) {
         return { status: "failed", metadata: liveMetadata(request.operationKey, []), error: transportError("Drive content read timed out; no write was attempted so retry is safe") };
       }

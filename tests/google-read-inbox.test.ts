@@ -34,9 +34,13 @@ function scripted(handler: (req: GoogleHttpRequest) => GoogleHttpResponse | Prom
   };
 }
 
-function poller(handler: (req: GoogleHttpRequest) => GoogleHttpResponse | Promise<GoogleHttpResponse>) {
+function poller(handler: (req: GoogleHttpRequest) => GoogleHttpResponse | Promise<GoogleHttpResponse>, userId = "me") {
   const { transport, log } = scripted(handler);
-  return { poller: new GmailInboxPoller({ transport, tokens: () => Promise.resolve("t") }), log };
+  return { poller: new GmailInboxPoller({ transport, tokens: () => Promise.resolve("t"), userId }), log };
+}
+
+function boundCursor(historyId: string, scope: { query?: string; pageToken?: string; seen?: string[] } = {}): string {
+  return encodeCursor(historyId, { account: "me", ...scope });
 }
 
 test("delta poll dedupes, advances the cursor, and flags truncation", async () => {
@@ -56,13 +60,13 @@ test("delta poll dedupes, advances the cursor, and flags truncation", async () =
       nextPageToken: "second",
     });
   });
-  const result = await poll.pollInbox("op-poll-1", { cursor: encodeCursor("9000"), maxMessages: 10 });
+  const result = await poll.pollInbox("op-poll-1", { cursor: boundCursor("9000"), maxMessages: 10 });
   assert.equal(result.status, "succeeded");
   if (result.status !== "succeeded") return;
   assert.equal(result.data.resetRequired, false);
   // m-1 arrived on both pages: reported once, in first-seen order.
   assert.deepEqual(result.data.changes.map((change) => change.messageId), ["m-1", "m-2"]);
-  assert.ok(result.data.nextCursor !== undefined && result.data.nextCursor !== encodeCursor("9000"));
+  assert.equal(result.data.nextCursor, boundCursor("9003"));
   assert.equal(result.data.truncated, false);
   assert.equal(result.metadata.simulated, false);
   assert.ok(result.data.provenance.every((ref) => ref.fictional === false));
@@ -70,7 +74,7 @@ test("delta poll dedupes, advances the cursor, and flags truncation", async () =
 
 test("expired history (404) demands reset, never partial progress", async () => {
   const { poller: poll, log } = poller(() => googleError(404, "notFound", "History expired"));
-  const result = await poll.pollInbox("op-poll-2", { cursor: encodeCursor("1") });
+  const result = await poll.pollInbox("op-poll-2", { cursor: boundCursor("1") });
   assert.equal(result.status, "succeeded");
   if (result.status !== "succeeded") return;
   assert.equal(result.data.resetRequired, true);
@@ -88,21 +92,34 @@ test("invalid cursors are rejected before any HTTP call", async () => {
   assert.equal(log.length, 0);
 });
 
-test("message bounds truncate honestly and revocation maps cleanly", async () => {
+test("message bounds truncate to an exact resume point, never past unread mail", async () => {
   const many = Array.from({ length: 10 }, (_, index) => ({
     id: `90${10 + index}`,
     messagesAdded: [{ message: { id: `m-${index}`, threadId: `t-${index}` } }],
   }));
-  const { poller: poll } = poller(() => json(200, { historyId: "9999", history: many }));
-  const result = await poll.pollInbox("op-poll-4", { cursor: encodeCursor("1"), maxMessages: 3 });
+  const seen: GoogleHttpRequest[] = [];
+  const { poller: poll } = poller((req) => {
+    seen.push(req);
+    return json(200, { historyId: "9999", history: many });
+  });
+  const result = await poll.pollInbox("op-poll-4", { cursor: boundCursor("1"), maxMessages: 3 });
   assert.equal(result.status, "succeeded");
   if (result.status !== "succeeded") return;
   assert.equal(result.data.changes.length, 3);
   assert.equal(result.data.truncated, true);
   assert.ok(result.data.nextCursor !== undefined);
+  // The resume point replays the same base (no page token was consumed), so
+  // the follow-up poll returns exactly the remaining messages, none lost.
+  const follow = await poll.pollInbox("op-poll-4b", { cursor: result.data.nextCursor, maxMessages: 10 });
+  assert.equal(follow.status, "succeeded");
+  if (follow.status !== "succeeded") return;
+  assert.deepEqual(follow.data.changes.map((change) => change.messageId),
+    ["m-3", "m-4", "m-5", "m-6", "m-7", "m-8", "m-9"]);
+  assert.equal(follow.data.truncated, false);
+  assert.equal(follow.data.nextCursor, boundCursor("9999"));
 
   const revoked = poller(() => googleError(401, "authError", "Invalid Credentials"));
-  const denied = await revoked.poller.pollInbox("op-poll-5", { cursor: encodeCursor("1") });
+  const denied = await revoked.poller.pollInbox("op-poll-5", { cursor: boundCursor("1") });
   assert.equal(denied.status, "failed");
   if (denied.status !== "failed") return;
   assert.equal(denied.error.kind, "access_revoked");
@@ -117,20 +134,38 @@ test("message bounds truncate honestly and revocation maps cleanly", async () =>
 
 test("malformed history JSON fails closed; empty history still advances", async () => {
   const broken = poller(() => ({ status: 200, headers: {}, text: "{\"history\":[}" }));
-  const bad = await broken.poller.pollInbox("op-poll-7", { cursor: encodeCursor("1") });
+  const bad = await broken.poller.pollInbox("op-poll-7", { cursor: boundCursor("1") });
   assert.equal(bad.status, "failed");
 
   const quiet = poller(() => json(200, { historyId: "4242" }));
-  const calm = await quiet.poller.pollInbox("op-poll-8", { cursor: encodeCursor("4241") });
+  const calm = await quiet.poller.pollInbox("op-poll-8", { cursor: boundCursor("4241") });
   assert.equal(calm.status, "succeeded");
   if (calm.status !== "succeeded") return;
   assert.deepEqual(calm.data.changes, []);
-  assert.equal(calm.data.nextCursor, encodeCursor("4242"));
+  assert.equal(calm.data.nextCursor, boundCursor("4242"));
 });
 
-test("cursor-less full sync pages ids then bootstraps from the profile", async () => {
+test("legacy v1 cursors are rejected before any HTTP call", async () => {
+  const { poller: poll, log } = poller(() => json(200, {}));
+  const legacy = `ghi.${Buffer.from(JSON.stringify({ v: 1, historyId: "99" }), "utf-8").toString("base64url")}`;
+  const result = await poll.pollInbox("op-poll-7b", { cursor: legacy });
+  assert.equal(result.status, "failed");
+  if (result.status !== "failed") return;
+  assert.equal(result.error.kind, "invalid_request");
+  assert.equal(log.length, 0);
+});
+
+test("cursor-less full sync snapshots ids, catches arrivals, then names a cursor", async () => {
   const { poller: poll, log } = poller((req) => {
     if (req.url.includes("/profile")) return json(200, { emailAddress: "owner@example.test", historyId: "7777" });
+    if (req.url.includes("/history")) {
+      // One message arrived during the snapshot: the catch-up delta must
+      // return it instead of letting a post-list cursor skip it.
+      return json(200, {
+        historyId: "7779",
+        history: [{ id: "7779", messagesAdded: [{ message: { id: "m-new", threadId: "t-new" } }] }],
+      });
+    }
     if (req.url.includes("pageToken=p2")) {
       return json(200, { messages: [{ id: "m-b", threadId: "t-b" }, { id: "m-a", threadId: "t-a" }] });
     }
@@ -139,9 +174,10 @@ test("cursor-less full sync pages ids then bootstraps from the profile", async (
   const result = await poll.pollInbox("op-poll-9", { maxMessages: 10 });
   assert.equal(result.status, "succeeded");
   if (result.status !== "succeeded") return;
-  assert.deepEqual(result.data.changes.map((change) => change.messageId), ["m-a", "m-b"]);
-  assert.equal(result.data.nextCursor, encodeCursor("7777"));
-  assert.ok(log.some((entry) => entry.url.includes("/profile")));
+  assert.deepEqual(result.data.changes.map((change) => change.messageId), ["m-a", "m-b", "m-new"]);
+  assert.equal(result.data.nextCursor, boundCursor("7779"));
+  assert.equal(result.data.truncated, false);
+  assert.ok(log[0]?.url.includes("/profile"), "watermark is read before the snapshot");
 });
 
 function b64url(text: string): string {

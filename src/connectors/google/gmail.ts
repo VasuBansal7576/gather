@@ -50,10 +50,18 @@ function base64UrlEncodeText(text: string): string {
   return Buffer.from(text, "utf-8").toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
 
-function base64UrlDecodeText(data: string): string | undefined {
+/**
+ * Strict base64url decode: malformed alphabets or lengths are rejected
+ * instead of silently accepted (Buffer otherwise strips invalid characters
+ * and yields mojibake), and undecodable byte sequences are rejected rather
+ * than passed through as replacement characters.
+ */
+function base64UrlDecodeStrict(data: string): string | undefined {
+  if (!/^[A-Za-z0-9\-_]*$/.test(data) || data.length % 4 === 1) return undefined;
   try {
-    const padded = data.replace(/-/g, "+").replace(/_/g, "/");
-    return Buffer.from(padded, "base64").toString("utf-8");
+    const text = Buffer.from(data.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf-8");
+    if (text.includes("�")) return undefined;
+    return text;
   } catch {
     return undefined;
   }
@@ -116,6 +124,7 @@ interface GmailHeader {
 interface GmailPayload {
   headers: GmailHeader[];
   textBody?: string;
+  textIssues?: string[];
 }
 
 function parseHeaders(value: unknown): GmailHeader[] | undefined {
@@ -137,28 +146,75 @@ function findHeader(headers: GmailHeader[], name: string): string | undefined {
 }
 
 function extractTextBody(part: unknown): string | undefined {
-  if (!isRecord(part)) return undefined;
+  return extractTextWithIssues(part).text;
+}
+
+const SUPPORTED_TEXT_CHARSETS = new Set(["utf-8", "utf8", "ascii", "us-ascii"]);
+
+function partCharset(part: Record<string, unknown>): string | undefined {
+  const headers = part.headers;
+  if (!Array.isArray(headers)) return undefined;
+  for (const item of headers) {
+    if (!isRecord(item)) continue;
+    if (asString(item.name)?.toLowerCase() !== "content-type") continue;
+    const value = asString(item.value);
+    if (value === undefined) return undefined;
+    const match = /charset\s*=\s*"?([^";\s]+)"?/i.exec(value);
+    return match?.[1]?.toLowerCase();
+  }
+  return undefined;
+}
+
+/**
+ * Single body-extraction path shared by the thread reader and the bounded
+ * variant: walks multipart structure preferring text/plain, and records an
+ * explicit issue for every skipped content part (malformed base64,
+ * unsupported charset, skipped attachment) instead of silently substituting
+ * empty or mojibake text.
+ */
+function extractTextWithIssues(part: unknown): { text?: string; issues: string[] } {
+  if (!isRecord(part)) return { issues: [] };
   const mimeType = asString(part.mimeType);
   const body = isRecord(part.body) ? asString(part.body.data) : undefined;
-  if ((mimeType === "text/plain" || mimeType?.startsWith("text/")) && body !== undefined) {
-    return base64UrlDecodeText(body);
+  const isText = mimeType === "text/plain" || (mimeType !== undefined && mimeType.startsWith("text/"));
+  const filename = asString(part.filename);
+  if (isText) {
+    if (body !== undefined) {
+      const charset = partCharset(part);
+      if (charset !== undefined && !SUPPORTED_TEXT_CHARSETS.has(charset)) {
+        return { issues: ["unsupported-charset"] };
+      }
+      const text = base64UrlDecodeStrict(body);
+      if (text === undefined) return { issues: ["malformed-base64-part"] };
+      return { text, issues: [] };
+    }
+    if (filename !== undefined && filename.length > 0) {
+      return { issues: ["attachment-skipped"] };
+    }
+  } else if (filename !== undefined && filename.length > 0) {
+    return { issues: ["attachment-skipped"] };
   }
+  const issues: string[] = [];
   const parts = part.parts;
   if (Array.isArray(parts)) {
     for (const child of parts) {
-      const text = extractTextBody(child);
-      if (text !== undefined) return text;
+      const found = extractTextWithIssues(child);
+      issues.push(...found.issues);
+      if (found.text !== undefined) return { text: found.text, issues };
     }
   }
-  return undefined;
+  return { issues };
 }
 
 function parsePayload(value: unknown): GmailPayload | undefined {
   if (!isRecord(value)) return undefined;
   const headers = parseHeaders(value.headers);
   if (headers === undefined) return undefined;
-  const text = extractTextBody(value);
-  return text === undefined ? { headers } : { headers, textBody: text };
+  const found = extractTextWithIssues(value);
+  const out: GmailPayload = { headers };
+  if (found.text !== undefined) out.textBody = found.text;
+  if (found.issues.length > 0) out.textIssues = found.issues;
+  return out;
 }
 
 interface ParsedGmailMessage {
@@ -169,6 +225,7 @@ interface ParsedGmailMessage {
   snippet?: string;
   headers: GmailHeader[];
   textBody?: string;
+  textIssues?: string[];
 }
 
 function parseGmailMessage(value: unknown): ParsedGmailMessage | undefined {
@@ -189,6 +246,7 @@ function parseGmailMessage(value: unknown): ParsedGmailMessage | undefined {
     if (payload === undefined) return undefined;
     message.headers = payload.headers;
     if (payload.textBody !== undefined) message.textBody = payload.textBody;
+    if (payload.textIssues !== undefined) message.textIssues = payload.textIssues;
   }
   return message;
 }
@@ -229,6 +287,28 @@ export interface SentExpectation {
 
 export type SentExpectationResolver = (operationKey: string) => Promise<SentExpectation | undefined>;
 
+/**
+ * Explicit body-completeness record for one intake message. Stable issue
+ * codes: `malformed-base64-part`, `unsupported-charset`,
+ * `attachment-skipped`, `snippet-fallback`, `no-text-content`.
+ */
+export interface MessageBodyCompleteness {
+  messageId: string;
+  complete: boolean;
+  issues: string[];
+}
+
+export interface ThreadBodyCompleteness {
+  complete: boolean;
+  messages: MessageBodyCompleteness[];
+}
+
+export interface BoundedThreadResponse {
+  thread: InquiryThread;
+  provenance: SourceReference[];
+  completeness: ThreadBodyCompleteness;
+}
+
 export interface GoogleGmailOptions extends GoogleAdapterOptions {
   /** Durable operationKey → approved-send lookup required for full reconcile identity. */
   resolveSentExpectation?: SentExpectationResolver;
@@ -262,6 +342,96 @@ export class GoogleGmailConnector implements InquiryThreadReader, EmailSender {
     };
   }
 
+  /**
+   * Shared thread fetch + parse (single truth for both readers): performs
+   * the GET, maps transport failures, and parses every message once.
+   */
+  private async fetchParsedThread(
+    operationKey: string,
+    threadId: string,
+  ): Promise<
+    | { ok: true; threadId: string; parsed: ParsedGmailMessage[] }
+    | { ok: false; result: ConnectorResult<ReadInquiryThreadResponse> }
+  > {
+    let response: GoogleHttpResponse;
+    try {
+      response = await authorized(this.options, {
+        method: "GET",
+        url: withQuery(`${GMAIL_BASE_URL}/users/${encodeURIComponent(this.userId())}/threads/${encodeURIComponent(threadId)}`, { format: "full" }),
+      });
+    } catch (error) {
+      if (error instanceof TokenUnavailableError) {
+        return { ok: false, result: { status: "failed", metadata: liveMetadata(operationKey, []), error: { kind: "access_revoked", message: "No approved Google access token is available (live gate BLOCKED until onboarding provides account assets)", retryable: false } } };
+      }
+      if (error instanceof TransportTimeoutError || error instanceof TransportNetworkError) {
+        return { ok: false, result: { status: "failed", metadata: liveMetadata(operationKey, []), error: transportError("Gmail thread read timed out; no write was attempted so retry is safe") } };
+      }
+      throw error;
+    }
+    if (response.status !== 200) {
+      const error = mapGoogleHttpError(response.status, safeParseJson(response.text), "readInquiryThread");
+      return { ok: false, result: { status: "failed", metadata: liveMetadata(operationKey, []), error } };
+    }
+    const body = safeParseJson(response.text);
+    if (!isRecord(body)) {
+      return { ok: false, result: { status: "failed", metadata: liveMetadata(operationKey, []), error: transportError("Gmail threads.get returned an unrecognized JSON shape") } };
+    }
+    const resolvedThreadId = asString(body.id) ?? threadId;
+    const rawMessages = body.messages;
+    if (!Array.isArray(rawMessages) || rawMessages.length === 0) {
+      return { ok: false, result: { status: "failed", metadata: liveMetadata(operationKey, []), error: { kind: "not_found", message: "Gmail thread has no messages", retryable: false } } };
+    }
+    const parsed: ParsedGmailMessage[] = [];
+    for (const raw of rawMessages) {
+      const message = parseGmailMessage(raw);
+      if (message === undefined) {
+        return { ok: false, result: { status: "failed", metadata: liveMetadata(operationKey, []), error: transportError("Gmail thread message had an unrecognized shape") } };
+      }
+      parsed.push(message);
+    }
+    return { ok: true, threadId: resolvedThreadId, parsed };
+  }
+
+  private buildThreadResponse(
+    operationKey: string,
+    threadId: string,
+    parsed: ParsedGmailMessage[],
+  ): { response: ConnectorResult<ReadInquiryThreadResponse>; completeness: ThreadBodyCompleteness } {
+    const messages: InquiryMessage[] = [];
+    const flagged: MessageBodyCompleteness[] = [];
+    for (const item of parsed) {
+      const subject = findHeader(item.headers, "Subject") ?? "(no subject)";
+      const from = findHeader(item.headers, "From") ?? "(unknown sender)";
+      const date = findHeader(item.headers, "Date");
+      const receivedMs = date !== undefined ? Date.parse(date) : Number.NaN;
+      messages.push({
+        id: item.id,
+        threadId,
+        from,
+        to: splitAddresses(findHeader(item.headers, "To")),
+        subject,
+        body: item.textBody ?? item.snippet ?? "",
+        receivedAt: Number.isFinite(receivedMs) && date !== undefined ? new Date(receivedMs).toISOString() : date ?? "",
+        sourceReferences: [this.gmailSource(threadId)],
+      });
+      const issues = [...(item.textIssues ?? [])];
+      if (item.textBody === undefined) {
+        issues.push(item.snippet !== undefined ? "snippet-fallback" : "no-text-content");
+      }
+      flagged.push({ messageId: item.id, complete: issues.length === 0, issues });
+    }
+    const provenance = [this.gmailSource(threadId)];
+    const firstSubject = messages[0]?.subject ?? "(no subject)";
+    return {
+      response: {
+        status: "succeeded",
+        metadata: liveMetadata(operationKey, provenance),
+        data: { thread: { threadId, subject: firstSubject, messages, sourceReferences: provenance }, provenance },
+      },
+      completeness: { complete: flagged.every((message) => message.complete), messages: flagged },
+    };
+  }
+
   async readInquiryThread(request: ReadInquiryThreadRequest): Promise<ConnectorResult<ReadInquiryThreadResponse>> {
     if (request.operationKey.trim().length === 0 || request.threadId.trim().length === 0) {
       return {
@@ -270,59 +440,34 @@ export class GoogleGmailConnector implements InquiryThreadReader, EmailSender {
         error: invalidRequest("operationKey and threadId are required"),
       };
     }
-    let response: GoogleHttpResponse;
-    try {
-      response = await authorized(this.options, {
-        method: "GET",
-        url: withQuery(`${GMAIL_BASE_URL}/users/${encodeURIComponent(this.userId())}/threads/${encodeURIComponent(request.threadId)}`, { format: "full" }),
-      });
-    } catch (error) {
-      if (error instanceof TokenUnavailableError) return tokenFailure(request.operationKey);
-      if (error instanceof TransportTimeoutError || error instanceof TransportNetworkError) {
-        return { status: "failed", metadata: liveMetadata(request.operationKey, []), error: transportError("Gmail thread read timed out; no write was attempted so retry is safe") };
-      }
-      throw error;
+    const fetched = await this.fetchParsedThread(request.operationKey, request.threadId);
+    if (!fetched.ok) return fetched.result;
+    return this.buildThreadResponse(request.operationKey, fetched.threadId, fetched.parsed).response;
+  }
+
+  /**
+   * Bounded thread read: one shared fetch with readInquiryThread (identical
+   * bodies), plus an explicit per-message completeness record. Skipped
+   * content (malformed base64, unsupported charset, attachments) and snippet
+   * fallbacks are surfaced as flags — never silent — so intake can decide
+   * rather than assume a complete body.
+   */
+  async readThreadBounded(request: ReadInquiryThreadRequest): Promise<ConnectorResult<BoundedThreadResponse>> {
+    if (request.operationKey.trim().length === 0 || request.threadId.trim().length === 0) {
+      return {
+        status: "failed",
+        metadata: liveMetadata(request.operationKey, []),
+        error: invalidRequest("operationKey and threadId are required"),
+      };
     }
-    if (response.status !== 200) {
-      const error = mapGoogleHttpError(response.status, safeParseJson(response.text), "readInquiryThread");
-      return { status: "failed", metadata: liveMetadata(request.operationKey, []), error };
-    }
-    const body = safeParseJson(response.text);
-    if (!isRecord(body)) {
-      return { status: "failed", metadata: liveMetadata(request.operationKey, []), error: transportError("Gmail threads.get returned an unrecognized JSON shape") };
-    }
-    const threadId = asString(body.id) ?? request.threadId;
-    const rawMessages = body.messages;
-    if (!Array.isArray(rawMessages) || rawMessages.length === 0) {
-      return { status: "failed", metadata: liveMetadata(request.operationKey, []), error: { kind: "not_found", message: "Gmail thread has no messages", retryable: false } };
-    }
-    const messages: InquiryMessage[] = [];
-    for (const raw of rawMessages) {
-      const parsed = parseGmailMessage(raw);
-      if (parsed === undefined) {
-        return { status: "failed", metadata: liveMetadata(request.operationKey, []), error: transportError("Gmail thread message had an unrecognized shape") };
-      }
-      const subject = findHeader(parsed.headers, "Subject") ?? "(no subject)";
-      const from = findHeader(parsed.headers, "From") ?? "(unknown sender)";
-      const date = findHeader(parsed.headers, "Date");
-      const receivedMs = date !== undefined ? Date.parse(date) : Number.NaN;
-      messages.push({
-        id: parsed.id,
-        threadId,
-        from,
-        to: splitAddresses(findHeader(parsed.headers, "To")),
-        subject,
-        body: parsed.textBody ?? parsed.snippet ?? "",
-        receivedAt: Number.isFinite(receivedMs) && date !== undefined ? new Date(receivedMs).toISOString() : date ?? "",
-        sourceReferences: [this.gmailSource(threadId)],
-      });
-    }
-    const provenance = [this.gmailSource(threadId)];
-    const firstSubject = messages[0]?.subject ?? "(no subject)";
+    const fetched = await this.fetchParsedThread(request.operationKey, request.threadId);
+    if (!fetched.ok) return fetched.result as unknown as ConnectorResult<BoundedThreadResponse>;
+    const built = this.buildThreadResponse(request.operationKey, fetched.threadId, fetched.parsed);
+    if (built.response.status !== "succeeded") return built.response as unknown as ConnectorResult<BoundedThreadResponse>;
     return {
       status: "succeeded",
-      metadata: liveMetadata(request.operationKey, provenance),
-      data: { thread: { threadId, subject: firstSubject, messages, sourceReferences: provenance }, provenance },
+      metadata: built.response.metadata,
+      data: { thread: built.response.data.thread, provenance: built.response.data.provenance, completeness: built.completeness },
     };
   }
 
