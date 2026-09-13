@@ -99,7 +99,8 @@ test("decision effects state exact consequences, including scoping", () => {
 });
 
 test("value formatting stays bounded and source flags stay explicit", () => {
-  assert.equal(formatValue({ unitCents: 9500 }), "unitCents: 9500");
+  assert.equal(formatValue({ unitCents: 9500 }), "9500 minor units (currency not stated)");
+  assert.equal(formatValue({ unitCents: 9500, currency: "USD" }), "$95.00");
   const long = formatValue({ statement: "x".repeat(300) }, 60);
   assert.ok(long.length <= 60, "long values are truncated");
   assert.equal(isFixtureOnly([DOC]), true);

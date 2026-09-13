@@ -107,9 +107,10 @@ export function subjectLabel(candidate: Pick<KnowledgeCandidate, "subjectId" | "
 
 /**
  * Monetary rendering with explicit source currency only. A numeric
- * amountCents paired with a usable currency renders via Intl in that
- * currency; without one it renders an honest minor-unit label. Currency is
- * never guessed and profit is never claimed here.
+ * amountCents (or unitCents, the price-fact minor-unit field) paired with a
+ * usable currency renders via Intl in that currency; without one it renders
+ * an honest minor-unit label. Currency is never guessed and profit is never
+ * claimed here.
  */
 export function formatMoneyPart(amountCents: number, currency: unknown): string {
   if (typeof currency === "string" && currency.trim().length > 0) {
@@ -120,6 +121,15 @@ export function formatMoneyPart(amountCents: number, currency: unknown): string 
     }
   }
   return `${amountCents} minor units (currency not stated)`;
+}
+
+/** Minor-unit amount from the known price fields, preferring amountCents. */
+function minorUnitAmount(value: Record<string, unknown>): number | undefined {
+  for (const key of ["amountCents", "unitCents"] as const) {
+    const amount = value[key];
+    if (typeof amount === "number" && Number.isFinite(amount)) return amount;
+  }
+  return undefined;
 }
 
 /**
@@ -147,11 +157,11 @@ export class LoadGeneration {
  */
 export function formatValue(value: Record<string, unknown>, maxLength = 160): string {
   const parts: string[] = [];
-  const amount = value.amountCents;
-  if (typeof amount === "number" && Number.isFinite(amount)) {
+  const amount = minorUnitAmount(value);
+  if (amount !== undefined) {
     parts.push(formatMoneyPart(amount, value.currency));
     for (const [key, entry] of Object.entries(value)) {
-      if (key === "amountCents" || key === "currency") continue;
+      if (key === "amountCents" || key === "unitCents" || key === "currency") continue;
       parts.push(`${key}: ${formatScalar(entry)}`);
     }
   } else {
