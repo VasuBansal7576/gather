@@ -142,9 +142,11 @@ function isDisabled(): boolean {
 
 /** Stop every managed timer while keeping durable state and operator wiring. */
 async function pauseAllManaged(drainTimeoutMs: number): Promise<void> {
-  for (const accountId of [...managed.keys()]) {
-    await stopManaged(accountId, "paused", drainTimeoutMs);
-  }
+  // Initiate every stop before awaiting any drain: stopProactiveBinding's
+  // synchronous prefix clears the interval, so a serially-awaited drain of
+  // one account must not leave the next account's timer firing.
+  const drains = [...managed.keys()].map((accountId) => stopProactiveBinding(accountId, drainTimeoutMs));
+  await Promise.all(drains.map((promise) => promise.catch(() => undefined)));
 }
 
 function nowIso(): string {

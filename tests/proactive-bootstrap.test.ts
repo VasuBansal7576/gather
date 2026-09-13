@@ -124,6 +124,9 @@ interface MailboxScript {
   listed: Array<{ id: string; threadId: string }>;
   added: Array<{ id: string; threadId: string }>;
   failInbox: boolean;
+  /** When true, inbox requests block until releaseInbox fires. */
+  holdInbox: boolean;
+  releaseInbox?: () => void;
 }
 
 /** Scripted fictional Gmail: per-bearer-token mailboxes over the real poller/reader. */
@@ -133,7 +136,7 @@ class ScriptedGmail {
   boxFor(auth: string): MailboxScript {
     let box = this.boxes.get(auth);
     if (!box) {
-      box = { historyId: "9000", listed: [], added: [], failInbox: false };
+      box = { historyId: "9000", listed: [], added: [], failInbox: false, holdInbox: false };
       this.boxes.set(auth, box);
     }
     return box;
@@ -145,6 +148,14 @@ class ScriptedGmail {
     this.requests.push(req);
     const auth = req.headers.Authorization ?? "";
     const box = this.boxFor(auth);
+    if (box.holdInbox && (req.url.includes("/history") || req.url.includes("/messages") || req.url.includes("/profile"))) {
+      await new Promise<void>((resolve) => {
+        box.releaseInbox = () => {
+          box.holdInbox = false;
+          resolve();
+        };
+      });
+    }
     if (box.failInbox && (req.url.includes("/history") || req.url.includes("/messages") || req.url.includes("/profile"))) {
       return this.json(500, { error: { message: "fictional mailbox failure" } });
     }
@@ -646,6 +657,51 @@ test("disable landing inside a deferred pause await blocks the next business's r
     await refreshProactiveHost();
     assert.equal(getProactiveBinding(accountB)?.status, "stopped");
     assert.equal(fx.gmail.requests.length, httpBefore);
+  } finally {
+    if (hadEnv === undefined) delete process.env.GATHER_PROACTIVE_DISABLE;
+    else process.env.GATHER_PROACTIVE_DISABLE = hadEnv;
+    await stopProactiveHost(1000).catch(() => undefined);
+    cleanupFx(fx);
+  }
+});
+
+test("disable stops all managed timers before awaiting any one drain", async () => {
+  const fx = fixture();
+  const hadEnv = process.env.GATHER_PROACTIVE_DISABLE;
+  try {
+    const hallA = fx.store.createBusiness({ name: "Held Hall", timezone: "UTC" });
+    const hallB = fx.store.createBusiness({ name: "Neighbor Hall", timezone: "UTC" });
+    await connectAccount(fx, hallA.id, "code-a", "google-sub-a");
+    await connectAccount(fx, hallB.id, "code-b", "google-sub-b");
+    hosted(fx);
+    await refreshProactiveHost();
+    const accountA = gmailAccountId(fx, hallA.id);
+    const accountB = gmailAccountId(fx, hallB.id);
+
+    // A's sweep is genuinely in flight, parked inside a held inbox request.
+    fx.gmail.boxFor("Bearer access-google-sub-a").holdInbox = true;
+    const heldTick = tickBinding(accountA);
+    for (let i = 0; i < 50 && !getProactiveBinding(accountA)?.inFlight; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(getProactiveBinding(accountA)?.inFlight, true, "A's sweep is in flight during the disable");
+
+    // With a serial drain, the refresh would park inside A's stop while B's
+    // interval stayed armed and status "running". Initiate-all-stops-first
+    // clears B's timer synchronously — observable before A's sweep releases.
+    process.env.GATHER_PROACTIVE_DISABLE = "1";
+    const refresh = refreshProactiveHost(30_000);
+    assert.equal(getProactiveBinding(accountB)?.status, "stopped", "B's timer cleared while A's drain is still held");
+    assert.equal(getProactiveBinding(accountA)?.status, "stopped");
+
+    const bCalls = () => fx.gmail.requests.filter((req) => req.headers.Authorization === "Bearer access-google-sub-b").length;
+    const bBefore = bCalls();
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    assert.equal(bCalls(), bBefore, "no B poll while A's drain pends");
+    fx.gmail.boxFor("Bearer access-google-sub-a").releaseInbox?.();
+    await refresh;
+    await heldTick.catch(() => undefined);
+    assert.equal(getProactiveBinding(accountB)?.status, "stopped");
   } finally {
     if (hadEnv === undefined) delete process.env.GATHER_PROACTIVE_DISABLE;
     else process.env.GATHER_PROACTIVE_DISABLE = hadEnv;
