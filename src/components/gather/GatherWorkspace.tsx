@@ -24,6 +24,7 @@ type IconName =
   | 'calendar'
   | 'check'
   | 'chevron-down'
+  | 'chevron-left'
   | 'chevron-right'
   | 'clock'
   | 'close'
@@ -37,18 +38,16 @@ type IconName =
   | 'link'
   | 'menu'
   | 'more'
+  | 'pin'
   | 'plus'
   | 'refresh'
   | 'search'
+  | 'send'
   | 'settings'
   | 'sparkle'
+  | 'users'
   | 'warning';
 
-const VIEW_LABELS: Record<WorkspaceView, string> = {
-  today: 'Today',
-  bookings: 'Bookings',
-  connections: 'Connections',
-};
 
 function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
   const common: SVGProps<SVGSVGElement> = {
@@ -72,6 +71,8 @@ function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
       return <svg {...common}><path d="m5 12 4.3 4.3L19 6.8" /></svg>;
     case 'chevron-down':
       return <svg {...common}><path d="m6 9 6 6 6-6" /></svg>;
+    case 'chevron-left':
+      return <svg {...common}><path d="m15 6-6 6 6 6" /></svg>;
     case 'chevron-right':
       return <svg {...common}><path d="m9 6 6 6-6 6" /></svg>;
     case 'clock':
@@ -98,16 +99,22 @@ function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
       return <svg {...common}><path d="M4 7h16M4 12h16M4 17h16" /></svg>;
     case 'more':
       return <svg {...common}><circle cx="5" cy="12" r="1" fill="currentColor" stroke="none" /><circle cx="12" cy="12" r="1" fill="currentColor" stroke="none" /><circle cx="19" cy="12" r="1" fill="currentColor" stroke="none" /></svg>;
+    case 'pin':
+      return <svg {...common}><path d="M12 21s-7-5.3-7-11a7 7 0 0 1 14 0c0 5.7-7 11-7 11Z" /><circle cx="12" cy="10" r="2.5" /></svg>;
     case 'plus':
       return <svg {...common}><path d="M12 5v14M5 12h14" /></svg>;
     case 'refresh':
       return <svg {...common}><path d="M19 8a7.5 7.5 0 1 0 1 6M19 4v4h-4" /></svg>;
     case 'search':
       return <svg {...common}><circle cx="10.8" cy="10.8" r="6.5" /><path d="m16 16 4 4" /></svg>;
+    case 'send':
+      return <svg {...common}><path d="m4 11 16-7-6 16-2.5-6.5L4 11Z" /><path d="M11.5 13.5 20 4" /></svg>;
     case 'settings':
-      return <svg {...common}><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-1.7 1.7-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.1h-2.4v-.1a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L8 17l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.6-1H6v-2.4h.1a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L7.3 8 9 6.3l.1.1a1.7 1.7 0 0 0 1.9.3 1.7 1.7 0 0 0 1-1.6V5h2.4v.1a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.1 8l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.1v2.4h-.1a1.7 1.7 0 0 0-1.6 1Z" /></svg>;
+      return <svg {...common}><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-1.7 1.7-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.1h-2.4v-.1a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L8 17l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.6-1H6v-2.4h.1a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L7.3 8 9 6.3l.1.1a1.7 1.7 0 0 0 1.9.3 1.7 1.7 0 0 0 1-1.6V5h2.4v.1a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.1 8l-.1.1a1.7 1.7 0 0 0 1.6 1h.1v2.4h-.1a1.7 1.7 0 0 0-1.6 1Z" /></svg>;
     case 'sparkle':
       return <svg {...common}><path d="m12 3 1.2 5.8L19 10l-5.8 1.2L12 17l-1.2-5.8L5 10l5.8-1.2L12 3ZM19 16l.5 2.5L22 19l-2.5.5L19 22l-.5-2.5L16 19l2.5-.5L19 16Z" /></svg>;
+    case 'users':
+      return <svg {...common}><path d="M16 19v-1.5a4 4 0 0 0-4-4H7a4 4 0 0 0-4 4V19" /><circle cx="9.5" cy="7.5" r="3.5" /><path d="M21 19v-1.5a4 4 0 0 0-2.5-3.7M15 4.2a3.5 3.5 0 0 1 0 6.6" /></svg>;
     case 'warning':
       return <svg {...common}><path d="m12 4 8.3 15H3.7L12 4Z" /><path d="M12 9v4M12 16h.01" /></svg>;
     default: {
@@ -187,7 +194,7 @@ function DemoLabel() {
 function Logo() {
   return (
     <div className="gather-logo" aria-label="Gather">
-      <span className="gather-logo-mark"><Icon name="leaf" size={19} /></span>
+      <span className="gather-logo-mark"><Icon name="leaf" size={17} /></span>
       <span>Gather</span>
     </div>
   );
@@ -223,7 +230,7 @@ function NavItem({
       aria-current={activeView === view ? 'page' : undefined}
       onClick={() => onClick(view)}
     >
-      <Icon name={icon} size={18} />
+      <Icon name={icon} size={17} />
       <span>{label}</span>
       {count ? <span className="gather-nav-count">{count}</span> : null}
     </button>
@@ -253,49 +260,32 @@ function Sidebar({
           onClick={() => setMenuOpen((open) => !open)}
         ><Icon name={menuOpen ? 'close' : 'menu'} /></button>
       </div>
+      <button type="button" className="gather-search-box" disabled aria-disabled="true" title="Search is not available yet">
+        <Icon name="search" size={15} /><span>Search</span><kbd>⌘ K</kbd>
+      </button>
       <div className="gather-sidebar-section">
-        <span className="gather-sidebar-eyebrow">Workspace</span>
         <nav className="gather-nav" aria-label="Workspace">
-          <NavItem view="today" activeView={activeView} label="Today" icon="sparkle" onClick={handleNavigate} />
-          <NavItem view="bookings" activeView={activeView} label="Bookings" icon="inbox" count={reviewCount} onClick={handleNavigate} />
+          <NavItem view="today" activeView={activeView} label="Today" icon="inbox" onClick={handleNavigate} />
         </nav>
       </div>
       <div className="gather-sidebar-section">
-        <span className="gather-sidebar-eyebrow">Set up</span>
-        <nav className="gather-nav" aria-label="Set up">
+        <span className="gather-sidebar-eyebrow">Venue</span>
+        <nav className="gather-nav" aria-label="Venue">
+          <NavItem view="bookings" activeView={activeView} label="Bookings" icon="email" count={reviewCount} onClick={handleNavigate} />
           <NavItem view="connections" activeView={activeView} label="Connections" icon="link" onClick={handleNavigate} />
         </nav>
       </div>
       <div className="gather-sidebar-bottom">
-        <div className="gather-sidebar-tip">
-          <span className="gather-tip-icon"><Icon name="leaf" size={16} /></span>
-          <div>
-            <strong>Keep the room warm</strong>
-            <p>Gather keeps decisions with you, where they belong.</p>
-          </div>
-        </div>
         <button type="button" className="gather-account-button" disabled aria-disabled="true" title="Account settings are not available yet">
-          <span className="gather-account-avatar">TG</span>
-          <span className="gather-account-copy"><strong>The Glasshouse</strong><small>Owner workspace</small></span>
-          <Icon name="chevron-down" size={15} />
+          <span className="gather-account-avatar">G</span>
+          <span className="gather-account-copy"><strong>Gather Venue</strong><small>Owner workspace</small></span>
+          <Icon name="chevron-right" size={14} />
+        </button>
+        <button type="button" className="gather-nav-item" disabled aria-disabled="true" title="Settings are not available yet">
+          <Icon name="settings" size={17} /><span>Settings</span>
         </button>
       </div>
     </aside>
-  );
-}
-
-function TopBar({ view, onNavigate }: { view: WorkspaceView; onNavigate: (view: WorkspaceView) => void }) {
-  return (
-    <header className="gather-topbar">
-      <div className="gather-breadcrumb"><span>Workspace</span><Icon name="chevron-right" size={14} /><strong>{VIEW_LABELS[view]}</strong></div>
-      <div className="gather-topbar-actions">
-        <button type="button" className="gather-quiet-button" aria-label="Search bookings" disabled aria-disabled="true" title="Search is not available yet"><Icon name="search" size={18} /></button>
-        <button type="button" className="gather-quiet-button" aria-label="Workspace settings" disabled aria-disabled="true" title="Settings are not available yet"><Icon name="settings" size={18} /></button>
-        <span className="gather-topbar-divider" />
-        <button type="button" className="gather-help-button" onClick={() => onNavigate('connections')}>Need help?</button>
-        <span className="gather-profile-dot">TG</span>
-      </div>
-    </header>
   );
 }
 
@@ -347,6 +337,28 @@ function BriefingCard({
   );
 }
 
+function TriageRow({
+  booking,
+  selected,
+  onSelect,
+}: {
+  booking: BookingSummary;
+  selected: boolean;
+  onSelect: (booking: BookingSummary) => void;
+}) {
+  return (
+    <button type="button" className={`gather-triage-row ${selected ? 'is-selected' : ''}`} onClick={() => onSelect(booking)} aria-current={selected ? 'true' : undefined}>
+      <span className="gather-triage-row-top">
+        <span className={`gather-triage-dot ${statusClass(booking.status)}`} />
+        <span className="gather-triage-row-name">{booking.clientName}</span>
+        <time>{booking.eventDate}</time>
+      </span>
+      <span className="gather-triage-row-sub">{booking.statusLabel}</span>
+      <span className="gather-triage-row-meta">{booking.eventType} · {booking.eventDate} · {booking.guestCount} guests</span>
+    </button>
+  );
+}
+
 function BookingRow({
   booking,
   selected,
@@ -370,40 +382,22 @@ function BookingRow({
 }
 
 function SourceIcon({ kind }: { kind: ProposalSource['kind'] }) {
-  return <span className={`gather-source-icon gather-source-${kind}`}><Icon name={kind} size={16} /></span>;
+  return <span className={`gather-source-icon gather-source-${kind}`}><Icon name={kind} size={15} /></span>;
 }
 
-function ProposalReview({
-  booking,
-  approvalPending,
-  approvalFailed,
-  canApprove,
-  canEdit,
-  onApprove,
-  onEdit,
+function ProposalPanel({
+  proposal,
 }: {
-  booking: BookingSummary;
-  approvalPending: boolean;
-  approvalFailed: boolean;
-  canApprove: boolean;
-  canEdit: boolean;
-  onApprove: (booking: BookingSummary) => void;
-  onEdit: (booking: BookingSummary) => void;
+  proposal: Proposal;
 }) {
-  const proposal: Proposal = booking.detail.proposal;
-  const approveDisabled = approvalPending || !canApprove;
   return (
-    <section className="gather-panel gather-proposal-panel" aria-labelledby="proposal-heading">
-      <div className="gather-panel-heading">
+    <section className="gather-review-block" aria-labelledby="proposal-heading">
+      <div className="gather-block-heading">
         <div>
           <span className="gather-eyebrow">Prepared offer</span>
-          <h2 id="proposal-heading">Review the proposal</h2>
+          <h2 id="proposal-heading">Quote breakdown</h2>
         </div>
         <span className="gather-version-label">{proposal.versionLabel}</span>
-      </div>
-      <div className="gather-proposal-total">
-        <div><span className="gather-total-label">Proposed total</span><strong>{proposal.total}</strong></div>
-        <div className="gather-total-context"><span>{proposal.deposit}</span><span>{proposal.validUntil}</span></div>
       </div>
       <div className="gather-proposal-lines">
         {proposal.lines.map((line) => (
@@ -411,6 +405,10 @@ function ProposalReview({
             <div><strong>{line.label}</strong><span>{line.detail}</span></div><b>{line.amount}</b>
           </div>
         ))}
+      </div>
+      <div className="gather-proposal-total">
+        <div><span className="gather-total-label">Total</span><strong>{proposal.total}</strong></div>
+        <div className="gather-total-context"><span>{proposal.deposit}</span><span>{proposal.validUntil}</span></div>
       </div>
       <div className="gather-proposal-scope">
         <span className="gather-scope-label">Exactly what approval will do</span>
@@ -421,30 +419,51 @@ function ProposalReview({
           Approves proposal <strong>{proposal.id}</strong> · version <strong>{proposal.version}</strong> · fingerprint <code>{proposal.fingerprint}</code>
         </p>
       </div>
-      <div className="gather-proposal-actions">
+    </section>
+  );
+}
+
+function ApprovalFooter({
+  approvalPending,
+  approvalFailed,
+  canApprove,
+  canEdit,
+  onApprove,
+  onEdit,
+}: {
+  approvalPending: boolean;
+  approvalFailed: boolean;
+  canApprove: boolean;
+  canEdit: boolean;
+  onApprove: () => void;
+  onEdit: () => void;
+}) {
+  const approveDisabled = approvalPending || !canApprove;
+  return (
+    <div className="gather-review-footer">
+      <div className="gather-review-actions">
         <button
           type="button"
-          className="gather-primary-button"
+          className="gather-approve-button"
           disabled={approveDisabled}
           aria-disabled={approveDisabled}
           title={canApprove ? undefined : 'Approval is not available in this workspace yet'}
-          onClick={() => onApprove(booking)}
+          onClick={onApprove}
         >
-          <Icon name={approvalPending ? 'clock' : approvalFailed ? 'refresh' : 'check'} size={17} />{approvalPending ? 'Approval sent — waiting' : approvalFailed ? 'Try approval again' : 'Approve proposal'}
+          <Icon name={approvalPending ? 'clock' : approvalFailed ? 'refresh' : 'send'} size={16} />{approvalPending ? 'Approval sent — waiting' : approvalFailed ? 'Try approval again' : 'Approve proposal'}
         </button>
-        <button type="button" className="gather-secondary-button" disabled={!canEdit} aria-disabled={!canEdit} title={canEdit ? undefined : 'Editing is not available in this workspace yet'} onClick={() => onEdit(booking)}><Icon name="edit" size={16} />Edit details</button>
+        <button type="button" className="gather-secondary-button" disabled={!canEdit} aria-disabled={!canEdit} title={canEdit ? undefined : 'Editing is not available in this workspace yet'} onClick={onEdit}><Icon name="edit" size={15} />Edit offer</button>
       </div>
       <p className={`gather-action-note ${approvalFailed ? 'is-error' : ''}`} role={approvalFailed ? 'alert' : 'status'}>
-        <Icon name={approvalFailed ? 'warning' : 'clock'} size={14} />
         {approvalFailed
           ? 'The approval request did not go through. Nothing was sent — you can try again.'
           : approvalPending
-            ? 'The approval request is on its way. This is not confirmed — the outcome will appear under Action receipts.'
+            ? 'The approval request is on its way. This is not confirmed.'
             : canApprove
-              ? 'Approving sends a request for this exact version. A sent request is not a hold, and a hold is not a confirmed booking.'
-              : 'Approval and editing are not available in this workspace yet — nothing will be sent.'}
+              ? 'A sent request is not a hold, and a hold is not a confirmed booking.'
+              : 'Approval and editing are not available in this workspace yet.'}
       </p>
-    </section>
+    </div>
   );
 }
 
@@ -460,8 +479,8 @@ function ReceiptsPanel({
   const receipts = booking.detail.receipts ?? [];
   if (receipts.length === 0) return null;
   return (
-    <section className="gather-panel gather-receipts-panel" aria-labelledby="receipts-heading">
-      <div className="gather-panel-heading gather-panel-heading-tight">
+    <section className="gather-review-block gather-receipts-panel" aria-labelledby="receipts-heading">
+      <div className="gather-block-heading gather-block-heading-tight">
         <div><span className="gather-eyebrow">Outcomes</span><h2 id="receipts-heading">Action receipts</h2></div>
       </div>
       <div className="gather-receipt-list" role="status" aria-live="polite">
@@ -508,8 +527,8 @@ function ReceiptsPanel({
 
 function SourcesPanel({ sources }: { sources: ProposalSource[] }) {
   return (
-    <section className="gather-panel gather-sources-panel" aria-labelledby="sources-heading">
-      <div className="gather-panel-heading gather-panel-heading-tight"><div><span className="gather-eyebrow">Evidence trail</span><h2 id="sources-heading">Sources used</h2></div></div>
+    <section className="gather-review-block gather-sources-panel" aria-labelledby="sources-heading">
+      <div className="gather-block-heading gather-block-heading-tight"><div><span className="gather-eyebrow">Evidence trail</span><h2 id="sources-heading">Sources used</h2></div></div>
       <div className="gather-source-list">
         {sources.map((source) => <div className="gather-source-row" key={source.title}><SourceIcon kind={source.kind} /><span><strong>{source.title}</strong><small>{source.detail}</small></span></div>)}
       </div>
@@ -520,13 +539,13 @@ function SourcesPanel({ sources }: { sources: ProposalSource[] }) {
 
 function ActivityPanel({ booking }: { booking: BookingSummary }) {
   return (
-    <section className="gather-panel gather-activity-panel" aria-labelledby="activity-heading">
-      <div className="gather-panel-heading gather-panel-heading-tight"><div><span className="gather-eyebrow">Record</span><h2 id="activity-heading">Activity</h2></div><button className="gather-icon-button" type="button" aria-label="More activity options" disabled aria-disabled="true" title="More options are not available yet"><Icon name="more" /></button></div>
+    <section className="gather-review-block gather-activity-panel" aria-labelledby="activity-heading">
+      <div className="gather-block-heading gather-block-heading-tight"><div><span className="gather-eyebrow">Record</span><h2 id="activity-heading">Activity</h2></div><button className="gather-icon-button" type="button" aria-label="More activity options" disabled aria-disabled="true" title="More options are not available yet"><Icon name="more" /></button></div>
       <div className="gather-activity-list">
         {booking.detail.activity.map((item) => (
           <div className="gather-activity-item" key={item.id}>
-            <span className={`gather-activity-marker is-${item.kind}`}><Icon name={item.kind === 'warning' ? 'warning' : item.kind === 'proposal' ? 'document' : item.kind === 'source' ? 'sparkle' : 'email'} size={13} /></span>
-            <div><strong>{item.label}</strong><span>{item.detail}</span></div><time>{item.timestamp}</time>
+            <span className={`gather-activity-marker is-${item.kind}`} />
+            <div><strong>{item.label}</strong></div><time>{item.timestamp}</time>
           </div>
         ))}
       </div>
@@ -561,8 +580,51 @@ function BlockedNotice({
   );
 }
 
+function MetaRow({ label, icon, value, sub }: { label: string; icon?: IconName; value: ReactNode; sub?: string }) {
+  return (
+    <div className="gather-meta-row">
+      <span className="gather-meta-label">{label}</span>
+      <span className="gather-meta-value">{icon ? <Icon name={icon} size={14} /> : null}<strong>{value}</strong></span>
+      {sub ? <span className="gather-meta-sub">{sub}</span> : null}
+    </div>
+  );
+}
+
+function BookingMeta({ booking }: { booking: BookingSummary }) {
+  const proposal = booking.detail.proposal;
+  return (
+    <aside className="gather-triage-meta" aria-label="Booking details">
+      <MetaRow label="Customer" value={booking.clientName} sub={booking.detail.source} />
+      <MetaRow label="Event date" icon="calendar" value={booking.eventDate} />
+      <MetaRow label="Venue" icon="pin" value={booking.venue} />
+      <MetaRow label="Attendance" icon="users" value={`${booking.guestCount} guests`} />
+      <MetaRow label="Budget" value={booking.budget} />
+      <div className="gather-meta-row">
+        <span className="gather-meta-label">Status</span>
+        <span className="gather-meta-value"><StatusPill booking={booking} /></span>
+        <span className="gather-meta-sub">{booking.nextAction}</span>
+      </div>
+      <MetaRow label="Deposit" icon="document" value={proposal.deposit} sub={proposal.validUntil} />
+      <div className="gather-meta-group">
+        <span className="gather-meta-label">Proposal</span>
+        <div className="gather-meta-related">
+          <span><Icon name="document" size={14} />{proposal.id}</span>
+          <span><Icon name="refresh" size={13} />Version {proposal.version}</span>
+        </div>
+      </div>
+      <div className="gather-meta-group">
+        <span className="gather-meta-label">Notes</span>
+        <button type="button" className="gather-meta-note-button" disabled aria-disabled="true" title="Notes are not available yet">
+          <Icon name="edit" size={14} />Add note
+        </button>
+      </div>
+    </aside>
+  );
+}
+
 function BookingDetailPanel({
   booking,
+  position,
   approvalPending,
   approvalFailed,
   canApprove,
@@ -573,9 +635,12 @@ function BookingDetailPanel({
   onReviewConnections,
   onRetryAction,
   onReconcileExecution,
+  onPrev,
+  onNext,
   onBack,
 }: {
   booking: BookingSummary;
+  position: string;
   approvalPending: boolean;
   approvalFailed: boolean;
   canApprove: boolean;
@@ -586,40 +651,65 @@ function BookingDetailPanel({
   onReviewConnections: () => void;
   onRetryAction?: (bookingId: string, actionId: string) => void;
   onReconcileExecution?: (bookingId: string, executionId: string) => void;
+  onPrev?: () => void;
+  onNext?: () => void;
   onBack?: () => void;
 }) {
   const waiting = booking.status === 'waiting' || booking.status === 'hold-pending';
   const waitingReason = booking.detail.waitingReason;
+  const proposal = booking.detail.proposal;
   return (
     <div className="gather-booking-detail">
-      {onBack ? <button type="button" className="gather-back-button" onClick={onBack}><Icon name="chevron-right" size={15} />All bookings</button> : null}
-      <div className="gather-detail-header">
-        <div className="gather-detail-client"><Avatar initials={booking.clientInitials} tone={booking.clientTone} /><div><div className="gather-detail-title-line"><h2>{booking.clientName}</h2><StatusPill booking={booking} /></div><p>{booking.eventType} · {booking.eventDate} · {booking.guestCount} guests</p></div></div>
-        <button type="button" className="gather-icon-button" aria-label="More booking options" disabled aria-disabled="true" title="More options are not available yet"><Icon name="more" /></button>
-      </div>
-      <div className="gather-detail-facts">
-        <div><span className="gather-fact-icon"><Icon name="calendar" size={16} /></span><span><small>Event date</small><strong>{booking.eventDate}</strong></span></div>
-        <div><span className="gather-fact-icon"><Icon name="clock" size={16} /></span><span><small>Time</small><strong>{booking.eventTime}</strong></span></div>
-        <div><span className="gather-fact-icon"><Icon name="inbox" size={16} /></span><span><small>Inquiry from</small><strong>{booking.detail.source.replace(' · ', ' / ')}</strong></span></div>
-      </div>
-      <div className="gather-request-summary"><span className="gather-eyebrow">What they asked for</span><p>{booking.detail.requestSummary}</p><span className="gather-package-label"><Icon name="leaf" size={15} /><strong>{booking.detail.packageName}</strong><span>{booking.detail.packageDescription}</span></span></div>
-      {waiting ? (
-        <BlockedNotice
-          title={waitingReason?.title ?? 'This booking is waiting'}
-          description={waitingReason?.description ?? booking.nextAction}
-          actionLabel={waitingReason?.actionLabel ?? 'Try again'}
-          secondaryActionLabel={waitingReason?.connectionsRelated ? 'Review connections' : undefined}
-          onAction={onBlockedAction}
-          onSecondaryAction={waitingReason?.connectionsRelated ? onReviewConnections : undefined}
-        />
-      ) : null}
-      <div className="gather-detail-grid">
-        <div className="gather-detail-main">
-          <ProposalReview booking={booking} approvalPending={approvalPending} approvalFailed={approvalFailed} canApprove={canApprove} canEdit={canEdit} onApprove={onApprove} onEdit={onEdit} />
-          <ReceiptsPanel booking={booking} onRetryAction={onRetryAction} onReconcileExecution={onReconcileExecution} />
+      <div className="gather-review-top">
+        {onBack ? <button type="button" className="gather-back-button" onClick={onBack}><Icon name="chevron-left" size={15} />All bookings</button> : null}
+        <div className="gather-review-crumbs"><span>Bookings</span><Icon name="chevron-right" size={12} /><strong>{booking.id}</strong></div>
+        <div className="gather-review-pager">
+          <span>{position}</span>
+          <button type="button" className="gather-icon-button" aria-label="Previous booking" disabled={!onPrev} aria-disabled={!onPrev} title={onPrev ? undefined : 'This is the first booking'} onClick={onPrev}><Icon name="chevron-left" size={15} /></button>
+          <button type="button" className="gather-icon-button" aria-label="Next booking" disabled={!onNext} aria-disabled={!onNext} title={onNext ? undefined : 'This is the last booking'} onClick={onNext}><Icon name="chevron-right" size={15} /></button>
         </div>
-        <div className="gather-detail-side"><SourcesPanel sources={booking.detail.proposal.sources} /><ActivityPanel booking={booking} /></div>
       </div>
+      <div className="gather-review-scroll">
+        <h2 className="gather-review-title">{booking.clientName}</h2>
+        <div className="gather-review-chips">
+          <span><Icon name="users" size={14} />{booking.guestCount} guests</span>
+          <span><Icon name="calendar" size={14} />{booking.eventDate}</span>
+          <span><Icon name="pin" size={14} />{booking.venue}</span>
+        </div>
+        <div className="gather-review-summary">
+          <h3>{booking.detail.packageName}</h3>
+          <p>{booking.detail.packageDescription}</p>
+        </div>
+        {waiting ? (
+          <BlockedNotice
+            title={waitingReason?.title ?? 'This booking is waiting'}
+            description={waitingReason?.description ?? booking.nextAction}
+            actionLabel={waitingReason?.actionLabel ?? 'Try again'}
+            secondaryActionLabel={waitingReason?.connectionsRelated ? 'Review connections' : undefined}
+            onAction={onBlockedAction}
+            onSecondaryAction={waitingReason?.connectionsRelated ? onReviewConnections : undefined}
+          />
+        ) : null}
+        <ProposalPanel proposal={proposal} />
+        <div className="gather-message-card">
+          <Avatar initials={booking.clientInitials} tone={booking.clientTone} />
+          <div>
+            <div className="gather-message-head"><strong>{booking.clientName}</strong><span>{booking.detail.source}</span><time>{booking.detail.receivedAt}</time></div>
+            <p>{booking.detail.requestSummary}</p>
+          </div>
+        </div>
+        <ReceiptsPanel booking={booking} onRetryAction={onRetryAction} onReconcileExecution={onReconcileExecution} />
+        <SourcesPanel sources={proposal.sources} />
+        <ActivityPanel booking={booking} />
+      </div>
+      <ApprovalFooter
+        approvalPending={approvalPending}
+        approvalFailed={approvalFailed}
+        canApprove={canApprove}
+        canEdit={canEdit}
+        onApprove={() => onApprove(booking)}
+        onEdit={() => onEdit(booking)}
+      />
     </div>
   );
 }
@@ -704,19 +794,53 @@ function BookingsView({
 }) {
   const [mobileDetail, setMobileDetail] = useState(false);
   const handleSelect = (booking: BookingSummary) => { onSelect(booking); setMobileDetail(true); };
+  const selectedIndex = selectedBooking ? bookings.findIndex((booking) => booking.id === selectedBooking.id) : -1;
+  const step = (offset: number) => {
+    const next = bookings[selectedIndex + offset];
+    if (next) onSelect(next);
+  };
   return (
-    <>
-      <PageIntro eyebrow="The whole room" title="Bookings" description="Review the moments that need your judgment, with the context close at hand.">{showDemoData ? <DemoLabel /> : null}<button type="button" className="gather-primary-button gather-small-button" disabled aria-disabled="true" title="New inquiries cannot be added here yet"><Icon name="plus" size={16} />New inquiry</button></PageIntro>
-      {bookings.length === 0 ? <EmptyState title="No bookings yet" description="Connect Gmail or add an inquiry to see your next opportunity here." /> : <div className={`gather-bookings-layout ${mobileDetail ? 'is-mobile-detail' : ''}`}>
-        <section className="gather-bookings-list-panel" aria-label="Bookings list"><div className="gather-list-toolbar"><div><strong>{bookings.length} active {bookings.length === 1 ? 'booking' : 'bookings'}</strong><span>Sorted by what needs you next</span></div><button className="gather-icon-button" type="button" aria-label="Filter bookings" disabled aria-disabled="true" title="Filtering is not available yet"><Icon name="settings" size={17} /></button></div>{bookings.map((booking) => <BookingRow booking={booking} selected={selectedBooking?.id === booking.id} onSelect={handleSelect} key={booking.id} />)}</section>
-        {selectedBooking ? <BookingDetailPanel booking={selectedBooking} approvalPending={approvalPending} approvalFailed={approvalFailed} canApprove={canApprove} canEdit={canEdit} onApprove={onApprove} onEdit={onEdit} onBlockedAction={canRetryBlocked ? () => onBlockedAction(selectedBooking) : undefined} onReviewConnections={onReviewConnections} onRetryAction={onRetryAction} onReconcileExecution={onReconcileExecution} onBack={() => setMobileDetail(false)} /> : null}
-      </div>}
-    </>
+    <div className={`gather-triage ${mobileDetail ? 'is-mobile-detail' : ''}`}>
+      <section className="gather-triage-list" aria-label="Bookings list">
+        <div className="gather-triage-list-head">
+          <h2>Bookings <span>{bookings.length}</span></h2>
+          <div className="gather-triage-list-actions">
+            {showDemoData ? <DemoLabel /> : null}
+            <button className="gather-icon-button" type="button" aria-label="Filter bookings" disabled aria-disabled="true" title="Filtering is not available yet"><Icon name="settings" size={15} /></button>
+          </div>
+        </div>
+        {bookings.length === 0 ? <EmptyState title="No bookings yet" description="Connect Gmail or add an inquiry to see your next opportunity here." /> : bookings.map((booking) => <TriageRow booking={booking} selected={selectedBooking?.id === booking.id} onSelect={handleSelect} key={booking.id} />)}
+      </section>
+      {selectedBooking ? (
+        <>
+          <BookingDetailPanel
+            booking={selectedBooking}
+            position={`${selectedIndex + 1} of ${bookings.length}`}
+            approvalPending={approvalPending}
+            approvalFailed={approvalFailed}
+            canApprove={canApprove}
+            canEdit={canEdit}
+            onApprove={onApprove}
+            onEdit={onEdit}
+            onBlockedAction={canRetryBlocked ? () => onBlockedAction(selectedBooking) : undefined}
+            onReviewConnections={onReviewConnections}
+            onRetryAction={onRetryAction}
+            onReconcileExecution={onReconcileExecution}
+            onPrev={selectedIndex > 0 ? () => step(-1) : undefined}
+            onNext={selectedIndex >= 0 && selectedIndex < bookings.length - 1 ? () => step(1) : undefined}
+            onBack={() => setMobileDetail(false)}
+          />
+          <BookingMeta booking={selectedBooking} />
+        </>
+      ) : (
+        <div className="gather-triage-empty"><EmptyState title="Nothing selected" description="Choose a booking from the list to review its proposal." /></div>
+      )}
+    </div>
   );
 }
 
 function ConnectionCard({ connection, hostWired, onConnect }: { connection: Connection; hostWired: boolean; onConnect: (provider: ConnectionProvider) => void }) {
-  return <article className={`gather-connection-card ${connection.connected ? 'is-connected' : 'is-needs-attention'}`}><div className="gather-connection-top"><span className={`gather-connection-icon is-${connection.provider}`}><Icon name={connectionIcon(connection.provider)} size={21} /></span><span className={connection.connected ? 'gather-connected-label' : 'gather-attention-label'}>{connection.connected ? <><Icon name="check" size={13} />Connected</> : <><Icon name="warning" size={13} />Needs attention</>}</span></div><h2>{connection.name}</h2><p>{connection.description}</p><div className="gather-connection-footer"><span>{connection.connected ? connection.lastSynced : connection.detail}</span>{connection.connected ? <button type="button" className="gather-text-button" disabled aria-disabled="true" title="Managing connections is not available yet">Manage <Icon name="chevron-right" size={14} /></button> : <button type="button" className="gather-primary-button gather-small-button" disabled={!hostWired} aria-disabled={!hostWired} title={hostWired ? `Reconnect ${connection.name}` : 'Reconnecting is not available in this workspace yet'} onClick={() => onConnect(connection.provider)}><Icon name="refresh" size={15} />Reconnect</button>}</div>{!connection.connected && !hostWired ? <p className="gather-connection-note">Reconnecting is not available in this demo workspace — the button stays off instead of pretending to work.</p> : null}</article>;
+  return <article className={`gather-connection-card ${connection.connected ? 'is-connected' : 'is-needs-attention'}`}><div className="gather-connection-top"><span className={`gather-connection-icon is-${connection.provider}`}><Icon name={connectionIcon(connection.provider)} size={21} /></span><span className={connection.connected ? 'gather-connected-label' : 'gather-attention-label'}>{connection.connected ? <><Icon name="check" size={13} />Connected</> : <><Icon name="warning" size={13} />Needs attention</>}</span></div><h2>{connection.name}</h2><p>{connection.description}</p><div className="gather-connection-footer"><span>{connection.connected ? connection.lastSynced : connection.detail}</span>{connection.connected ? <button type="button" className="gather-text-button" disabled aria-disabled="true" title="Managing connections is not available yet">Manage <Icon name="chevron-right" size={14} /></button> : <button type="button" className="gather-approve-button gather-small-button" disabled={!hostWired} aria-disabled={!hostWired} title={hostWired ? `Reconnect ${connection.name}` : 'Reconnecting is not available in this workspace yet'} onClick={() => onConnect(connection.provider)}><Icon name="refresh" size={15} />Reconnect</button>}</div>{!connection.connected && !hostWired ? <p className="gather-connection-note">Reconnecting is not available in this demo workspace — the button stays off instead of pretending to work.</p> : null}</article>;
 }
 
 function ConnectionsView({ connections, showDemoData, hostWired, onConnect }: { connections: Connection[]; showDemoData: boolean; hostWired: boolean; onConnect: (provider: ConnectionProvider) => void }) {
@@ -823,29 +947,27 @@ export function GatherWorkspace({
   const reconcileExecution = onReconcileExecution ? (bookingId: string, executionId: string) => onReconcileExecution({ bookingId, executionId }) : undefined;
   const canRetryBlocked = onRetryAction !== undefined || onReconcileExecution !== undefined || onRetryBlockedAction !== undefined;
   const retryBlocked = (booking: BookingSummary) => {
-    // Route through the first recoverable receipt so the host receives the
-    // exact action/execution context; fall back to the generic blocked retry.
-    const receipt = (booking.detail.receipts ?? []).find((candidate) => receiptRecoveryKind(candidate) !== undefined);
-    if (receipt) {
-      const kind = receiptRecoveryKind(receipt);
-      if (kind === 'retry' && onRetryAction) { onRetryAction({ bookingId: booking.id, actionId: receipt.actionId }); return; }
-      if (kind === 'reconcile' && receipt.executionId && onReconcileExecution) { onReconcileExecution({ bookingId: booking.id, executionId: receipt.executionId }); return; }
+    const recoverable = (booking.detail.receipts ?? []).find((receipt) => receiptRecoveryKind(receipt) !== undefined);
+    if (recoverable) {
+      const kind = receiptRecoveryKind(recoverable);
+      if (kind === 'retry' && onRetryAction) onRetryAction({ bookingId: booking.id, actionId: recoverable.actionId });
+      else if (kind === 'reconcile' && recoverable.executionId && onReconcileExecution) onReconcileExecution({ bookingId: booking.id, executionId: recoverable.executionId });
+      else onRetryBlockedAction?.();
+      return;
     }
     onRetryBlockedAction?.();
   };
 
   return <div className="gather-app-shell">
     <Sidebar activeView={activeView} reviewCount={reviewCount} onNavigate={navigate} />
-    <div className="gather-main-column"><TopBar view={activeView} onNavigate={navigate} /><main className="gather-main-content">
+    <main className="gather-main">
       {blockedState ? <BlockedNotice title={blockedState.title} description={blockedState.description} actionLabel={blockedState.actionLabel} onAction={onRetryBlockedAction} /> : null}
       {loading ? <LoadingState /> : <>
-        {isDemoData ? <div className="gather-demo-ribbon"><DemoLabel /><span>Local interface fixtures are shown here. Connect your sources to replace them with workspace data.</span></div> : null}
+        {isDemoData && activeView !== 'bookings' ? <div className="gather-demo-ribbon"><DemoLabel /><span>Simulated records are shown here — nothing shown is real or confirmed.</span></div> : null}
         {activeView === 'today' ? <TodayView bookings={bookings} connectedSourceCount={connections.filter((connection) => connection.connected).length} showDemoData={isDemoData} selectedBooking={selectedBooking} onSelect={selectBooking} onNavigate={navigate} /> : null}
         {activeView === 'bookings' ? <BookingsView bookings={bookings} showDemoData={isDemoData} selectedBooking={selectedBooking} approvalPending={approvalPending} approvalFailed={approvalFailed} canApprove={onApproveProposal !== undefined} canEdit={onEditProposal !== undefined} canRetryBlocked={canRetryBlocked} onSelect={selectBooking} onApprove={approveProposal} onEdit={editProposal} onBlockedAction={retryBlocked} onReviewConnections={() => navigate('connections')} onRetryAction={retryAction} onReconcileExecution={reconcileExecution} /> : null}
         {activeView === 'connections' ? <ConnectionsView connections={connections} showDemoData={isDemoData} hostWired={onConnect !== undefined} onConnect={connect} /> : null}
       </>}
-    </main></div>
+    </main>
   </div>;
 }
-
-export default GatherWorkspace;
