@@ -50,8 +50,8 @@ function fail(tool: string, message: string): never {
 
 /**
  * Reviewable hold window: a GATHER TEST offer holds the slot for at most 24
- * hours and always releases at least one hour before the event starts —
- * never past the event itself.
+ * hours and offer validity ends no later than one hour before the event
+ * starts; no automatic provider release is implied.
  */
 const HOLD_VALIDITY_MS = 24 * 60 * 60 * 1000;
 const HOLD_RELEASE_BUFFER_MS = 60 * 60 * 1000;
