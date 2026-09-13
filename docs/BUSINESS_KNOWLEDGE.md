@@ -86,8 +86,30 @@ stale corrections are rejected and audited, and each correction supersedes
 the prior revision (rev N → N+1), preserving provenance.
 
 `addScopedException` requires an explicit `booking` or `customer` scope +
-`scopeId`, stamps `scope`/`scopeId` into the fact (contradictions rejected),
-and stays versioned under that scope — exceptions never silently globalize.
+`scopeId`, plus an explicit `policyId` and `effect` (`allow` or
+`require_owner_decision`). The stored value is canonical and adapter-shaped
+(`exceptionId` server-minted, `policyId`, `scope` as `{ bookingId }` or
+`{ customerId }`, `effect`, `approvedBy` always the commanding owner id):
+client-supplied authority fields that contradict the command are rejected,
+and the fact stays versioned under its revision scope — exceptions never
+silently globalize.
+
+## Transaction discipline and honest contention
+
+Every mutating call runs its state reads, validation of live state,
+conditional mutation, and applied-decision audit inside exactly one
+`BEGIN IMMEDIATE` transaction (bounded lock-busy retries with backoff).
+Status and version checks re-run under the lock, conditional updates assert
+`changes === 1`, and the partial unique index on active revisions is the
+final fence — so concurrent confirms apply once (losers observe the terminal
+state idempotently) and concurrent corrections admit exactly one winner
+(losers report audited `stale_version`). Only lock contention
+(`SQLITE_BUSY`) is retried; constraint and application conflicts propagate
+unchanged, and exhaustion surfaces an honest retryable `busy` error rather
+than a silent or mislabeled outcome. Rejection evidence is recorded outside
+any rolled-back transaction, so the audit always survives the failure it
+describes; intake validation failures carry no command id and are not
+decision-logged by design.
 
 ## Snapshot for offers
 
