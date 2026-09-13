@@ -82,7 +82,11 @@ Cursors bind a stable account identity and query, preserve capped page progress,
 Persistent booking waiting work was integrated as `dae72d8` from `7f21c7e` after Astra reran 37 coordination tests, type checking, and both exact migration counterexamples.
 Review verified scoped deduplication, reply suppression, persisted pause controls, claim fencing, and legacy migrations that preserve queued work and live leases.
 All 247 tests, type checking, and the production build pass on the combined integration.
-These are component acceptances; business knowledge, delivery readiness, owner interaction polish, and actual runtime intake wiring remain under review or implementation.
+Source-linked business knowledge was integrated as `1091509` from `640f57b` after independent review, 28 focused tests, type checking, and Astra reproducing the exact two-connection command race.
+Competing commands now produce one fact and one decision; altered command reuse is rejected inside the write transaction.
+Rejected decisions replay as typed errors, corrected facts retain consistent revision identity, and unconfirmed source changes remain withheld from offer inputs.
+All 275 tests, type checking, and the production build pass on the combined integration.
+These are component acceptances; knowledge-to-offer host integration, delivery readiness, owner interaction polish, setup and connection recovery, and actual runtime intake wiring remain under review or implementation.
 The isolated-runtime intake integration now has verified dependency artifacts; live provider and model execution remain separate blocked gates.
 The next demonstrable owner journey is explicit demo initialization, exact proposal review and approval, individually persisted hold and email receipts, and restart recovery through the workspace.
 
@@ -101,8 +105,9 @@ No credentials, personal OpenClaw configuration or data, provider actions, custo
 
 ## Workspace cleanup and dependency findings
 
-Twelve completed review, failed-launch, runtime, dependency-maintenance, and inherited milestone worktrees were removed after checking clean tracked state and active worker ownership.
+Thirteen completed review, failed-launch, runtime, dependency-maintenance, knowledge, and inherited milestone worktrees were removed after checking clean tracked state and active worker ownership.
 Original foundation, interface, connector-contract, and packaging commits remain preserved by local branch references; integrated review commits remain reachable on remote main.
+The completed knowledge commit is additionally preserved at `archive/gather-business-knowledge-640f57b`; its successor worker uses a separate business-operator worktree.
 Active execution worktrees and unrelated work were preserved.
 
 Dependency remediation `64bb96e` was integrated as `1fbbb754` after compatibility review.
