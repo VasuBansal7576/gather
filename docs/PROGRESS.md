@@ -14,7 +14,8 @@ The demo connectors and fixture workspace remain explicitly simulated and are no
 
 This checklist has a fixed total of 17 gates.
 
-Fourteen gates are accepted after the latest combined 343-test run and production build.
+Fourteen gates were accepted on the combined 343-test run and production build at `cb913a9`.
+The newer setup integration at `8b35a2d` passes its production build but only 380 of 381 combined tests, so its aggregate test gate remains open.
 The recurring isolated Gateway startup timeout remains an open reliability issue despite the passing rerun.
 This count describes the local application milestone only, not completion of the product requirements in [PRD.md](PRD.md).
 
@@ -110,11 +111,12 @@ No credentials, personal OpenClaw configuration or data, provider actions, custo
 
 ## Workspace cleanup and dependency findings
 
-Fifteen completed review, failed-launch, runtime, dependency-maintenance, knowledge, delivery-evaluator, owner-workspace, and inherited milestone worktrees were removed after checking clean tracked state and active worker ownership.
+Eighteen completed review, failed-launch, runtime, dependency-maintenance, knowledge, delivery-evaluator, owner-workspace, setup, connection-service, and inherited milestone worktrees were removed after checking clean tracked state and active worker ownership.
 Original foundation, interface, connector-contract, and packaging commits remain preserved by local branch references; integrated review commits remain reachable on remote main.
 The completed knowledge commit is additionally preserved at `archive/gather-business-knowledge-640f57b`; its successor worker uses a separate business-operator worktree.
 The completed delivery evaluator is preserved at `archive/gather-delivery-readiness-e626000`; its successor uses a separate booking-delivery worktree.
 The completed owner workspace is preserved at `archive/gather-owner-host-fbafe11`; its worker now independently reviews the confirmation service.
+The setup UI, setup integration review, and connection service are preserved at `archive/gather-setup-ui-57e2518`, `archive/gather-setup-integration-9d65478`, and `archive/gather-connections-db6815f`.
 Active execution worktrees and unrelated work were preserved.
 
 Dependency remediation `64bb96e` was integrated as `1fbbb754` after compatibility review.
@@ -150,3 +152,19 @@ Desktop 1586×992 and mobile 390×844 checks showed no horizontal overflow, with
 Removing only the task-owned simulated email execution reproduced a crash between steps: the UI remained incomplete and reapproval recovered the missing step while preserving the original hold execution.
 The browser tab and task-owned server were closed after verification.
 These checks establish local simulated approval behavior, not live booking confirmation or complete proactive operation.
+
+## Guided setup and recovery integration
+
+Guided business setup and app connection boundaries were integrated at `8b35a2d`.
+The connection service passed 23 focused tests and type checking independently, including business ownership, single-use callbacks, transaction fences and staged-secret cleanup.
+The setup component passed an independent production browser and route review with 95 focused checks on its review branch.
+The combined production build passes; its 380/381 test result repeats the actual isolated Gateway `hello-ok` timeout within the unchanged 30-second limit.
+The child was stopped after timeout, and no port collision has been demonstrated as the cause.
+A separate production browser review of the combined setup-to-booking journey is in progress.
+No actual OAuth exchange or connected-account outcome is claimed.
+
+Consistent local backup and restore-to-new-database were integrated at `bf73f3e` from `03cafd4` after independent review, 13 focused tests and type checking passed.
+Regression checks cover concurrent destination creation, competing publishers, foreign staging files, invalid database markers, and committed SQLite WAL rows surviving restore.
+Publication refuses an existing destination atomically; restore creates a new database and does not replace the current one.
+The database marker is a sanity check, not a schema-version compatibility guarantee.
+No private or live business database was used for this verification.
