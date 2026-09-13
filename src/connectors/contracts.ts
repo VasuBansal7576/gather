@@ -9,19 +9,21 @@ export type ConnectorKind = "email" | "document" | "calendar";
 
 export type ConnectorMode = "demo" | "live";
 
-export type ConnectorModeLabel =
-  | {
-      mode: "demo";
-      label: "DEMO ONLY";
-      fictional: true;
-    }
-  | {
-      mode: "live";
-      label: "LIVE";
-      fictional: false;
-    };
+export interface DemoModeLabel {
+  mode: "demo";
+  label: "DEMO ONLY";
+  fictional: true;
+}
 
-export const DEMO_MODE: ConnectorModeLabel = {
+export interface LiveModeLabel {
+  mode: "live";
+  label: "LIVE";
+  fictional: false;
+}
+
+export type ConnectorModeLabel = DemoModeLabel | LiveModeLabel;
+
+export const DEMO_MODE: DemoModeLabel = {
   mode: "demo",
   label: "DEMO ONLY",
   fictional: true,
@@ -48,18 +50,19 @@ export interface DemoSourceReference extends SourceReference {
   fictional: true;
 }
 
-export interface ConnectorMetadata {
+export interface ConnectorMetadataBase {
   operationKey: string;
-  mode: ConnectorModeLabel;
-  /**
-   * Discriminated with {@link ConnectorModeLabel}: demo results are
-   * simulated (true) and fictional; live provider receipts are not
-   * simulated (false) and not fictional. Live adapters must set false and
-   * expose provider-issued receipt identifiers distinctly from demo ones.
-   */
-  simulated: boolean;
   sourceReferences: SourceReference[];
 }
+
+/**
+ * Correlated demo/live metadata: demo results are simulated and fictional,
+ * live provider receipts are neither. The union (not a bare boolean with a
+ * comment) makes a live result with `simulated: true` — or a demo result
+ * claiming live provenance — a compile-time error.
+ */
+export type ConnectorMetadata = ConnectorMetadataBase &
+  ({ mode: DemoModeLabel; simulated: true } | { mode: LiveModeLabel; simulated: false });
 
 export type ConnectorErrorKind =
   | "invalid_request"

@@ -46,6 +46,7 @@ export interface HoldScope {
   bookingId?: string;
   startAt?: string;
   endAt?: string;
+  expiresAt?: string;
 }
 
 export type HoldScopeResolver = (operationKey: string) => Promise<HoldScope | undefined>;
@@ -137,18 +138,44 @@ function parseGoogleEvent(value: unknown): ParsedGoogleEvent | undefined {
   return event;
 }
 
-function parseEventList(body: unknown): { items: ParsedGoogleEvent[]; nextPageToken?: string } | undefined {
+interface FreeBusyWindow {
+  startMs: number;
+  endMs: number;
+}
+
+function parseFreeBusy(body: unknown, calendarId: string): { busy: FreeBusyWindow[] } | { calendarError: string } | undefined {
   if (!isRecord(body)) return undefined;
-  const rawItems = body.items;
-  if (rawItems !== undefined && !Array.isArray(rawItems)) return undefined;
-  const items: ParsedGoogleEvent[] = [];
-  for (const raw of rawItems ?? []) {
-    const event = parseGoogleEvent(raw);
-    if (event === undefined) return undefined;
-    items.push(event);
+  const calendars = body.calendars;
+  if (!isRecord(calendars)) return undefined;
+  const entry = calendars[calendarId];
+  if (!isRecord(entry)) return undefined;
+  const errors = entry.errors;
+  if (Array.isArray(errors) && errors.length > 0) {
+    const reasons: string[] = [];
+    for (const item of errors) {
+      if (!isRecord(item)) return undefined;
+      const reason = asString(item.reason);
+      if (reason === undefined) return undefined;
+      reasons.push(reason);
+    }
+    return { calendarError: reasons.join(",") };
   }
-  const token = asString(body.nextPageToken);
-  return token === undefined ? { items } : { items, nextPageToken: token };
+  const busyRaw = entry.busy;
+  if (busyRaw !== undefined && !Array.isArray(busyRaw)) return undefined;
+  const busy: FreeBusyWindow[] = [];
+  for (const item of busyRaw ?? []) {
+    if (!isRecord(item)) return undefined;
+    const start = asString(item.start);
+    const end = asString(item.end);
+    // Fail closed: a busy window without exact instants cannot authorize
+    // a free verdict.
+    if (start === undefined || end === undefined) return undefined;
+    const startMs = Date.parse(start);
+    const endMs = Date.parse(end);
+    if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || startMs >= endMs) return undefined;
+    busy.push({ startMs, endMs });
+  }
+  return { busy };
 }
 
 function slotIdFor(calendarId: string, startMs: number, endMs: number, kind: string): string {
@@ -206,6 +233,15 @@ export class GoogleCalendarConnector implements CalendarAvailabilityReader, Prov
     return undefined;
   }
 
+  /**
+   * Enforce an explicit calendar binding: a bound adapter serves exactly one
+   * calendar and must reject any request naming another. Without this, a
+   * caller could probe or write calendar B through an adapter bound to A.
+   */
+  private bindingViolation(calendarId: string): boolean {
+    return this.options.calendarId !== undefined && this.options.calendarId !== calendarId;
+  }
+
   async checkAvailability(request: CheckAvailabilityRequest): Promise<ConnectorResult<CheckAvailabilityResponse>> {
     if (request.operationKey.trim().length === 0 || request.calendarId.trim().length === 0) {
       return {
@@ -223,49 +259,59 @@ export class GoogleCalendarConnector implements CalendarAvailabilityReader, Prov
         error: invalidRequest("A valid startAt/endAt range is required"),
       };
     }
-    // Fresh, calendar-scoped read across all pages: cancelled events and
-    // transparent (free) events never block; everything else overlapping the
-    // window is busy. timeMin bounds event end, timeMax bounds event start,
-    // so the query window matches overlap semantics exactly.
-    const busy: Array<{ startMs: number; endMs: number; summary?: string; id: string }> = [];
-    let pageToken: string | undefined;
+    if (this.bindingViolation(request.calendarId)) {
+      return {
+        status: "failed",
+        metadata: liveMetadata(request.operationKey, []),
+        error: invalidRequest(`Adapter is bound to calendar "${this.options.calendarId}"; request names "${request.calendarId}"`),
+      };
+    }
+    // Fresh, calendar-scoped availability via freeBusy.query: the server
+    // returns busy instants (all-day dates resolved in the calendar's own
+    // timezone, DST included), so the adapter performs no timezone math and
+    // needs no event pagination. Per-calendar errors are surfaced, not
+    // swallowed; malformed busy windows fail the whole check closed.
+    let busy: FreeBusyWindow[];
     try {
-      do {
-        const url = withQuery(
-          `${CALENDAR_BASE_URL}/calendars/${encodeURIComponent(request.calendarId)}/events`,
-          {
-            timeMin: request.startAt,
-            timeMax: request.endAt,
-            singleEvents: "true",
-            orderBy: "startTime",
-            maxResults: "2500",
-            pageToken,
-          },
-        );
-        const response = await authorized(this.options, { method: "GET", url });
-        if (response.status !== 200) {
-          const error = mapGoogleHttpError(response.status, safeParseJson(response.text), "checkAvailability");
-          return { status: "failed", metadata: liveMetadata(request.operationKey, []), error };
-        }
-        const page = parseEventList(safeParseJson(response.text));
-        if (page === undefined) {
+      const response = await authorized(this.options, {
+        method: "POST",
+        url: `${CALENDAR_BASE_URL}/freeBusy`,
+        body: JSON.stringify({
+          timeMin: request.startAt,
+          timeMax: request.endAt,
+          timeZone: "UTC",
+          items: [{ id: request.calendarId }],
+        }),
+      });
+      if (response.status !== 200) {
+        const error = mapGoogleHttpError(response.status, safeParseJson(response.text), "checkAvailability");
+        return { status: "failed", metadata: liveMetadata(request.operationKey, []), error };
+      }
+      const parsed = parseFreeBusy(safeParseJson(response.text), request.calendarId);
+      if (parsed === undefined) {
+        return {
+          status: "failed",
+          metadata: liveMetadata(request.operationKey, []),
+          error: transportError("Calendar freeBusy returned an unrecognized JSON shape; availability cannot be verified"),
+        };
+      }
+      if ("calendarError" in parsed) {
+        if (parsed.calendarError.includes("notFound")) {
           return {
             status: "failed",
             metadata: liveMetadata(request.operationKey, []),
-            error: transportError("Calendar events.list returned an unrecognized JSON shape"),
+            error: { kind: "invalid_request", message: `Calendar "${request.calendarId}" was not found or is not visible`, retryable: false },
           };
         }
-        for (const event of page.items) {
-          if (event.status === "cancelled" || event.transparency === "transparent") continue;
-          if (event.startMs === undefined || event.endMs === undefined) continue;
-          const clippedStart = Math.max(event.startMs, startMs);
-          const clippedEnd = Math.min(event.endMs, endMs);
-          if (clippedStart < clippedEnd) {
-            busy.push({ startMs: clippedStart, endMs: clippedEnd, summary: event.summary, id: event.id });
-          }
-        }
-        pageToken = page.nextPageToken;
-      } while (pageToken !== undefined);
+        return {
+          status: "failed",
+          metadata: liveMetadata(request.operationKey, []),
+          error: transportError(`Calendar freeBusy reported calendar errors: ${parsed.calendarError}`),
+        };
+      }
+      busy = parsed.busy
+        .map((window) => ({ startMs: Math.max(window.startMs, startMs), endMs: Math.min(window.endMs, endMs) }))
+        .filter((window) => window.startMs < window.endMs);
     } catch (error) {
       if (error instanceof TokenUnavailableError) return tokenFailure(request.operationKey);
       if (error instanceof TransportTimeoutError || error instanceof TransportNetworkError) {
@@ -278,7 +324,7 @@ export class GoogleCalendarConnector implements CalendarAvailabilityReader, Prov
       throw error;
     }
     busy.sort((left, right) => left.startMs - right.startMs);
-    const merged: typeof busy = [];
+    const merged: FreeBusyWindow[] = [];
     for (const interval of busy) {
       const last = merged[merged.length - 1];
       if (last !== undefined && interval.startMs <= last.endMs) {
@@ -307,7 +353,7 @@ export class GoogleCalendarConnector implements CalendarAvailabilityReader, Prov
         startAt: new Date(interval.startMs).toISOString(),
         endAt: new Date(interval.endMs).toISOString(),
         available: false,
-        reason: interval.summary !== undefined ? `Blocked by live event "${interval.summary}"` : `Blocked by live event ${interval.id}`,
+        reason: "Blocked by a live calendar event",
         sourceReferences: provenance,
       });
       cursor = Math.max(cursor, interval.endMs);
@@ -335,6 +381,13 @@ export class GoogleCalendarConnector implements CalendarAvailabilityReader, Prov
         status: "failed",
         metadata: liveMetadata(request.operationKey, []),
         error: invalidRequest("operationKey, bookingId, and calendarId are required"),
+      };
+    }
+    if (this.bindingViolation(request.calendarId)) {
+      return {
+        status: "failed",
+        metadata: liveMetadata(request.operationKey, []),
+        error: invalidRequest(`Adapter is bound to calendar "${this.options.calendarId}"; request names "${request.calendarId}"`),
       };
     }
     const startMs = Date.parse(request.startAt);
@@ -378,23 +431,16 @@ export class GoogleCalendarConnector implements CalendarAvailabilityReader, Prov
       throw error;
     }
     if (response.status === 200 || response.status === 201) {
-      const event = parseGoogleEvent(safeParseJson(response.text));
-      if (event === undefined) {
-        return {
-          status: "failed",
-          metadata: liveMetadata(request.operationKey, []),
-          error: transportError("Calendar events.insert returned an unrecognized JSON shape"),
-        };
-      }
-      return this.holdSuccess(request, event);
+      return this.holdSuccess(request, parseGoogleEvent(safeParseJson(response.text)));
     }
     if (response.status === 409) {
       // Deterministic id replay: verify the existing event matches the exact
-      // calendar, booking, and approved window before reusing it.
+      // calendar, booking, approved window, and expiry before reusing it.
       return this.fetchAndVerify(request.calendarId, request.operationKey, {
         bookingId: request.bookingId,
         startAt: request.startAt,
         endAt: request.endAt,
+        expiresAt: request.expiresAt,
       });
     }
     if (response.status >= 500 || response.status === 408 || response.status === 425) {
@@ -427,16 +473,19 @@ export class GoogleCalendarConnector implements CalendarAvailabilityReader, Prov
   }
 
   /**
-   * Fetch the deterministic event and verify it is exactly ours: same
-   * calendar (by construction of the GET URL), same stored operation key,
-   * and — when the caller supplies them — same booking and approved window.
-   * A cancelled event or a linkage mismatch is reported honestly, never
-   * coerced into success.
+   * Fetch the deterministic event and verify it is exactly ours. Every
+   * check below must pass: the event id equals the deterministic id (by
+   * construction of the GET URL, re-asserted on the response), the stored
+   * operation-key linkage is present and equal (absent metadata is NOT a
+   * pass), the event is not cancelled, and — when the durable resolver
+   * supplies the approved payload — booking, exact window, and expiry all
+   * match. Anything else is conflict, never a coerced success with blank
+   * booking/dates/expiry.
    */
   private async fetchAndVerify(
     calendarId: string,
     operationKey: string,
-    expected: { bookingId?: string; startAt?: string; endAt?: string },
+    expected: { bookingId?: string; startAt?: string; endAt?: string; expiresAt?: string },
   ): Promise<ConnectorResult<CreateProvisionalHoldResponse>> {
     const eventId = googleEventIdFor(operationKey);
     let response: GoogleHttpResponse;
@@ -472,35 +521,56 @@ export class GoogleCalendarConnector implements CalendarAvailabilityReader, Prov
           error: { kind: "not_found", message: "The reconciled event was cancelled; no live hold exists", retryable: false },
         };
       }
-      if (event.operationKey !== undefined && event.operationKey !== operationKey) {
+      if (event.id !== eventId) {
         return {
           status: "failed",
           metadata: liveMetadata(operationKey, []),
-          error: { kind: "conflict", message: "The deterministic event id is linked to a different operation key", retryable: false },
+          error: { kind: "conflict", message: "Provider returned a different event id than the deterministic one", retryable: false },
         };
       }
-      if (expected.bookingId !== undefined && event.bookingId !== undefined && event.bookingId !== expected.bookingId) {
+      if (event.operationKey === undefined || event.operationKey !== operationKey) {
         return {
           status: "failed",
           metadata: liveMetadata(operationKey, []),
-          error: { kind: "conflict", message: "The existing event belongs to a different booking", retryable: false },
+          error: { kind: "conflict", message: "The event carries no verifiable linkage to this operation key; cannot verify identity", retryable: false },
         };
       }
-      if (expected.startAt !== undefined && event.startMs !== undefined && event.startMs !== Date.parse(expected.startAt)) {
+      if (expected.bookingId !== undefined && event.bookingId !== expected.bookingId) {
         return {
           status: "failed",
           metadata: liveMetadata(operationKey, []),
-          error: { kind: "conflict", message: "The existing event covers a different window than approved", retryable: false },
+          error: { kind: "conflict", message: "The existing event belongs to a different booking (or its booking linkage is missing)", retryable: false },
         };
       }
-      if (expected.endAt !== undefined && event.endMs !== undefined && event.endMs !== Date.parse(expected.endAt)) {
+      if (expected.startAt !== undefined && event.startMs !== Date.parse(expected.startAt)) {
         return {
           status: "failed",
           metadata: liveMetadata(operationKey, []),
-          error: { kind: "conflict", message: "The existing event covers a different window than approved", retryable: false },
+          error: { kind: "conflict", message: "The existing event starts at a different time than approved (or its start is missing)", retryable: false },
+        };
+      }
+      if (expected.endAt !== undefined && event.endMs !== Date.parse(expected.endAt)) {
+        return {
+          status: "failed",
+          metadata: liveMetadata(operationKey, []),
+          error: { kind: "conflict", message: "The existing event ends at a different time than approved (or its end is missing)", retryable: false },
+        };
+      }
+      if (expected.expiresAt !== undefined && event.expiresAt !== expected.expiresAt) {
+        return {
+          status: "failed",
+          metadata: liveMetadata(operationKey, []),
+          error: { kind: "conflict", message: "The existing event carries a different expiry than approved (or its expiry is missing)", retryable: false },
         };
       }
       const hold = this.toHold(operationKey, calendarId, event, undefined);
+      if (hold === undefined) {
+        return {
+          status: "failed",
+          metadata: liveMetadata(operationKey, []),
+          error: transportError("The verified event is missing required hold fields; provider evidence is incomplete"),
+        };
+      }
       const provenance = [this.calendarSource(calendarId, `eventId=${eventId}`)];
       return { status: "succeeded", metadata: liveMetadata(operationKey, provenance), data: { hold, provenance } };
     }
@@ -510,24 +580,44 @@ export class GoogleCalendarConnector implements CalendarAvailabilityReader, Prov
 
   private holdSuccess(
     request: CreateProvisionalHoldRequest,
-    event: ParsedGoogleEvent,
+    event: ParsedGoogleEvent | undefined,
   ): ConnectorResult<CreateProvisionalHoldResponse> {
-    const hold = this.toHold(request.operationKey, request.calendarId, event, request.expiresAt);
+    const hold = event !== undefined ? this.toHold(request.operationKey, request.calendarId, event, request.expiresAt) : undefined;
+    if (event === undefined || hold === undefined) {
+      // A 200/201 without usable event fields is ambiguous, not a success:
+      // the write may exist server-side, so report uncertain, never a
+      // blind-retryable failure.
+      return {
+        status: "uncertain",
+        metadata: liveMetadata(request.operationKey, []),
+        error: { kind: "timeout_after_success", message: "Calendar insert succeeded but returned unusable event fields; reconcile the deterministic event id before retrying", retryable: false },
+        reconciliationRequired: true,
+      };
+    }
     const provenance = [this.calendarSource(request.calendarId, `eventId=${event.id}`)];
     return { status: "succeeded", metadata: liveMetadata(request.operationKey, provenance), data: { hold, provenance } };
   }
 
-  private toHold(operationKey: string, calendarId: string, event: ParsedGoogleEvent, expiresAt: string | undefined): ProvisionalHold {
+  /**
+   * Build provider evidence into a hold receipt. Returns undefined when any
+   * required field is absent: blanks and local-time coercion are never
+   * substituted for provider evidence.
+   */
+  private toHold(operationKey: string, calendarId: string, event: ParsedGoogleEvent, expiresAt: string | undefined): ProvisionalHold | undefined {
+    if (event.bookingId === undefined || event.startMs === undefined || event.endMs === undefined) return undefined;
+    const resolvedExpiry = event.expiresAt ?? expiresAt;
+    const createdAt = event.created ?? event.updated;
+    if (resolvedExpiry === undefined || createdAt === undefined) return undefined;
     return {
       holdId: event.id,
       operationKey,
-      bookingId: event.bookingId ?? "",
+      bookingId: event.bookingId,
       calendarId,
-      startAt: event.startMs !== undefined ? new Date(event.startMs).toISOString() : "",
-      endAt: event.endMs !== undefined ? new Date(event.endMs).toISOString() : "",
-      expiresAt: event.expiresAt ?? expiresAt ?? "",
+      startAt: new Date(event.startMs).toISOString(),
+      endAt: new Date(event.endMs).toISOString(),
+      expiresAt: resolvedExpiry,
       status: "provisional_hold",
-      createdAt: event.created ?? event.updated ?? new Date().toISOString(),
+      createdAt,
       sourceReferences: [this.calendarSource(calendarId, `eventId=${event.id}`)],
     };
   }

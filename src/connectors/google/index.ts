@@ -6,13 +6,13 @@
  * live account verification has been performed.
  */
 import { GoogleCalendarConnector, type GoogleCalendarOptions, type HoldScopeResolver } from "./calendar.ts";
-import { GoogleGmailConnector } from "./gmail.ts";
+import { GoogleGmailConnector, type GoogleGmailOptions, type SentExpectationResolver } from "./gmail.ts";
 import type { GoogleAdapterOptions } from "./transport.ts";
 
 export * from "./transport.ts";
 export * from "./errors.ts";
 export { GoogleCalendarConnector, googleEventIdFor, type GoogleCalendarOptions, type HoldScope, type HoldScopeResolver } from "./calendar.ts";
-export { GoogleGmailConnector, gmailMessageIdFor, escapeGmailQuery } from "./gmail.ts";
+export { GoogleGmailConnector, gmailMessageIdFor, escapeGmailQuery, type GoogleGmailOptions, type SentExpectation, type SentExpectationResolver } from "./gmail.ts";
 
 export interface GoogleConnectorSet {
   calendar: GoogleCalendarConnector;
@@ -31,6 +31,11 @@ export interface GoogleConnectorFactoryOptions extends GoogleAdapterOptions {
    * storage) used for hold reconciliation when no explicit binding exists.
    */
   resolveHoldScope?: HoldScopeResolver;
+  /**
+   * Durable operationKey → approved-send resolver used for full send
+   * reconcile identity (recipients, subject, body, thread).
+   */
+  resolveSentExpectation?: SentExpectationResolver;
 }
 
 /**
@@ -46,8 +51,14 @@ export function createGoogleConnectors(options: GoogleConnectorFactoryOptions): 
     ...(options.calendarId === undefined ? {} : { calendarId: options.calendarId }),
     ...(options.resolveHoldScope === undefined ? {} : { resolveHoldScope: options.resolveHoldScope }),
   };
+  const gmailOptions: GoogleGmailOptions = {
+    transport: options.transport,
+    tokens: options.tokens,
+    ...(options.userId === undefined ? {} : { userId: options.userId }),
+    ...(options.resolveSentExpectation === undefined ? {} : { resolveSentExpectation: options.resolveSentExpectation }),
+  };
   return {
     calendar: new GoogleCalendarConnector(calendarOptions),
-    gmail: new GoogleGmailConnector({ transport: options.transport, tokens: options.tokens, ...(options.userId === undefined ? {} : { userId: options.userId }) }),
+    gmail: new GoogleGmailConnector(gmailOptions),
   };
 }

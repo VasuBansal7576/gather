@@ -1,6 +1,6 @@
 import type {
   ConnectorMetadata,
-  ConnectorModeLabel,
+  LiveModeLabel,
   SourceReference,
 } from "../contracts.ts";
 
@@ -116,7 +116,7 @@ export async function authorized(
 }
 
 /** Live mode marker: receipts are provider-issued, never simulated or fictional. */
-export const LIVE_MODE: ConnectorModeLabel = {
+export const LIVE_MODE: LiveModeLabel = {
   mode: "live",
   label: "LIVE",
   fictional: false,
@@ -135,11 +135,63 @@ export type { ConnectorMetadata };
 
 /** Least-privilege scopes required by each adapter surface. */
 export const GOOGLE_SCOPES = {
+  /** Event reads (reconcile/409 verification). */
   calendarRead: "https://www.googleapis.com/auth/calendar.readonly",
+  /** Availability reads via freeBusy.query (least privilege for busy intervals). */
+  calendarFreeBusy: "https://www.googleapis.com/auth/calendar.freebusy",
   calendarWrite: "https://www.googleapis.com/auth/calendar.events",
   gmailRead: "https://www.googleapis.com/auth/gmail.readonly",
   gmailSend: "https://www.googleapis.com/auth/gmail.send",
 } as const;
+
+export type FetchImpl = (
+  url: string,
+  init: { method: string; headers: Record<string, string>; body?: string; signal: AbortSignal },
+) => Promise<{ status: number; headers: Record<string, string>; text: () => Promise<string> }>;
+
+export interface FetchTransportOptions {
+  fetchImpl?: FetchImpl;
+  /** Bounded per-request timeout. No request may hang indefinitely. */
+  timeoutMs?: number;
+}
+
+const DEFAULT_FETCH_TIMEOUT_MS = 30_000;
+
+/**
+ * Built-in fetch transport with a bounded timeout per request. Aborts (and
+ * any network failure before a response) surface as {@link TransportTimeoutError}
+ * / {@link TransportNetworkError}, which mutating adapters translate into
+ * `uncertain` — never into a blind retry. Performs no auth lookup and
+ * registers nothing; it only speaks the injected fetch.
+ */
+export function createFetchTransport(options: FetchTransportOptions = {}): GoogleHttpTransport {
+  const fetchImpl: FetchImpl = options.fetchImpl ?? (async (url, init) => {
+    const response = await fetch(url, init);
+    const headers: Record<string, string> = {};
+    response.headers.forEach((value, key) => {
+      headers[key] = value;
+    });
+    return { status: response.status, headers, text: () => response.text() };
+  });
+  const timeoutMs = options.timeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS;
+  return {
+    request: async (req: GoogleHttpRequest): Promise<GoogleHttpResponse> => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const response = await fetchImpl(req.url, { method: req.method, headers: req.headers, body: req.body, signal: controller.signal });
+        return { status: response.status, headers: response.headers, text: await response.text() };
+      } catch (error) {
+        if (error instanceof Error && (error.name === "AbortError" || error instanceof TransportTimeoutError)) {
+          throw new TransportTimeoutError(`Request aborted after ${timeoutMs}ms; a write may have been accepted`);
+        }
+        throw new TransportNetworkError(error instanceof Error ? error.message : "Network failure before any response");
+      } finally {
+        clearTimeout(timer);
+      }
+    },
+  };
+}
 
 export function withQuery(base: string, params: Record<string, string | undefined>): string {
   const query = Object.entries(params)

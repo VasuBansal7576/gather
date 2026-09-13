@@ -34,10 +34,30 @@ function scripted(handler: (req: GoogleHttpRequest) => GoogleHttpResponse | Prom
   };
 }
 
-function gmail(options: { handler: (req: GoogleHttpRequest) => GoogleHttpResponse | Promise<GoogleHttpResponse>; tokens?: () => Promise<string> }) {
+function gmail(options: {
+  handler: (req: GoogleHttpRequest) => GoogleHttpResponse | Promise<GoogleHttpResponse>;
+  tokens?: () => Promise<string>;
+  resolveSentExpectation?: (operationKey: string) => Promise<
+    { to: string[]; cc?: string[]; subject: string; body?: string; threadId?: string } | undefined
+  >;
+}) {
   const { transport, log } = scripted(options.handler);
-  const connector = new GoogleGmailConnector({ transport, tokens: options.tokens ?? (() => Promise.resolve("approved-test-token")) });
+  const connector = new GoogleGmailConnector({
+    transport,
+    tokens: options.tokens ?? (() => Promise.resolve("approved-test-token")),
+    ...(options.resolveSentExpectation === undefined ? {} : { resolveSentExpectation: options.resolveSentExpectation }),
+  });
   return { connector, log };
+}
+
+function expectationFor(operationKey: string, overrides: Record<string, unknown> = {}) {
+  return {
+    to: ["guest@example.test"],
+    cc: [],
+    subject: "Your proposal",
+    body: "Hello",
+    ...overrides,
+  };
 }
 
 function b64url(text: string): string {
@@ -143,6 +163,33 @@ test("send maps revoked, rate limits, and ambiguous failures honestly", async ()
   const crashed = gmail({ handler: () => googleError(500, "backendError", "Backend Error") });
   const ambiguous = await crashed.connector.sendEmail({ operationKey: "op-5", to: ["a@example.test"], subject: "s", body: "b" });
   assert.equal(ambiguous.status, "uncertain");
+});
+
+test("multiline bodies are preserved while headers stay injection-safe", async () => {
+  const { connector } = gmail({
+    handler: (req) => {
+      const body = JSON.parse(req.body ?? "{}") as { raw?: string };
+      const decoded = Buffer.from((body.raw ?? "").replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf-8");
+      assert.match(decoded.replace(/\r\n/g, "\n"), /line one\nline two\nline three/);
+      return json(200, { id: "gmail-multi", threadId: "t", labelIds: ["SENT"] });
+    },
+  });
+  const result = await connector.sendEmail({
+    operationKey: "op-multi",
+    to: ["guest@example.test"],
+    cc: ["owner@example.test"],
+    subject: "Lines",
+    body: "line one\nline two\nline three",
+  });
+  assert.equal(result.status, "succeeded");
+  if (result.status !== "succeeded") return;
+  assert.deepEqual(result.data.sentEmail.cc, ["owner@example.test"]);
+});
+
+test("send 200 with a malformed body is uncertain, never blind-retryable", async () => {
+  const { connector } = gmail({ handler: () => ({ status: 200, headers: {}, text: "not-json" }) });
+  const result = await connector.sendEmail({ operationKey: "op-malformed", to: ["a@example.test"], subject: "s", body: "b" });
+  assert.equal(result.status, "uncertain");
 });
 
 test("timeout after acceptance reconciles by Message-ID without resending", async () => {
@@ -264,6 +311,90 @@ test("thread reads parse ordered messages with bodies and provenance", async () 
   assert.equal(missing.status, "failed");
   if (missing.status !== "failed") return;
   assert.equal(missing.error.kind, "not_found");
+});
+
+test("reconcile enforces SENT label and the durable approved payload", async () => {
+  function reconcileWorld(record: unknown, expectation: Record<string, unknown> | undefined) {
+    return gmail({
+      resolveSentExpectation: (key) => Promise.resolve(
+        expectation === undefined ? undefined : { to: ["guest@example.test"], cc: [], subject: "Your proposal", body: "Hello", ...(expectation as object) },
+      ),
+      handler: (req) => {
+        if (req.url.includes("messages?q=")) return json(200, { messages: [{ id: "gmail-c", threadId: "thread-9" }] });
+        return json(200, record);
+      },
+    });
+  }
+  const baseRecord = {
+    id: "gmail-c",
+    threadId: "thread-9",
+    labelIds: ["SENT"],
+    internalDate: "1780000000000",
+    payload: {
+      headers: [
+        { name: "Message-ID", value: gmailMessageIdFor("op-verify") },
+        { name: "Subject", value: "Your proposal" },
+        { name: "To", value: "guest@example.test" },
+      ],
+      mimeType: "text/plain",
+      body: { data: Buffer.from("Hello", "utf-8").toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "") },
+    },
+  };
+  const ok = reconcileWorld(baseRecord, {});
+  const good = await ok.connector.reconcileSentEmail({ operationKey: "op-verify" });
+  assert.equal(good.status, "succeeded");
+
+  const variants: Array<{ name: string; mutate: (record: Record<string, unknown>) => unknown; kind: string }> = [
+    {
+      name: "missing SENT label",
+      mutate: (record) => ({ ...record, labelIds: ["INBOX"] }),
+      kind: "conflict",
+    },
+    {
+      name: "different recipients",
+      mutate: (record) => ({
+        ...record,
+        payload: {
+          ...(record.payload as object),
+          headers: [
+            { name: "Message-ID", value: gmailMessageIdFor("op-verify") },
+            { name: "Subject", value: "Your proposal" },
+            { name: "To", value: "someone-else@example.test" },
+          ],
+        },
+      }),
+      kind: "conflict",
+    },
+    {
+      name: "different subject",
+      mutate: (record) => ({
+        ...record,
+        payload: {
+          ...(record.payload as object),
+          headers: [
+            { name: "Message-ID", value: gmailMessageIdFor("op-verify") },
+            { name: "Subject", value: "Another subject" },
+            { name: "To", value: "guest@example.test" },
+          ],
+        },
+      }),
+      kind: "conflict",
+    },
+  ];
+  for (const variant of variants) {
+    const world = reconcileWorld(variant.mutate(baseRecord as unknown as Record<string, unknown>), {});
+    const result = await world.connector.reconcileSentEmail({ operationKey: "op-verify" });
+    assert.equal(result.status, "failed", variant.name);
+    if (result.status !== "failed") continue;
+    assert.equal(result.error.kind, variant.kind, variant.name);
+  }
+
+  // A configured resolver that stays silent cannot verify: no coercion.
+  const silent = reconcileWorld(baseRecord, undefined);
+  const unverifiable = await silent.connector.reconcileSentEmail({ operationKey: "op-verify" });
+  assert.equal(unverifiable.status, "failed");
+  if (unverifiable.status !== "failed") return;
+  assert.equal(unverifiable.error.kind, "conflict");
 });
 
 test("query escaping neutralizes quote injection", () => {

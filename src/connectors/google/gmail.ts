@@ -86,7 +86,9 @@ function buildRfc2822(request: SendEmailRequest, messageId: string): string {
   const to = request.to.map((item) => cleanAddress(item, "to"));
   if (to.length === 0) throw new Error("At least one recipient is required");
   const cc = (request.cc ?? []).map((item) => cleanAddress(item, "cc"));
-  cleanHeader(request.body, "body");
+  // The body follows the blank header/body separator, so newlines are
+  // legitimate content and must be preserved; injection validation applies
+  // to headers and addresses only.
   const lines = [
     `To: ${to.join(", ")}`,
     ...(cc.length > 0 ? [`Cc: ${cc.join(", ")}`] : []),
@@ -212,6 +214,26 @@ function splitAddresses(value: string | undefined): string[] {
   return value.split(",").map((part) => part.trim()).filter((part) => part.length > 0);
 }
 
+/**
+ * Durable approved-send expectation, owned by the caller (e.g. the booking
+ * service's SQLite receipts). Reconciliation verifies the provider record
+ * against this payload — Message-ID discoverability alone is not identity.
+ */
+export interface SentExpectation {
+  to: string[];
+  cc?: string[];
+  subject: string;
+  body?: string;
+  threadId?: string;
+}
+
+export type SentExpectationResolver = (operationKey: string) => Promise<SentExpectation | undefined>;
+
+export interface GoogleGmailOptions extends GoogleAdapterOptions {
+  /** Durable operationKey → approved-send lookup required for full reconcile identity. */
+  resolveSentExpectation?: SentExpectationResolver;
+}
+
 function tokenFailure(operationKey: string): ConnectorResult<never> {
   return {
     status: "failed",
@@ -221,9 +243,9 @@ function tokenFailure(operationKey: string): ConnectorResult<never> {
 }
 
 export class GoogleGmailConnector implements InquiryThreadReader, EmailSender {
-  private readonly options: GoogleAdapterOptions;
+  private readonly options: GoogleGmailOptions;
 
-  constructor(options: GoogleAdapterOptions) {
+  constructor(options: GoogleGmailOptions) {
     this.options = options;
   }
 
@@ -342,11 +364,11 @@ export class GoogleGmailConnector implements InquiryThreadReader, EmailSender {
     if (response.status === 200) {
       const sent = parseGmailMessage(safeParseJson(response.text));
       if (sent === undefined) {
-        return {
-          status: "failed",
-          metadata: liveMetadata(request.operationKey, []),
-          error: transportError("Gmail messages.send returned an unrecognized JSON shape"),
-        };
+        // HTTP 200 after a send may follow server-side acceptance: a
+        // malformed success body is ambiguous, so report uncertain (reconcile
+        // by Message-ID) rather than a retryable failure that could duplicate
+        // the send on blind retry.
+        return this.uncertainSend(request.operationKey, "Gmail send returned HTTP 200 with an unrecognized body");
       }
       return this.sentEmail(request, messageId, sent);
     }
@@ -359,6 +381,20 @@ export class GoogleGmailConnector implements InquiryThreadReader, EmailSender {
   }
 
   async reconcileSentEmail(request: { operationKey: string }): Promise<ConnectorResult<SendEmailResponse>> {
+    // Full reconcile identity requires the durable approved payload: the
+    // record must carry the SENT label and match expected recipients,
+    // subject, thread, and (when recorded) body — not merely a discoverable
+    // Message-ID.
+    const expected = this.options.resolveSentExpectation !== undefined
+      ? await this.options.resolveSentExpectation(request.operationKey)
+      : undefined;
+    if (this.options.resolveSentExpectation !== undefined && expected === undefined) {
+      return {
+        status: "failed",
+        metadata: liveMetadata(request.operationKey, []),
+        error: { kind: "conflict", message: "Cannot verify the sent record: no durable approved payload exists for this operation key", retryable: false },
+      };
+    }
     const messageId = gmailMessageIdFor(request.operationKey);
     // Correlate by our Message-ID in sent mail. Gmail search indexing lags
     // behind acceptance, so an empty result proves nothing yet.
@@ -394,12 +430,23 @@ export class GoogleGmailConnector implements InquiryThreadReader, EmailSender {
           if (parsed === undefined) continue;
           const headerId = findHeader(parsed.headers, "Message-ID");
           if (headerId !== messageId) continue;
+          if (!parsed.labelIds.includes("SENT")) {
+            return {
+              status: "failed",
+              metadata: liveMetadata(request.operationKey, []),
+              error: { kind: "conflict", message: "The correlated record lacks the SENT label; it is not verifiable sent evidence", retryable: false },
+            };
+          }
+          const verified = this.verifyExpectation(request.operationKey, expected, parsed);
+          if (verified !== undefined) return verified;
           return this.sentEmail(
             {
               operationKey: request.operationKey,
               to: splitAddresses(findHeader(parsed.headers, "To")),
-              subject: findHeader(parsed.headers, "Subject") ?? "",
-              body: parsed.textBody ?? "",
+              cc: splitAddresses(findHeader(parsed.headers, "Cc")),
+              subject: findHeader(parsed.headers, "Subject") ?? expected?.subject ?? "",
+              body: parsed.textBody ?? expected?.body ?? "",
+              threadId: parsed.threadId,
             },
             messageId,
             parsed,
@@ -427,6 +474,46 @@ export class GoogleGmailConnector implements InquiryThreadReader, EmailSender {
     };
   }
 
+  /**
+   * Verify a Message-ID-correlated record against the durable approved
+   * payload. Returns a conflict failure when anything disagrees, or
+   * undefined when the record is fully verified (or no expectation exists,
+   * in which case Message-ID + SENT is the documented minimum).
+   */
+  private verifyExpectation(
+    operationKey: string,
+    expected: SentExpectation | undefined,
+    parsed: ParsedGmailMessage,
+  ): ConnectorResult<SendEmailResponse> | undefined {
+    if (expected === undefined) return undefined;
+    const fail = (message: string): ConnectorResult<SendEmailResponse> => ({
+      status: "failed",
+      metadata: liveMetadata(operationKey, []),
+      error: { kind: "conflict", message, retryable: false },
+    });
+    const sameSet = (left: string[], right: string[]): boolean => {
+      const a = [...left].sort();
+      const b = [...right].sort();
+      return a.length === b.length && a.every((value, index) => value === b[index]);
+    };
+    if (!sameSet(splitAddresses(findHeader(parsed.headers, "To")), expected.to)) {
+      return fail("The correlated record was sent to different recipients than approved");
+    }
+    if (expected.cc !== undefined && !sameSet(splitAddresses(findHeader(parsed.headers, "Cc")), expected.cc)) {
+      return fail("The correlated record carries different Cc recipients than approved");
+    }
+    if (findHeader(parsed.headers, "Subject") !== expected.subject) {
+      return fail("The correlated record carries a different subject than approved");
+    }
+    if (expected.threadId !== undefined && parsed.threadId !== expected.threadId) {
+      return fail("The correlated record belongs to a different thread than approved");
+    }
+    if (expected.body !== undefined && (parsed.textBody ?? "") !== expected.body) {
+      return fail("The correlated record carries a different body than approved");
+    }
+    return undefined;
+  }
+
   private uncertainSend(operationKey: string, detail: string): ConnectorResult<never> {
     return {
       status: "uncertain",
@@ -441,7 +528,7 @@ export class GoogleGmailConnector implements InquiryThreadReader, EmailSender {
    * accepted for sending — it proves sent, not delivery.
    */
   private sentEmail(
-    request: { operationKey: string; to: string[]; threadId?: string; subject: string; body?: string },
+    request: { operationKey: string; to: string[]; cc?: string[]; threadId?: string; subject: string; body?: string },
     messageId: string,
     sent: ParsedGmailMessage,
   ): ConnectorResult<SendEmailResponse> {
@@ -460,7 +547,7 @@ export class GoogleGmailConnector implements InquiryThreadReader, EmailSender {
       operationKey: request.operationKey,
       ...(threadId === undefined ? {} : { threadId }),
       to: request.to,
-      cc: [],
+      cc: request.cc ?? [],
       subject: request.subject,
       body: request.body ?? `LIVE Gmail message ${sent.id} correlated by Message-ID ${messageId}`,
       sentAt,

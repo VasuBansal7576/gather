@@ -19,10 +19,13 @@ Calendar v3 (verified against developers.google.com/calendar/api):
   guaranteed detectable), `sendUpdates=none` for silent provisional holds,
   returns the Events resource. Duplicate id → HTTP 409.
 - `GET .../events/{eventId}` (`events.get`): reconciliation read.
-- `GET .../events?timeMin&timeMax&singleEvents=true&orderBy=startTime`
-  (`events.list`): `timeMin` bounds event end, `timeMax` bounds event start;
-  `maxResults` ≤ 2500 with `nextPageToken` pagination; `showDeleted`
-  semantics for cancellations.
+- `POST /calendar/v3/freeBusy` (`freebusy.query`; ref
+  `/workspace/calendar/api/v3/reference/freebusy/query`): availability comes
+  from server-computed busy instants (`timeMin`/`timeMax`, single-item
+  `items:[{id}]`), so all-day dates resolve in the calendar's own timezone
+  (DST included) with zero client timezone math. Per-calendar `errors[]`
+  reasons (`notFound`, `internalError`, …) are surfaced, never swallowed;
+  malformed busy windows fail the whole check closed.
 - Errors (`/workspace/calendar/api/guides/errors`): 401, 403
   (`rateLimitExceeded`/`userRateLimitExceeded`, also 429), 404, 409
   (identifier exists), 5xx.
@@ -43,7 +46,9 @@ Gmail v1 (verified against developers.google.com/gmail/api):
 
 ## Least-privilege scopes
 
-- Availability reads: `calendar.readonly`.
+- Availability reads: `calendar.freebusy` (freeBusy only; event bodies are
+  never listed for availability).
+- Event reads for reconcile/409 verification: `calendar.readonly`.
 - Provisional holds: `calendar.events` (never full `calendar`, which also
   grants sharing/ACL control).
 - Inquiry reads + send reconciliation: `gmail.readonly`.
@@ -55,13 +60,26 @@ Gmail v1 (verified against developers.google.com/gmail/api):
 - Calendar: `googleEventIdFor(operationKey)` = `g` + 31 sha256 hex chars
   (hex ⊆ base32hex, always valid). 409 replays fetch the event and verify
   the exact calendar, stored operation key, booking, and approved window
-  before reuse; mismatches are `conflict`. Timeout/5xx/408/425/network
-  ambiguity on insert → `uncertain` (reconcile by id, never blind-retry).
+  before reuse. Every reuse path (409 replay, reconcile) verifies **all**
+  of: response id equals the deterministic id, stored operation-key linkage
+  is present and equal (absent metadata is never a pass), event not
+  cancelled, and — when the durable resolver supplies the approved payload —
+  exact booking, window, and expiry. Anything else is `conflict`; receipts
+  never carry blank booking/dates/expiry or locally-coerced timestamps.
+  Timeout/5xx/408/425/network ambiguity on insert → `uncertain`, as is a
+  200/201 with unusable event fields (reconcile by deterministic id, never
+  blind-retry). A bound adapter rejects any request naming another calendar
+  without any HTTP call.
 - Gmail: `gmailMessageIdFor(operationKey)` Message-ID is generated per send
   and recomputed for reconciliation, which searches `rfc822msgid:` in sent
-  mail (≤5 pages) and confirms via `messages.get`. Gmail search indexing
-  lags acceptance, so an empty result is `not_found` **retryable**, never
-  proof of non-delivery; a 5xx/timeout on send is `uncertain`.
+  mail (≤5 pages) and confirms via full `messages.get`. The record must
+  carry the SENT label and match the durable approved payload (recipients,
+  subject, thread, body when recorded) — Message-ID discoverability alone
+  is not identity, and a silent expectation resolver reports cannot-verify
+  (`conflict`). Cc is preserved from provider headers. Gmail search
+  indexing lags acceptance, so an empty result is `not_found` **retryable**,
+  never proof of non-delivery; a 5xx/timeout (or a 200 with a malformed
+  body) on send is `uncertain`.
 - Reconcile scope: `reconcileProvisionalHold` receives only the operation
   key, so the adapter resolves the calendar from an explicit `calendarId`
   binding or an injected durable `resolveHoldScope` (caller-owned storage),
@@ -69,12 +87,24 @@ Gmail v1 (verified against developers.google.com/gmail/api):
 
 ## Availability semantics
 
-Fresh `events.list` per check, scoped to the request calendar, paged fully:
-`cancelled` and `transparent` events never block; other overlaps become
-unavailable slots (reason names the live event); gaps become available
-slots. Times normalize to epoch millis (`dateTime` exact; all-day `date`
-as UTC day boundaries, RFC5545-exclusive ends preserved via the API's own
-values). Slot ids are content hashes prefixed `live-slot-`.
+Fresh `freeBusy.query` per check for exactly the request calendar: the
+server returns busy instants, so all-day dates resolve in the calendar's
+own timezone (DST included) with no client timezone math. Overlaps become
+unavailable slots; gaps become available slots; per-calendar errors and
+malformed busy windows fail the check closed instead of reporting free.
+Slot ids are content hashes prefixed `live-slot-`. Event reads
+(`events.get`) remain `dateTime`-exact with all-day `date` boundaries used
+only for window verification, never for availability math.
+
+## Built-in fetch transport
+
+`createFetchTransport({ fetchImpl?, timeoutMs? })` wraps an injected fetch
+(default: global fetch) with a bounded per-request timeout via
+AbortController. Timeouts and pre-response network failures surface as
+`TransportTimeoutError`/`TransportNetworkError`, which mutating adapters
+translate into `uncertain`. The transport performs no auth lookup, adds no
+headers, and registers nothing — callers supply every header, including
+Authorization.
 
 ## Error mapping
 
@@ -90,20 +120,24 @@ BLOCKED); no HTTP call is attempted.
 
 All provider JSON crosses `unknown` guards (no `any`); recipients must be
 plain ASCII addresses; Subject/addresses reject CR/LF (header-injection
-safe); non-ASCII subjects are RFC 2047 encoded; Gmail search terms are
+safe) while the body after the blank separator preserves newlines as
+content; non-ASCII subjects are RFC 2047 encoded; Gmail search terms are
 quote-escaped; calendar ids/event ids are `encodeURIComponent`-escaped.
 Tokens travel only in the Authorization header, are never logged, stored,
 or embedded in bodies/receipts (tests assert absence).
 
 ## Receipt distinction
 
-Live receipts carry `mode: {mode:"live",label:"LIVE",fictional:false}` with
-`simulated:false` under the discriminated `ConnectorMetadata` contract
-(`simulated: boolean`, correlated with the mode), provider-issued ids
-(Calendar event id, Gmail immutable message id), and `LIVE` locators
-(`google-calendar://…`, `gmail://…`). A Gmail receipt proves **sent, not
-delivery**. Demo receipts remain `DEMO ONLY`/`simulated:true`/fictional and
-are structurally unmistakable.
+Live receipts carry the correlated metadata union: `{mode:LIVE,
+fictional:false, simulated:false}` is the only constructible live shape —
+a live result claiming `simulated:true` (or a demo result claiming live
+provenance) is a compile-time error, enforced by the
+`ConnectorMetadata` discriminated union rather than a boolean with a
+comment. Receipts carry provider-issued ids (Calendar event id, Gmail
+immutable message id) and `LIVE` locators (`google-calendar://…`,
+`gmail://…`). A Gmail receipt proves **sent, not delivery**. Demo receipts
+remain `DEMO ONLY`/`simulated:true`/fictional and are structurally
+unmistakable.
 
 ## Escalated interface notes (resolved this task)
 

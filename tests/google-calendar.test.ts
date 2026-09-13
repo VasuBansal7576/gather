@@ -46,27 +46,26 @@ function connectorFor(handler: (req: GoogleHttpRequest) => GoogleHttpResponse | 
   return { connector, log };
 }
 
-const BUSY_EVENT = {
-  id: "live-event-1",
-  status: "confirmed",
-  summary: "Board dinner",
-  start: { dateTime: "2030-06-12T19:00:00.000Z" },
-  end: { dateTime: "2030-06-12T21:00:00.000Z" },
-};
-
-test("availability pages, clips busy windows, and skips cancelled/transparent events", async () => {
+test("availability clips server busy windows and merges overlaps", async () => {
   const { connector } = connectorFor((req) => {
-    assert.match(req.url, /\/events/);
+    assert.match(req.url, /\/freeBusy$/);
+    assert.equal(req.method, "POST");
     assert.equal(req.headers.Authorization, "Bearer approved-test-token");
-    if (req.url.includes("pageToken=second")) {
-      return json(200, {
-        items: [
-          { id: "cancelled-1", status: "cancelled", start: { dateTime: START }, end: { dateTime: END } },
-          { id: "free-1", status: "confirmed", transparency: "transparent", start: { dateTime: START }, end: { dateTime: END } },
-        ],
-      });
-    }
-    return json(200, { items: [BUSY_EVENT], nextPageToken: "second" });
+    const body = JSON.parse(req.body ?? "{}") as { items?: Array<{ id?: string }> };
+    assert.deepEqual(body.items, [{ id: CAL }]);
+    return json(200, {
+      kind: "calendar#freeBusy",
+      timeMin: START,
+      timeMax: END,
+      calendars: {
+        [CAL]: {
+          busy: [
+            { start: "2030-06-12T19:00:00.000Z", end: "2030-06-12T21:00:00.000Z" },
+            { start: "2030-06-12T20:30:00.000Z", end: "2030-06-12T22:00:00.000Z" },
+          ],
+        },
+      },
+    });
   });
   const result = await connector.checkAvailability({ operationKey: "op-avail-1", calendarId: CAL, startAt: START, endAt: END });
   assert.equal(result.status, "succeeded");
@@ -77,11 +76,56 @@ test("availability pages, clips busy windows, and skips cancelled/transparent ev
   const free = result.data.slots.filter((slot) => slot.available);
   assert.equal(busy.length, 1);
   assert.equal(busy[0]?.startAt, "2030-06-12T19:00:00.000Z");
-  assert.equal(busy[0]?.endAt, "2030-06-12T21:00:00.000Z");
+  assert.equal(busy[0]?.endAt, "2030-06-12T22:00:00.000Z");
   assert.equal(busy[0]?.calendarId, CAL);
-  assert.match(busy[0]?.reason ?? "", /Board dinner/);
   assert.equal(free.length, 2);
   assert.ok(result.data.provenance.every((ref) => ref.fictional === false));
+});
+
+test("availability fails closed on malformed busy windows", async () => {
+  const { connector } = connectorFor(() => json(200, {
+    kind: "calendar#freeBusy",
+    calendars: { [CAL]: { busy: [{ start: "not-a-time", end: END }] } },
+  }));
+  const result = await connector.checkAvailability({ operationKey: "op-avail-bad", calendarId: CAL, startAt: START, endAt: END });
+  assert.equal(result.status, "failed");
+});
+
+test("availability surfaces per-calendar errors without coating them as free", async () => {
+  const missing = connectorFor(() => json(200, {
+    kind: "calendar#freeBusy",
+    calendars: { [CAL]: { errors: [{ domain: "global", reason: "notFound" }] } },
+  }));
+  const gone = await missing.connector.checkAvailability({ operationKey: "op-x", calendarId: CAL, startAt: START, endAt: END });
+  assert.equal(gone.status, "failed");
+  if (gone.status !== "failed") return;
+  assert.equal(gone.error.kind, "invalid_request");
+
+  const broken = connectorFor(() => json(200, {
+    kind: "calendar#freeBusy",
+    calendars: { [CAL]: { errors: [{ domain: "global", reason: "internalError" }] } },
+  }));
+  const failed = await broken.connector.checkAvailability({ operationKey: "op-y", calendarId: CAL, startAt: START, endAt: END });
+  assert.equal(failed.status, "failed");
+  if (failed.status !== "failed") return;
+  assert.equal(failed.error.kind, "transport_error");
+  assert.equal(failed.error.retryable, true);
+});
+
+test("bound adapter rejects requests naming another calendar", async () => {
+  const { connector, log } = connectorFor(() => json(200, { kind: "calendar#freeBusy", calendars: {} }));
+  const avail = await connector.checkAvailability({ operationKey: "op-b", calendarId: "other-calendar", startAt: START, endAt: END });
+  assert.equal(avail.status, "failed");
+  if (avail.status !== "failed") return;
+  assert.equal(avail.error.kind, "invalid_request");
+  assert.equal(log.length, 0);
+  const held = await connector.createProvisionalHold({
+    operationKey: "op-b2", bookingId: "booking-001", calendarId: "other-calendar", startAt: START, endAt: END, expiresAt: "2030-06-13T23:00:00.000Z",
+  });
+  assert.equal(held.status, "failed");
+  if (held.status !== "failed") return;
+  assert.equal(held.error.kind, "invalid_request");
+  assert.equal(log.length, 0);
 });
 
 test("availability maps revoked, rate-limited, and server errors honestly", async () => {
@@ -236,7 +280,88 @@ test("malformed provider JSON is never coerced into success", async () => {
   assert.equal(avail.status, "failed");
   const { connector: holdConnector } = connectorFor(() => ({ status: 201, headers: {}, text: "[1,2" }));
   const held = await holdConnector.createProvisionalHold(holdBody("op-y"));
-  assert.equal(held.status, "failed");
+  // Ambiguous success body after a write: uncertain, never blind-retryable failure.
+  assert.equal(held.status, "uncertain");
+});
+
+test("reconcile rejects unrelated ids, missing linkage, and payload mismatches", async () => {
+  const variants: Array<{ name: string; event: unknown; kind: string }> = [
+    { name: "unrelated id", event: { ...createdEvent("op-v"), id: "unrelated" }, kind: "conflict" },
+    {
+      name: "missing linkage",
+      event: { id: googleEventIdFor("op-v"), status: "confirmed", start: { dateTime: START }, end: { dateTime: END }, created: "2030-01-02T00:00:00.000Z" },
+      kind: "conflict",
+    },
+    {
+      name: "wrong booking",
+      event: { ...createdEvent("op-v"), extendedProperties: { private: { gatherOperationKey: "op-v", gatherBookingId: "booking-999", gatherExpiresAt: "2030-06-13T23:00:00.000Z" } } },
+      kind: "conflict",
+    },
+    {
+      name: "wrong window",
+      event: { ...createdEvent("op-v"), start: { dateTime: "2030-06-13T17:00:00.000Z" }, end: { dateTime: "2030-06-13T23:00:00.000Z" } },
+      kind: "conflict",
+    },
+    {
+      name: "wrong expiry",
+      event: { ...createdEvent("op-v"), extendedProperties: { private: { gatherOperationKey: "op-v", gatherBookingId: "booking-001", gatherExpiresAt: "2030-07-01T00:00:00.000Z" } } },
+      kind: "conflict",
+    },
+    {
+      name: "missing times",
+      event: { id: googleEventIdFor("op-v"), status: "confirmed", created: "2030-01-02T00:00:00.000Z", extendedProperties: { private: { gatherOperationKey: "op-v", gatherBookingId: "booking-001", gatherExpiresAt: "2030-06-13T23:00:00.000Z" } } },
+      kind: "conflict",
+    },
+  ];
+  for (const variant of variants) {
+    const { transport } = scripted(() => json(200, variant.event));
+    const connector = new GoogleCalendarConnector({
+      transport,
+      tokens: () => Promise.resolve("t"),
+      resolveHoldScope: () => Promise.resolve({
+        calendarId: CAL,
+        bookingId: "booking-001",
+        startAt: START,
+        endAt: END,
+        expiresAt: "2030-06-13T23:00:00.000Z",
+      }),
+    });
+    const result = await connector.reconcileProvisionalHold({ operationKey: "op-v" });
+    assert.equal(result.status, "failed", variant.name);
+    if (result.status !== "failed") continue;
+    assert.equal(result.error.kind, variant.kind, variant.name);
+  }
+});
+
+test("reconcile verifies full identity through the durable resolver", async () => {
+  const { transport, log } = scripted(() => json(200, createdEvent("op-full")));
+  const connector = new GoogleCalendarConnector({
+    transport,
+    tokens: () => Promise.resolve("t"),
+    resolveHoldScope: (key) => Promise.resolve(
+      key === "op-full"
+        ? { calendarId: CAL, bookingId: "booking-001", startAt: START, endAt: END, expiresAt: "2030-06-13T23:00:00.000Z" }
+        : undefined,
+    ),
+  });
+  const result = await connector.reconcileProvisionalHold({ operationKey: "op-full" });
+  assert.equal(result.status, "succeeded");
+  if (result.status !== "succeeded") return;
+  assert.equal(result.data.hold.bookingId, "booking-001");
+  assert.equal(result.data.hold.startAt, START);
+  assert.equal(result.data.hold.expiresAt, "2030-06-13T23:00:00.000Z");
+  assert.ok(log[0]?.url.includes(`/calendars/${CAL}/events/`));
+
+  // Resolver silence means the scope cannot be established: no coercion.
+  const connector2 = new GoogleCalendarConnector({
+    transport,
+    tokens: () => Promise.resolve("t"),
+    resolveHoldScope: () => Promise.resolve(undefined),
+  });
+  const missing = await connector2.reconcileProvisionalHold({ operationKey: "op-unknown" });
+  assert.equal(missing.status, "failed");
+  if (missing.status !== "failed") return;
+  assert.equal(missing.error.kind, "invalid_request");
 });
 
 test("missing token maps to revoked access, never to a live call", async () => {
