@@ -98,9 +98,21 @@ live readiness.
 
 `GET .../handoff` is read-only: it evaluates fresh through the verifier
 boundary (a persisted decision is never reused — its availability
-evidence could be stale) and reports the latest persisted revision
-number, or `null`. `POST .../handoff` is the explicit build command that
-persists a new numbered revision.
+evidence could be stale) and reports a revision number only when the
+freshly evaluated view is byte-identical to the latest persisted
+revision; otherwise `revision` is `null` and the view is an explicit
+unpersisted preview, never paired with an old revision number.
+`POST .../handoff` is the explicit build command that persists a new
+numbered revision.
+
+Both paths re-read the exact binding (action identity, version,
+fingerprint, live approval, booking snapshot) after every awaited
+evaluation and — for POST — transactionally before persist. Anything that
+moved mid-flight (approval invalidated, new proposal or action, booking
+paused or cancelled, evidence changed) turns the call explicitly
+`blocked` with nothing built or persisted: an older view is never
+inserted under a newer action, and `ready` never claims an obsolete
+approval or status.
 
 Both paths report `state`:
 
@@ -135,12 +147,15 @@ re-classified against the winner's row — `conflict`, `in_progress`, or
 
 ## Verified
 
-- `tests/booking-delivery.test.ts` — 16 tests: live confirm +
+- `tests/booking-delivery.test.ts` — 22 tests: live confirm +
   persisted decision, canonical replay, key conflict and in-progress
   concurrency, stale version + invalidated approval, fixture
   provenance block, missing/revoked/refunded evidence, hold-alone
   block, fail-closed drift revalidation, handoff state + read-only
-  GET + numbered POST revisions, unapproved handoff block, restart
+  GET + numbered POST revisions, unapproved handoff block,
+  mid-await handoff drift fence (approval invalidation, proposal
+  replacement, brand-new action, booking cancel, evidence change),
+  revision/content pairing on GET, restart
   persistence, read-only readiness + cancelled booking, required
   hold/email execution gate (missing/incomplete/superseded-version
   steps), and single-claim lease reclaim.

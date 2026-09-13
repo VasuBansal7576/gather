@@ -401,83 +401,194 @@ export async function confirmBooking(deps: BookingDeliveryDeps, input: ConfirmRe
 }
 
 /**
- * Evaluate the current handoff view. Freshness is enforced by evaluating
- * through the verifier boundary on every call — a persisted decision is
- * never reused, because its availability evidence can be stale. A live
- * approval for the exact current version is required before any handoff is
- * produced; without one the view is explicitly blocked.
+ * The exact binding a handoff evaluation was built against. Re-read after
+ * every await and transactionally before persist: anything that moved —
+ * action identity, version, fingerprint, approval liveness, booking status
+ * — invalidates the evaluated view instead of persisting it under drift.
  */
-async function evaluateHandoff(
-  deps: BookingDeliveryDeps,
-  bookingId: string,
-): Promise<Omit<HandoffResponseDTO, "revision">> {
-  const { store } = deps;
-  const booking = store.getBooking(bookingId);
-  const action = currentAction(store, bookingId);
-  const approvalLive = store.listApprovals(action.id).some(
+interface HandoffBinding {
+  actionId: string;
+  actionVersion: number;
+  actionFingerprint: string;
+  actionStatus: ProposedAction["status"];
+  bookingStatus: Booking["status"];
+  approvalLive: boolean;
+}
+
+function readHandoffBinding(deps: BookingDeliveryDeps, bookingId: string): { booking: Booking; action: ProposedAction; binding: HandoffBinding } {
+  const booking = deps.store.getBooking(bookingId);
+  const action = currentAction(deps.store, bookingId);
+  const approvalLive = deps.store.listApprovals(action.id).some(
     (approval) =>
       approval.status === "approved" &&
       approval.proposalVersion === action.proposalVersion &&
       approval.proposalFingerprint === action.proposalFingerprint,
   );
-  const current = store.getBooking(booking.id);
-  if (!approvalLive) {
+  return {
+    booking,
+    action,
+    binding: {
+      actionId: action.id,
+      actionVersion: action.proposalVersion,
+      actionFingerprint: action.proposalFingerprint,
+      actionStatus: action.status,
+      bookingStatus: booking.status,
+      approvalLive,
+    },
+  };
+}
+
+function sameHandoffBinding(left: HandoffBinding, right: HandoffBinding): boolean {
+  return (
+    left.actionId === right.actionId &&
+    left.actionVersion === right.actionVersion &&
+    left.actionFingerprint === right.actionFingerprint &&
+    left.actionStatus === right.actionStatus &&
+    left.bookingStatus === right.bookingStatus &&
+    left.approvalLive === right.approvalLive
+  );
+}
+
+function describeBindingDrift(before: HandoffBinding, after: HandoffBinding, driftedEvidence: string[]): string {
+  if (after.actionId !== before.actionId) return "the current proposed action changed";
+  if (after.actionVersion !== before.actionVersion || after.actionFingerprint !== before.actionFingerprint) {
+    return "the proposal version changed";
+  }
+  if (before.approvalLive && !after.approvalLive) return "the owner approval was invalidated";
+  if (after.bookingStatus !== before.bookingStatus) return "the booking status changed";
+  if (driftedEvidence.length > 0) return `evidence changed (${driftedEvidence.join(", ")})`;
+  return "the binding changed";
+}
+
+/**
+ * Evaluate the current handoff view. Freshness is enforced by evaluating
+ * through the verifier boundary on every call — a persisted decision is
+ * never reused, because its availability evidence can be stale — and by
+ * re-reading the exact binding after the await: a view evaluated under a
+ * binding that moved (approval invalidated, new proposal or action,
+ * booking paused or cancelled, evidence changed) is reported explicitly
+ * blocked with nothing built, never persisted under drift.
+ */
+async function evaluateHandoff(
+  deps: BookingDeliveryDeps,
+  bookingId: string,
+): Promise<Omit<HandoffResponseDTO, "revision"> & { binding: HandoffBinding }> {
+  const { store } = deps;
+  const before = readHandoffBinding(deps, bookingId);
+  if (!before.binding.approvalLive) {
+    const current = store.getBooking(bookingId);
     return {
       demo: true,
       booking: current,
       state: "blocked",
-      reason: `No live owner approval for the current proposal v${action.proposalVersion}; an operational handoff is only prepared for the approved proposal`,
+      reason: `No live owner approval for the current proposal v${before.action.proposalVersion}; an operational handoff is only prepared for the approved proposal`,
       handoff: null,
+      binding: before.binding,
     };
   }
+  const collecting = new CollectingVerifiers(new StoreDeliveryVerifiers(deps.delivery, deps.calendar, () => clockIso(deps)));
   let decision: ReadinessDecision;
   try {
-    decision = await evaluateForAction(deps, booking, action);
+    decision = await evaluateForAction(deps, before.booking, before.action, collecting);
   } catch (error) {
     return {
       demo: true,
-      booking: current,
+      booking: store.getBooking(bookingId),
       state: "blocked",
       reason: `Handoff evaluation unavailable: ${error instanceof Error ? error.message : "unknown error"}`,
       handoff: null,
+      binding: before.binding,
     };
   }
+  const after = readHandoffBinding(deps, bookingId);
+  const driftedEvidence = collecting.driftedStoreFetches();
+  if (!sameHandoffBinding(before.binding, after.binding) || driftedEvidence.length > 0) {
+    return {
+      demo: true,
+      booking: after.booking,
+      state: "blocked",
+      reason: `Handoff evaluation went stale while proofs were verified (${describeBindingDrift(before.binding, after.binding, driftedEvidence)}); nothing was built or persisted — retry`,
+      handoff: null,
+      binding: after.binding,
+    };
+  }
+  // The binding did not move, so the decision's binding matches the fresh
+  // snapshots below exactly; the handoff content is built from current rows.
   const handoff = buildHandoff({
     decision,
-    booking: snapshotBooking(current),
-    proposal: snapshotProposal(action, current),
+    booking: snapshotBooking(after.booking),
+    proposal: snapshotProposal(after.action, after.booking),
   });
-  if (decision.ready && decision.liveReady && current.status === "confirmed") {
-    return { demo: demoOf(decision.provenance), booking: current, state: "ready", handoff };
+  if (decision.ready && decision.liveReady && after.booking.status === "confirmed") {
+    return { demo: demoOf(decision.provenance), booking: after.booking, state: "ready", handoff, binding: after.binding };
   }
   const reason = !decision.ready
     ? `Handoff is preliminary: the proposal is approved but readiness is blocked (${decision.blockedBy.join("; ") || "conditions unmet"})`
     : !decision.liveReady
       ? "Handoff is preliminary: the proposal is approved and ready on demo evidence, but live provenance has not been verified"
       : "Handoff is preliminary: the proposal is approved and live-ready, but the booking is not confirmed yet";
-  return { demo: demoOf(decision.provenance), booking: current, state: "preliminary", reason, handoff };
+  return { demo: demoOf(decision.provenance), booking: after.booking, state: "preliminary", reason, handoff, binding: after.binding };
 }
 
 /**
  * Read-only operational handoff for the booking's current proposal (GET).
- * Never persists: reports the latest previously built revision, or null.
+ * Never persists. The revision label corresponds to actually persisted
+ * content only: it names the latest persisted revision when the freshly
+ * evaluated view is byte-identical to it, and is null otherwise — a fresh
+ * view that differs from anything persisted is an explicit unpersisted
+ * preview, never paired with an old revision number.
  */
 export async function handoffForBooking(deps: BookingDeliveryDeps, bookingId: string): Promise<HandoffResponseDTO> {
   const view = await evaluateHandoff(deps, bookingId);
-  const latest = deps.delivery.latestHandoff(currentAction(deps.store, bookingId).id);
-  return { ...view, revision: latest?.revision ?? null };
+  if (view.handoff === null) return { ...view, revision: null };
+  const latest = deps.delivery.latestHandoff(view.binding.actionId);
+  const matches =
+    latest !== undefined &&
+    latest.bookingId === bookingId &&
+    latest.proposalVersion === view.binding.actionVersion &&
+    latest.proposalFingerprint === view.binding.actionFingerprint &&
+    canonicalHash(latest.handoff) === canonicalHash(view.handoff);
+  return { ...view, revision: matches ? latest.revision : null };
 }
 
 /**
- * Build and persist a new numbered handoff revision (POST). The revision is
- * created only when an evaluated handoff exists; a blocked view persists
- * nothing and reports the same explicit state.
+ * Build and persist a new numbered handoff revision (POST). The evaluated
+ * binding is revalidated transactionally before persist: if the action,
+ * version, approval, or booking moved after evaluation, nothing is
+ * persisted and the call reports blocked — an older view is never inserted
+ * under a newer action. A blocked view persists nothing.
  */
 export async function recordHandoff(deps: BookingDeliveryDeps, bookingId: string): Promise<HandoffResponseDTO> {
   const view = await evaluateHandoff(deps, bookingId);
   if (view.handoff === null) {
-    return { ...view, revision: deps.delivery.latestHandoff(currentAction(deps.store, bookingId).id)?.revision ?? null };
+    return { ...view, revision: null };
   }
-  const revision = deps.delivery.insertHandoffRevision(currentAction(deps.store, bookingId).id, view.handoff);
-  return { ...view, revision: revision.revision };
+  const evaluated = view.binding;
+  try {
+    return deps.delivery.transaction(() => {
+      const live = readHandoffBinding(deps, bookingId);
+      if (!sameHandoffBinding(live.binding, evaluated)) {
+        throw new ServiceError(
+          "STALE_PROPOSAL",
+          `Handoff binding changed before persist (${describeBindingDrift(evaluated, live.binding, [])}); nothing was persisted — retry`,
+          true,
+        );
+      }
+      const revision = deps.delivery.insertHandoffRevision(evaluated.actionId, view.handoff as NonNullable<typeof view.handoff>);
+      return { ...view, revision: revision.revision };
+    });
+  } catch (error) {
+    if (error instanceof ServiceError && error.code === "STALE_PROPOSAL") {
+      const current = deps.store.getBooking(bookingId);
+      return {
+        demo: true,
+        booking: current,
+        state: "blocked",
+        reason: error.message,
+        handoff: null,
+        revision: null,
+      };
+    }
+    throw error;
+  }
 }

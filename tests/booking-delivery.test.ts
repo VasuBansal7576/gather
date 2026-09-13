@@ -724,3 +724,183 @@ test("an expired in-progress lease is reclaimable exactly once", async () => {
     s.cleanup();
   }
 });
+
+/**
+ * Mid-await drift harness: the injected availability provider mutates the
+ * store exactly once while proofs are being verified, deterministically
+ * reproducing the evaluation/commit race the handoff paths must fence.
+ */
+function driftingCalendar(s: Setup, mutate: () => void): CalendarAvailabilityReader {
+  const inner = coveringCalendar(false);
+  let fired = false;
+  return {
+    async checkAvailability(request: CheckAvailabilityRequest): Promise<ConnectorResult<CheckAvailabilityResponse>> {
+      if (!fired) {
+        fired = true;
+        mutate();
+      }
+      return inner.checkAvailability(request);
+    },
+  };
+}
+
+function handoffRowCount(s: Setup, actionId?: string): number {
+  const found = actionId
+    ? s.delivery.db.prepare("SELECT COUNT(*) AS n FROM delivery_handoffs WHERE proposed_action_id = $id").get({ $id: actionId })
+    : s.delivery.db.prepare("SELECT COUNT(*) AS n FROM delivery_handoffs").get();
+  return (found as { n: number }).n;
+}
+
+/** Setup driven to a confirmed booking whose handoff evaluates ready. */
+async function readySetup(): Promise<Setup> {
+  const s = setup();
+  seedLiveEvidence(s);
+  seedExecutedSteps(s);
+  const confirmed = await confirmBooking(s.deps, confirmInput(s));
+  assert.equal(confirmed.confirmedBooking, true);
+  return s;
+}
+
+test("handoff drift: mid-await approval invalidation blocks POST with nothing persisted", async () => {
+  const s = await readySetup();
+  try {
+    const baseline = await recordHandoff(s.deps, s.bookingId);
+    assert.equal(baseline.state, "ready");
+    assert.equal(baseline.revision, 1);
+    s.deps.calendar = driftingCalendar(s, () => {
+      s.store.db.prepare("UPDATE approvals SET status = 'invalidated' WHERE proposed_action_id = $id").run({ $id: s.actionId });
+    });
+    const drifted = await recordHandoff(s.deps, s.bookingId);
+    assert.equal(drifted.state, "blocked");
+    assert.equal(drifted.handoff, null);
+    assert.equal(drifted.revision, null);
+    assert.match(drifted.reason ?? "", /invalidated/);
+    assert.equal(handoffRowCount(s), 1);
+    // GET after the drift reports the live blocked truth, never the old revision.
+    const read = await handoffForBooking(s.deps, s.bookingId);
+    assert.equal(read.state, "blocked");
+    assert.equal(read.handoff, null);
+    assert.equal(read.revision, null);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("handoff drift: mid-await proposal replacement never persists the old view", async () => {
+  const s = await readySetup();
+  try {
+    await recordHandoff(s.deps, s.bookingId);
+    s.deps.calendar = driftingCalendar(s, () => {
+      s.store.replaceProposedAction(s.actionId, { kind: "create_provisional_hold", payload: payload(), sourceReferences: [liveRef("proposal://drift")] });
+    });
+    const drifted = await recordHandoff(s.deps, s.bookingId);
+    assert.equal(drifted.state, "blocked");
+    assert.equal(drifted.handoff, null);
+    assert.equal(drifted.revision, null);
+    assert.match(drifted.reason ?? "", /proposal version changed/);
+    // Exactly the baseline revision persists; no row carries the new version.
+    assert.equal(handoffRowCount(s), 1);
+    const newVersionRows = s.delivery.db.prepare("SELECT COUNT(*) AS n FROM delivery_handoffs WHERE proposal_version != $v").get({ $v: s.version });
+    assert.equal((newVersionRows as { n: number }).n, 0);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("handoff drift: a brand-new mid-await action never receives the old handoff", async () => {
+  const s = await readySetup();
+  try {
+    await recordHandoff(s.deps, s.bookingId);
+    let newActionId = "";
+    s.deps.calendar = driftingCalendar(s, () => {
+      newActionId = s.store.createProposedAction({
+        bookingId: s.bookingId,
+        kind: "create_provisional_hold",
+        payload: payload(),
+        sourceReferences: [liveRef("proposal://new-action")],
+      }).id;
+    });
+    const drifted = await recordHandoff(s.deps, s.bookingId);
+    assert.equal(drifted.state, "blocked");
+    assert.equal(drifted.handoff, null);
+    assert.match(drifted.reason ?? "", /proposed action changed/);
+    assert.ok(newActionId.length > 0);
+    assert.equal(handoffRowCount(s, newActionId), 0);
+    assert.equal(handoffRowCount(s), 1);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("handoff drift: mid-await booking cancel blocks POST with nothing persisted", async () => {
+  const s = await readySetup();
+  try {
+    await recordHandoff(s.deps, s.bookingId);
+    s.deps.calendar = driftingCalendar(s, () => {
+      s.store.updateBookingStatus(s.bookingId, "cancelled");
+    });
+    const drifted = await recordHandoff(s.deps, s.bookingId);
+    assert.equal(drifted.state, "blocked");
+    assert.equal(drifted.handoff, null);
+    assert.equal(drifted.revision, null);
+    assert.match(drifted.reason ?? "", /booking status changed/);
+    assert.equal(handoffRowCount(s), 1);
+    assert.equal(s.store.getBooking(s.bookingId).status, "cancelled");
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("handoff drift: mid-await evidence change blocks POST with nothing persisted", async () => {
+  const s = await readySetup();
+  try {
+    await recordHandoff(s.deps, s.bookingId);
+    s.deps.calendar = driftingCalendar(s, () => {
+      s.delivery.recordAcceptance({
+        businessId: s.businessId,
+        bookingId: s.bookingId,
+        proposalVersion: s.version,
+        proposalFingerprint: s.fingerprint,
+        acceptedAt: "2030-04-30T11:00:00.000Z",
+        sourceRefs: [liveRef("acceptance://late")],
+      });
+    });
+    const drifted = await recordHandoff(s.deps, s.bookingId);
+    assert.equal(drifted.state, "blocked");
+    assert.equal(drifted.handoff, null);
+    assert.equal(drifted.revision, null);
+    assert.match(drifted.reason ?? "", /evidence changed/);
+    assert.equal(handoffRowCount(s), 1);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("GET pairs a revision only with byte-identical persisted content, never an old number", async () => {
+  const s = await readySetup();
+  try {
+    const built = await recordHandoff(s.deps, s.bookingId);
+    assert.equal(built.revision, 1);
+    // Fresh GET with no drift reports the matching persisted revision.
+    const matching = await handoffForBooking(s.deps, s.bookingId);
+    assert.equal(matching.state, "ready");
+    assert.equal(matching.revision, 1);
+    // Replace the proposal with different services and approve it: the fresh
+    // view is an unpersisted preview of the new content, not revision 1.
+    const altered = { ...payload(), services: [{ name: "Late-night snacks" }] };
+    s.store.replaceProposedAction(s.actionId, { kind: "create_provisional_hold", payload: altered, sourceReferences: [liveRef("proposal://v2")] });
+    const v2 = s.store.getProposedAction(s.actionId);
+    s.store.approveProposedAction(s.actionId, "test-owner");
+    const before = handoffRowCount(s);
+    const preview = await handoffForBooking(s.deps, s.bookingId);
+    assert.equal(preview.revision, null);
+    assert.deepEqual(preview.handoff?.services.map((svc) => svc.name), ["Late-night snacks"]);
+    assert.equal(preview.handoff?.binding.proposalVersion, v2.proposalVersion);
+    // GET persisted nothing: row count and the old revision are untouched.
+    assert.equal(handoffRowCount(s), before);
+    const latest = s.delivery.latestHandoff(s.actionId);
+    assert.equal(latest?.revision, 1);
+  } finally {
+    s.cleanup();
+  }
+});
