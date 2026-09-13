@@ -92,7 +92,7 @@ export interface PreparedProposal {
   provenance: ToolProvenance;
 }
 
-export type LiveRunStatus = "ok" | "error" | "continuing";
+export type LiveRunStatus = "ok" | "error" | "continuing" | "running";
 
 export interface LiveRunStep {
   tool: LiveToolName;
@@ -106,6 +106,8 @@ export interface LiveRunRecord {
   runId: string;
   businessId: string;
   accountId: string;
+  /** Designated inputs this run was claimed for; resubmits must match exactly. */
+  designation: { threadId: string; fileId: string; calendarId: string };
   mode: "scripted" | "live";
   simulated: boolean;
   status: LiveRunStatus;

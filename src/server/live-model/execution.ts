@@ -177,6 +177,74 @@ export async function startScopedExecutionHost(input: {
   };
 }
 
+function designationOf(input: LiveRunInput): { threadId: string; fileId: string; calendarId: string } {
+  return { threadId: input.threadId, fileId: input.fileId, calendarId: input.calendarId };
+}
+
+/**
+ * Atomic idempotency claim: same key + same designated inputs replays or
+ * resumes without duplicating provider runs; same key + CHANGED inputs
+ * rejects (the key names one exact journey). Concurrent duplicates lose
+ * the claim race and receive the winner's record instead of running twice.
+ */
+function claimRun(
+  store: GatherStore,
+  input: LiveRunInput,
+  runId: string,
+  startedAt: string,
+): { action: "proceed" } | { action: "return"; record: LiveRunRecord } {
+  const key = input.idempotencyKey;
+  if (!key) return { action: "proceed" };
+  const designation = designationOf(input);
+  store.db.exec("BEGIN IMMEDIATE");
+  try {
+    const row = store.db
+      .prepare("SELECT record_json FROM live_model_runs WHERE business_id = $b AND idempotency_key = $k ORDER BY created_at DESC LIMIT 1")
+      .get({ $b: input.businessId, $k: key }) as { record_json: string } | undefined;
+    if (!row) {
+      const placeholder: LiveRunRecord = {
+        runId,
+        businessId: input.businessId,
+        accountId: "",
+        designation,
+        mode: input.mode,
+        simulated: input.mode === "scripted",
+        status: "running",
+        steps: [],
+        startedAt,
+        finishedAt: startedAt,
+      };
+      writeLiveRun(store, placeholder, key);
+      store.db.exec("COMMIT");
+      return { action: "proceed" };
+    }
+    const prior = JSON.parse(String(row.record_json)) as LiveRunRecord;
+    const same = prior.designation !== undefined &&
+      prior.designation.threadId === designation.threadId &&
+      prior.designation.fileId === designation.fileId &&
+      prior.designation.calendarId === designation.calendarId;
+    if (!same) {
+      store.db.exec("ROLLBACK");
+      throw new LiveModelError("INVALID_REQUEST", "idempotency key was already used for different designated inputs; a key names one exact journey");
+    }
+    if (prior.status === "continuing") {
+      const resumed: LiveRunRecord = { ...prior, runId, status: "running", steps: [], startedAt, finishedAt: startedAt };
+      writeLiveRun(store, resumed, key);
+      store.db.exec("COMMIT");
+      return { action: "proceed" };
+    }
+    store.db.exec("ROLLBACK");
+    return { action: "return", record: prior };
+  } catch (error) {
+    try {
+      store.db.exec("ROLLBACK");
+    } catch {
+      // Already committed, rolled back, or never began.
+    }
+    throw error;
+  }
+}
+
 /**
  * Execute one designated journey with the model (or its scripted planner
  * stand-in) calling the registered MCP tools over loopback HTTP. Source
@@ -191,10 +259,10 @@ export async function runLiveExecution(
     throw new LiveModelError("INVALID_REQUEST", "businessId, threadId, fileId, and calendarId are all designated and required");
   }
   ensureLiveRunTables(deps.store);
-  if (input.idempotencyKey) {
-    const prior = readPriorRun(deps.store, input.businessId, input.idempotencyKey);
-    if (prior && prior.status !== "continuing") return prior;
-  }
+  const runId = `lmr_${randomUUID()}`;
+  const startedAt = nowIso(deps);
+  const claimed = claimRun(deps.store, input, runId, startedAt);
+  if (claimed.action === "return") return claimed.record;
   if (!deps.planner) {
     throw new LiveModelError(
       "MODEL_UNCONFIGURED",
@@ -203,8 +271,6 @@ export async function runLiveExecution(
   }
   const planner = deps.planner;
   const execution = deps.execution ?? (input.mode === "scripted" ? "simulated" : "live");
-  const runId = `lmr_${randomUUID()}`;
-  const startedAt = nowIso(deps);
   const steps: LiveRunStep[] = [];
   let accountId = "";
   const persistAudit = (entry: LiveMcpAuditEntry): void => {
@@ -217,6 +283,7 @@ export async function runLiveExecution(
       runId,
       businessId: input.businessId,
       accountId,
+      designation: designationOf(input),
       mode: input.mode,
       simulated: execution === "simulated",
       status,
@@ -395,6 +462,7 @@ export async function runLiveExecution(
       runId,
       businessId: input.businessId,
       accountId,
+      designation: designationOf(input),
       mode: input.mode,
       simulated: execution === "simulated",
       status: "error",

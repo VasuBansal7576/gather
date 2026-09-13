@@ -66,7 +66,7 @@ const CALENDAR_ID = "gather-test-calendar";
 const BODY_B64URL = Buffer.from(INQUIRY_TEXT, "utf-8").toString("base64url");
 const SLOT = { startAt: "2026-09-18T18:00:00+01:00", endAt: "2026-09-18T20:00:00+01:00" };
 
-const MODEL = { model: "openai-codex/gpt-5.6-luna", auth: { provider: "openai-codex", mode: "oauth" as const, profileId: "profile-test-1" } };
+const MODEL = { model: "openai/gpt-5.6-luna", auth: { provider: "openai", mode: "oauth" as const, profileId: "openai:bansalv8198@gmail.com" } };
 
 class ScriptedOAuth implements OAuthTransport {
   async exchangeCode(): Promise<OAuthTokenResponse> {
@@ -376,6 +376,39 @@ test("unauthenticated MCP transport is refused before any tool runs", async () =
     cleanupFx(fx);
   }
 });
+test("same key with changed designated inputs rejects instead of aliasing", async () => {
+  const fx = await fixture();
+  try {
+    const first = await runLiveExecution(baseInput(fx, { idempotencyKey: "exec-fixed" }), baseDeps(fx));
+    assert.equal(first.status, "ok");
+    const submitsBefore = fx.tasks.submits.length;
+    await assert.rejects(
+      runLiveExecution(baseInput(fx, { idempotencyKey: "exec-fixed", threadId: "t-other" }), baseDeps(fx)),
+      (error: unknown) => error instanceof LiveModelError && error.code === "INVALID_REQUEST",
+    );
+    assert.equal(fx.tasks.submits.length, submitsBefore, "rejected resubmit never reaches the provider");
+  } finally {
+    cleanupFx(fx);
+  }
+});
+
+test("concurrent duplicates collapse onto one run without duplicate work", async () => {
+  const fx = await fixture();
+  try {
+    const input = baseInput(fx, { idempotencyKey: "exec-race" });
+    const [left, right] = await Promise.all([
+      runLiveExecution(input, baseDeps(fx)),
+      runLiveExecution(input, baseDeps(fx)),
+    ]);
+    assert.equal(left.runId, right.runId, "loser receives the winner's claimed run");
+    assert.equal(fx.tasks.submits.length, 1, "one provider run for concurrent duplicates");
+    const proposals = (fx.store.db.prepare("SELECT COUNT(*) AS n FROM proposed_actions").all() as Array<{ n: number }>)[0]?.n ?? 0;
+    assert.equal(proposals, 1);
+  } finally {
+    cleanupFx(fx);
+  }
+});
+
 test("live mode without consent reads nothing; missing model is explicit", async () => {
   const fx = await fixture();
   try {
