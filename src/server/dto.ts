@@ -145,7 +145,9 @@ export interface ErrorDTO {
     | "EXECUTION_FAILED"
     | "DENIED"
     | "BUSY"
-    | "UNCERTAIN";
+    | "UNCERTAIN"
+    | "BOOKING_PAUSED"
+    | "CANCELLATION_REQUESTED";
   message: string;
   retryable: boolean;
   demo: true;

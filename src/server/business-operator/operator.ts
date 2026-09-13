@@ -12,6 +12,7 @@ import type { OfferPreparationResult } from "../../offers/index.ts";
 import type { GatherStore } from "../sqlite-store.ts";
 import {
   previewConsequences,
+  requireBookingWritable,
   resolveHoldParams,
   ServiceError,
   type BookingServiceDeps,
@@ -567,6 +568,7 @@ export function persistPreparedProposal(
   args: { email?: OperatorPrepareEmail; expiresAt?: string },
 ): PersistedProposal | { missing: ProposalMissingItem[] } {
   const { offer } = built;
+  requireBookingWritable(deps.store, built.bookingId);
   const primary = offer.offers.find((item) => item.rank === "primary");
   if (offer.status !== "feasible" || !primary || !primary.totalKnown) {
     const missing: ProposalMissingItem[] = [{ code: "offer_not_feasible", detail: `Offer status is ${offer.status}; only a feasible primary with a known total may persist.` }];

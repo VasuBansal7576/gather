@@ -565,6 +565,21 @@ export class GatherStore {
     return rows.map((value) => this.getApproval(String(row(value).id)));
   }
 
+  /**
+   * Narrow G11 hook: invalidate every live approval across all of a
+   * booking's actions (used when cancellation is requested — the booking's
+   * authority dies at request time, long before external verification).
+   * Receipts, executions, and audit rows are untouched. Returns the number
+   * of approvals invalidated.
+   */
+  invalidateApprovalsForBooking(bookingId: string): number {
+    const timestamp = now();
+    const result = this.db.prepare(`UPDATE approvals SET status = 'invalidated', invalidated_at = $timestamp
+      WHERE proposed_action_id IN (SELECT id FROM proposed_actions WHERE booking_id = $bookingId)
+      AND status = 'approved'`).run({ $timestamp: timestamp, $bookingId: bookingId });
+    return Number(result.changes);
+  }
+
   executeApprovedAction(actionId: string, perform: () => ActionOutcome): ActionExecution {
     const action = this.getProposedAction(actionId);
     const approval = this.db.prepare(`SELECT id FROM approvals WHERE proposed_action_id = $actionId
