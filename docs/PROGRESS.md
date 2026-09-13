@@ -111,7 +111,7 @@ No credentials, personal OpenClaw configuration or data, provider actions, custo
 
 ## Workspace cleanup and dependency findings
 
-Thirty completed review, failed-launch, runtime, dependency-maintenance, knowledge, delivery-evaluator, owner-workspace, setup, connection-service, backup, confirmation-service, commercial, extraction-backend, conflict-resolution, proactive-monitoring, and inherited milestone worktrees were removed after checking clean tracked state and active worker ownership.
+Thirty-two completed review, failed-launch, runtime, dependency-maintenance, knowledge, delivery-evaluator, owner-workspace, setup, connection-service, backup, confirmation-service, commercial, extraction-backend, conflict-resolution, proactive-monitoring, and inherited milestone worktrees were removed after checking clean tracked state and active worker ownership.
 Original foundation, interface, connector-contract, and packaging commits remain preserved by local branch references; integrated review commits remain reachable on remote main.
 The completed knowledge commit is additionally preserved at `archive/gather-business-knowledge-640f57b`; its successor worker uses a separate business-operator worktree.
 The completed delivery evaluator is preserved at `archive/gather-delivery-readiness-e626000`; its successor uses a separate booking-delivery worktree.
@@ -256,3 +256,26 @@ Explicit OAuth model configuration was integrated at `29a83ec` after review, six
 Configuration status reports configured and unverified; caller-supplied identity metadata never proves authentication.
 The real Google consent callback subsequently failed with `MISSING_SCOPE` and persisted no connected account.
 A bounded correction for documented Google identity-scope aliases is under investigation; required Gmail, Drive, and Calendar scopes remain mandatory.
+
+## Live connection and model-tool verification
+
+The identity-scope alias correction was integrated at `3f13fa8` after independent review, 25 focused tests, and type checking passed.
+The actual Google consent callback then succeeded, and separate metadata checks verified connected Gmail, Drive, and Calendar accounts for the designated test business.
+This verifies account connection, not completed provider actions.
+
+The live empty-workspace correction was integrated at `b575ae6` after 23 host tests and type checking passed, followed by truthful empty-state copy at `2fa3f35`.
+The running host returned three connected apps, zero bookings, and unverified evidence without labeling the empty live workspace as a demo.
+
+Two actual Luna turns successfully called the controlled Gather ping tool in the dedicated OpenClaw runtime.
+Astra independently verified the model identity and successful tool outputs in that runtime's task transcript.
+These calls did not read Google business sources or perform booking actions.
+The model-driven booking composition was integrated at `088af7d` after independent review, 16 focused integration tests, and type checking passed.
+Those integration checks used controlled providers and do not establish a live booking journey.
+
+Cold-listener and concurrent-start corrections were integrated at `af89d15` after independent reproduction checks, 12 focused integration tests, and type checking passed.
+The latest full 670-test and production-build pass remains the separate checkout at `0ebb118`; it does not cover every later change.
+
+Repeated macOS Keychain prompts currently block reliable live provider access.
+A consistent native read/write identity correction is under independent review, with repeated-access and refresh verification still pending.
+There is no verified complete live inquiry-to-offer journey, confirmed booking, payment outcome, or operational handoff.
+The accepted local milestone count remains 14 of 17, and no whole-product completion percentage is established.
