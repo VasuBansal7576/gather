@@ -78,8 +78,14 @@ async function main() {
     mcpPort: 0,
     connectTimeoutMs: Number(arg("--connect-timeout-ms", "120000")),
   });
+  // Configured-unverified labeling (N cde4775): configuration alone never
+  // proves OAuth or model readiness — verified is always false here. The
+  // gate admits only an explicit supported selection; actual verification
+  // is the live run receipt below, produced against the separately managed
+  // live auth root.
   const status = runtime.modelStatus();
-  if (!status.ready) throw new Error(`model gate refusing live turn: ${status.reason}`);
+  if (!status.configured) throw new Error(`model gate refusing live turn: ${status.reason}`);
+  if (status.verified !== false) throw new Error("model gate mislabeled: configuration must never report verified");
 
   let runId = null;
   try {
