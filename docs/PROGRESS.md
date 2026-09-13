@@ -111,7 +111,7 @@ No credentials, personal OpenClaw configuration or data, provider actions, custo
 
 ## Workspace cleanup and dependency findings
 
-Twenty-nine completed review, failed-launch, runtime, dependency-maintenance, knowledge, delivery-evaluator, owner-workspace, setup, connection-service, backup, confirmation-service, commercial, extraction-backend, conflict-resolution, proactive-monitoring, and inherited milestone worktrees were removed after checking clean tracked state and active worker ownership.
+Thirty completed review, failed-launch, runtime, dependency-maintenance, knowledge, delivery-evaluator, owner-workspace, setup, connection-service, backup, confirmation-service, commercial, extraction-backend, conflict-resolution, proactive-monitoring, and inherited milestone worktrees were removed after checking clean tracked state and active worker ownership.
 Original foundation, interface, connector-contract, and packaging commits remain preserved by local branch references; integrated review commits remain reachable on remote main.
 The completed knowledge commit is additionally preserved at `archive/gather-business-knowledge-640f57b`; its successor worker uses a separate business-operator worktree.
 The completed delivery evaluator is preserved at `archive/gather-delivery-readiness-e626000`; its successor uses a separate booking-delivery worktree.
@@ -248,3 +248,11 @@ The service rechecks proposal authority after asynchronous reconciliation, and t
 These checks use controlled fixtures and scripted provider responses; they do not establish real booking confirmation.
 The remote `main` was verified at `5d1bfee` after push.
 The latest production build attempt was stopped when the live development host started sharing its output directory; no production-build pass is claimed for this integration.
+The shared build output was repaired and the task-owned development host restarted while preserving the live database.
+Subsequent independent verification in a separate checkout at `0ebb118` passed the production build, type checking, and all 670 tests.
+The actual isolated Gateway doctor passed at 27.8 seconds in that run; the unchanged 30-second deadline was met, but that result alone does not establish a cold-start fix.
+
+Explicit OAuth model configuration was integrated at `29a83ec` after review, six focused integration tests, and type checking passed.
+Configuration status reports configured and unverified; caller-supplied identity metadata never proves authentication.
+The real Google consent callback subsequently failed with `MISSING_SCOPE` and persisted no connected account.
+A bounded correction for documented Google identity-scope aliases is under investigation; required Gmail, Drive, and Calendar scopes remain mandatory.
