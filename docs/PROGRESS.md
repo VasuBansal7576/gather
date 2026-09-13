@@ -10,7 +10,8 @@ The demo connectors and fixture workspace remain explicitly simulated and are no
 
 This checklist has a fixed total of 17 gates.
 
-The current completion is 13/17 gates, or 76%.
+The inherited local application evidence satisfies 13/17 gates in this checklist.
+This count describes the local application milestone only, not completion of the product requirements in [PRD.md](PRD.md).
 
 - [x] Next.js application scaffold is present and builds.
 - [x] Owner workspace renders Today, Bookings, and Connections views.
@@ -35,6 +36,18 @@ The current completion is 13/17 gates, or 76%.
 Foundation commit `b9844b6` was integrated as `06798e9`, and packaging commit `bcd0a8d` was integrated as `aefd08a`.
 
 The executable checks above ran on the integrated working tree on 13 September 2026.
+
+The incoming orchestrator independently verified that `main` and the remote `origin/main` both point to `f137a4401ae52fbc0ba36b104653d704caabd829` after the authorized handover.
+The test results above are the outgoing orchestrator's evidence and have not yet been rerun for the next milestone.
+
+## Next integrated milestone
+
+Parallel implementation is in progress for durable exact-version approval and booking execution, and for owner approval and recovery interactions.
+API and UI integration depends on their verified contracts, followed by independent review and direct application checks.
+The review identified missing UI version/fingerprint binding, attempt-scoped execution keys, incomplete uncertain/partial outcome presentation, and a retry control that only navigated.
+These findings remain open until the corresponding fixes are verified.
+
+The full product requirements and build ownership are recorded in [PRD.md](PRD.md) and [ORCHESTRATION.md](ORCHESTRATION.md).
 
 Two supervised Codex child launches were attempted with the active managed account metadata and effective model `gpt-5.6-luna`.
 
