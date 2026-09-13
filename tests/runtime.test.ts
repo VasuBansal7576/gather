@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { request as httpRequest } from "node:http";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -11,6 +11,7 @@ import { z } from "zod";
 import {
   GatherGatewayConnection,
   GatherMcpBoundary,
+  GatherOpenClawRuntime,
   GatherRuntimeTasks,
   GatewayRequestFailed,
   OpenClawGatewayProcess,
@@ -755,6 +756,160 @@ test("MCP boundary rejects wrong paths, bad JSON, short tokens and non-loopback 
   await assert.rejects(refused.listen({ host: "0.0.0.0", port: 0 }), /loopback/);
 });
 
+// ---------- facade lifecycle (injected seams, no real gateway) ----------
+
+function fakeProcess(behavior: {
+  failStart?: string;
+  neverExit?: boolean;
+}) {
+  const state = {
+    started: false,
+    stopCalls: 0,
+    currentState: "stopped" as string,
+  };
+  const proc = {
+    gatewayToken: "fake-token",
+    pid: 5555,
+    openclawVersion: null,
+    get currentState() {
+      return state.currentState;
+    },
+    async start() {
+      if (behavior.failStart) {
+        state.currentState = "failed";
+        throw new Error(behavior.failStart);
+      }
+      state.started = true;
+      state.currentState = "running";
+    },
+    async stop() {
+      state.stopCalls += 1;
+      if (behavior.neverExit) {
+        state.currentState = "failed";
+        throw new Error("did not exit after SIGKILL");
+      }
+      state.currentState = "stopped";
+    },
+  };
+  return { proc: proc as unknown as OpenClawGatewayProcess, state };
+}
+
+function fakeConnection(behavior: { failConnect?: string }) {
+  const state = { ready: false, closeCalls: 0 };
+  const conn = {
+    get isReady() {
+      return state.ready;
+    },
+    get currentState() {
+      return state.ready ? "ready" : "closed";
+    },
+    async connect() {
+      if (behavior.failConnect) throw new Error(behavior.failConnect);
+      state.ready = true;
+      return fakeHello();
+    },
+    async close() {
+      state.closeCalls += 1;
+      state.ready = false;
+    },
+    async request() {
+      return {};
+    },
+  };
+  return { conn: conn as unknown as GatherGatewayConnection, state };
+}
+
+function runtimeFixture(overrides: {
+  processBehavior?: { failStart?: string; neverExit?: boolean };
+  connectionBehavior?: { failConnect?: string };
+  processFactory?: (count: { n: number }) => OpenClawGatewayProcess;
+  connectionFactory?: () => GatherGatewayConnection;
+  mcpPort?: number;
+} = {}) {
+  const directory = mkdtempSync(join(tmpdir(), "gather-facade-test-"));
+  const count = { n: 0 };
+  const runtime = new GatherOpenClawRuntime(
+    {
+      rootDir: join(directory, "openclaw"),
+      gatewayPort: 19511,
+      mcpTools: [simulatedAvailabilityTool()],
+      // Fixed port: a leaked first listener would fail the second bind.
+      mcpPort: overrides.mcpPort ?? 19771,
+    },
+    {
+      processFactory: () => {
+        count.n += 1;
+        return overrides.processFactory
+          ? overrides.processFactory(count)
+          : fakeProcess(overrides.processBehavior ?? {}).proc;
+      },
+      connectionFactory:
+        overrides.connectionFactory ??
+        (() => fakeConnection(overrides.connectionBehavior ?? {}).conn),
+    },
+  );
+  return { runtime, count, cleanup: () => rmSync(directory, { recursive: true, force: true }) };
+}
+
+test("failed start rolls back the MCP boundary the invocation created", async () => {
+  const behaviors = { proc: { failStart: "spawn denied" as string | undefined }, conn: {} };
+  const { runtime, cleanup } = runtimeFixture({
+    processFactory: () => fakeProcess(behaviors.proc).proc,
+    connectionFactory: () => fakeConnection(behaviors.conn).conn,
+    mcpPort: 19772,
+  });
+  try {
+    await assert.rejects(runtime.start(), /spawn denied/);
+    // MCP listener + token ref were created then rolled back.
+    assert.equal(runtime.mcpUrl, null);
+    // Config no longer references the torn-down MCP server.
+    const config = JSON.parse(readFileSync(runtime.layout.configPath, "utf8"));
+    assert.equal(config.mcp, undefined);
+    // A second start rebinds the SAME MCP port — proving the first listener
+    // was actually released rather than orphaned.
+    delete behaviors.proc.failStart;
+    await runtime.start();
+    assert.ok(runtime.mcpUrl);
+    await runtime.stop();
+    assert.equal(runtime.mcpUrl, null);
+  } finally {
+    cleanup();
+  }
+});
+
+test("connect failure stops the spawned child and tears down MCP", async () => {
+  const proc = fakeProcess({});
+  const conn = fakeConnection({ failConnect: "ws handshake refused" });
+  const { runtime, cleanup } = runtimeFixture({
+    processFactory: () => proc.proc,
+    connectionFactory: () => conn.conn,
+  });
+  try {
+    await assert.rejects(runtime.start(), /ws handshake refused/);
+    assert.equal(proc.state.stopCalls, 1);
+    assert.equal(conn.state.closeCalls, 1);
+    assert.equal(runtime.mcpUrl, null);
+  } finally {
+    cleanup();
+  }
+});
+
+test("concurrent and repeated start() produce exactly one startup", async () => {
+  const { runtime, count, cleanup } = runtimeFixture();
+  try {
+    const first = runtime.start();
+    const second = runtime.start();
+    await Promise.all([first, second]);
+    assert.equal(count.n, 1, "one process for two concurrent starts");
+    await assert.rejects(runtime.start(), /already started/);
+    assert.equal(count.n, 1);
+    await runtime.stop();
+    assert.equal(runtime.state.process, "stopped");
+  } finally {
+    cleanup();
+  }
+});
+
 // ---------- actual isolated gateway boot (doctor end-to-end) ----------
 
 test(
@@ -798,6 +953,73 @@ test(
         .split("\n")
         .filter((name) => name.startsWith("openclaw-doctor-"));
       assert.deepEqual(leftovers, [], "doctor-owned dir must be removed after verified shutdown");
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "doctor: SIGTERM mid-run still observes child exit and preserves sentinel",
+  { timeout: 90000 },
+  async () => {
+    let binary: string | null = null;
+    try {
+      binary = execFileSync("which", ["openclaw"], { encoding: "utf8" }).trim() || null;
+    } catch {
+      binary = null;
+    }
+    if (!binary) {
+      console.log("SKIP: openclaw binary not installed; doctor signal run not run");
+      return;
+    }
+
+    const projectDir = mkdtempSync(join(tmpdir(), "gather-doctor-signal-"));
+    const realState = join(projectDir, ".runtime", "openclaw");
+    mkdirSync(join(realState, "state"), { recursive: true });
+    writeFileSync(join(realState, "sentinel.txt"), "pre-existing gather state\n");
+
+    try {
+      const result = await new Promise<{ code: number | null; signal: string | null; output: string }>(
+        (resolvePromise, rejectPromise) => {
+          const child = spawn(
+            process.execPath,
+            [join(process.cwd(), "scripts", "openclaw-doctor.mjs"), "--port", "19393"],
+            {
+              cwd: projectDir,
+              env: { ...process.env, GATHER_OPENCLAW_BIN: binary! },
+            },
+          );
+          let output = "";
+          let signaled = false;
+          child.stdout.on("data", (chunk: Buffer) => {
+            output += chunk.toString("utf8");
+            // Signal while the run is in flight — gateway is up, later RPCs pending.
+            if (!signaled && output.includes("PASS gateway boot")) {
+              signaled = true;
+              child.kill("SIGTERM");
+            }
+          });
+          child.stderr.on("data", (chunk: Buffer) => {
+            output += chunk.toString("utf8");
+          });
+          child.on("error", rejectPromise);
+          child.on("close", (code, signal) => resolvePromise({ code, signal, output }));
+        },
+      );
+
+      // The doctor's coordinated shutdown must still record an observed child
+      // exit even though the run was interrupted.
+      assert.match(result.output, /PASS shutdown: gateway child exit observed/);
+      assert.doesNotMatch(result.output, /refusing cleanup/);
+      assert.equal(
+        readFileSync(join(realState, "sentinel.txt"), "utf8"),
+        "pre-existing gather state\n",
+      );
+      const leftovers = execFileSync("ls", ["-A", join(projectDir, ".runtime")], { encoding: "utf8" })
+        .split("\n")
+        .filter((name) => name.startsWith("openclaw-doctor-"));
+      assert.deepEqual(leftovers, [], "doctor-owned dir must be removed after observed signal shutdown");
     } finally {
       rmSync(projectDir, { recursive: true, force: true });
     }

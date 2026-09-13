@@ -117,11 +117,21 @@ tokens):
   (default 30 s). The library retries `startup-sidecars` closes internally.
 - **Reconnect**: the client owns backoff/reconnect; the adapter surfaces
   `connecting`/`ready`/`reconnecting`/`closed`.
-- **Shutdown**: `stop()` closes the WS client (`stopAndWait`), then SIGTERMs
-  the child and waits for the *observed* exit event; SIGKILL follows after
-  the grace window. If no exit is observed even after SIGKILL the state is
-  `failed` (never `stopped`), resources are retained, and `stop()` rejects —
-  "stopped" always means the exit was observed.
+- **Facade startup**: `GatherOpenClawRuntime.start()` is single-flight —
+  concurrent calls share the one in-flight startup, calling `start()` on a
+  running runtime rejects. A failed start rolls back only the resources that
+  invocation owned (WS client closed, child stopped, MCP listener torn down
+  and the config rewritten without the stale MCP ref), and keeps the process
+  reference whenever the child's exit was not verifiably observed.
+- **Shutdown**: `stop()` first lets any in-flight startup settle, then closes
+  the WS client (`stopAndWait`), SIGTERMs the child and waits for the
+  *observed* exit event; SIGKILL follows after the grace window. If no exit
+  is observed even after SIGKILL the state is `failed` (never `stopped`),
+  resources are retained, and `stop()` rejects — "stopped" always means the
+  exit was observed.
+- **Signals**: `openclaw-doctor.mjs` runs the same coordinated shutdown on
+  SIGINT/SIGTERM — client close, observed child exit, then cleanup of only
+  the unique doctor-owned directory — before exiting 130/143.
 
 ## Task API
 
@@ -182,20 +192,23 @@ missing/unknown session ids get `404` per the MCP spec.
 ## Verification
 
 - `npm run typecheck` — clean.
-- `npm test` — 35 tests pass. `tests/runtime.test.ts` covers isolation,
+- `npm test` — 39 tests pass. `tests/runtime.test.ts` covers isolation,
   config materialization, env allowlist rejection, executable validation,
   collision-proof session keys, mock-transport protocol (connect/hello-ok,
   malformed responses, wait-status mapping), spawn-error and observed-exit
-  shutdown semantics, real loopback MCP (auth/Host/Origin, two-session
-  reconnect, simulated labeling), and a real-boot doctor sentinel test.
+  shutdown semantics, facade lifecycle (failed-start MCP rollback, connect-
+  failure cleanup, single-flight concurrent/repeated start), real loopback
+  MCP (auth/Host/Origin, two-session reconnect, simulated labeling), and two
+  real-boot doctor tests (sentinel preservation; SIGTERM mid-run still
+  observing child exit and cleaning only its own directory).
 - `node scripts/openclaw-doctor.mjs` — actual isolated boot on host
   `openclaw@2026.9.4`: unique `.runtime/openclaw-doctor-*` root → verified
   `--version` → spawn → `hello-ok` (protocol 4, 424 methods) → `status`,
   `sessions.list`, `config.get` (proves `tools.profile=messaging` +
   `mcp.servers=[gather]` accepted) → observed SIGTERM exit → removes only the
   directory it created. Contract tests use a mock transport; the doctor and
-  the sentinel test are real-process proofs. No model/provider invocation
-  occurs.
+  the two end-to-end tests are real-process proofs. No model/provider
+  invocation occurs.
 
 ## Known limitations
 
