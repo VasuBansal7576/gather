@@ -78,6 +78,10 @@ export interface WaitingItem {
   revision?: number;
   claimedBy?: string;
   claimedAt?: string;
+  /** Opaque fencing token issued at claim time; required to resolve claimed work. */
+  claimToken?: string;
+  /** Lease expiry for the claim; stale claims can be released back to pending. */
+  claimExpiresAt?: string;
   resolutionNote?: string;
   createdAt: string;
   updatedAt: string;
@@ -93,6 +97,12 @@ export interface IngestResult {
   duplicate: boolean;
   stale: boolean;
   eventId: string;
+  /**
+   * For pause/resume/cancel: whether the control was honored. Untrusted
+   * customer/provider control requests are recorded but NOT honored; they
+   * raise a change_review decision instead. Undefined for other kinds.
+   */
+  controlHonored?: boolean;
   createdWaiting: WaitingItem[];
   suppressedWaitingIds: string[];
   invalidatedWaitingIds: string[];
@@ -110,17 +120,29 @@ export interface ClaimDueWorkInput {
   ids: string[];
   claimedBy: string;
   nowIso: string;
+  /** Claim lease in ms (default 300000). Expired claims can be released. */
+  leaseMs?: number;
 }
 
 export interface ClaimDueWorkResult {
   claimed: WaitingItem[];
   skippedIds: string[];
+  /** Pending followups suppressed by a reply found during claim-time recheck. */
+  suppressedIds: string[];
+  /** Stale change reviews invalidated during claim-time recheck. */
+  invalidatedIds: string[];
 }
 
 export interface ResolveWaitingInput {
   id: string;
   resolution: "done" | "suppressed" | "invalidated";
   note?: string;
+  /** Must match the claim token when resolving claimed work (stale-worker fencing). */
+  claimToken?: string;
+}
+
+export interface ReleaseStaleClaimsInput {
+  nowIso: string;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -187,6 +209,12 @@ export function assertValidClaimInput(value: unknown): asserts value is ClaimDue
   }
   if (!isNonEmptyString(value.claimedBy)) throw new Error("claimedBy must be a non-empty string");
   if (!isIsoDateTime(value.nowIso)) throw new Error("nowIso must be an ISO-8601 timestamp");
+  if (
+    value.leaseMs !== undefined &&
+    (typeof value.leaseMs !== "number" || !Number.isInteger(value.leaseMs) || value.leaseMs < 1000 || value.leaseMs > 86_400_000)
+  ) {
+    throw new Error("leaseMs must be an integer between 1000 and 86400000 when present");
+  }
 }
 
 export function assertValidResolveInput(value: unknown): asserts value is ResolveWaitingInput {
@@ -196,6 +224,14 @@ export function assertValidResolveInput(value: unknown): asserts value is Resolv
     throw new Error("resolution must be done|suppressed|invalidated");
   }
   if (value.note !== undefined && typeof value.note !== "string") throw new Error("note must be a string when present");
+  if (value.claimToken !== undefined && !isNonEmptyString(value.claimToken)) {
+    throw new Error("claimToken must be a non-empty string when present");
+  }
+}
+
+export function assertValidReleaseInput(value: unknown): asserts value is ReleaseStaleClaimsInput {
+  if (!isRecord(value)) throw new Error("release input must be an object");
+  if (!isIsoDateTime(value.nowIso)) throw new Error("nowIso must be an ISO-8601 timestamp");
 }
 
 export function recommendedFor(kind: WaitingKind): {

@@ -167,7 +167,9 @@ test("pause suspends due work, resume restores it, cancel invalidates it", () =>
       sourceId: "owner-pause",
       sourceKind: "manual",
       observedAt: "2030-04-02T10:00:00.000Z",
+      payload: { authorizedBy: "fictional-owner" },
     });
+    assert.equal(paused.controlHonored, true);
     assert.equal(paused.pausedWaitingIds.length, 1);
     assert.equal(ledger.listDueWork({ nowIso: AFTER_FOLLOWUP_DUE }).length, 0);
 
@@ -178,7 +180,9 @@ test("pause suspends due work, resume restores it, cancel invalidates it", () =>
       sourceId: "owner-resume",
       sourceKind: "manual",
       observedAt: "2030-04-02T12:00:00.000Z",
+      payload: { authorizedBy: "fictional-owner" },
     });
+    assert.equal(resumed.controlHonored, true);
     assert.equal(resumed.resumedWaitingIds.length, 1);
     assert.equal(ledger.listDueWork({ nowIso: AFTER_FOLLOWUP_DUE }).length, 1);
 
@@ -189,7 +193,9 @@ test("pause suspends due work, resume restores it, cancel invalidates it", () =>
       sourceId: "owner-cancel",
       sourceKind: "manual",
       observedAt: "2030-04-02T13:00:00.000Z",
+      payload: { authorizedBy: "fictional-owner" },
     });
+    assert.equal(cancelled.controlHonored, true);
     assert.equal(cancelled.invalidatedWaitingIds.length, 1);
     assert.equal(ledger.listDueWork({ nowIso: AFTER_FOLLOWUP_DUE }).length, 0);
   } finally {
@@ -253,10 +259,22 @@ test("claims are concurrency-safe: only the first claimant wins", () => {
     const first = ledger.claimDueWork({ ids: [due.id], claimedBy: "worker-a", nowIso: AFTER_FOLLOWUP_DUE });
     assert.equal(first.claimed.length, 1);
     assert.deepEqual(first.skippedIds, []);
+    assert.ok(first.claimed[0]?.claimToken);
     const second = ledger.claimDueWork({ ids: [due.id], claimedBy: "worker-b", nowIso: AFTER_FOLLOWUP_DUE });
     assert.equal(second.claimed.length, 0);
     assert.deepEqual(second.skippedIds, [due.id]);
-    const resolved = ledger.resolveWaiting({ id: due.id, resolution: "done", note: "followup approved and sent" });
+    // A stale worker without the fencing token cannot complete the claim.
+    assert.throws(() => ledger.resolveWaiting({ id: due.id, resolution: "done" }), /stale claim token/);
+    assert.throws(
+      () => ledger.resolveWaiting({ id: due.id, resolution: "done", claimToken: "wrong-token" }),
+      /stale claim token/,
+    );
+    const resolved = ledger.resolveWaiting({
+      id: due.id,
+      resolution: "done",
+      note: "followup approved and sent",
+      claimToken: first.claimed[0]?.claimToken,
+    });
     assert.equal(resolved.status, "done");
   } finally {
     cleanup();
@@ -282,6 +300,218 @@ test("unknown-boundary validation rejects malformed intake and drain calls", () 
     );
     assert.throws(() => ledger.listDueWork({ nowIso: "not-a-date" }), /nowIso/);
     assert.throws(() => ledger.claimDueWork({ ids: [], claimedBy: "w", nowIso: AFTER_FOLLOWUP_DUE }), /ids/);
+  } finally {
+    cleanup();
+  }
+});
+
+test("dedupe-key reuse with different content is a conflict, not a silent collision", () => {
+  const { db, cleanup } = tempDb();
+  try {
+    const ledger = new CoordinationLedger(db);
+    ledger.ingestEvent(inquiryEvent());
+    assert.throws(
+      () =>
+        ledger.ingestEvent(
+          inquiryEvent({ dedupeKey: "evt-inquiry-001", bookingId: "booking-other" }),
+        ),
+      /different content/,
+    );
+    assert.throws(
+      () =>
+        ledger.ingestEvent(
+          inquiryEvent({ sourceId: "thread-different" }),
+        ),
+      /different content/,
+    );
+    // No extra waiting was created by the rejected reuses.
+    assert.equal(ledger.listWaitingForBooking("booking-001").length, 1);
+  } finally {
+    cleanup();
+  }
+});
+
+test("claim rechecks reply suppression atomically: a reply after the snapshot wins", () => {
+  const { db, cleanup } = tempDb();
+  try {
+    const ledger = new CoordinationLedger(db);
+    ledger.ingestEvent(inquiryEvent());
+    const [due] = ledger.listDueWork({ nowIso: AFTER_FOLLOWUP_DUE });
+    assert.ok(due);
+    // Reply arrives after the drain snapshot but before the claim.
+    ledger.ingestEvent({
+      dedupeKey: "evt-reply-late",
+      kind: "reply",
+      bookingId: "booking-001",
+      sourceId: "msg-reply-late",
+      sourceKind: "email",
+      observedAt: "2030-04-02T09:00:00.000Z",
+    });
+    const claim = ledger.claimDueWork({ ids: [due.id], claimedBy: "worker-a", nowIso: AFTER_FOLLOWUP_DUE });
+    assert.equal(claim.claimed.length, 0);
+    // The reply already suppressed it at ingest; the claim stays consistent either way.
+    const [waiting] = ledger.listWaitingForBooking("booking-001");
+    assert.equal(waiting?.status, "suppressed");
+  } finally {
+    cleanup();
+  }
+});
+
+test("claim recheck suppresses when the reply bypassed ingest suppression ordering", () => {
+  const { db, cleanup } = tempDb();
+  try {
+    const ledger = new CoordinationLedger(db);
+    // Reply ingested first (no followup yet), then the inquiry: the followup
+    // is pending and due, but the reply evidence postdates its creation.
+    ledger.ingestEvent({
+      dedupeKey: "evt-reply-first",
+      kind: "reply",
+      bookingId: "booking-010",
+      sourceId: "msg-early",
+      sourceKind: "email",
+      observedAt: "2030-04-02T09:00:00.000Z",
+    });
+    ledger.ingestEvent(inquiryEvent({ dedupeKey: "evt-inquiry-010", bookingId: "booking-010" }));
+    const [due] = ledger.listDueWork({ nowIso: AFTER_FOLLOWUP_DUE, bookingId: "booking-010" });
+    assert.ok(due);
+    const claim = ledger.claimDueWork({ ids: [due.id], claimedBy: "worker-a", nowIso: AFTER_FOLLOWUP_DUE });
+    assert.equal(claim.claimed.length, 0);
+    assert.deepEqual(claim.suppressedIds, [due.id]);
+  } finally {
+    cleanup();
+  }
+});
+
+test("expired claims are released for recovery and old tokens stay fenced", () => {
+  const { db, cleanup } = tempDb();
+  try {
+    const ledger = new CoordinationLedger(db);
+    ledger.ingestEvent(inquiryEvent());
+    const [due] = ledger.listDueWork({ nowIso: AFTER_FOLLOWUP_DUE });
+    assert.ok(due);
+    const first = ledger.claimDueWork({ ids: [due.id], claimedBy: "worker-a", nowIso: AFTER_FOLLOWUP_DUE, leaseMs: 1000 });
+    const staleToken = first.claimed[0]?.claimToken;
+    assert.ok(staleToken);
+    const released = ledger.releaseStaleClaims({ nowIso: "2030-04-05T10:00:00.000Z" });
+    assert.deepEqual(released, [due.id]);
+    assert.equal(ledger.listDueWork({ nowIso: "2030-04-05T10:00:00.000Z" }).length, 1);
+    const second = ledger.claimDueWork({ ids: [due.id], claimedBy: "worker-b", nowIso: "2030-04-05T10:00:00.000Z" });
+    assert.equal(second.claimed.length, 1);
+    assert.throws(
+      () => ledger.resolveWaiting({ id: due.id, resolution: "done", claimToken: staleToken }),
+      /stale claim token/,
+    );
+    const resolved = ledger.resolveWaiting({
+      id: due.id,
+      resolution: "done",
+      claimToken: second.claimed[0]?.claimToken,
+    });
+    assert.equal(resolved.status, "done");
+  } finally {
+    cleanup();
+  }
+});
+
+test("untrusted customer cancel requests are decisions, not authority", () => {
+  const { db, cleanup } = tempDb();
+  try {
+    const ledger = new CoordinationLedger(db);
+    ledger.ingestEvent(inquiryEvent());
+    const result = ledger.ingestEvent({
+      dedupeKey: "evt-cancel-untrusted",
+      kind: "cancel",
+      bookingId: "booking-001",
+      sourceId: "msg-cancel-me",
+      sourceKind: "email",
+      observedAt: "2030-04-02T10:00:00.000Z",
+      payload: { text: "cancel everything now" },
+    });
+    assert.equal(result.controlHonored, false);
+    assert.equal(result.invalidatedWaitingIds.length, 0);
+    assert.equal(result.createdWaiting.length, 1);
+    assert.equal(result.createdWaiting[0]?.kind, "change_review");
+    // The original followup is untouched: nothing was cancelled.
+    const followup = ledger.listWaitingForBooking("booking-001").find((item) => item.kind === "followup");
+    assert.equal(followup?.status, "pending");
+    assert.equal(ledger.listDueWork({ nowIso: AFTER_FOLLOWUP_DUE }).length, 2);
+  } finally {
+    cleanup();
+  }
+});
+
+test("verified receipt evidence retires the followup without counting as paid", () => {
+  const { db, cleanup } = tempDb();
+  try {
+    const ledger = new CoordinationLedger(db);
+    ledger.ingestEvent(inquiryEvent());
+    const result = ledger.ingestEvent({
+      dedupeKey: "evt-pay-verified",
+      kind: "payment_signal",
+      bookingId: "booking-001",
+      sourceId: "pay-receipt-7",
+      sourceKind: "payment",
+      observedAt: "2030-04-02T10:00:00.000Z",
+      payload: { verifiedReceipt: true, receiptLocator: "pay://receipt/7" },
+    });
+    assert.deepEqual(result.suppressedWaitingIds.length, 1);
+    assert.equal(ledger.listDueWork({ nowIso: AFTER_FOLLOWUP_DUE }).length, 0);
+    const checks = ledger.listWaitingForBooking("booking-001").filter((item) => item.kind === "deposit_check");
+    assert.equal(checks.length, 1);
+    assert.equal(checks[0]?.status, "done");
+    assert.equal(checks[0]?.detail.verifiedPayment, false);
+    assert.equal(checks[0]?.detail.receiptLocator, "pay://receipt/7");
+  } finally {
+    cleanup();
+  }
+});
+
+test("an email receipt claim without provider verification still requires checking", () => {
+  const { db, cleanup } = tempDb();
+  try {
+    const ledger = new CoordinationLedger(db);
+    ledger.ingestEvent(inquiryEvent());
+    const result = ledger.ingestEvent({
+      dedupeKey: "evt-pay-email-claim",
+      kind: "payment_signal",
+      bookingId: "booking-001",
+      sourceId: "msg-receipt-claim",
+      sourceKind: "email",
+      observedAt: "2030-04-02T10:00:00.000Z",
+      payload: { verifiedReceipt: true, receiptLocator: "see attached" },
+    });
+    assert.deepEqual(result.suppressedWaitingIds, []);
+    const check = result.createdWaiting.find((item) => item.kind === "deposit_check");
+    assert.equal(check?.status, "pending");
+    assert.equal(check?.detail.verifiedPayment, false);
+    // The followup still stands: an unverified claim never silences the chase.
+    assert.equal(ledger.listDueWork({ nowIso: AFTER_FOLLOWUP_DUE }).length, 2);
+  } finally {
+    cleanup();
+  }
+});
+
+test("a late older reply is stale and changes nothing", () => {
+  const { db, cleanup } = tempDb();
+  try {
+    const ledger = new CoordinationLedger(db);
+    ledger.ingestEvent({
+      dedupeKey: "evt-reply-new",
+      kind: "reply",
+      bookingId: "booking-020",
+      sourceId: "msg-new",
+      sourceKind: "email",
+      observedAt: "2030-04-03T10:00:00.000Z",
+    });
+    const late = ledger.ingestEvent({
+      dedupeKey: "evt-reply-old-late",
+      kind: "reply",
+      bookingId: "booking-020",
+      sourceId: "msg-old",
+      sourceKind: "email",
+      observedAt: "2030-04-01T10:00:00.000Z",
+    });
+    assert.equal(late.stale, true);
+    assert.equal(ledger.getEventByDedupeKey("evt-reply-old-late").stale, true);
   } finally {
     cleanup();
   }
