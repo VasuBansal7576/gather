@@ -31,4 +31,6 @@ A provisional hold is not a confirmed or paid booking. Track partial failures an
 
 ## Status
 
-Planning scaffold only. No working application, runtime, app connections, or hosted deployment yet. Setup commands will be documented after verification.
+The local application milestone is runnable with the owner workspace, deterministic demo connectors, server-only SQLite persistence, and local doctor/launcher scripts.
+Demo connectors are fixtures only, and no live provider integration, isolated OpenClaw adapter, or hosted deployment is claimed yet.
+See [docs/PROGRESS.md](docs/PROGRESS.md) for the evidence-backed acceptance checklist and pending gates.

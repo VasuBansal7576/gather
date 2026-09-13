@@ -41,4 +41,6 @@ Keep personal OpenClaw untouched. Use separate runtime state, credentials and po
 
 ## Current implementation status
 
-Planning scaffold only. Worker capability verification is in progress; no application behavior or external booking integration has been verified yet.
+The local application milestone is integrated and verified with the owner workspace, deterministic demo connectors, server-only SQLite persistence, and local doctor/launcher scripts.
+Worker capability verification and supported OpenClaw adapter work remain in progress.
+No live provider actions or external booking integration have been verified.

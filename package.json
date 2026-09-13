@@ -9,7 +9,7 @@
     "start": "next start",
     "lint": "tsc --noEmit",
     "typecheck": "tsc --noEmit",
-    "test": "node --experimental-strip-types --test tests/*.test.ts"
+    "test": "node --experimental-strip-types --test tests/*.test.ts src/connectors/demo.test.ts"
   },
   "dependencies": {
     "next": "15.5.25",
