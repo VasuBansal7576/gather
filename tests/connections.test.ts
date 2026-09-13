@@ -713,3 +713,57 @@ test("summaries hide accounts bound by another owner but keep own and unbound ro
     fx.cleanup();
   }
 });
+
+test("in-flight reauthorization callback cannot resurrect a disconnected binding", async () => {
+  const fx = fixture();
+  try {
+    const svc = service(fx);
+    const first = svc.startAuthorization({ businessId: fx.businessId, provider: "google" });
+    await svc.completeAuthorization({ code: "c1", state: stateOf(first.authorizationUrl) });
+    const publicId = svc.getConnections(fx.businessId).providers[0]!.accounts[0]!.id;
+    // Pause the provider exchange so a disconnect lands mid-callback.
+    let releaseExchange: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      releaseExchange = resolve;
+    });
+    const racing = new ConnectionService({
+      store: fx.store,
+      secrets: fx.secrets,
+      transport: {
+        exchangeCode: async () => {
+          await gate;
+          return fx.transport.tokenResponse;
+        },
+        refresh: (...args: unknown[]) => (fx.transport.refresh as (...a: unknown[]) => Promise<OAuthTokenResponse>)(...args),
+        fetchAccountIdentity: () => Promise.resolve({ ...fx.transport.identity }),
+        revokeToken: () => Promise.resolve(),
+      },
+      googleApp: APP,
+      ownerId: "local-owner",
+      nowMs: () => fx.nowMs,
+    });
+    const second = racing.startAuthorization({ businessId: fx.businessId, provider: "google" });
+    const pending = racing.completeAuthorization({ code: "c2", state: stateOf(second.authorizationUrl) });
+    await svc.disconnect({ accountId: publicId, businessId: fx.businessId });
+    releaseExchange();
+    await assert.rejects(
+      pending,
+      (e: unknown) => e instanceof ConnectionError && e.code === "STALE",
+    );
+    const row = fx.store.db.prepare("SELECT status FROM connection_accounts").get() as Record<string, unknown>;
+    assert.equal(row.status, "revoked", "the disconnected binding stays revoked");
+    assert.equal(
+      (fx.store.db.prepare("SELECT COUNT(*) AS n FROM connection_token_meta").get() as Record<string, unknown>).n,
+      0,
+      "no token refs are resurrected for the stale callback",
+    );
+    assert.deepEqual(
+      fx.secrets.keys().filter((key) => key.includes("sub-1")),
+      [],
+      "only staged refs are cleaned; nothing usable remains",
+    );
+    assert.equal(svc.getConnections(fx.businessId).providers[0]?.status, "revoked");
+  } finally {
+    fx.cleanup();
+  }
+});

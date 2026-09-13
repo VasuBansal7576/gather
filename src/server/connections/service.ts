@@ -374,6 +374,26 @@ export class ConnectionService {
   }
 
   /**
+   * Snapshot every binding of a business for the callback fence: id to the
+   * exact revision, business, and owner captured before a provider exchange.
+   */
+  private snapshotBindings(
+    businessId: string,
+  ): Map<string, { revision: number; businessId: string; ownerId: string }> {
+    const snap = new Map<string, { revision: number; businessId: string; ownerId: string }>();
+    for (const row of this.db.prepare(
+      "SELECT id, revision, business_id, owner_id FROM connection_accounts WHERE business_id = $b",
+    ).all({ $b: businessId }) as SqlRow[]) {
+      snap.set(String(row.id), {
+        revision: Number(row.revision ?? 1),
+        businessId: String(row.business_id),
+        ownerId: row.owner_id ? String(row.owner_id) : "local-owner",
+      });
+    }
+    return snap;
+  }
+
+  /**
    * Complete an authorization-code callback. The session is consumed
    * atomically BEFORE any provider call: a replayed state — or one that
    * expired or never existed — is rejected with REPLAY. The granted scopes
@@ -397,12 +417,14 @@ export class ConnectionService {
         "Authorization session is unknown, expired, or already consumed; start a new authorization",
       );
     }
-    // Single-use: consume under a write lock before any provider call.
+    // Single-use: consume under a write lock before any provider call, and
+    // re-check expiry inside the transaction — a session expiring between
+    // the read above and now must not complete.
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const consumed = this.db.prepare(
-        "UPDATE connection_auth_sessions SET status = 'consumed' WHERE id = $id AND status = 'pending'",
-      ).run({ $id: session.id });
+        "UPDATE connection_auth_sessions SET status = 'consumed' WHERE id = $id AND status = 'pending' AND expires_at_ms > $now",
+      ).run({ $id: session.id, $now: this.nowMs() });
       if (Number(consumed.changes) !== 1) {
         throw new ConnectionError("REPLAY", "Authorization session was already consumed by a concurrent callback");
       }
@@ -415,6 +437,13 @@ export class ConnectionService {
       }
       throw error;
     }
+    // Binding fence captured BEFORE the provider exchange: the verified
+    // account identity only arrives after the exchange, so no single row
+    // can be fenced yet — instead every binding of this business is
+    // snapshotted. A disconnect, reconnect, or refresh landing mid-exchange
+    // changes a snapshotted row (or adds one), and the commit below rejects
+    // rather than resurrecting a stale binding with a usable token.
+    const fence = this.snapshotBindings(session.businessId);
     const codeVerifier = this.secrets.get(session.verifierRef);
     if (!codeVerifier) {
       this.failSession(session.id);
@@ -485,6 +514,27 @@ export class ConnectionService {
     const priorMeta = existing ? this.tokenMeta(existing.id) : undefined;
     this.db.exec("BEGIN IMMEDIATE");
     try {
+      for (const [id, snap] of fence) {
+        const current = this.connectionById(id);
+        if (
+          !current ||
+          current.revision !== snap.revision ||
+          current.businessId !== snap.businessId ||
+          current.ownerId !== snap.ownerId
+        ) {
+          throw new ConnectionError(
+            "STALE",
+            "Connection changed during authorization; the stale callback was rejected and no binding was modified",
+          );
+        }
+      }
+      const currentByKey = this.connectionByAccountKey("google", identity.accountKey);
+      if (currentByKey && !fence.has(currentByKey.id)) {
+        throw new ConnectionError(
+          "STALE",
+          "Connection changed during authorization; the stale callback was rejected and no binding was modified",
+        );
+      }
       const timestamp = nowIso();
       const connectionId = existing?.id ?? randomUUID();
       const capabilities = capabilityProviders(grantedScopes);
