@@ -122,6 +122,51 @@ payment/confirmation step.
   uncertain email after a succeeded hold); reconciliation refreshes the
   aggregate back to `provisional_hold` once nothing is uncertain.
 
+## Current proposal authority (durable pointer, not ordering)
+
+Each booking has exactly one **current proposal**, resolved through the
+durable `booking_current_proposals` pointer — never by comparing per-action
+`proposalVersion`, wall-clock `createdAt`, or UUID order. The pointer and a
+persisted per-booking `proposal_seq` are assigned atomically at insert;
+pre-pointer databases backfill sequences in legacy creation order and point
+at the last-created action, preserving the old confirmation behavior.
+
+- `GET /api/workspace` exposes the pointer per booking as
+  `currentProposedActionId`. **UI contract (including delivery UI): display,
+  approve, and confirm exactly the proposal named by
+  `currentProposedActionId` — never `proposals.at(-1)`, never
+  max-`proposalVersion`.** When the pointer is absent (pre-pointer
+  payloads), the adapter falls back to version-then-`createdAt` ordering.
+- `proposalVersion` keeps its existing meaning: the in-place revision count
+  *within one action row*. A genuinely new proposal is a *new row* (new id,
+  version reset to 1, next `proposal_seq`) that atomically supersedes the
+  old row (`status: "superseded"`), invalidates live approvals on it, and
+  moves the pointer — all inside one `IMMEDIATE` transaction, so concurrent
+  publishes serialize with no duplicates and no half-moved state. Old
+  receipts, executions, and audit rows are preserved untouched, scoped to
+  their exact action + version.
+- Fingerprint-bound idempotency: republishing an identical proposal reuses
+  the existing row (`reused: true`) without moving the pointer. A replay
+  whose fingerprint matches a *superseded* row never revives that row.
+- Approve, retry, and reconcile all gate on the pointer **before and after
+  every await**: a superseded action (even with a matching version and
+  fingerprint) is refused with `STALE_PROPOSAL`. A proposal published
+  mid-approval halts the pipeline after the await — observed provider
+  evidence is preserved as versioned history on the old action, the email
+  step never runs, and the booking parks as `uncertain`. Confirmation binds
+  the same pointer and revalidates it transactionally at commit.
+
+## Receipt provenance (preserved connector proof)
+
+Every completed step result embeds the serving connector's proof
+(`{ mode, simulated, provenance }`) taken from its response metadata — it is
+read back, never re-derived. A receipt reads as live only on positive proof:
+live mode, explicitly not simulated, non-empty provenance, zero fictional
+refs. Missing/malformed proof (legacy rows, unknown connectors), simulated
+results, and fixture refs all fail closed to demo, and completion notes name
+the actual proof per step instead of blanket-claiming simulated. Fixture
+receipts are never upgraded to live, at the service or at display.
+
 ## Errors
 
 Typed `{ code, message, retryable, demo: true }`. Codes: `INVALID_REQUEST`

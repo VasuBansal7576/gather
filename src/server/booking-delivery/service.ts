@@ -188,8 +188,7 @@ function canonicalHash(value: unknown): string {
 
 /** The booking's current proposed action — the only proposal confirm can bind to. */
 function currentAction(store: GatherStore, bookingId: string): ProposedAction {
-  const actions = store.listProposedActionsForBooking(bookingId);
-  const action = actions.at(-1);
+  const action = store.getCurrentProposalAction(bookingId);
   if (!action) {
     throw new ServiceError("NOT_FOUND", `No proposed action exists for booking ${bookingId}; nothing can be confirmed`, false);
   }
@@ -230,6 +229,7 @@ interface BindingSnapshot {
   actionFingerprint: string;
   actionStatus: ProposedAction["status"];
   approvalLive: boolean;
+  isCurrent: boolean;
 }
 
 function bindingSnapshot(deps: BookingDeliveryDeps, bookingId: string, actionId: string): BindingSnapshot {
@@ -247,6 +247,7 @@ function bindingSnapshot(deps: BookingDeliveryDeps, bookingId: string, actionId:
     actionFingerprint: action.proposalFingerprint,
     actionStatus: action.status,
     approvalLive,
+    isCurrent: deps.store.isCurrentProposalAction(actionId),
   };
 }
 
@@ -273,6 +274,19 @@ export async function confirmBooking(deps: BookingDeliveryDeps, input: ConfirmRe
     throw new ServiceError(
       "STALE_PROPOSAL",
       `Stale proposal: expected v${action.proposalVersion}/${action.proposalFingerprint.slice(0, 12)}…, refusing confirmation`,
+      false,
+    );
+  }
+  // Authority: confirmation binds only the booking's durable current
+  // proposal. A superseded action — even with a matching version and
+  // fingerprint — can never confirm after a newer proposal was published.
+  if (!store.isCurrentProposalAction(action.id)) {
+    const current = store.getCurrentProposalAction(booking.id);
+    throw new ServiceError(
+      "STALE_PROPOSAL",
+      current
+        ? `Proposal ${action.id} was superseded by the current proposal ${current.id}; re-confirm the displayed proposal`
+        : `Proposal ${action.id} is not the booking's current proposal; re-confirm the displayed proposal`,
       false,
     );
   }
@@ -335,7 +349,8 @@ export async function confirmBooking(deps: BookingDeliveryDeps, input: ConfirmRe
         snapshotAfter.actionFingerprint !== snapshotBefore.actionFingerprint ||
         snapshotAfter.bookingStatus !== snapshotBefore.bookingStatus ||
         snapshotAfter.actionStatus !== snapshotBefore.actionStatus ||
-        !snapshotAfter.approvalLive
+        !snapshotAfter.approvalLive ||
+        !snapshotAfter.isCurrent
       ) {
         throw new ServiceError("STALE_PROPOSAL", "The booking or proposal changed while proofs were being verified; the evaluation was discarded — re-confirm", true);
       }

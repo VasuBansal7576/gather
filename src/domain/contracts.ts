@@ -92,6 +92,16 @@ export interface ProposedAction {
   status: ProposalStatus;
   createdAt: ISODateTime;
   updatedAt: ISODateTime;
+  /**
+   * Durable per-booking publication order, assigned atomically at insert.
+   * Unlike wall-clock createdAt (which can tie) or random UUIDs (which carry
+   * no order), the sequence establishes newest-first without ambiguity.
+   * proposalVersion keeps its existing meaning: the in-place revision count
+   * within this action row.
+   */
+  proposalSeq: number;
+  /** True only for the booking's single durable current proposal. */
+  isCurrent: boolean;
 }
 
 export type ApprovalStatus = "approved" | "invalidated";

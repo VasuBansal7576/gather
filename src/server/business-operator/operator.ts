@@ -609,42 +609,20 @@ export function persistPreparedProposal(
   const kind = "create_provisional_hold" as const;
   const fingerprint = proposalFingerprint({ bookingId: built.bookingId, kind, payload, sourceReferences });
   const nowMs = clockMs(deps);
-  let action = findProposal(deps, built.bookingId, fingerprint);
-  let reused = action !== undefined;
-  if (!reused) {
-    deps.store.db.exec("BEGIN IMMEDIATE");
-    try {
-      verifySnapshotCurrent(deps, built);
-      action = findProposal(deps, built.bookingId, fingerprint);
-      if (action) {
-        // The reuse path still verifies: the found row must be live and
-        // carry a live status — a deleted ghost or a superseded version is
-        // never reused, and stale fact checks above are never bypassed.
-        let live;
-        try {
-          live = deps.store.getProposedAction(action.id);
-        } catch {
-          live = undefined;
-        }
-        if (!live || (live.status !== "pending_approval" && live.status !== "approved")) {
-          action = undefined;
-        }
-      }
-      if (!action) {
-        action = deps.store.createProposedAction({ bookingId: built.bookingId, kind, payload, sourceReferences });
-      } else {
-        reused = true;
-      }
-      deps.store.db.exec("COMMIT");
-    } catch (error) {
-      try {
-        deps.store.db.exec("ROLLBACK");
-      } catch {
-        // Already rolled back; surface the original failure.
-      }
-      throw error;
-    }
-  }
+  // Fingerprint-bound idempotent publish under one write lock: an identical
+  // repeat reuses the existing row without moving the durable current
+  // pointer (a replay of a superseded fingerprint never resurrects it), and
+  // a genuinely new fingerprint publishes a new current proposal while
+  // atomically superseding the old action and invalidating its approval.
+  // The snapshot re-check runs inside the same lock so a concurrent
+  // correction aborts the publish instead of racing it.
+  let published: { action: import("../../domain/contracts.ts").ProposedAction; reused: boolean };
+  published = deps.store.publishProposalAction(
+    { bookingId: built.bookingId, kind, payload, sourceReferences, fingerprint },
+    { verify: () => verifySnapshotCurrent(deps, built) },
+  );
+  const action = published.action;
+  const reused = published.reused;
   const preview = previewConsequences(payload, { nowMs });
   if (preview.consequences === null || !action) {
     return { missing: [{ code: "proposal_window_invalid", detail: preview.consequencesError ?? "Proposal window is not executable" }] };
@@ -662,12 +640,6 @@ function dedupeSources(sources: SourceReference[]): SourceReference[] {
     out.push({ ...source });
   }
   return out;
-}
-
-function findProposal(deps: OperatorDeps, bookingId: string, fingerprint: string) {
-  return deps.store
-    .listProposedActionsForBooking(bookingId)
-    .find((item) => item.proposalFingerprint === fingerprint);
 }
 
 /**
