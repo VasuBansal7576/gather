@@ -31,9 +31,12 @@ contract below.
   of revoking the fresh binding. Each row carries the configured local
   `owner_id` (single local owner; not a multi-user auth claim): resolution,
   reauthorization, status, and every mutation only ever see rows owned by
-  the configured owner. The public DTO account list stays business-scoped
-  over the shared `connected_accounts` table, which demo fixtures also
-  write directly.
+  the configured owner. The public DTO account list follows the
+  authoritative binding: accounts bound by the configured owner's
+  connections stay listed in every status, accounts bound only by another
+  owner are hidden (foreign owners fail closed), and rows nobody bound
+  (demo fixtures write `connected_accounts` directly) keep their previous
+  visibility.
 - `connection_token_meta`: token *references* — versioned secret-store
   keys and the access-token expiry; never token material. A missing expiry
   means the provider issued a non-expiring token: the cached value is

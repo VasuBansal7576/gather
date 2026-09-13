@@ -231,7 +231,24 @@ export class ConnectionService {
         $p: provider,
       }) as SqlRow[]
     ).filter((row) => String(row.owner_id ?? "local-owner") === this.ownerId);
-    const linked = this.store.listConnectedAccounts(businessId).map((account) => this.toAccountDTO(account));
+    // Account visibility follows the authoritative owner/business binding:
+    // accounts bound by this owner's connections stay visible in every
+    // status (connected, revoked, ...); accounts bound only by another
+    // owner's connections are hidden, so a foreign owner fails closed;
+    // accounts bound by nobody (fixtures, legacy rows) keep their previous
+    // visibility, preserving local demo behavior.
+    const ownedIds = new Set<string>();
+    const foreignIds = new Set<string>();
+    for (const row of this.db.prepare(
+      "SELECT connected_account_ids_json, owner_id FROM connection_accounts WHERE business_id = $b AND provider = $p",
+    ).all({ $b: businessId, $p: provider }) as SqlRow[]) {
+      const target = String(row.owner_id ?? "local-owner") === this.ownerId ? ownedIds : foreignIds;
+      for (const id of JSON.parse(String(row.connected_account_ids_json)) as string[]) target.add(id);
+    }
+    const linked = this.store
+      .listConnectedAccounts(businessId)
+      .filter((account) => ownedIds.has(account.id) || !foreignIds.has(account.id))
+      .map((account) => this.toAccountDTO(account));
     if (provider === "google" && !this.googleApp) {
       return {
         provider,

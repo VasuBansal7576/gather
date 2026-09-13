@@ -669,3 +669,47 @@ test("connections are bound to the configured owner: foreign owners resolve noth
     fx.cleanup();
   }
 });
+
+test("summaries hide accounts bound by another owner but keep own and unbound rows", async () => {
+  const fx = fixture();
+  try {
+    const svc = service(fx);
+    const first = svc.startAuthorization({ businessId: fx.businessId, provider: "google" });
+    await svc.completeAuthorization({ code: "c1", state: stateOf(first.authorizationUrl) });
+    // Standalone row with no connection binding (demo/legacy shape).
+    fx.store.upsertConnectedAccount({
+      id: "standalone-1",
+      businessId: fx.businessId,
+      provider: "gmail",
+      displayName: "Fictional Standalone",
+      status: "connected",
+    });
+    const foreign = new ConnectionService({
+      store: fx.store, secrets: fx.secrets, transport: fx.transport,
+      googleApp: APP, ownerId: "someone-else", nowMs: () => fx.nowMs,
+    });
+    const foreignSummary = foreign.getConnections(fx.businessId).providers[0]!;
+    assert.deepEqual(
+      foreignSummary.accounts.map((account) => account.id),
+      ["standalone-1"],
+      "foreign owners see no bound accounts — only rows nobody bound",
+    );
+    assert.equal(foreignSummary.status, "not_connected");
+    // Local owner keeps the full previous picture: bound plus unbound.
+    const ownIds = svc.getConnections(fx.businessId).providers[0]!.accounts.map((account) => account.id).sort();
+    assert.ok(ownIds.includes("standalone-1"), "unbound rows stay visible to the local owner");
+    assert.equal(ownIds.length, 2);
+    // After disconnect the revoked binding stays visible with revoked state.
+    const boundId = ownIds.find((id) => id !== "standalone-1")!;
+    await svc.disconnect({ accountId: boundId, businessId: fx.businessId });
+    const after = svc.getConnections(fx.businessId).providers[0]!;
+    assert.equal(after.status, "revoked");
+    assert.deepEqual(
+      after.accounts.find((account) => account.id === boundId)?.status,
+      "revoked",
+      "disconnected bindings remain listed as revoked, not silently dropped",
+    );
+  } finally {
+    fx.cleanup();
+  }
+});
