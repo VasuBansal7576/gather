@@ -80,6 +80,7 @@ function baseInput(evidence: unknown[] = []): EvaluateReadinessInput {
     booking: {
       id: "booking-1",
       businessId: "biz-1",
+      status: "provisional_hold",
       eventName: "Fictional wedding",
       startAt: WIN_START,
       endAt: WIN_END,

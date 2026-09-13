@@ -47,6 +47,8 @@ export interface ConfirmationPolicy {
 export interface BookingSnapshot {
   id: string;
   businessId: string;
+  /** Booking lifecycle status; cancelled bookings can never be ready. */
+  status: string;
   eventName: string;
   startAt?: string;
   endAt?: string;
@@ -91,6 +93,8 @@ export interface DepositReceipt {
   amountCents: number;
   currency: string;
   status: "settled" | "pending" | "rejected" | "refunded" | "revoked";
+  /** Partial refund against this receipt; net settled is amount minus refunds. */
+  refundedCents?: number;
   observedAt: string;
   sourceRefs: SourceReference[];
 }
@@ -274,7 +278,7 @@ const CONDITION_KINDS: ReadonlySet<string> = new Set([
   "resource_commitment",
 ]);
 
-function assertConditionConfig(value: unknown, index: number): asserts value is ConditionConfig {
+export function assertConditionConfig(value: unknown, index: number): asserts value is ConditionConfig {
   if (!isRecord(value)) throw new Error(`policy.conditions[${index}] must be an object`);
   if (typeof value.kind !== "string" || !CONDITION_KINDS.has(value.kind)) {
     throw new Error(`policy.conditions[${index}].kind must be a known condition kind`);
@@ -309,6 +313,7 @@ export function assertValidEvaluateInput(value: unknown): asserts value is Evalu
   if (!isRecord(value.booking)) throw new Error("booking must be an object");
   if (!isNonEmptyString(value.booking.id)) throw new Error("booking.id must be a non-empty string");
   if (!isNonEmptyString(value.booking.businessId)) throw new Error("booking.businessId must be a non-empty string");
+  if (!isNonEmptyString(value.booking.status)) throw new Error("booking.status must be a non-empty string");
   if (!isNonEmptyString(value.booking.eventName)) throw new Error("booking.eventName must be a non-empty string");
   for (const field of ["startAt", "endAt"] as const) {
     const entry: unknown = value.booking[field];
