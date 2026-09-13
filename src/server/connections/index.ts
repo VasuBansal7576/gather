@@ -9,8 +9,8 @@ export {
   ConnectionService,
   type ConnectionServiceDeps,
 } from "./service.ts";
-export { EnvSecretStore, KeychainSecretStore, MemorySecretStore } from "./secrets.ts";
-export { FetchOAuthTransport } from "./oauth.ts";
+export { EnvSecretStore, KeychainSecretStore, MemorySecretStore, type KeychainRunner } from "./secrets.ts";
+export { FetchOAuthTransport, type FetchImpl } from "./oauth.ts";
 export {
   ConnectionError,
   type AuthorizationCompleteDTO,
