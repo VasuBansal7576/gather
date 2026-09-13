@@ -31,6 +31,36 @@ A provisional hold is not a confirmed or paid booking. Track partial failures an
 
 ## Status
 
-The local application milestone is runnable with the owner workspace, deterministic demo connectors, server-only SQLite persistence, and local doctor/launcher scripts.
-Demo connectors are fixtures only, and no live provider integration, isolated OpenClaw adapter, or hosted deployment is claimed yet.
+The usable local subset includes guided demo setup, the owner workspace, exact proposal approval, separate simulated hold and email receipts, and SQLite persistence across restarts.
+Google adapter code and an isolated OpenClaw control-plane adapter exist, but real connected-app actions and model execution have not been verified.
+The isolated Gateway doctor has an unresolved intermittent startup timeout; it is separate from the demo launch below.
+There is no verified real-model, three-app booking journey or hosted deployment.
 See [docs/PROGRESS.md](docs/PROGRESS.md) for the evidence-backed acceptance checklist and pending gates.
+
+## Run the local demo
+
+Use Node.js 26 or newer and run these commands from the repository root.
+Run `npm ci` once if dependencies are missing.
+
+```sh
+mkdir -p .runtime
+node scripts/gather-doctor.mjs
+npm run build
+GATHER_DATABASE_PATH=.runtime/owner-demo.sqlite npm run start -- --hostname 127.0.0.1 --port 3000
+```
+
+Open [Gather setup locally](http://127.0.0.1:3000/setup) and keep the terminal running.
+This uses a separate local demo database and preserves it on restart.
+If port 3000 is occupied, choose another port in the command and browser address.
+The demo needs no Google credentials, model provider, or OpenClaw process.
+For development and launcher options, see [local setup](docs/LOCAL_SETUP.md).
+
+## Two-minute demonstration
+
+1. Choose **Try demo** and enter the workspace with the explicitly fictional venue.
+2. Open **Today**, then the Clara booking, and inspect its proposed offer and approval request.
+3. Approve the proposal and show the separate simulated calendar hold and offer email results.
+4. Explain that the booking remains provisional: a sent offer and a hold do not establish payment, customer acceptance, or delivery readiness.
+
+The local UI, approval records, and persistence run for real; the demo's business data and external effects are simulated.
+Connected-app onboarding, proactive model operation, verified payments/resources, and the complete owner journey remain work in progress.
