@@ -125,3 +125,18 @@ The styling is scoped under `.gather-app-shell` so the host application can moun
 ## Local checks
 
 `src/components/gather/state.ts` holds the pure selection, pending-approval, and recovery-routing helpers; `src/components/gather/state.test.ts` covers them and runs with `node --experimental-strip-types --test src/components/gather/state.test.ts` until the shared test script picks it up.
+
+## Delivery readiness route (later integration hook)
+
+`app/bookings/[bookingId]/delivery` renders confirmation readiness, guarded
+confirmation, per-step receipts, and the operational handoff for one booking
+against the actual readiness/confirm/handoff endpoints
+(`src/delivery-owner/` client with strict response validation). It is
+deliberately outside the shared workspace nav: hosts link to it via
+`deliveryRouteForBooking(bookingId)` from `src/delivery-owner/state.ts`.
+Confirm posts only the exact displayed action/version/fingerprint plus a
+fresh idempotency key and stays disabled until readiness is live-ready;
+handoff previews label unpersisted revisions explicitly, and recording
+requires an explicit owner action. All fixture data encountered here is
+labeled DEMO ONLY; no paid state is editable and no provider proofs are
+fabricated.
