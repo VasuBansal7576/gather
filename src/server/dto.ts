@@ -131,6 +131,8 @@ export interface ErrorDTO {
     | "RECONCILE_PENDING"
     | "CROSS_ORIGIN_DENIED"
     | "EXECUTION_FAILED"
+    | "DENIED"
+    | "BUSY"
     | "UNCERTAIN";
   message: string;
   retryable: boolean;
