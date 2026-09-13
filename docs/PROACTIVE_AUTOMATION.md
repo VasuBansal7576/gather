@@ -10,11 +10,19 @@ binding, replaced on refresh, cleared on remove/stop/degrade.
 
 Each timer tick runs exactly one guarded cycle for its account: the
 injected sweep body only (normally intake sweep + due-work drain via
-`startProactiveAccount`). Overlapping ticks skip and count instead of
-running concurrently. Repeated sweep failures degrade the binding
+`startProactiveAccount`). Overlap protection is a shared per-account
+latch: overlapping ticks skip and count instead of running concurrently,
+a refresh during an in-flight sweep keeps the latch (the fresh binding
+waits, then sweeps normally — it can never wedge), and a prior sweep's
+completion releases the shared latch without writing stale counters onto
+the new record. Repeated sweep failures degrade the binding
 explicitly — timer stopped, status `degraded` with the last error —
 instead of retrying silently forever; re-register to resume. `stop` clears
-the timer and drains any in-flight sweep (bounded).
+the timer and awaits the in-flight sweep on a real elapsed-time deadline
+(default 30 s, never the injectable business clock); the returned state
+honestly reports `inFlight` when the sweep did not drain in time, and a
+sweep finishing after stop/revoke/refresh writes nothing (epoch-guarded)
+— no late counters, no clobbered revocation error, no resurrected status.
 
 The scheduler never sends, approves, holds, or links anything: pause/cancel
 and commercial approval gates stay enforced inside the existing intake and
@@ -57,12 +65,14 @@ Also exported: `registerProactiveBinding` (raw sweep callbacks),
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/api/operator/automation/status[?accountId]` | Real binding state; unwired accounts report intake-not-configured, never a fabricated schedule. |
+| `GET` | `/api/operator/automation/status[?accountId]` | Real binding state, scoped to wired operator-deps accounts (`listProactiveBindingsForAccounts`) — the proactive registry is separate, and unwired/foreign entries never appear. |
 | `POST` | `/api/operator/automation/sweep` | One guarded manual cycle for the resolved binding. |
 | `POST` | `/api/operator/retry` | `{ messageId, accountId? }`: re-arms exactly one validated dead-lettered message under the binding's business; unregistered accounts refused. |
 
-`operator.health` keeps its static scheduler field (per-deps snapshot);
-the automation status route is the live source for registration truth.
+`operator.health` reports the real per-account binding state
+(`registered` + `running`/`stopped`/`degraded`, or `pending-registration`
+when unwired) — the automation status route and health agree on the same
+source of truth.
 
 ## Limits
 

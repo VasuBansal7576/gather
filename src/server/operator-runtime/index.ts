@@ -22,6 +22,7 @@ export {
   MIN_SWEEP_INTERVAL_MS,
   getProactiveBinding,
   listProactiveBindings,
+  listProactiveBindingsForAccounts,
   noteProactiveRevocation,
   registerProactiveBinding,
   removeProactiveBinding,
