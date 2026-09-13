@@ -127,8 +127,32 @@ export function createDeliveryApi(fetchImpl: DeliveryFetch): DeliveryApi {
         const booking = record.booking as Record<string, unknown> | undefined;
         if (!booking || booking.id !== bookingId) continue;
         const proposals = Array.isArray(record.proposals) ? record.proposals : [];
-        const last = proposals.length > 0 ? proposals[proposals.length - 1] : undefined;
-        const action = (last as Record<string, unknown> | undefined)?.action as Record<string, unknown> | undefined;
+        // Authoritative current-proposal selection (K 4402f67): the host
+        // exposes the durable pointer as `currentProposedActionId`. Select
+        // exactly that action id — never proposals.at(-1), never max
+        // version. A pointer naming no listed proposal fails closed to no
+        // identity (never a wrong proposal). Absent pointers are pre-pointer
+        // payloads from servers predating the integration: legacy
+        // last-position fallback applies only then.
+        const hasPointerField = Object.hasOwn(record, "currentProposedActionId");
+        const pointer = typeof record.currentProposedActionId === "string" && record.currentProposedActionId.length > 0
+          ? record.currentProposedActionId
+          : undefined;
+        let selected: unknown;
+        if (pointer !== undefined) {
+          selected = proposals.find((entry) => {
+            if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return false;
+            const candidate = (entry as Record<string, unknown>).action as Record<string, unknown> | undefined;
+            return typeof candidate?.id === "string" && candidate.id === pointer;
+          });
+        } else if (hasPointerField) {
+          // Pointer field present but malformed (wrong type/empty): fail
+          // closed rather than guessing at(-1) or max version.
+          selected = undefined;
+        } else {
+          selected = proposals.length > 0 ? proposals[proposals.length - 1] : undefined;
+        }
+        const action = (selected as Record<string, unknown> | undefined)?.action as Record<string, unknown> | undefined;
         let identity: ProposalIdentity | undefined;
         if (action && typeof action.id === "string" && typeof action.proposalVersion === "number" && typeof action.proposalFingerprint === "string" && typeof action.kind === "string") {
           identity = { proposedActionId: action.id, proposalVersion: action.proposalVersion, proposalFingerprint: action.proposalFingerprint, kind: action.kind };

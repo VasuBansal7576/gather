@@ -140,3 +140,17 @@ handoff previews label unpersisted revisions explicitly, and recording
 requires an explicit owner action. All fixture data encountered here is
 labeled DEMO ONLY; no paid state is editable and no provider proofs are
 fabricated.
+
+The displayed proposal is the host's durable current pointer
+(`currentProposedActionId` on the workspace booking record): the delivery
+client selects exactly that action id — never `proposals.at(-1)`, never
+max version. A pointer naming no listed proposal (or a malformed pointer)
+fails closed to "no current proposal" instead of confirming the wrong one;
+pointer-less payloads from pre-pointer servers keep the legacy last-position
+fallback until integration supplies the pointer. Page lifecycle is guarded
+by `src/delivery-owner/page-lifecycle.ts`: load generation is separate from
+each operation lifecycle and every commit is booking-scoped, so a
+post-confirm reload settles busy instead of wedging it, the command result
+survives refresh while the exact proposal is current (cleared on
+booking/proposal change), and stale reload/navigation/unmount/concurrent
+commits never mutate the current booking.

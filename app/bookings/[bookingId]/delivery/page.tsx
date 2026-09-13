@@ -18,7 +18,8 @@ import {
   type ReadinessResponse,
   type StepReceipt,
 } from "../../../../src/delivery-owner/api.ts";
-import { canAttemptConfirm, RequestEpoch } from "../../../../src/delivery-owner/state.ts";
+import { canAttemptConfirm } from "../../../../src/delivery-owner/state.ts";
+import { DeliveryPageLifecycle, proposalKey } from "../../../../src/delivery-owner/page-lifecycle.ts";
 
 type LoadState =
   | { kind: "idle" | "loading" }
@@ -36,7 +37,10 @@ export default function DeliveryPage({ params }: { params: Promise<{ bookingId: 
   const { bookingId } = React.use(params);
   const fetchImpl: DeliveryFetch = useMemo(() => (input, init) => fetch(input, init), []);
   const api = useMemo(() => createDeliveryApi(fetchImpl), [fetchImpl]);
-  const epoch = useRef(new RequestEpoch());
+  // Load generation is independent from each operation lifecycle; booking
+  // identity guards every commit so stale work for a previous booking,
+  // reload, or unmounted tree can never mutate the current view.
+  const lifecycle = useRef(new DeliveryPageLifecycle());
 
   const [state, setState] = useState<LoadState>({ kind: "idle" });
   const [readiness, setReadiness] = useState<ReadinessResponse | null>(null);
@@ -55,18 +59,20 @@ export default function DeliveryPage({ params }: { params: Promise<{ bookingId: 
   const [status, setStatus] = useState("");
 
   const load = useCallback(async () => {
-    const run = epoch.current.next();
+    const myBooking = bookingId;
+    const run = lifecycle.current.beginLoad(myBooking);
     setState({ kind: "loading" });
-    setConfirmResult(null);
-    setConfirmError(null);
+    // The command result/error survives refresh while the same exact
+    // proposal is current (cleared on booking/proposal change below), so a
+    // successful confirm stays visible after the post-confirm reload.
     // Each part loads independently: a readiness failure must not blank
     // the handoff preview, receipts, or confirm panel (and vice versa).
     const [readinessSettled, handoffSettled, contextSettled] = await Promise.allSettled([
-      api.getReadiness(bookingId),
-      api.getHandoff(bookingId),
-      api.getBookingContext(bookingId),
+      api.getReadiness(myBooking),
+      api.getHandoff(myBooking),
+      api.getBookingContext(myBooking),
     ]);
-    if (!epoch.current.isCurrent(run)) return;
+    if (!lifecycle.current.isLoadCurrent(myBooking, run)) return;
     if (readinessSettled.status === "fulfilled") {
       setReadiness(readinessSettled.value);
       setReadinessError({ kind: "ready" });
@@ -95,8 +101,41 @@ export default function DeliveryPage({ params }: { params: Promise<{ bookingId: 
   }, [api, bookingId]);
 
   useEffect(() => {
+    lifecycle.current.mount();
+    return () => {
+      lifecycle.current.unmount();
+    };
+  }, []);
+
+  useEffect(() => {
     void load();
   }, [load]);
+
+  // Booking navigation: drop operation UI tied to the previous booking and
+  // invalidate its in-flight commits. Runs on bookingId only, never on
+  // every refresh, so a same-booking reload preserves the command result.
+  useEffect(() => {
+    lifecycle.current.rebindBooking(bookingId);
+    setConfirmResult(null);
+    setConfirmError(null);
+    setStatus("");
+    setConfirmBusy(false);
+    setRecordBusy(false);
+  }, [bookingId]);
+
+  // A stored command result only addresses the exact proposal it ran
+  // against. When the current proposal identity moves (new version,
+  // fingerprint, or action), the old result/error is dropped so the next
+  // attempt runs fresh exact proposal/refusal checks.
+  const identityKey = proposalKey(identity);
+  const prevIdentityKeyRef = useRef(identityKey);
+  useEffect(() => {
+    if (prevIdentityKeyRef.current !== identityKey) {
+      prevIdentityKeyRef.current = identityKey;
+      setConfirmResult(null);
+      setConfirmError(null);
+    }
+  }, [identityKey]);
 
   const confirmKey = useMemo(() => {
     if (typeof crypto !== "undefined" && "randomUUID" in crypto) return crypto.randomUUID();
@@ -114,39 +153,46 @@ export default function DeliveryPage({ params }: { params: Promise<{ bookingId: 
 
   const onConfirm = async (): Promise<void> => {
     if (!identity || !permitted) return;
-    const run = epoch.current.next();
+    const myBooking = bookingId;
+    const myIdentity = identity;
+    const myKey = confirmKey;
+    const run = lifecycle.current.beginConfirm(myBooking);
     setConfirmBusy(true);
     setConfirmError(null);
     try {
-      const result = await api.confirmBooking(bookingId, identity, confirmKey);
-      if (!epoch.current.isCurrent(run)) return;
+      const result = await api.confirmBooking(myBooking, myIdentity, myKey);
+      if (!lifecycle.current.isConfirmCurrent(myBooking, run)) return;
       setConfirmResult(result);
       setStatus(result.confirmedBooking ? "Booking confirmed." : "Confirmation refused — review the decision.");
+      // Refresh on the operation's own lifecycle: load() carries a separate
+      // load generation, so this await can no longer invalidate the
+      // finally below (the shared-epoch wedge this fixes).
       await load();
     } catch (error) {
-      if (!epoch.current.isCurrent(run)) return;
+      if (!lifecycle.current.isConfirmCurrent(myBooking, run)) return;
       const apiError = error instanceof DeliveryApiError ? error.apiError : { code: "UNKNOWN", message: "Confirmation did not complete.", retryable: true };
       setConfirmError(`${apiError.code}: ${apiError.message}`);
     } finally {
-      if (epoch.current.isCurrent(run)) setConfirmBusy(false);
+      if (lifecycle.current.isConfirmCurrent(myBooking, run)) setConfirmBusy(false);
     }
   };
 
   const onRecordHandoff = async (): Promise<void> => {
-    const run = epoch.current.next();
+    const myBooking = bookingId;
+    const run = lifecycle.current.beginRecord(myBooking);
     setRecordBusy(true);
     try {
-      const response = await api.recordHandoff(bookingId);
-      if (!epoch.current.isCurrent(run)) return;
+      const response = await api.recordHandoff(myBooking);
+      if (!lifecycle.current.isRecordCurrent(myBooking, run)) return;
       setHandoff(response);
       setStatus(response.revision === null ? "Handoff evaluated but not recorded." : `Handoff recorded as revision ${response.revision}.`);
       await load();
     } catch (error) {
-      if (!epoch.current.isCurrent(run)) return;
+      if (!lifecycle.current.isRecordCurrent(myBooking, run)) return;
       const apiError = error instanceof DeliveryApiError ? error.apiError : { code: "UNKNOWN", message: "Handoff could not be recorded.", retryable: true };
       setStatus(`${apiError.code}: ${apiError.message}`);
     } finally {
-      if (epoch.current.isCurrent(run)) setRecordBusy(false);
+      if (lifecycle.current.isRecordCurrent(myBooking, run)) setRecordBusy(false);
     }
   };
 
