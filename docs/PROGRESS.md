@@ -111,7 +111,7 @@ No credentials, personal OpenClaw configuration or data, provider actions, custo
 
 ## Workspace cleanup and dependency findings
 
-Thirty-two completed review, failed-launch, runtime, dependency-maintenance, knowledge, delivery-evaluator, owner-workspace, setup, connection-service, backup, confirmation-service, commercial, extraction-backend, conflict-resolution, proactive-monitoring, and inherited milestone worktrees were removed after checking clean tracked state and active worker ownership.
+Thirty-six completed review, failed-launch, runtime, dependency-maintenance, knowledge, delivery-evaluator, owner-workspace, setup, connection-service, backup, confirmation-service, commercial, extraction-backend, conflict-resolution, proactive-monitoring, and inherited milestone worktrees were removed after checking clean tracked state and active worker ownership.
 Original foundation, interface, connector-contract, and packaging commits remain preserved by local branch references; integrated review commits remain reachable on remote main.
 The completed knowledge commit is additionally preserved at `archive/gather-business-knowledge-640f57b`; its successor worker uses a separate business-operator worktree.
 The completed delivery evaluator is preserved at `archive/gather-delivery-readiness-e626000`; its successor uses a separate booking-delivery worktree.
@@ -281,6 +281,20 @@ The implementation worker verified a real isolated fictional Keychain entry thro
 The host worker then reported two successful existing-credential reads through Gather's application service in a separate process.
 That check did not force Google token expiry, disconnect an account, or prove token use through an HTTP request to the running host.
 Astra separately verified that the restarted host preserved all three connections and reported intake as unconfigured while background polling was disabled.
-A lifecycle-refresh correction for that temporary pause remains under review.
+The host worker subsequently verified three existing-credential reads, one real Google OAuth refresh, and three post-refresh reads without prompts or security changes.
+A one-shot in-memory cache miss triggered that exchange with the real clock; natural token expiry was not the trigger.
+The lifecycle pause correction was integrated at `1a3bd81` after 12 integration tests and type checking passed.
+It prevents disabled refreshes from registering later businesses and stops all managed timers before awaiting any slow drain.
+
+The authorized fictional 12-person, GBP 600, September 18 inquiry was sent once to the designated test account itself.
+The execution worker verified the uploaded Drive policy against the original and created a separate Gather Test calendar; Astra independently verified its business binding through the running host.
+The actual Drive probe exposed a complete HTTP 206 response that the adapter incorrectly rejected as oversized.
+The bounded correction was integrated at `bf3be3c` after eight document tests, including a real loopback HTTP response, and type checking passed.
+
+Generated proposals did not originally match the exact-approval service contract.
+The correction was integrated at `877fa30` after 12 tests and type checking passed, including generated proposal, reviewable consequences, exact approval, and separate scripted hold and email receipts.
+Offer text uses venue-local times and does not promise automatic release or treat venue approval alone as confirmation.
+These component checks do not establish actual Google booking execution.
+An actual Luna preparation run against the designated sources is the next verification, and its proposal must remain unapproved for the owner's visible recording.
 There is no verified complete live inquiry-to-offer journey, confirmed booking, payment outcome, or operational handoff.
 The accepted local milestone count remains 14 of 17, and no whole-product completion percentage is established.
