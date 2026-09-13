@@ -543,6 +543,86 @@ test("re-register after the stuck watchdog keeps holding until the hung body set
   }
 });
 
+test("watchdog-interleaved held promotion resumes actual periodic work on one timer", async () => {
+  const old = deferred();
+  const ACCT = "auto-acct-watchdog-held";
+  try {
+    registerProactiveBinding({
+      accountId: ACCT, businessId: BUSINESS, runSweep: old.run, intervalMs: 30_000, maxSweepMs: 60,
+    });
+    const first = tickBinding(ACCT);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    let newRuns = 0;
+    const held = registerProactiveBinding({
+      accountId: ACCT, businessId: BUSINESS,
+      runSweep: async () => { newRuns += 1; },
+      intervalMs: 30_000,
+    });
+    assert.equal(held.status, "degraded", "held behind the still-running old body");
+    await new Promise((resolve) => setTimeout(resolve, 120)); // old watchdog fires on the held record
+    assert.equal(getProactiveBinding(ACCT)?.status, "degraded");
+    old.release();
+    await first;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(getProactiveBinding(ACCT)?.status, "running", "promoted on the observed settle");
+    // The actual next scheduled body must fire on the retained interval —
+    // status alone never proves scheduling resumed. The 30 s floor keeps
+    // this to one interval fire (the next would land at 60 s).
+    await new Promise((resolve) => setTimeout(resolve, 33_000));
+    const state = getProactiveBinding(ACCT);
+    assert.ok(newRuns >= 1, `expected the retained timer to fire the new body, ran ${newRuns}`);
+    assert.equal(newRuns, 1, "exactly one body per interval: the timer was retained, never duplicated");
+    assert.equal(state?.skippedOverlaps, 0, "no overlapping twin timer");
+    assert.equal(state?.status, "running");
+  } finally {
+    old.release();
+    resetProactiveAutomation();
+  }
+});
+
+test("stop while held is never resurrected by the late settle", async () => {
+  const old = deferred();
+  const ACCT = "auto-acct-stop-held";
+  try {
+    registerProactiveBinding({ accountId: ACCT, businessId: BUSINESS, runSweep: old.run, intervalMs: 60_000 });
+    const first = tickBinding(ACCT);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    registerProactiveBinding({ accountId: ACCT, businessId: BUSINESS, runSweep: async () => {}, intervalMs: 60_000 });
+    const stopped = await stopProactiveAccount(ACCT, 20);
+    assert.equal(stopped?.status, "stopped");
+    old.release();
+    await first;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(getProactiveBinding(ACCT)?.status, "stopped", "late settle must not revive a stopped binding");
+    assert.equal((await tickBinding(ACCT)).ok, false);
+  } finally {
+    old.release();
+    resetProactiveAutomation();
+  }
+});
+
+test("revoke while held is never resurrected and keeps its error", async () => {
+  const old = deferred();
+  const ACCT = "auto-acct-revoke-held";
+  try {
+    registerProactiveBinding({ accountId: ACCT, businessId: BUSINESS, runSweep: old.run, intervalMs: 60_000 });
+    const first = tickBinding(ACCT);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    registerProactiveBinding({ accountId: ACCT, businessId: BUSINESS, runSweep: async () => {}, intervalMs: 60_000 });
+    noteProactiveRevocation(ACCT, "credential revoked while held");
+    old.release();
+    await first;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const after = getProactiveBinding(ACCT);
+    assert.equal(after?.status, "degraded", "late settle must not revive a revoked binding");
+    assert.match(after?.lastError ?? "", /credential revoked while held/);
+    assert.equal((await tickBinding(ACCT)).ok, false);
+  } finally {
+    old.release();
+    resetProactiveAutomation();
+  }
+});
+
 test("remove during an unsettled sweep keeps business ownership: cross-business rebind rejected until settle", async () => {
   const slow = deferred();
   try {

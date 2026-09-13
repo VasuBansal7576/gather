@@ -25,7 +25,12 @@ cross-business re-register while the old body is unsettled is rejected
 until it settles; an idle remove releases the cell immediately. A body
 that never settles is declared explicitly stuck (degraded with the reason
 kept, timer stopped, ownership and tombstone retained — no forced new
-body). Repeated sweep failures degrade the binding
+body). A held record keeps its own timer through the old body's stuck
+declaration (it never ran, so there is nothing to stop): the observed
+settle promotes it onto that retained timer, so periodic work actually
+resumes with no duplicate — never `running` with no timer. `stop` and
+revocation clear the timer and disarm the held flag, so a late settle can
+never resurrect them. Repeated sweep failures degrade the binding
 explicitly — timer stopped, status `degraded` with the last error —
 instead of retrying silently forever; re-register to resume. `stop` clears
 the timer and awaits the in-flight sweep on a real elapsed-time deadline

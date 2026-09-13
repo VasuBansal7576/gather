@@ -329,7 +329,12 @@ export async function tickBinding(accountId: string): Promise<ProactiveSweepResu
       target.lastRunAt = nowIso(target);
       target.lastOk = false;
       target.lastError = `sweep body did not settle within ${record.maxSweepMs}ms; treated as stuck (ownership retained, re-register to resume)`;
-      if (target.timer !== undefined) {
+      // A record held behind the stuck body keeps its own timer: it never
+      // ran, so there is nothing to stop, and clearing it would wedge the
+      // settle promotion into running-with-no-timer. The promotion runs on
+      // the retained live timer, resuming actual periodic work with no
+      // duplicate; stop/remove/revoke still clear it on their own paths.
+      if (target.timer !== undefined && !target.heldForPriorSweep) {
         clearInterval(target.timer);
         target.timer = undefined;
       }
