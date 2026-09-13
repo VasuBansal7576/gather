@@ -15,7 +15,7 @@ import type {
   ProposalSource,
   WorkspaceView,
 } from './types';
-import { isApprovalInFlight, receiptRecoveryKind, resolveSelectedBookingId } from './state';
+import { isApprovalInFlight, proposalApprovalComplete, receiptRecoveryKind, resolveSelectedBookingId } from './state';
 import { DEMO_BOOKINGS, DEMO_CONNECTIONS } from './demo-data';
 import './GatherWorkspace.css';
 
@@ -422,8 +422,12 @@ function ProposalPanel({
           {proposal.consequences.map((consequence) => <li key={consequence}>{consequence}</li>)}
         </ul>
         <p className="gather-scope-identity">
-          Approves proposal <strong>{proposal.id}</strong> · version <strong>{proposal.version}</strong> · fingerprint <code>{proposal.fingerprint}</code>
+          Approval applies to exactly this version — <strong>v{proposal.version}</strong> — never a newer one.
         </p>
+        <details className="gather-technical-details">
+          <summary>Technical identifiers</summary>
+          <p>Proposal <strong>{proposal.id}</strong> · version <strong>{proposal.version}</strong> · fingerprint <code>{proposal.fingerprint}</code></p>
+        </details>
       </div>
       {proposal.emailPreview ? (
         <div className="gather-email-preview">
@@ -442,6 +446,7 @@ function ProposalPanel({
 function ApprovalFooter({
   approvalPending,
   approvalFailed,
+  approvalComplete,
   canApprove,
   canEdit,
   onApprove,
@@ -449,35 +454,39 @@ function ApprovalFooter({
 }: {
   approvalPending: boolean;
   approvalFailed: boolean;
+  /** True only when every receipt scoped to this exact action/version succeeded. */
+  approvalComplete: boolean;
   canApprove: boolean;
   canEdit: boolean;
   onApprove: () => void;
   onEdit: () => void;
 }) {
-  const approveDisabled = approvalPending || !canApprove;
+  const approveDisabled = approvalPending || approvalComplete || !canApprove;
   return (
     <div className="gather-review-footer">
       <div className="gather-review-actions">
         <button
           type="button"
-          className="gather-approve-button"
+          className={`gather-approve-button ${approvalComplete ? 'is-complete' : ''}`}
           disabled={approveDisabled}
           aria-disabled={approveDisabled}
-          title={canApprove ? undefined : 'Approval is not available in this workspace yet'}
+          title={approvalComplete ? 'This exact proposal version is already approved — receipts for each step are shown above' : canApprove ? undefined : 'Approval is not available in this workspace yet'}
           onClick={onApprove}
         >
-          <Icon name={approvalPending ? 'clock' : approvalFailed ? 'refresh' : 'send'} size={16} />{approvalPending ? 'Approval sent — waiting' : approvalFailed ? 'Try approval again' : 'Approve proposal'}
+          <Icon name={approvalComplete ? 'check' : approvalPending ? 'clock' : approvalFailed ? 'refresh' : 'send'} size={16} />{approvalComplete ? 'Proposal approved' : approvalPending ? 'Approval sent — waiting' : approvalFailed ? 'Try approval again' : 'Approve proposal'}
         </button>
         <button type="button" className="gather-secondary-button" disabled={!canEdit} aria-disabled={!canEdit} title={canEdit ? undefined : 'Editing is not available in this workspace yet'} onClick={onEdit}><Icon name="edit" size={15} />Edit offer</button>
       </div>
       <p className={`gather-action-note ${approvalFailed ? 'is-error' : ''}`} role={approvalFailed ? 'alert' : 'status'}>
-        {approvalFailed
-          ? 'The approval request did not go through. Nothing was sent — you can try again.'
-          : approvalPending
-            ? 'The approval request is on its way. This is not confirmed.'
-            : canApprove
-              ? 'A sent request is not a hold, and a hold is not a confirmed booking.'
-              : 'Approval and editing are not available in this workspace yet.'}
+        {approvalComplete
+          ? 'Approved — each step\'s outcome is in the receipts above. A hold is not a confirmed booking.'
+          : approvalFailed
+            ? 'The approval request did not go through. Nothing was sent — you can try again.'
+            : approvalPending
+              ? 'The approval request is on its way. This is not confirmed.'
+              : canApprove
+                ? 'A sent request is not a hold, and a hold is not a confirmed booking.'
+                : 'Approval and editing are not available in this workspace yet.'}
       </p>
     </div>
   );
@@ -674,6 +683,7 @@ function BookingDetailPanel({
   const waiting = booking.status === 'waiting' || booking.status === 'hold-pending';
   const waitingReason = booking.detail.waitingReason;
   const proposal = booking.detail.proposal;
+  const approvalComplete = proposalApprovalComplete(proposal, booking.detail.receipts);
   return (
     <div className="gather-booking-detail">
       <div className="gather-review-top">
@@ -721,6 +731,7 @@ function BookingDetailPanel({
       <ApprovalFooter
         approvalPending={approvalPending}
         approvalFailed={approvalFailed}
+        approvalComplete={approvalComplete}
         canApprove={canApprove}
         canEdit={canEdit}
         onApprove={() => onApprove(booking)}
@@ -735,21 +746,22 @@ function TodayView({
   connectedSourceCount,
   showDemoData,
   selectedBooking,
-  onSelect,
+  onOpen,
   onNavigate,
 }: {
   bookings: BookingSummary[];
   connectedSourceCount: number;
   showDemoData: boolean;
   selectedBooking?: BookingSummary;
-  onSelect: (booking: BookingSummary) => void;
+  /** Opens the booking's detail — navigates to the bookings view (mobile detail on narrow screens). */
+  onOpen: (booking: BookingSummary) => void;
   onNavigate: (view: WorkspaceView) => void;
 }) {
   const reviewCount = bookings.filter((booking) => booking.status === 'needs-review' || booking.status === 'proposal-ready').length;
   const nextBooking = bookings.find((booking) => booking.status === 'needs-review' || booking.status === 'proposal-ready');
   return (
     <>
-      <PageIntro eyebrow="Your day, your way" title="Good morning, Taylor" description={`${formatToday()} · a little room to breathe before the next service.`}>
+      <PageIntro eyebrow="Your day, your way" title="Welcome back" description={`${formatToday()} · a little room to breathe before the next service.`}>
         {showDemoData ? <DemoLabel /> : null}
       </PageIntro>
       <div className="gather-briefing-grid">
@@ -759,7 +771,7 @@ function TodayView({
       </div>
       <div className="gather-section-heading"><div><span className="gather-eyebrow">Your queue</span><h2>Bookings worth a look</h2></div><button type="button" className="gather-text-button" onClick={() => onNavigate('bookings')}>View all <Icon name="arrow-up-right" size={14} /></button></div>
       <div className="gather-home-bookings">
-        {bookings.slice(0, 3).map((booking) => <BookingRow booking={booking} selected={selectedBooking?.id === booking.id} onSelect={onSelect} key={booking.id} />)}
+        {bookings.slice(0, 3).map((booking) => <BookingRow booking={booking} selected={selectedBooking?.id === booking.id} onSelect={onOpen} key={booking.id} />)}
         {bookings.length === 0 ? <EmptyState title="Your queue is quiet" description="New inquiries and proposals will appear here when your connected sources have something for you." actionLabel="Review connections" onAction={() => onNavigate('connections')} /> : null}
       </div>
       <div className="gather-quiet-note"><Icon name="leaf" size={16} /><span><strong>Gather is keeping the details warm.</strong> You stay in charge of every consequential step.</span></div>
@@ -791,6 +803,8 @@ function BookingsView({
   onReviewConnections,
   onRetryAction,
   onReconcileExecution,
+  mobileDetail,
+  onMobileDetailChange,
 }: {
   bookings: BookingSummary[];
   showDemoData: boolean;
@@ -807,9 +821,11 @@ function BookingsView({
   onReviewConnections: () => void;
   onRetryAction?: (bookingId: string, actionId: string) => void;
   onReconcileExecution?: (bookingId: string, executionId: string) => void;
+  /** Whether narrow screens show the detail pane (lifted so Today can open detail directly). */
+  mobileDetail: boolean;
+  onMobileDetailChange: (open: boolean) => void;
 }) {
-  const [mobileDetail, setMobileDetail] = useState(false);
-  const handleSelect = (booking: BookingSummary) => { onSelect(booking); setMobileDetail(true); };
+  const handleSelect = (booking: BookingSummary) => { onSelect(booking); onMobileDetailChange(true); };
   const selectedIndex = selectedBooking ? bookings.findIndex((booking) => booking.id === selectedBooking.id) : -1;
   const step = (offset: number) => {
     const next = bookings[selectedIndex + offset];
@@ -844,7 +860,7 @@ function BookingsView({
             onReconcileExecution={onReconcileExecution}
             onPrev={selectedIndex > 0 ? () => step(-1) : undefined}
             onNext={selectedIndex >= 0 && selectedIndex < bookings.length - 1 ? () => step(1) : undefined}
-            onBack={() => setMobileDetail(false)}
+            onBack={() => onMobileDetailChange(false)}
           />
           <BookingMeta booking={selectedBooking} />
         </>
@@ -893,6 +909,7 @@ export function GatherWorkspace({
     ? dataMode === 'demo'
     : bookingsProp === undefined || connectionsProp === undefined;
   const [activeView, setActiveView] = useState<WorkspaceView>(initialView);
+  const [mobileDetail, setMobileDetail] = useState(false);
   const [selectedBookingId, setSelectedBookingId] = useState<string>();
   // Local approval lifecycle per proposal fingerprint: 'sending' is a
   // synchronous duplicate-click guard that lasts until the host acknowledges
@@ -933,6 +950,14 @@ export function GatherWorkspace({
 
   const navigate = (view: WorkspaceView) => { setActiveView(view); onNavigate?.(view); };
   const selectBooking = (booking: BookingSummary) => { setSelectedBookingId(booking.id); onSelectBooking?.(booking.id); };
+  // A Today-row tap opens the booking's detail — navigate to the bookings
+  // view and (on narrow screens) straight into the detail pane.
+  const openBooking = (booking: BookingSummary) => {
+    selectBooking(booking);
+    setActiveView('bookings');
+    setMobileDetail(true);
+    onNavigate?.('bookings');
+  };
   const approveProposal = (booking: BookingSummary) => {
     const identity = proposalIdentityOf(booking);
     const fingerprint = identity.proposalFingerprint;
@@ -980,8 +1005,8 @@ export function GatherWorkspace({
       {blockedState ? <BlockedNotice title={blockedState.title} description={blockedState.description} actionLabel={blockedState.actionLabel} onAction={onRetryBlockedAction} /> : null}
       {loading ? <LoadingState /> : <>
         {isDemoData && activeView !== 'bookings' ? <div className="gather-demo-ribbon"><DemoLabel /><span>Simulated records are shown here — nothing shown is real or confirmed.</span></div> : null}
-        {activeView === 'today' ? <TodayView bookings={bookings} connectedSourceCount={connections.filter((connection) => connection.connected).length} showDemoData={isDemoData} selectedBooking={selectedBooking} onSelect={selectBooking} onNavigate={navigate} /> : null}
-        {activeView === 'bookings' ? <BookingsView bookings={bookings} showDemoData={isDemoData} selectedBooking={selectedBooking} approvalPending={approvalPending} approvalFailed={approvalFailed} canApprove={onApproveProposal !== undefined} canEdit={onEditProposal !== undefined} canRetryBlocked={canRetryBlocked} onSelect={selectBooking} onApprove={approveProposal} onEdit={editProposal} onBlockedAction={retryBlocked} onReviewConnections={() => navigate('connections')} onRetryAction={retryAction} onReconcileExecution={reconcileExecution} /> : null}
+        {activeView === 'today' ? <TodayView bookings={bookings} connectedSourceCount={connections.filter((connection) => connection.connected).length} showDemoData={isDemoData} selectedBooking={selectedBooking} onOpen={openBooking} onNavigate={navigate} /> : null}
+        {activeView === 'bookings' ? <BookingsView bookings={bookings} showDemoData={isDemoData} selectedBooking={selectedBooking} approvalPending={approvalPending} approvalFailed={approvalFailed} canApprove={onApproveProposal !== undefined} canEdit={onEditProposal !== undefined} canRetryBlocked={canRetryBlocked} onSelect={selectBooking} onApprove={approveProposal} onEdit={editProposal} onBlockedAction={retryBlocked} onReviewConnections={() => navigate('connections')} onRetryAction={retryAction} onReconcileExecution={reconcileExecution} mobileDetail={mobileDetail} onMobileDetailChange={setMobileDetail} /> : null}
         {activeView === 'connections' ? <ConnectionsView connections={connections} showDemoData={isDemoData} hostWired={onConnect !== undefined} onConnect={connect} /> : null}
       </>}
     </main>

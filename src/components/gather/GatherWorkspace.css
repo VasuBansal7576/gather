@@ -205,6 +205,13 @@
 .gather-email-preview-head small { flex: 0 0 52px; color: var(--gather-ink-faint); font-size: 10px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; padding-top: 2px; }
 .gather-email-preview-body { padding: 10px 12px; color: var(--gather-ink-muted); font-size: 12px; line-height: 1.55; white-space: pre-wrap; }
 .gather-source-unsupported { color: var(--gather-gold); }
+.gather-technical-details { margin-top: 8px; }
+.gather-technical-details summary { cursor: pointer; color: var(--gather-ink-faint); font-size: 11px; list-style: none; display: inline-flex; align-items: center; gap: 5px; }
+.gather-technical-details summary::before { content: '▸'; font-size: 9px; }
+.gather-technical-details[open] summary::before { content: '▾'; }
+.gather-technical-details summary:focus-visible { outline: 2px solid var(--gather-lavender); outline-offset: 2px; border-radius: 4px; }
+.gather-technical-details p { margin-top: 6px; color: var(--gather-ink-faint); font-size: 11px; line-height: 1.5; }
+.gather-technical-details code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; word-break: break-all; }
 .gather-message-card {
   display: flex; gap: 10px; margin-bottom: 22px;
   padding: 12px 14px; border: 1px solid var(--gather-border); border-radius: 10px;
@@ -290,6 +297,7 @@
 }
 .gather-approve-button:hover:not(:disabled) { background: var(--gather-lavender); }
 .gather-approve-button:disabled { background: #2c2c38; color: var(--gather-ink-faint); opacity: 1; box-shadow: none; }
+.gather-approve-button.is-complete { background: rgba(95, 184, 120, 0.16); color: var(--gather-sage); box-shadow: 0 0 0 1px rgba(95, 184, 120, 0.3); }
 .gather-approve-button:focus-visible { outline: 2px solid var(--gather-lavender); outline-offset: 2px; }
 .gather-secondary-button {
   display: inline-flex; align-items: center; gap: 7px;
@@ -425,10 +433,23 @@
   .gather-triage .gather-triage-meta { display: none; }
   .gather-triage.is-mobile-detail .gather-triage-list { display: none; }
   .gather-triage:not(.is-mobile-detail) .gather-booking-detail { display: none; }
+  /* overflow:hidden would create a non-scrolling clip context that breaks
+     the sticky footer; on narrow screens the document itself scrolls. */
+  .gather-booking-detail { overflow: visible; height: auto; }
   .gather-back-button { display: inline-flex; }
   .gather-review-top { padding: 10px 14px; }
   .gather-review-scroll { padding: 14px 16px 20px; }
-  .gather-review-footer { flex-wrap: wrap; padding: 12px 16px; }
+  /* Pinned action bar: sticks to the viewport bottom while its booking is on
+     screen, over a solid background, with safe-area padding. */
+  .gather-review-footer {
+    flex-wrap: wrap;
+    padding: 12px 16px;
+    padding-bottom: calc(12px + env(safe-area-inset-bottom, 0px));
+    position: sticky;
+    bottom: 0;
+    z-index: 5;
+    box-shadow: 0 -8px 18px rgba(11, 11, 14, 0.7);
+  }
   .gather-action-note { margin-left: 0; max-width: none; text-align: left; }
   .gather-main > * { padding: 14px 16px 32px; }
   .gather-briefing-grid { grid-template-columns: 1fr; }

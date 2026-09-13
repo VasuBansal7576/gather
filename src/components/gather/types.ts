@@ -131,6 +131,10 @@ export interface ActionReceipt {
   actionId: string;
   /** Host ActionExecution id — passed to onReconcileExecution when set. */
   executionId?: string;
+  /** Numeric proposal version this step executed for — scopes receipts to the exact displayed version. */
+  proposalVersion?: number;
+  /** Which consequential step this receipt reports on. */
+  step?: 'hold' | 'email';
   label: string;
   detail?: string;
   status: ActionReceiptStatus;

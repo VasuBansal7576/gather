@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   isApprovalInFlight,
+  proposalApprovalComplete,
   receiptRecoveryKind,
   resolveSelectedBookingId,
 } from "./state.ts";
@@ -65,6 +66,35 @@ test("receipt recovery routes retry vs reconcile honestly", () => {
   assert.equal(receiptRecoveryKind({ status: "succeeded", recoveryLabel: "Retry" }), undefined);
   assert.equal(receiptRecoveryKind({ status: "pending" }), undefined);
   assert.equal(receiptRecoveryKind({ status: "failed" }), undefined);
+});
+
+test("approval completes only when the exact version's receipts all succeed", () => {
+  const proposal = { id: "act-1", version: 2 };
+  // No receipts — nothing was approved.
+  assert.equal(proposalApprovalComplete(proposal, undefined), false);
+  assert.equal(proposalApprovalComplete(proposal, []), false);
+  // All steps for the exact action + version succeeded — approved.
+  assert.equal(proposalApprovalComplete(proposal, [
+    { id: "r1", actionId: "act-1", proposalVersion: 2, step: "hold", label: "Provisional hold", status: "succeeded" },
+    { id: "r2", actionId: "act-1", proposalVersion: 2, step: "email", label: "Offer email", status: "succeeded" },
+  ]), true);
+  // Succeeded receipts on an OLDER version do not complete the new proposal.
+  assert.equal(proposalApprovalComplete(proposal, [
+    { id: "r1", actionId: "act-1", proposalVersion: 1, step: "hold", label: "Provisional hold", status: "succeeded" },
+    { id: "r2", actionId: "act-1", proposalVersion: 1, step: "email", label: "Offer email", status: "succeeded" },
+  ]), false);
+  // Succeeded receipts on a different action never count.
+  assert.equal(proposalApprovalComplete(proposal, [
+    { id: "r1", actionId: "act-old", proposalVersion: 2, step: "hold", label: "Provisional hold", status: "succeeded" },
+  ]), false);
+  // Partial/uncertain/failed receipts keep the proposal un-approved so
+  // recovery paths stay visible.
+  for (const status of ["failed", "partial", "uncertain", "pending"] as const) {
+    assert.equal(proposalApprovalComplete(proposal, [
+      { id: "r1", actionId: "act-1", proposalVersion: 2, step: "hold", label: "Provisional hold", status: "succeeded" },
+      { id: "r2", actionId: "act-1", proposalVersion: 2, step: "email", label: "Offer email", status },
+    ]), false);
+  }
 });
 
 test("demo fixtures carry exact proposal identity for the approval contract", () => {
