@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { buildHandoff } from "../src/delivery/handoff.ts";
 import { evaluateReadiness } from "../src/delivery/readiness.ts";
+import { evaluateBookingReadiness } from "../src/delivery/verifiers.ts";
 import type { EvaluateReadinessInput } from "../src/delivery/contracts.ts";
 import type { SourceReference } from "../src/domain/contracts.ts";
 
@@ -181,4 +182,147 @@ test("booking/proposal window mismatch blocks evaluation and handoff", () => {
   const decision = evaluateReadiness(consistent);
   const moved = { ...consistent.booking, endAt: "2030-06-02T22:00:00.000Z" };
   assert.throws(() => buildHandoff({ decision, booking: moved, proposal: consistent.proposal }), /window differs/);
+});
+
+// Defect 6 (fix for R1): receipt dedupe must be order-independent — the
+// canonical snapshot is the latest observedAt, so an older redelivery can
+// never downgrade a fresh one; changed snapshots still fail closed.
+test("equivalent receipt redeliveries collapse to the latest observedAt regardless of order", () => {
+  const older = receipt("rcpt-1", "settled", 60000, { observedAt: "2020-01-01T00:00:00.000Z" });
+  const fresher = receipt("rcpt-1", "settled", 60000, { observedAt: "2030-05-01T11:00:00.000Z" });
+  const conditions = [
+    { kind: "deposit" as const, required: true, deposit: { requiredAmountCents: 50000, currency: "USD" }, maxAgeMs: 3_600_000 },
+  ];
+  const oldFirst = evaluateReadiness({ ...depositOnly([older, fresher]), policy: { businessId: "biz-1", conditions } });
+  const freshFirst = evaluateReadiness({ ...depositOnly([fresher, older]), policy: { businessId: "biz-1", conditions } });
+  assert.equal(oldFirst.conditions[0]?.status, "verified");
+  assert.equal(freshFirst.conditions[0]?.status, "verified");
+});
+
+// Defect 7 (fix for R2): an expired hold can never veto a fresh valid hold
+// covering the same window; expiry decides only when nothing usable remains.
+test("a valid hold verifies availability even alongside an expired hold", () => {
+  const input = baseInput([
+    {
+      resolver: "calendar_provider",
+      calendarId: "cal-1",
+      startAt: "2030-06-01T17:00:00.000Z",
+      endAt: "2030-06-01T23:00:00.000Z",
+      available: true,
+      holdId: "hold-expired",
+      holdValidUntil: "2030-05-01T11:00:00.000Z",
+      observedAt: "2030-05-01T11:55:00.000Z",
+      sourceRefs: [liveRef("cal://expired")],
+    },
+    {
+      resolver: "calendar_provider",
+      calendarId: "cal-1",
+      startAt: "2030-06-01T17:00:00.000Z",
+      endAt: "2030-06-01T23:00:00.000Z",
+      available: true,
+      holdId: "hold-valid",
+      holdValidUntil: "2030-05-01T13:00:00.000Z",
+      observedAt: "2030-05-01T11:55:00.000Z",
+      sourceRefs: [liveRef("cal://valid")],
+    },
+  ]);
+  input.policy.conditions = [{ kind: "availability", required: true }];
+  const decision = evaluateReadiness(input);
+  assert.equal(decision.conditions[0]?.status, "verified");
+
+  // All expired still goes stale.
+  const allExpired = baseInput([
+    {
+      resolver: "calendar_provider",
+      calendarId: "cal-1",
+      startAt: "2030-06-01T17:00:00.000Z",
+      endAt: "2030-06-01T23:00:00.000Z",
+      available: true,
+      holdId: "hold-expired",
+      holdValidUntil: "2030-05-01T11:00:00.000Z",
+      observedAt: "2030-05-01T11:55:00.000Z",
+      sourceRefs: [liveRef("cal://expired")],
+    },
+  ]);
+  allExpired.policy.conditions = [{ kind: "availability", required: true }];
+  assert.equal(evaluateReadiness(allExpired).conditions[0]?.status, "stale");
+});
+
+// Defect 8 (fix for R3): a window field present on only one side is a
+// partial binding — reject it rather than silently evaluating different
+// windows for availability vs handoff.
+test("partial booking/proposal windows are rejected before readiness or handoff", () => {
+  const input = baseInput([]);
+  input.booking.endAt = undefined;
+  input.booking.startAt = "2030-06-02T18:00:00.000Z";
+  assert.throws(() => evaluateReadiness(input), /startAt is present on only one side|window differs/);
+
+  // Payload-only endAt with booking endAt absent is also a partial binding.
+  const oneSidedEnd = baseInput([]);
+  oneSidedEnd.booking.endAt = undefined;
+  assert.throws(() => evaluateReadiness(oneSidedEnd), /endAt is present on only one side/);
+
+  // Fully absent booking window remains allowed (nothing to diverge from).
+  const absent = baseInput([]);
+  absent.booking.startAt = undefined;
+  absent.booking.endAt = undefined;
+  absent.proposal.payload = { ...absent.proposal.payload };
+  delete absent.proposal.payload.startAt;
+  delete absent.proposal.payload.endAt;
+  assert.doesNotThrow(() => evaluateReadiness(absent));
+});
+
+// Defect 9 (fix for R4): an expired record observed at/after the latest
+// covering commitment supersedes it; a commitment observed after the
+// expiry stands.
+test("expired resource evidence supersedes an older committed record deterministically", () => {
+  const stale = evaluateReadiness(resourcesOnly([
+    commitment("room-a", { observedAt: "2030-05-01T10:30:00.000Z" }),
+    commitment("room-a", { status: "expired", observedAt: "2030-05-01T11:30:00.000Z", sourceRefs: [liveRef("registry://expired")] }),
+  ]));
+  assert.equal(stale.conditions[0]?.status, "stale");
+
+  const renewed = evaluateReadiness(resourcesOnly([
+    commitment("room-a", { observedAt: "2030-05-01T11:30:00.000Z" }),
+    commitment("room-a", { status: "expired", observedAt: "2030-05-01T10:30:00.000Z", sourceRefs: [liveRef("registry://expired")] }),
+  ]));
+  assert.equal(renewed.conditions[0]?.status, "verified");
+});
+
+// Defect 10 (fix for R5): non-object evidence is rejected into
+// rejectedEvidence, never thrown — even through the host boundary.
+test("non-object evidence is rejected safely instead of throwing", async () => {
+  const decision = evaluateReadiness(depositOnly([null]));
+  assert.equal(decision.conditions[0]?.status, "missing");
+  assert.ok(decision.rejectedEvidence.some((entry) => entry.includes("not an object")));
+
+  const viaBoundary = await evaluateBookingReadiness({
+    nowIso: NOW,
+    businessId: "biz-1",
+    booking: depositOnly([]).booking,
+    proposal: depositOnly([]).proposal,
+    verifiers: {
+      loadPolicy: async () => depositOnly([]).policy,
+      fetchAcceptance: async () => [],
+      fetchDepositReceipts: async () => [null],
+      fetchAvailability: async () => [],
+      fetchResourceCommitments: async () => [],
+      fetchWaivers: async () => [],
+    },
+  });
+  assert.equal(viaBoundary.ready, false);
+  assert.ok(viaBoundary.rejectedEvidence.some((entry) => entry.includes("not an object")));
+});
+
+// Defect 11 (fix for R7/R8): fingerprint mismatches name the fingerprint,
+// and NaN guest counts never reach the handoff event.
+test("fingerprint mismatch diagnostics name the fingerprint; NaN guest count is dropped", () => {
+  const fpMismatch = evaluateReadiness(resourcesOnly([commitment("room-a", { proposalFingerprint: "fp-other" })]));
+  assert.ok(fpMismatch.rejectedEvidence.some((entry) => entry.includes("fingerprint fp-other")));
+
+  const input = baseInput([]);
+  input.booking.guestCount = Number.NaN;
+  const decision = evaluateReadiness(input);
+  const handoff = buildHandoff({ decision, booking: input.booking, proposal: input.proposal });
+  assert.equal(handoff.event.guestCount, undefined);
 });

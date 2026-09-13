@@ -279,7 +279,8 @@ function evaluateDeposit(ctx: EvalContext, cfg: ConditionConfig): ConditionResul
   }
   // Identity dedupe: repeated rows for the same receiptId are one receipt.
   // Snapshots that disagree on status, amount, currency, or refunds fail
-  // closed instead of summing twice.
+  // closed instead of summing twice; equivalent redeliveries collapse to the
+  // latest observedAt so freshness never depends on input ordering.
   const byReceipt = new Map<string, DepositReceipt[]>();
   for (const receipt of receipts) {
     const group = byReceipt.get(receipt.receiptId) ?? [];
@@ -300,7 +301,11 @@ function evaluateDeposit(ctx: EvalContext, cfg: ConditionConfig): ConditionResul
     if (divergent) {
       return { ...base, status: "conflicting", detail: `Conflicting ledger snapshots for receipt ${receiptId}; deposit cannot be verified until the ledger agrees`, evidence: snapshots.flatMap((snapshot) => snapshot.sourceRefs) };
     }
-    canonical.push(first);
+    canonical.push(
+      snapshots.reduce((latest, snapshot) =>
+        Date.parse(snapshot.observedAt) > Date.parse(latest.observedAt) ? snapshot : latest,
+      ),
+    );
   }
   const freshReceipts = canonical.filter((receipt) => fresh(receipt.observedAt, ctx.nowMs, cfg.maxAgeMs));
   if (freshReceipts.length === 0) {
@@ -360,14 +365,15 @@ function evaluateAvailability(ctx: EvalContext, cfg: ConditionConfig): Condition
   if (unavailable.length > 0) {
     return { ...base, status: "conflicting", detail: "Calendar provider reports the requested window unavailable", evidence: unavailable.flatMap((att) => att.sourceRefs) };
   }
-  const expiredHold = current.filter(
-    (att) => att.holdId && att.holdValidUntil && Date.parse(att.holdValidUntil) <= ctx.nowMs,
-  );
-  if (expiredHold.length > 0 && current.every((att) => att.holdId)) {
-    return { ...base, status: "stale", detail: "Provisional hold expired; availability must be rechecked and the hold renewed", evidence: expiredHold.flatMap((att) => att.sourceRefs) };
-  }
+  // A still-valid hold or hold-free attestation verifies; an expired hold can
+  // never veto fresher valid evidence for the same window. Only when no usable
+  // attestation remains does stale expiry evidence decide the verdict.
   const usable = current.filter((att) => att.available && (!att.holdId || !att.holdValidUntil || Date.parse(att.holdValidUntil) > ctx.nowMs));
   if (usable.length === 0) {
+    const expiredHold = current.filter((att) => att.holdId && att.holdValidUntil);
+    if (expiredHold.length > 0) {
+      return { ...base, status: "stale", detail: "Provisional hold expired; availability must be rechecked and the hold renewed", evidence: expiredHold.flatMap((att) => att.sourceRefs) };
+    }
     return { ...base, status: "stale", detail: "No usable current availability: holds expired", evidence: current.flatMap((att) => att.sourceRefs) };
   }
   const holdNote = usable.some((att) => att.holdId) ? " with a valid provisional hold" : " (availability only, no hold claimed)";
@@ -389,7 +395,9 @@ function evaluateResources(ctx: EvalContext, cfg: ConditionConfig): ConditionRes
       commit.proposalFingerprint !== ctx.input.proposal.proposalFingerprint
     ) {
       ctx.rejectedEvidence.push(
-        `rejected resource_registry output for ${commit.resourceId}: binds v${commit.proposalVersion}, accepted proposal is v${ctx.input.proposal.proposalVersion}`,
+        commit.proposalVersion !== ctx.input.proposal.proposalVersion
+          ? `rejected resource_registry output for ${commit.resourceId}: binds v${commit.proposalVersion}, accepted proposal is v${ctx.input.proposal.proposalVersion}`
+          : `rejected resource_registry output for ${commit.resourceId}: binds fingerprint ${commit.proposalFingerprint}, accepted proposal fingerprint is ${ctx.input.proposal.proposalFingerprint}`,
       );
     } else {
       bound.push(commit);
@@ -413,6 +421,14 @@ function evaluateResources(ctx: EvalContext, cfg: ConditionConfig): ConditionRes
     const bad = current.filter((commit) => commit.status === "rejected" || commit.status === "revoked");
     if (committed.length > 0 && bad.length > 0) {
       return { resourceId, status: "conflicting" as const, detail: "Conflicting commitment and rejection/revocation evidence" };
+    }
+    // Deterministic supersession: an expiry observed at or after the latest
+    // covering commitment ends the commitment — an older committed record can
+    // never outrank newer expiry evidence.
+    const latestCommittedAt = committed.reduce((latest, commit) => Math.max(latest, Date.parse(commit.observedAt)), -Infinity);
+    const expired = current.filter((commit) => commit.status === "expired" && Date.parse(commit.observedAt) >= latestCommittedAt);
+    if (expired.length > 0 && committed.length > 0) {
+      return { resourceId, status: "stale" as const, detail: "Commitment expired after the latest committed record; re-verify" };
     }
     if (committed.length > 0) {
       const responsible = committed.find((commit) => commit.responsible)?.responsible;
@@ -500,7 +516,11 @@ export function evaluateReadiness(raw: unknown): ReadinessDecision {
   };
 
   for (const item of input.evidence) {
-    const record = item as unknown as Record<string, unknown>;
+    if (!isRecord(item)) {
+      ctx.rejectedEvidence.push("rejected evidence item that is not an object; only well-formed trusted resolver outputs count");
+      continue;
+    }
+    const record: Record<string, unknown> = item;
     const resolver: unknown = record.resolver;
     if (resolver === "acceptance_record" || resolver === "deposit_ledger" || resolver === "calendar_provider" || resolver === "resource_registry") {
       const classified =

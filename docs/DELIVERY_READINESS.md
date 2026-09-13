@@ -45,31 +45,39 @@ const handoff = buildHandoff({ decision, booking, proposal });
   other-version-only records conflict.
 - **Deposit:** net settled receipts (amount minus refunds) in the required
   currency sum to the required amount (split payments supported). Receipts
-  dedupe by receiptId: identical redeliveries collapse to one, while
-  conflicting status/amount/refund snapshots for one id fail closed as
-  `conflicting`. Pending receipts do not verify;
+  dedupe by receiptId: equivalent redeliveries collapse to the snapshot
+  with the latest `observedAt` (freshness never depends on input order),
+  while conflicting status/amount/refund snapshots for one id fail closed
+  as `conflicting`. Pending receipts do not verify;
   rejected/refunded/revoked receipts are excluded; wrong currency
   conflicts; partial payment is `missing` with net paid-vs-required
   detail.
 - **Availability:** a current provider attestation must fully cover the
-  accepted window. Unknown windows are `missing`, old proofs and expired
-  holds are `stale`, unavailable slots conflict. A hold alone — without a
+  accepted window. A still-valid hold or hold-free current attestation
+  verifies; an expired hold can never veto fresher valid evidence for the
+  same window, so expiry decides only when no usable attestation remains.
+  Unknown windows are `missing`, old proofs and all-expired holds are
+  `stale`, unavailable slots conflict. A hold alone — without a
   current available attestation — never verifies.
 - **Resources:** every required resource needs an explicit, current
   `committed` status bound to the exact proposal version/fingerprint,
   whose start/end commitment window covers the event window. Stale
   revisions and short windows are rejected as evidence; `requested` is
   `missing`, expired evidence is `stale`, rejected/revoked evidence
-  conflicts, and committed-plus-revoked ambiguity conflicts.
+  conflicts, and committed-plus-revoked ambiguity conflicts. Expiry
+  evidence supersedes deterministically: an `expired` record observed at
+  or after the latest covering commitment ends it (`stale`), while a
+  commitment observed after the expiry stands.
 - **Window consistency:** the booking snapshot and accepted proposal must
   describe the same event window (availability reads the proposal, handoff
-  and lifecycle guards read the booking); mismatches throw instead of
-  averaging.
+  and lifecycle guards read the booking); the check is per-field — any
+  window field present on only one side, or present with divergent values,
+  throws instead of averaging.
 - **Trusted resolver boundary:** only `acceptance_record`,
   `deposit_ledger`, `calendar_provider`, `resource_registry`, and
-  `owner_authority` outputs count. Malformed shapes, unknown resolvers, and
-  arbitrary `verified: true` flags are rejected as evidence (listed in
-  `rejectedEvidence`), never verifying.
+  `owner_authority` outputs count. Malformed shapes, non-object items,
+  unknown resolvers, and arbitrary `verified: true` flags are rejected as
+  evidence (listed in `rejectedEvidence`), never verifying.
 - **Waivers:** only persisted waivers scoped to business, booking,
   condition, proposal version **and** fingerprint under an owner identity
   verify. Version alone never scopes a waiver.
@@ -93,11 +101,13 @@ or services are fabricated. Provenance travels with the handoff.
 - `tests/delivery.verifiers.test.ts` — 6 tests (host boundary: exact
   binding queries, hostile input rejection, cancelled/past blocks, net
   refunds, window coverage, fail-closed verifiers).
-- `tests/delivery.defects.test.ts` — 5 regression tests (duplicate
+- `tests/delivery.defects.test.ts` — 11 regression tests (duplicate
   receiptId collapse, conflicting snapshot fail-closed, resource
   revision/window binding, waiver fingerprint scope, window-mismatch
-  rejection).
-- Full suite: 88 tests pass; `npm run typecheck` clean (see commit).
+  rejection, order-independent redelivery freshness, expired-hold veto,
+  partial window binding, expiry supersession, non-object evidence
+  rejection, fingerprint diagnostics and NaN guest count).
+- Full suite: 94 tests pass; `npm run typecheck` clean (see commit).
   These are module tests with injected fakes; they do not establish live
   provider integration acceptance and do not prove live confirmation.
 
