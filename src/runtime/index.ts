@@ -6,9 +6,15 @@ export {
 export {
   buildGatewayConfig,
   writeGatewayConfig,
+  resolveModelConfig,
   GATHER_TOOL_DENY,
+  GATHER_SUPPORTED_MODELS,
+  ModelConfigError,
   type GatherGatewayConfigOptions,
   type GatherMcpServerRef,
+  type GatherModelSelection,
+  type GatherModelAuthProfile,
+  type ModelConfigErrorCode,
 } from "./config.ts";
 export {
   OpenClawGatewayProcess,
