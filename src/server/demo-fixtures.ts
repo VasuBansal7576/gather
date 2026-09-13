@@ -127,6 +127,7 @@ export function demoFixtureSlots(): CalendarSlot[] {
   return [
     {
       slotId: "demo-slot-2026-10-18",
+      calendarId: DEMO_CALENDAR_ID,
       startAt: "2026-10-18T00:00:00.000Z",
       endAt: "2026-10-19T00:00:00.000Z",
       available: true,
@@ -134,6 +135,7 @@ export function demoFixtureSlots(): CalendarSlot[] {
     },
     {
       slotId: "demo-slot-2026-10-23",
+      calendarId: DEMO_CALENDAR_ID,
       startAt: "2026-10-23T00:00:00.000Z",
       endAt: "2026-10-24T00:00:00.000Z",
       available: true,

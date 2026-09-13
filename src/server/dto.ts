@@ -128,6 +128,7 @@ export interface ErrorDTO {
     | "ACCESS_REVOKED"
     | "CONFLICT"
     | "RECONCILE_REQUIRED"
+    | "RECONCILE_PENDING"
     | "CROSS_ORIGIN_DENIED"
     | "EXECUTION_FAILED"
     | "UNCERTAIN";

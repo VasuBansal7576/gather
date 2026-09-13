@@ -77,15 +77,57 @@ payment/confirmation step.
   recovery survives adapter rebuilds. The demo adapter's in-memory world is
   volatile and is never the source of truth; simulation restart recovery
   proves SQLite durability, not a real external provider restart.
+- Hold windows are claimed atomically in SQLite (`provider_hold_intents` +
+  `provider_receipts` overlap check inside one IMMEDIATE transaction) before
+  the volatile adapter is touched, so a restarted process or a second booking
+  action cannot double-book the same calendar window; definitive failures
+  release the claim.
 - Failed steps reopen under the **same** idempotency key, so a real provider
   dedupes them.
+
+## Ordering and state rules
+
+- The executable payload is validated **before** any approval row is stored:
+  invalid, past-window, or unsupported-kind proposals gain no approval and no
+  executions. Past event windows (`endAt` at or before the server clock) are
+  rejected outright.
+- Only `kind: "create_provisional_hold"` is executable. Any other kind —
+  including `custom` with a hold-shaped payload — is rejected with
+  `INVALID_REQUEST` at the approve/retry boundary.
+- Availability is scoped to the proposal's `calendarId` (required end to
+  end: payload, availability request/key, and slot attribution) and must
+  fully cover the requested range. A repeat approval whose own hold already
+  succeeded skips the availability read and reuses receipts.
+- Booking status aggregates step uncertainty: any outstanding
+  `uncertain`/`partial` step keeps the booking `uncertain` (including an
+  uncertain email after a succeeded hold); reconciliation refreshes the
+  aggregate back to `provisional_hold` once nothing is uncertain.
 
 ## Errors
 
 Typed `{ code, message, retryable, demo: true }`. Codes: `INVALID_REQUEST`
 (400), `NOT_FOUND` (404), `STALE_PROPOSAL`/`CROSS_BOOKING`/`SLOT_UNAVAILABLE`/
 `CONFLICT`/`RECONCILE_REQUIRED` (409), `CROSS_ORIGIN_DENIED` (403),
-`ACCESS_REVOKED`/`EXECUTION_FAILED` (502), `UNCERTAIN` (503).
+`ACCESS_REVOKED`/`EXECUTION_FAILED` (502), `UNCERTAIN`/`RECONCILE_PENDING`
+(503, retryable).
+
+`RECONCILE_PENDING` means reconciliation found no provider evidence yet: the
+execution stays `uncertain` and the caller may retry reconciliation later.
+It is explicitly not a failure verdict, and it never authorizes a new write.
+
+## Manual resolution limits
+
+Protected indefinite uncertainty is a legitimate durable state, not a
+failure to be reclassified to make a flow complete. When the provider can
+never prove absence (e.g. a timeout-after-success whose record is
+unreachable), the execution remains `uncertain`, retry stays refused, and no
+API exists to force-resolve it: the operator must verify the provider state
+out of band (provider dashboard / calendar / mailbox) and then reconcile —
+reconciliation succeeds only if the provider actually holds the record. If
+the provider confirms absence out of band, the current API still offers no
+absence-attested re-execution; that path is intentionally unbuilt rather
+than faked. Simulation restart recovery proves SQLite durability of these
+states, not real external provider restart behavior.
 
 Mutations require `Content-Type: application/json` and reject cross-origin
 browser requests: when `Origin` (or `Referer` fallback) is present it must

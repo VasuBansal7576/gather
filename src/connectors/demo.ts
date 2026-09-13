@@ -96,6 +96,7 @@ function copyDocument(document: DocumentRecord): DocumentRecord {
 function copySlot(slot: CalendarSlot): CalendarSlot {
   return {
     ...slot,
+    ...(slot.calendarId === undefined ? {} : { calendarId: slot.calendarId }),
     sourceReferences: copySources(slot.sourceReferences),
   };
 }
@@ -457,18 +458,23 @@ export class DemoCalendarConnector implements CalendarAvailabilityReader, Provis
   ): Promise<ConnectorResult<CheckAvailabilityResponse>> {
     if (
       !validNonEmpty(request.operationKey) ||
+      !validNonEmpty(request.calendarId) ||
       !validTimeRange(request.startAt, request.endAt)
     ) {
       return failure(
         request.operationKey,
         undefined,
         "invalid_request",
-        "operationKey and a valid startAt/endAt range are required",
+        "operationKey, calendarId, and a valid startAt/endAt range are required",
       );
     }
 
+    // Strictly scoped: only slots attributed to the requested calendar are
+    // visible. Unattributed slots match nothing, so one calendar's openings
+    // can never authorize another calendar's hold.
     const slots = this.store
       .listCalendarSlots()
+      .filter((slot) => slot.calendarId === request.calendarId)
       .filter((slot) => overlaps(slot.startAt, slot.endAt, request.startAt, request.endAt));
     const provenance = copySources(slots.flatMap((slot) => slot.sourceReferences));
     return success(request.operationKey, provenance, {

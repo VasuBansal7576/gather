@@ -182,10 +182,21 @@ export class GatherStore {
         receipt_json TEXT NOT NULL,
         created_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS provider_hold_intents (
+        operation_key TEXT PRIMARY KEY,
+        calendar_id TEXT NOT NULL,
+        start_at TEXT NOT NULL,
+        end_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
     `);
     // Migrations for databases created before these columns/tables existed.
     this.ensureColumn("action_executions", "claim_token", "TEXT");
     this.ensureColumn("action_executions", "claim_expires_at", "TEXT");
+    this.ensureColumn("provider_receipts", "calendar_id", "TEXT");
+    this.ensureColumn("provider_receipts", "start_at", "TEXT");
+    this.ensureColumn("provider_receipts", "end_at", "TEXT");
   }
 
   private ensureColumn(table: string, column: string, ddl: string): void {
@@ -634,18 +645,27 @@ export class GatherStore {
    * pending OR already-terminal-uncertain rows; succeeding rows are never
    * overwritten to uncertain.
    */
+  /**
+   * Record uncertainty for an owned pending/uncertain execution. Terminal
+   * failed, partial, and succeeded rows are never rewritten: a failure
+   * verdict and provider evidence must not be reclassified as uncertainty,
+   * and uncertainty must not mask them.
+   */
   markExecutionUncertain(executionId: string, message: string, opts: { claimToken?: string } = {}): ActionExecution {
     const current = this.getActionExecution(executionId);
-    if (current.status === "succeeded") throw new Error("A succeeded step must never be rewritten to uncertain");
+    if (current.status !== "pending" && current.status !== "uncertain") {
+      throw new Error(`Only pending or uncertain executions can be marked uncertain (row is ${current.status})`);
+    }
     const timestamp = now();
     if (opts.claimToken === undefined) {
       this.db.prepare(`UPDATE action_executions SET status = 'uncertain', error = $error,
-        completed_at = COALESCE(completed_at, $timestamp) WHERE id = $id`).run({ $error: message, $timestamp: timestamp, $id: executionId });
+        completed_at = COALESCE(completed_at, $timestamp)
+        WHERE id = $id AND status IN ('pending', 'uncertain')`).run({ $error: message, $timestamp: timestamp, $id: executionId });
       return this.getActionExecution(executionId);
     }
     const updated = this.db.prepare(`UPDATE action_executions SET status = 'uncertain', error = $error,
       completed_at = COALESCE(completed_at, $timestamp)
-      WHERE id = $id AND status = 'pending' AND claim_token = $claim`).run({
+      WHERE id = $id AND status IN ('pending', 'uncertain') AND claim_token = $claim`).run({
       $error: message, $timestamp: timestamp, $id: executionId, $claim: opts.claimToken,
     });
     if (updated.changes === 0) {
@@ -671,9 +691,14 @@ export class GatherStore {
    * relying on volatile adapter memory. First write wins per operation key.
    */
   saveProviderReceipt(kind: ProviderReceiptKind, operationKey: string, receipt: Record<string, unknown>): void {
-    this.db.prepare(`INSERT INTO provider_receipts (operation_key, kind, receipt_json, created_at)
-      VALUES ($key, $kind, $receipt, $timestamp) ON CONFLICT(operation_key) DO NOTHING`).run({
+    const hold = kind === "hold" ? ((receipt.hold ?? {}) as Record<string, unknown>) : {};
+    const calendarId = typeof hold.calendarId === "string" ? hold.calendarId : undefined;
+    const startAt = typeof hold.startAt === "string" ? hold.startAt : undefined;
+    const endAt = typeof hold.endAt === "string" ? hold.endAt : undefined;
+    this.db.prepare(`INSERT INTO provider_receipts (operation_key, kind, receipt_json, created_at, calendar_id, start_at, end_at)
+      VALUES ($key, $kind, $receipt, $timestamp, $calendar, $start, $end) ON CONFLICT(operation_key) DO NOTHING`).run({
       $key: operationKey, $kind: kind, $receipt: JSON.stringify(receipt), $timestamp: now(),
+      $calendar: calendarId ?? null, $start: startAt ?? null, $end: endAt ?? null,
     });
   }
 
@@ -686,6 +711,78 @@ export class GatherStore {
       operationKey: String(value.operation_key),
       receipt: parseJson(value.receipt_json, {}) as Record<string, unknown>,
     };
+  }
+
+  /**
+   * Atomically claim a hold window for one stable operation key (C4).
+   *
+   * Inside a single IMMEDIATE transaction this records the caller's intent
+   * and checks it against every other intent and durable receipt for the
+   * same calendar. Concurrent connections serialize on the write lock, so a
+   * fresh (restarted, memory-empty) adapter and a second booking action both
+   * observe the same durable conflict set — a different booking can never
+   * take an overlapping window on the same calendar. Own retries (same key)
+   * always pass. Stale intents (crashed before their provider call) expire
+   * and are purged, so they cannot block the calendar forever.
+   */
+  claimHoldSlot(
+    operationKey: string,
+    calendarId: string,
+    startAt: string,
+    endAt: string,
+    opts: { nowMs?: number; intentLeaseMs?: number } = {},
+  ): { ok: true } | { ok: false; conflictingKey: string } {
+    const nowMs = opts.nowMs ?? Date.now();
+    const timestamp = now();
+    const expiresAt = new Date(nowMs + (opts.intentLeaseMs ?? DEFAULT_CLAIM_LEASE_MS)).toISOString();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.prepare(`INSERT INTO provider_hold_intents (operation_key, calendar_id, start_at, end_at, expires_at, created_at)
+        VALUES ($key, $calendar, $start, $end, $expires, $timestamp) ON CONFLICT(operation_key) DO NOTHING`).run({
+        $key: operationKey, $calendar: calendarId, $start: startAt, $end: endAt, $expires: expiresAt, $timestamp: timestamp,
+      });
+      this.db.prepare("DELETE FROM provider_hold_intents WHERE expires_at <= $nowIso").run({ $nowIso: new Date(nowMs).toISOString() });
+      const startMs = Date.parse(startAt);
+      const endMs = Date.parse(endAt);
+      const intents = this.db.prepare("SELECT operation_key, start_at, end_at FROM provider_hold_intents WHERE calendar_id = $calendar").all({ $calendar: calendarId });
+      for (const item of intents) {
+        const candidate = row(item);
+        if (String(candidate.operation_key) === operationKey) continue;
+        if (Date.parse(String(candidate.start_at)) < endMs && Date.parse(String(candidate.end_at)) > startMs) {
+          this.db.exec("ROLLBACK");
+          return { ok: false, conflictingKey: String(candidate.operation_key) };
+        }
+      }
+      const receipts = this.db.prepare("SELECT operation_key, receipt_json, start_at, end_at FROM provider_receipts WHERE kind = 'hold' AND (calendar_id = $calendar OR calendar_id IS NULL)").all({ $calendar: calendarId });
+      for (const item of receipts) {
+        const candidate = row(item);
+        if (String(candidate.operation_key) === operationKey) continue;
+        const hold = ((parseJson(candidate.receipt_json, {}) as Record<string, unknown>).hold ?? {}) as Record<string, unknown>;
+        const receiptCalendar = typeof hold.calendarId === "string" ? hold.calendarId : undefined;
+        if (receiptCalendar !== undefined && receiptCalendar !== calendarId) continue;
+        const receiptStart = candidate.start_at ? String(candidate.start_at) : typeof hold.startAt === "string" ? hold.startAt : undefined;
+        const receiptEnd = candidate.end_at ? String(candidate.end_at) : typeof hold.endAt === "string" ? hold.endAt : undefined;
+        if (!receiptStart || !receiptEnd) continue;
+        if (Date.parse(receiptStart) < endMs && Date.parse(receiptEnd) > startMs) {
+          this.db.exec("ROLLBACK");
+          return { ok: false, conflictingKey: String(candidate.operation_key) };
+        }
+      }
+      this.db.exec("COMMIT");
+      return { ok: true };
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        // Already rolled back; surface the original failure.
+      }
+      throw error;
+    }
+  }
+
+  /** Release a hold intent after a definitive provider failure (no effect). */
+  releaseHoldSlot(operationKey: string): void {
+    this.db.prepare("DELETE FROM provider_hold_intents WHERE operation_key = $key").run({ $key: operationKey });
   }
 
   private toActionExecution(value: SqlRow): ActionExecution {

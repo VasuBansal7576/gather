@@ -47,6 +47,7 @@ function holdPayload(to: string[] = ["guest@example.test"]): Record<string, unkn
 function coveringSlot() {
   return {
     slotId: "slot-cover",
+    calendarId: "demo-calendar-001",
     startAt: "2030-06-12T00:00:00.000Z",
     endAt: "2030-06-13T00:00:00.000Z",
     available: true as const,
@@ -164,6 +165,7 @@ test("unavailable date blocks the hold and writes nothing provider-side", async 
   const connectors = createDemoConnectors({
     calendarSlots: [{
       slotId: "slot-blocked",
+      calendarId: "demo-calendar-001",
       startAt: "2030-06-12T00:00:00.000Z",
       endAt: "2030-06-13T00:00:00.000Z",
       available: false,

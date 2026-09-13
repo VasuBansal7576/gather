@@ -43,9 +43,9 @@ function holdPayload(overrides: Record<string, unknown> = {}): Record<string, un
   };
 }
 
-function slot(slotId: string, startAt: string, endAt: string, available: boolean, reason?: string) {
+function slot(slotId: string, startAt: string, endAt: string, available: boolean, reason?: string, calendarId = "demo-calendar-001") {
   return {
-    slotId, startAt, endAt, available,
+    slotId, calendarId, startAt, endAt, available,
     ...(reason ? { reason } : {}),
     sourceReferences: [{ kind: "fixture" as const, locator: "demo://test/gate-slot", fictional: true as const }],
   };
@@ -179,7 +179,9 @@ test("crash before any provider call reconciles to uncertain with zero writes", 
     assert.equal(response.email, null);
     assert.equal(s.connectors.store.listProvisionalHolds().length, 0);
     assert.equal(s.store.getBooking(booking.id).status, "uncertain");
-    await assertServiceError(reconcileExecution(s.deps, response.hold.execution.id), "NOT_FOUND");
+    const pending = await assertServiceError(reconcileExecution(s.deps, response.hold.execution.id), "RECONCILE_PENDING");
+    assert.equal(pending.retryable, true);
+    assert.equal(s.store.getActionExecution(response.hold.execution.id).status, "uncertain");
   } finally {
     s.cleanup();
   }
@@ -268,7 +270,10 @@ test("retry after the proposal changes refuses stale receipts", async () => {
 });
 
 test("changed calendar target invalidates approval and executes the new target", async () => {
-  const s = setup();
+  const s = setup([
+    slot("slot-cal-1", "2030-06-12T00:00:00.000Z", "2030-06-13T00:00:00.000Z", true, undefined, "demo-calendar-001"),
+    slot("slot-cal-2", "2030-06-12T00:00:00.000Z", "2030-06-13T00:00:00.000Z", true, undefined, "demo-calendar-002"),
+  ]);
   try {
     const { action, booking } = seedBooking(s, { booking: "b-calchange", action: "a-calchange" });
     const firstInput = approveInput(s, action.id, booking.id);

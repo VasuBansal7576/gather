@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { stableOperationKey } from "../connectors/contracts.ts";
+import { availabilityOperationKey, stableOperationKey } from "../connectors/contracts.ts";
 import type {
   CalendarAvailabilityReader,
   EmailSender,
@@ -28,6 +28,7 @@ export type ServiceErrorCode =
   | "ACCESS_REVOKED"
   | "CONFLICT"
   | "RECONCILE_REQUIRED"
+  | "RECONCILE_PENDING"
   | "EXECUTION_FAILED"
   | "UNCERTAIN"
   | "INVALID_REQUEST";
@@ -121,6 +122,10 @@ export function resolveHoldParams(actionPayload: Record<string, unknown>, opts: 
     throw new ServiceError("INVALID_REQUEST", "Proposal payload must carry an explicit calendarId (it is part of the approved fingerprint)", false);
   }
   const nowMs = opts.nowMs ?? Date.now();
+  const endMs = Date.parse(endAt);
+  if (endMs <= nowMs) {
+    throw new ServiceError("INVALID_REQUEST", "Proposal event window has already ended; past windows cannot be approved", false);
+  }
   const expiryMs = expiresAt ? Date.parse(expiresAt) : Number.NaN;
   if (!expiresAt || !Number.isFinite(expiryMs)) {
     throw new ServiceError("INVALID_REQUEST", "Proposal payload must carry an explicit valid expiresAt", false);
@@ -178,8 +183,26 @@ function toReceipt(execution: ActionExecution): StepReceiptDTO {
   return { execution, step: stepOf(execution.idempotencyKey), demo: true as const };
 }
 
-function availabilityKey(startAt: string, endAt: string): string {
-  return stableOperationKey({ connector: "calendar", operation: "availability", identity: { endAt, startAt } });
+function availabilityKey(calendarId: string, startAt: string, endAt: string): string {
+  return availabilityOperationKey({ calendarId, startAt, endAt });
+}
+
+/**
+ * Action kinds the approval pipeline is allowed to execute (C6). The
+ * pipeline always runs a provisional-hold + email plan, so any other kind —
+ * including `custom` with a hold-shaped payload — is rejected at the
+ * approval/retry boundary before any approval row or side effect.
+ */
+const SUPPORTED_APPROVAL_KINDS = ["create_provisional_hold"] as const;
+
+function requireSupportedKind(kind: string): void {
+  if (!(SUPPORTED_APPROVAL_KINDS as readonly string[]).includes(kind)) {
+    throw new ServiceError(
+      "INVALID_REQUEST",
+      `Unsupported proposal kind "${kind}": the approval pipeline executes only a provisional-hold + email plan (kind "create_provisional_hold")`,
+      false,
+    );
+  }
 }
 
 /** Read-only workspace aggregation for the owner UI. */
@@ -260,8 +283,43 @@ function reserveStep(
     if (error instanceof Error && /already in progress/.test(error.message)) {
       throw new ServiceError("CONFLICT", `${step === "hold" ? "Hold" : "Email"} step is already in progress for this approved proposal; wait or reconcile`, true);
     }
+    if (error instanceof Error && /exact current proposal version|Stale proposal version/.test(error.message)) {
+      throw new ServiceError("STALE_PROPOSAL", "The proposal changed while the request was in flight; re-approve the displayed proposal", false);
+    }
     throw error;
   }
+}
+
+function hasLiveApproval(store: GatherStore, actionId: string): boolean {
+  const action = store.getProposedAction(actionId);
+  return store.listApprovals(actionId).some(
+    (approval) =>
+      approval.status === "approved" &&
+      approval.proposalVersion === action.proposalVersion &&
+      approval.proposalFingerprint === action.proposalFingerprint,
+  );
+}
+
+function isStale(store: GatherStore, actionId: string, version: number): boolean {
+  const action = store.getProposedAction(actionId);
+  return action.proposalVersion !== version || !hasLiveApproval(store, actionId);
+}
+
+/**
+ * Re-verify a live exact-version approval after an async wait. A proposal
+ * edited (or superseded) while a provider call was outstanding must not keep
+ * executing as if approved: the booking is parked as uncertain and the
+ * pipeline halts with STALE_PROPOSAL.
+ */
+function assertLiveApprovalAfterWait(store: GatherStore, actionId: string, version: number): void {
+  const action = store.getProposedAction(actionId);
+  if (action.proposalVersion === version && hasLiveApproval(store, actionId)) return;
+  try {
+    store.updateBookingStatus(action.bookingId, "uncertain");
+  } catch {
+    // Booking already gone; the STALE error below still carries the signal.
+  }
+  throw new ServiceError("STALE_PROPOSAL", "The proposal changed while the request was in flight; re-approve the displayed proposal", false);
 }
 
 /**
@@ -286,13 +344,17 @@ async function recoverReclaimedHold(
       "Recovered pending hold matched provider evidence on reconcile",
       { claimToken },
     );
-    return store.reconcileActionExecution(pending.id, { status: "succeeded", result: { ...reconciled.data, demo: true } });
+    const healed = store.reconcileActionExecution(pending.id, { status: "succeeded", result: { ...reconciled.data, demo: true } });
+    assertLiveApprovalAfterWait(store, execution.proposedActionId, execution.proposalVersion);
+    return healed;
   }
-  return store.markExecutionUncertain(
+  const pending = store.markExecutionUncertain(
     execution.id,
     "Recovered pending hold could not be reconciled against the provider; it remains uncertain until provider evidence appears",
     { claimToken },
   );
+  assertLiveApprovalAfterWait(store, execution.proposedActionId, execution.proposalVersion);
+  return pending;
 }
 
 async function recoverReclaimedEmail(
@@ -309,13 +371,17 @@ async function recoverReclaimedEmail(
       "Recovered pending email matched provider evidence on reconcile",
       { claimToken },
     );
-    return store.reconcileActionExecution(pending.id, { status: "succeeded", result: { ...reconciled.data, demo: true } });
+    const healed = store.reconcileActionExecution(pending.id, { status: "succeeded", result: { ...reconciled.data, demo: true } });
+    assertLiveApprovalAfterWait(store, execution.proposedActionId, execution.proposalVersion);
+    return healed;
   }
-  return store.markExecutionUncertain(
+  const pending = store.markExecutionUncertain(
     execution.id,
     "Recovered pending email could not be reconciled against the provider; it remains uncertain until provider evidence appears",
     { claimToken },
   );
+  assertLiveApprovalAfterWait(store, execution.proposedActionId, execution.proposalVersion);
+  return pending;
 }
 
 async function runHoldStep(deps: BookingServiceDeps, actionId: string, version: number, params: HoldParams): Promise<ActionExecution> {
@@ -337,29 +403,48 @@ async function runHoldStep(deps: BookingServiceDeps, actionId: string, version: 
   }
   // execution is now pending under our claim: only our token can complete it.
   const claim = { claimToken };
+  const bookingId = store.getProposedAction(actionId).bookingId;
+  /** Halt when the proposal moved on across an async wait. A still-pending
+   *  row is preserved as uncertain (never silently dropped); observed
+   *  provider evidence in terminal rows is kept as versioned history. */
+  const haltIfStale = (): void => {
+    if (!isStale(store, actionId, version)) return;
+    const current = store.getActionExecution(execution.id);
+    if (current.status === "pending") {
+      store.markExecutionUncertain(execution.id, "Proposal changed while the provider call was outstanding; outcome left uncertain for reconciliation", claim);
+    }
+    assertLiveApprovalAfterWait(store, actionId, version);
+  };
   let outcome;
   try {
     outcome = await calendar.createProvisionalHold({
       operationKey: key,
-      bookingId: store.getProposedAction(actionId).bookingId,
+      bookingId,
       calendarId: params.calendarId,
       startAt: params.startAt,
       endAt: params.endAt,
       expiresAt: params.expiresAt,
     });
   } catch (error) {
-    return store.markExecutionUncertain(execution.id, error instanceof Error ? error.message : "Hold outcome was not received", claim);
+    const pending = store.markExecutionUncertain(execution.id, error instanceof Error ? error.message : "Hold outcome was not received", claim);
+    haltIfStale();
+    return pending;
   }
   if (outcome.status === "succeeded") {
-    return store.completeActionExecution(execution.id, { status: "succeeded", result: { ...outcome.data, demo: true } }, claim);
+    const done = store.completeActionExecution(execution.id, { status: "succeeded", result: { ...outcome.data, demo: true } }, claim);
+    haltIfStale();
+    return done;
   }
   if (outcome.status === "uncertain") {
     // Persist uncertainty BEFORE any retry, then attempt one reconciliation read.
     const pending = store.markExecutionUncertain(execution.id, outcome.error.message, claim);
     const reconciled = await calendar.reconcileProvisionalHold({ operationKey: key });
     if (reconciled.status === "succeeded") {
-      return store.reconcileActionExecution(pending.id, { status: "succeeded", result: { ...reconciled.data, demo: true } });
+      const healed = store.reconcileActionExecution(pending.id, { status: "succeeded", result: { ...reconciled.data, demo: true } });
+      haltIfStale();
+      return healed;
     }
+    haltIfStale();
     return pending;
   }
   // outcome.status === "failed"
@@ -390,6 +475,14 @@ async function runEmailStep(deps: BookingServiceDeps, actionId: string, version:
     throw new ServiceError("CONFLICT", "Email step is already in progress for this approved proposal; wait or reconcile", true);
   }
   const claim = { claimToken };
+  const haltIfStale = (): void => {
+    if (!isStale(store, actionId, version)) return;
+    const current = store.getActionExecution(execution.id);
+    if (current.status === "pending") {
+      store.markExecutionUncertain(execution.id, "Proposal changed while the provider call was outstanding; outcome left uncertain for reconciliation", claim);
+    }
+    assertLiveApprovalAfterWait(store, actionId, version);
+  };
   let outcome;
   try {
     outcome = await email.sendEmail({
@@ -399,17 +492,24 @@ async function runEmailStep(deps: BookingServiceDeps, actionId: string, version:
       body: params.emailBody,
     });
   } catch (error) {
-    return store.markExecutionUncertain(execution.id, error instanceof Error ? error.message : "Email outcome was not received", claim);
+    const pending = store.markExecutionUncertain(execution.id, error instanceof Error ? error.message : "Email outcome was not received", claim);
+    haltIfStale();
+    return pending;
   }
   if (outcome.status === "succeeded") {
-    return store.completeActionExecution(execution.id, { status: "succeeded", result: { ...outcome.data, demo: true } }, claim);
+    const done = store.completeActionExecution(execution.id, { status: "succeeded", result: { ...outcome.data, demo: true } }, claim);
+    haltIfStale();
+    return done;
   }
   if (outcome.status === "uncertain") {
     const pending = store.markExecutionUncertain(execution.id, outcome.error.message, claim);
     const reconciled = await email.reconcileSentEmail({ operationKey: key });
     if (reconciled.status === "succeeded") {
-      return store.reconcileActionExecution(pending.id, { status: "succeeded", result: { ...reconciled.data, demo: true } });
+      const healed = store.reconcileActionExecution(pending.id, { status: "succeeded", result: { ...reconciled.data, demo: true } });
+      haltIfStale();
+      return healed;
     }
+    haltIfStale();
     return pending;
   }
   if (outcome.error.kind === "access_revoked" || outcome.error.kind === "authorization_denied") {
@@ -433,13 +533,7 @@ async function runEmailStep(deps: BookingServiceDeps, actionId: string, version:
  */
 function requireLiveApproval(store: GatherStore, actionId: string): void {
   const action = store.getProposedAction(actionId);
-  const live = store.listApprovals(actionId).some(
-    (approval) =>
-      approval.status === "approved" &&
-      approval.proposalVersion === action.proposalVersion &&
-      approval.proposalFingerprint === action.proposalFingerprint,
-  );
-  if (!live) {
+  if (!hasLiveApproval(store, actionId)) {
     throw new ServiceError(
       "STALE_PROPOSAL",
       `No live approval for the current proposal version (v${action.proposalVersion}); re-approve the displayed proposal first`,
@@ -461,7 +555,8 @@ async function requireFreshAvailability(
 ): Promise<void> {
   const { store, calendar } = deps;
   const availability = await calendar.checkAvailability({
-    operationKey: availabilityKey(params.startAt, params.endAt),
+    operationKey: availabilityKey(params.calendarId, params.startAt, params.endAt),
+    calendarId: params.calendarId,
     startAt: params.startAt,
     endAt: params.endAt,
   });
@@ -498,11 +593,20 @@ export async function approveAndExecute(deps: BookingServiceDeps, input: Approve
   const { store } = deps;
   const action = requireExactApproval(store, input);
   const booking = store.getBooking(action.bookingId);
+  requireSupportedKind(action.kind);
+  // Validate the executable consequences BEFORE recording an approval: an
+  // invalid (or past) proposal must never gain an approval row.
+  const params = resolveHoldParams(action.payload, { nowMs: clockMs(deps) });
   const approvedBy = ownerIdentity(deps);
   const approval = store.approveProposedAction(action.id, approvedBy);
-  const params = resolveHoldParams(action.payload, { nowMs: clockMs(deps) });
 
-  await requireFreshAvailability(deps, booking.id, params);
+  // A repeated approval whose own hold already succeeded reuses receipts: no
+  // new write can occur, so a fresh availability read must not fail it.
+  const ownHold = store.getExecutionByIdempotencyKey(holdOperationKey(action.id, action.proposalVersion));
+  if (ownHold?.status !== "succeeded") {
+    await requireFreshAvailability(deps, booking.id, params);
+    assertLiveApprovalAfterWait(store, action.id, action.proposalVersion);
+  }
 
   const holdExecution = await runHoldStep(deps, action.id, action.proposalVersion, params);
   if (holdExecution.status === "failed") {
@@ -528,6 +632,11 @@ export async function approveAndExecute(deps: BookingServiceDeps, input: Approve
   }
 
   const emailExecution = await runEmailStep(deps, action.id, action.proposalVersion, params);
+  // Aggregate uncertainty: a hold with an uncertain email is not cleanly
+  // provisional — the booking must show uncertainty until reconciled.
+  if (emailExecution.status === "uncertain") {
+    store.updateBookingStatus(booking.id, "uncertain");
+  }
   const current = store.getBooking(booking.id);
   return {
     demo: true,
@@ -539,7 +648,9 @@ export async function approveAndExecute(deps: BookingServiceDeps, input: Approve
     email: toReceipt(emailExecution),
     availabilityFresh: true as const,
     confirmedBooking: false as const,
-    note: "DEMO ONLY: provisional hold is not a confirmed booking. Email receipt is simulated.",
+    note: emailExecution.status === "uncertain"
+      ? "DEMO ONLY: email outcome is uncertain; reconcile before retrying. A hold is never a confirmed booking."
+      : "DEMO ONLY: provisional hold is not a confirmed booking. Email receipt is simulated.",
   };
 }
 
@@ -551,6 +662,7 @@ export async function retryFailedSteps(deps: BookingServiceDeps, proposedActionI
   // Even when every step already succeeded, retry must verify the current
   // proposal still carries a live exact-version approval.
   requireLiveApproval(store, action.id);
+  requireSupportedKind(action.kind);
   const params = resolveHoldParams(action.payload, { nowMs: clockMs(deps) });
   const holdKey = holdOperationKey(action.id, action.proposalVersion);
   const mailKey = emailOperationKey(action.id, action.proposalVersion);
@@ -579,6 +691,10 @@ export async function retryFailedSteps(deps: BookingServiceDeps, proposedActionI
   }
   store.updateBookingStatus(action.bookingId, "provisional_hold");
   const email = mailExisting?.status === "succeeded" ? mailExisting : await runEmailStep(deps, action.id, action.proposalVersion, params);
+  if (email.status === "uncertain") {
+    store.updateBookingStatus(action.bookingId, "uncertain");
+    throw new ServiceError("RECONCILE_REQUIRED", email.error ?? "Email retry is uncertain; reconcile before retrying", false);
+  }
   return {
     demo: true,
     mode: DEMO_MARKER,
@@ -590,7 +706,12 @@ export async function retryFailedSteps(deps: BookingServiceDeps, proposedActionI
   };
 }
 
-/** Reconcile a single uncertain/partial execution by its stable idempotency key. */
+/**
+ * Reconcile a single uncertain/partial execution by its stable idempotency
+ * key. Reconcile failures preserve uncertainty and are reported honestly:
+ * a missing record means "no provider evidence yet" (retryable), never
+ * proof of non-execution, so no new write is permitted on that basis.
+ */
 export async function reconcileExecution(deps: BookingServiceDeps, executionId: string): Promise<ReconcileResponseDTO> {
   const { store, calendar, email } = deps;
   const current = store.getActionExecution(executionId);
@@ -602,7 +723,21 @@ export async function reconcileExecution(deps: BookingServiceDeps, executionId: 
     ? await calendar.reconcileProvisionalHold({ operationKey: current.idempotencyKey })
     : await email.reconcileSentEmail({ operationKey: current.idempotencyKey });
   if (outcome.status !== "succeeded") {
-    throw new ServiceError("NOT_FOUND", "No completed provider write was found for reconciliation", false);
+    const errKind = outcome.error.kind;
+    if (errKind === "access_revoked" || errKind === "authorization_denied") {
+      throw new ServiceError("ACCESS_REVOKED", `Reconciliation blocked: ${outcome.error.message}`, false);
+    }
+    if (errKind === "invalid_request") {
+      throw new ServiceError("INVALID_REQUEST", outcome.error.message, false);
+    }
+    // not_found, rate_limited, transport_error, timeout_after_success, or any
+    // other ambiguous outcome: the execution stays uncertain and the caller
+    // may retry reconciliation later. This is not a failure verdict.
+    throw new ServiceError(
+      "RECONCILE_PENDING",
+      `No provider evidence yet for ${current.idempotencyKey}: ${outcome.error.message}. Execution remains uncertain; retry reconciliation later.`,
+      true,
+    );
   }
   const execution = store.reconcileActionExecution(current.id, { status: "succeeded", result: { ...outcome.data, demo: true } });
   const action = store.getProposedAction(execution.proposedActionId);
@@ -611,5 +746,26 @@ export async function reconcileExecution(deps: BookingServiceDeps, executionId: 
   if (kind === "hold" && booking.status !== "provisional_hold") {
     store.updateBookingStatus(booking.id, "provisional_hold");
   }
+  refreshBookingAggregate(store, booking.id);
   return { demo: true, mode: DEMO_MARKER, execution, booking: store.getBooking(booking.id), note: "DEMO ONLY: reconciled against the simulated provider record." };
+}
+
+/**
+ * Recompute the aggregate booking state from its step executions. Any
+ * outstanding uncertain/partial step keeps the booking uncertain; once no
+ * uncertainty remains and a hold succeeded, an uncertain booking returns to
+ * provisional_hold (never confirmed). Failed steps leave the last explicit
+ * state untouched.
+ */
+function refreshBookingAggregate(store: GatherStore, bookingId: string): void {
+  const booking = store.getBooking(bookingId);
+  const executions = store.listProposedActionsForBooking(bookingId).flatMap((action) => store.listActionExecutions(action.id));
+  if (executions.some((item) => item.status === "uncertain" || item.status === "partial")) {
+    if (booking.status !== "uncertain") store.updateBookingStatus(bookingId, "uncertain");
+    return;
+  }
+  const holdSucceeded = executions.some((item) => item.status === "succeeded" && stepOf(item.idempotencyKey) === "hold");
+  if (holdSucceeded && booking.status === "uncertain") {
+    store.updateBookingStatus(bookingId, "provisional_hold");
+  }
 }

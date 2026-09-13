@@ -80,7 +80,23 @@ export class DurableDemoCalendar implements CalendarAvailabilityReader, Provisio
         error: { kind: "conflict", message: "The operation key is already associated with a different hold payload", retryable: false },
       };
     }
-    const result = await this.demo.createProvisionalHold(request);
+    // Durable conflict gate (C4): a fresh volatile world may admit a window
+    // that SQLite already gave to another booking — refuse before any write.
+    const claim = this.store.claimHoldSlot(request.operationKey, request.calendarId, request.startAt, request.endAt);
+    if (!claim.ok) {
+      return {
+        status: "failed",
+        metadata: { operationKey: request.operationKey, mode: { mode: "demo", label: "DEMO ONLY", fictional: true }, simulated: true, sourceReferences: [] },
+        error: { kind: "conflict", message: `Demo calendar window is already held (durable record ${claim.conflictingKey})`, retryable: false },
+      };
+    }
+    let result: ConnectorResult<CreateProvisionalHoldResponse>;
+    try {
+      result = await this.demo.createProvisionalHold(request);
+    } catch (error) {
+      this.store.releaseHoldSlot(request.operationKey);
+      throw error;
+    }
     if (result.status === "succeeded") {
       this.store.saveProviderReceipt("hold", request.operationKey, result.data as unknown as Record<string, unknown>);
       return result;
@@ -94,6 +110,9 @@ export class DurableDemoCalendar implements CalendarAvailabilityReader, Provisio
       }
       return result;
     }
+    // Definitive failure: no provider effect, so release the durable intent
+    // and let a later retry re-evaluate the window honestly.
+    this.store.releaseHoldSlot(request.operationKey);
     return result;
   }
 

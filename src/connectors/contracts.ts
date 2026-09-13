@@ -201,6 +201,8 @@ export interface DocumentRetriever {
 
 export interface CalendarSlot {
   slotId: string;
+  /** Owning calendar. Slots without one match no scoped availability query. */
+  calendarId?: string;
   startAt: string;
   endAt: string;
   available: boolean;
@@ -209,6 +211,8 @@ export interface CalendarSlot {
 }
 
 export interface CheckAvailabilityRequest extends OperationRequest {
+  /** Required scope: availability is always evaluated for one calendar. */
+  calendarId: string;
   startAt: string;
   endAt: string;
 }
@@ -268,6 +272,14 @@ export type CalendarConnector =
  * of object insertion order. Callers should persist this value with the
  * proposed action and reuse it for retries and reconciliation.
  */
+export function availabilityOperationKey(input: { calendarId: string; startAt: string; endAt: string }): string {
+  return stableOperationKey({
+    connector: "calendar",
+    operation: "availability",
+    identity: { calendarId: input.calendarId, endAt: input.endAt, startAt: input.startAt },
+  });
+}
+
 export function stableOperationKey(input: {
   connector: ConnectorKind;
   operation: string;
