@@ -1152,3 +1152,63 @@ test("conflicting legacy event rows abort recovery with both tables preserved", 
     cleanup();
   }
 });
+
+test("ancient waiting without claim columns recovers half-migration with rows intact", () => {
+  const { db, cleanup } = tempDb();
+  try {
+    db.exec("PRAGMA foreign_keys = ON");
+    const ledger = new CoordinationLedger(db);
+    ledger.ingestEvent(inquiryEvent({ dedupeKey: "evt-ancient-1", bookingId: "booking-ancient" }));
+    // Ancient shape: claim columns dropped before the half-migration aftermath.
+    db.exec("ALTER TABLE coord_waiting DROP COLUMN claim_token");
+    db.exec("ALTER TABLE coord_waiting DROP COLUMN claim_expires_at");
+    const schemaRow = db.prepare("SELECT sql FROM sqlite_master WHERE name = 'coord_events'").get();
+    db.exec("ALTER TABLE coord_events RENAME TO coord_events_legacy");
+    db.exec(String((schemaRow as Record<string, unknown>).sql));
+    const recovered = new CoordinationLedger(db);
+    const items = recovered.listWaitingForBooking("booking-ancient");
+    assert.equal(items.length, 1);
+    assert.equal(items[0]?.kind, "followup");
+    assert.equal(items[0]?.status, "pending");
+    assert.equal(items[0]?.claimToken, undefined);
+    const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all()
+      .map((row) => String((row as Record<string, unknown>).name));
+    assert.ok(!tables.includes("coord_events_legacy"));
+    assert.ok(!tables.includes("coord_waiting_legacy"));
+    assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(), []);
+    // The recovered row drains and claims normally.
+    assert.equal(recovered.listDueWork({ nowIso: AFTER_FOLLOWUP_DUE, bookingId: "booking-ancient" }).length, 1);
+  } finally {
+    cleanup();
+  }
+});
+
+test("migration preserves prior pragma settings and leaves indexes behind", () => {
+  const { db, cleanup } = tempDb();
+  try {
+    db.exec("PRAGMA foreign_keys = OFF");
+    db.exec("PRAGMA legacy_alter_table = ON");
+    db.exec(`CREATE TABLE coord_events (
+      id TEXT PRIMARY KEY, dedupe_key TEXT NOT NULL UNIQUE, kind TEXT NOT NULL,
+      booking_id TEXT NOT NULL, source_id TEXT NOT NULL, source_kind TEXT NOT NULL,
+      observed_at TEXT NOT NULL, received_at TEXT NOT NULL, revision INTEGER,
+      payload_json TEXT NOT NULL, stale INTEGER NOT NULL DEFAULT 0);
+    INSERT INTO coord_events
+      (id, dedupe_key, kind, booking_id, source_id, source_kind, observed_at, received_at, revision, payload_json, stale)
+      VALUES ('e1', 'email:m1', 'inquiry', 'b1', 'm1', 'email',
+        '2030-04-01T10:00:00.000Z', '2030-04-01T10:00:00.000Z', NULL, '{}', 0);`);
+    const ledger = new CoordinationLedger(db);
+    assert.equal(ledger.getEventByDedupeKey("b1", "email:m1").id, "e1");
+    const fk = db.prepare("PRAGMA foreign_keys").get() as Record<string, unknown>;
+    assert.equal(Number(fk.foreign_keys), 0);
+    const legacy = db.prepare("PRAGMA legacy_alter_table").get() as Record<string, unknown>;
+    assert.equal(Number(legacy.legacy_alter_table), 1);
+    const indexes = db.prepare("PRAGMA index_list(coord_events)").all()
+      .map((row) => String((row as Record<string, unknown>).name));
+    assert.ok(indexes.includes("idx_coord_events_dedupe"));
+    assert.ok(indexes.includes("idx_coord_events_booking"));
+    assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(), []);
+  } finally {
+    cleanup();
+  }
+});

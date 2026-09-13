@@ -120,7 +120,8 @@ UTC for storage and compared as epoch millis, so caller clock shapes
   the same way on open, with exactness gates: every waiting column —
   including live claim tokens, lease expiries, and resolution metadata —
   is copied verbatim (NULL only where the legacy table predates the
-  column), every merged event row must have a field-identical twin, and a
+  column, projected under authoritative column names so ancient tables
+  verify), every merged event row must have a field-identical twin, and a
   same-identity conflict aborts atomically with both original tables
   preserved instead of silently dropping one side.
 - **Stale revisions:** intake tracks the max non-stale revision per booking.
