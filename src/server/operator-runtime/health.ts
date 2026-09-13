@@ -33,8 +33,11 @@ export function operatorHealth(deps: OperatorRuntimeDeps): OperatorHealth {
   const cursor = intake.getCursor(deps.accountId);
   const failures = intake.listFailures(deps.accountId, 10);
   const connection = deps.connections?.getConnection(deps.accountId);
+  // Simulation derives from durable evidence (latest batch wiring), never a
+  // caller flag; with no evidence yet, assume simulated rather than live.
+  const simulation = intake.latestSimulation(deps.accountId);
   return {
-    simulation: deps.simulation,
+    simulation,
     generatedAt: nowIso(deps),
     accounts: [
       {
@@ -48,6 +51,7 @@ export function operatorHealth(deps: OperatorRuntimeDeps): OperatorHealth {
     waitingByStatus,
     pausedBookings,
     failures: failures.map((failure) => ({ scope: failure.scope, message: failure.message, at: failure.at })),
+    scheduler: { registered: false, status: "pending-registration" },
     lastSweep: undefined,
     lastDueWork: undefined,
   };

@@ -16,8 +16,16 @@ import type { GatherStore } from "../sqlite-store.ts";
  * then commits the cursor checkpoint.
  */
 
-/** Injected Gmail history poller, pre-bound to one stable accountId. */
-export type InboxPort = Pick<GmailInboxPoller, "pollInbox">;
+/**
+ * Injected Gmail history poller, pre-bound to one stable accountId.
+ * Provenance is bound to the wiring (not a per-request caller boolean):
+ * scripted/demo stand-ins declare simulated:true here, live wiring declares
+ * the approved provider source. Sweeps additionally cross-check the poll
+ * result metadata mode and report simulated when either side says so.
+ */
+export interface InboxPort extends Pick<GmailInboxPoller, "pollInbox"> {
+  readonly provenance: { simulated: boolean; label: string };
+}
 
 export interface ConnectionDirectoryPort {
   /** Resolve a stable accountId to its connection record, if the connections lane knows it. */
@@ -34,12 +42,6 @@ export interface OperatorRuntimeDeps {
   businessId: string;
   now?: () => string;
   connections?: ConnectionDirectoryPort;
-  /**
-   * Host-declared wiring mode: true while the inbox poller/transport is a
-   * stand-in (scripted/demo), false only for approved live assets. Echoed
-   * on every sweep and health report — simulated runs never claim live.
-   */
-  simulation: boolean;
 }
 
 export type IntakeItemStatus =
@@ -47,7 +49,8 @@ export type IntakeItemStatus =
   | "linked"
   | "needs_decision"
   | "ingested"
-  | "failed";
+  | "failed"
+  | "skipped";
 
 export interface IntakeBatchRecord {
   id: string;
@@ -99,7 +102,6 @@ export interface DueWorkReport {
   simulation: boolean;
   claimed: string[];
   skipped: string[];
-  retried: string[];
   reconciled: string[];
   awaitingOwner: string[];
   error?: string;
@@ -120,6 +122,8 @@ export interface OperatorHealth {
   waitingByStatus: Record<string, number>;
   pausedBookings: string[];
   failures: Array<{ scope: string; message: string; at: string }>;
+  /** Scheduler registration is explicit: no fake scheduled/watching label. */
+  scheduler: { registered: boolean; status: string };
   lastSweep?: SweepReport;
   lastDueWork?: DueWorkReport;
 }

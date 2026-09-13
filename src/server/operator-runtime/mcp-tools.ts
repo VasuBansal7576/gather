@@ -53,7 +53,7 @@ export function operatorMcpTools(deps: OperatorRuntimeDeps): GatherTool[] {
       const intake = new OperatorIntakeStore(deps.store.db);
       const latest = intake.latestBatch(deps.accountId) ?? null;
       const cursor = intake.getCursor(deps.accountId) ?? null;
-      const report = { latest, cursor, simulation: deps.simulation };
+      const report = { latest, cursor, simulation: intake.latestSimulation(deps.accountId) };
       return {
         content: [{ type: "text", text: JSON.stringify(report, null, 2) }],
         structuredContent: { intake: report as unknown as Record<string, unknown> },

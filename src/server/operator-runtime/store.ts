@@ -54,7 +54,7 @@ export class OperatorIntakeStore {
         message_id TEXT NOT NULL,
         thread_id TEXT,
         observed_at TEXT NOT NULL,
-        status TEXT NOT NULL CHECK (status IN ('received', 'linked', 'needs_decision', 'ingested', 'failed')),
+        status TEXT NOT NULL CHECK (status IN ('received', 'linked', 'needs_decision', 'ingested', 'failed', 'skipped')),
         booking_id TEXT,
         source_key TEXT,
         ledger_event_id TEXT,
@@ -192,11 +192,43 @@ export class OperatorIntakeStore {
     return found ? toCursor(row(found)) : undefined;
   }
 
+  /**
+   * Durably clear a dead cursor (history 404): the next sweep polls
+   * cursor-less and full-syncs instead of replaying the expired cursor
+   * forever. Own transaction.
+   */
+  clearCursor(accountId: string): void {
+    this.db.prepare("DELETE FROM cursor_checkpoints WHERE account_id = $account").run({ $account: accountId });
+  }
+
+  /**
+   * Parked items (needs_decision/failed) across all batches for one
+   * account, oldest first, bounded. Re-driven after owner resolution or
+   * restart even when the next poll returns nothing new.
+   */
+  listParked(accountId: string, limit = 50): IntakeItemRecord[] {
+    const rows = this.db.prepare(
+      `SELECT items.* FROM intake_items AS items
+       JOIN intake_batches AS batches ON batches.id = items.batch_id
+       WHERE batches.account_id = $account AND items.status IN ('needs_decision', 'failed')
+       ORDER BY items.observed_at, items.message_id LIMIT $limit`,
+    ).all({ $account: accountId, $limit: limit });
+    return rows.map((value) => toItem(row(value)));
+  }
+
   latestBatch(accountId: string): IntakeBatchRecord | undefined {
     const found = this.db.prepare(
       "SELECT * FROM intake_batches WHERE account_id = $account ORDER BY created_at DESC LIMIT 1",
     ).get({ $account: accountId });
     return found ? toBatch(row(found)) : undefined;
+  }
+
+  /**
+   * Surface simulation flag derived from durable evidence (latest batch
+   * wiring). With no evidence yet, assume simulated rather than live.
+   */
+  latestSimulation(accountId: string): boolean {
+    return this.latestBatch(accountId)?.simulation ?? true;
   }
 }
 

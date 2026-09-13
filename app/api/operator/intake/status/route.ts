@@ -16,7 +16,7 @@ export async function GET(): Promise<NextResponse> {
     }
     const intake = new OperatorIntakeStore(deps.store.db);
     return NextResponse.json({
-      simulation: deps.simulation,
+      simulation: intake.latestSimulation(deps.accountId),
       latest: intake.latestBatch(deps.accountId) ?? null,
       cursor: intake.getCursor(deps.accountId) ?? null,
     });
