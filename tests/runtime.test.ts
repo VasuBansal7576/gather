@@ -98,6 +98,8 @@ function resolveTestBinary(): string | null {
 // Placeholder URL for mock-transport tests: the fake transport never dials,
 // so no port here is ever bound. Kept as a constant to make that explicit.
 const FAKE_WS_URL = "ws://127.0.0.1:1";
+/** Fake-transport tests never dial a real port: the listener gate is stubbed open. */
+const listenerOpen = async () => true;
 
 // ---------- isolation ----------
 
@@ -359,6 +361,7 @@ test("connect resolves on hello-ok and presents operator role, token and scopes"
         captured = options;
         return factory(options);
       },
+      probeListener: listenerOpen,
     },
   );
   const hello = await connection.connect({ timeoutMs: 2000 });
@@ -375,9 +378,151 @@ test("connect rejects when hello-ok never arrives", async () => {
   const { factory } = fakeTransportFactory({ hello: false });
   const connection = new GatherGatewayConnection(
     { url: FAKE_WS_URL, token: "t" },
-    { transportFactory: factory },
+    { transportFactory: factory, probeListener: listenerOpen },
   );
   await assert.rejects(connection.connect({ timeoutMs: 50 }), /hello-ok not received/);
+  assert.equal(connection.currentState, "closed");
+});
+
+test("connect waits for a delayed listener before starting the transport", async () => {
+  // Cold-start regression: the gateway binds its loopback port only after
+  // plugin load. The WS transport must not start (and burn reconnect
+  // backoff) until the listener accepts — TCP accept is liveness, never
+  // readiness; hello-ok still proves readiness.
+  const server = createServer();
+  let port = 0;
+  const { factory } = fakeTransportFactory({ hello: true });
+  let transportStartedAt = 0;
+  const t0 = Date.now();
+  try {
+    port = await new Promise<number>((resolvePort) => {
+      // Bound but then closed: bind only to learn a free port, listen later.
+      const probe = createServer();
+      probe.listen(0, "127.0.0.1", () => {
+        const p = (probe.address() as { port: number }).port;
+        probe.close(() => resolvePort(p));
+      });
+    });
+    // Listener arrives 600ms into connect — inside the budget, after the
+    // first probes have already been refused.
+    setTimeout(() => server.listen(port, "127.0.0.1"), 600).unref();
+    const connection = new GatherGatewayConnection(
+      { url: `ws://127.0.0.1:${port}`, token: "t" },
+      {
+        transportFactory: (options) => {
+          const transport = factory(options);
+          const innerStart = transport.start;
+          transport.start = () => { transportStartedAt = Date.now() - t0; innerStart(); };
+          return transport;
+        },
+      },
+    );
+    const hello = await connection.connect({ timeoutMs: 5000 });
+    assert.equal(hello.protocol, 4);
+    assert.ok(transportStartedAt >= 550, `transport started before the listener accepted (${transportStartedAt}ms)`);
+    await connection.close();
+  } finally {
+    server.close();
+  }
+});
+
+test("connect rejects honestly when the listener never appears", async () => {
+  // A port that never binds: the probe consumes the shared deadline and the
+  // error names the listener, not a phantom handshake.
+  const probe = createServer();
+  const port = await new Promise<number>((resolvePort) => {
+    probe.listen(0, "127.0.0.1", () => {
+      const p = (probe.address() as { port: number }).port;
+      probe.close(() => resolvePort(p));
+    });
+  });
+  let factoryCalled = false;
+  const connection = new GatherGatewayConnection(
+    { url: `ws://127.0.0.1:${port}`, token: "t" },
+    { transportFactory: (options) => { factoryCalled = true; return fakeTransportFactory({ hello: true }).factory(options); } },
+  );
+  const t0 = Date.now();
+  await assert.rejects(connection.connect({ timeoutMs: 800 }), /listener did not accept/);
+  assert.ok(Date.now() - t0 < 2500, "absent listener rejects near the deadline, not slowly");
+  assert.equal(factoryCalled, false, "transport is never created for a dead port");
+  assert.equal(connection.currentState, "closed");
+});
+
+test("close() racing a late-accepting probe never creates or starts a transport", async () => {
+  // The probe's final attempt resolves true AFTER close() ran — the factory
+  // and start() must still not run, or a dead connection resurrects.
+  let probeCalls = 0;
+  let factoryCalled = false;
+  let transportStarted = false;
+  const connection = new GatherGatewayConnection(
+    { url: FAKE_WS_URL, token: "t" },
+    {
+      probeListener: async () => {
+        probeCalls += 1;
+        if (probeCalls === 1) return false; // first probe refused
+        // Second probe: close lands while this await is in flight, then
+        // accept arrives — must NOT reach the factory below.
+        await new Promise((r) => setTimeout(r, 30));
+        return true;
+      },
+      transportFactory: (options) => {
+        factoryCalled = true;
+        const transport = fakeTransportFactory({ hello: true }).factory(options);
+        const innerStart = transport.start;
+        transport.start = () => { transportStarted = true; innerStart(); };
+        return transport;
+      },
+    },
+  );
+  const pending = connection.connect({ timeoutMs: 10000 });
+  setTimeout(() => void connection.close(), 10).unref();
+  await assert.rejects(pending, /closed/);
+  // Let the second probe's resolution land.
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(factoryCalled, false, "transport factory ran after close");
+  assert.equal(transportStarted, false, "transport.start ran after close");
+});
+
+test("concurrent connect calls produce at most one transport", async () => {
+  // Two connects before the transport is allocated: the second must reject
+  // immediately and exactly one transport may exist.
+  let factoryCalls = 0;
+  const connection = new GatherGatewayConnection(
+    { url: FAKE_WS_URL, token: "t" },
+    {
+      probeListener: async () => { await new Promise((r) => setTimeout(r, 20)); return true; },
+      transportFactory: (options) => {
+        factoryCalls += 1;
+        return fakeTransportFactory({ hello: true }).factory(options);
+      },
+    },
+  );
+  const first = connection.connect({ timeoutMs: 5000 });
+  const second = connection.connect({ timeoutMs: 5000 });
+  await assert.rejects(second, /already started/);
+  await first;
+  assert.equal(factoryCalls, 1);
+  assert.equal(connection.isReady, true);
+  await connection.close();
+});
+
+test("close during the listener probe aborts connect promptly", async () => {
+  const probe = createServer();
+  const port = await new Promise<number>((resolvePort) => {
+    probe.listen(0, "127.0.0.1", () => {
+      const p = (probe.address() as { port: number }).port;
+      probe.close(() => resolvePort(p));
+    });
+  });
+  const connection = new GatherGatewayConnection(
+    { url: `ws://127.0.0.1:${port}`, token: "t" },
+    { transportFactory: fakeTransportFactory({ hello: true }).factory },
+  );
+  const pending = connection.connect({ timeoutMs: 30000 });
+  setTimeout(() => void connection.close(), 100).unref();
+  const t0 = Date.now();
+  await assert.rejects(pending, /closed while waiting/);
+  assert.ok(Date.now() - t0 < 2000, "cancellation aborts the probe promptly");
   assert.equal(connection.currentState, "closed");
 });
 
@@ -391,6 +536,7 @@ test("a socket close after readiness surfaces a reconnecting state", async () =>
         closeHandler = options.onClose;
         return fakeTransportFactory({ hello: true }).factory(options);
       },
+      probeListener: listenerOpen,
     },
   );
   await connection.connect({ timeoutMs: 1000 });
@@ -406,7 +552,7 @@ test("submitTask calls the agent RPC with sessionKey, idempotencyKey and no deli
   });
   const connection = new GatherGatewayConnection(
     { url: FAKE_WS_URL, token: "t" },
-    { transportFactory: factory },
+    { transportFactory: factory, probeListener: listenerOpen },
   );
   await connection.connect({ timeoutMs: 1000 });
   const tasks = new GatherRuntimeTasks(connection);
@@ -431,7 +577,7 @@ test("malformed agent responses are rejected, never trusted", async () => {
     const { factory } = fakeTransportFactory({ hello: true, respond: () => bad });
     const connection = new GatherGatewayConnection(
       { url: FAKE_WS_URL, token: "t" },
-      { transportFactory: factory },
+      { transportFactory: factory, probeListener: listenerOpen },
     );
     await connection.connect({ timeoutMs: 1000 });
     const tasks = new GatherRuntimeTasks(connection);
@@ -450,7 +596,7 @@ test("agent.wait timeout is wait-only and never proves the run stopped", async (
   });
   const connection = new GatherGatewayConnection(
     { url: FAKE_WS_URL, token: "t" },
-    { transportFactory: factory },
+    { transportFactory: factory, probeListener: listenerOpen },
   );
   await connection.connect({ timeoutMs: 1000 });
   const tasks = new GatherRuntimeTasks(connection);
@@ -475,7 +621,7 @@ test("terminal and unrecognized wait statuses map faithfully", async () => {
     });
     const connection = new GatherGatewayConnection(
       { url: FAKE_WS_URL, token: "t" },
-      { transportFactory: factory },
+      { transportFactory: factory, probeListener: listenerOpen },
     );
     await connection.connect({ timeoutMs: 1000 });
     const tasks = new GatherRuntimeTasks(connection);
@@ -494,7 +640,7 @@ test("malformed chat.history responses are rejected", async () => {
   });
   const connection = new GatherGatewayConnection(
     { url: FAKE_WS_URL, token: "t" },
-    { transportFactory: factory },
+    { transportFactory: factory, probeListener: listenerOpen },
   );
   await connection.connect({ timeoutMs: 1000 });
   const tasks = new GatherRuntimeTasks(connection);
@@ -511,7 +657,7 @@ test("non-timeout RPC failures are wrapped as GatewayRequestFailed", async () =>
   });
   const connection = new GatherGatewayConnection(
     { url: FAKE_WS_URL, token: "t" },
-    { transportFactory: factory },
+    { transportFactory: factory, probeListener: listenerOpen },
   );
   await connection.connect({ timeoutMs: 1000 });
   const tasks = new GatherRuntimeTasks(connection);
