@@ -1,17 +1,17 @@
 #!/usr/bin/env node
 /**
- * Live-model journey runner (integration hook).
+ * Live-model execution runner (integration hook).
  *
- * Exact run command (from the repository root, Node >= 22):
+ * Exact verification command (scripted MCP loop, no live requests):
+ *   node --experimental-strip-types --test tests/live-model-execution.test.ts
+ *
+ * Exact live-attempt command (refuses honestly until consent, the
+ * designated account/recipient, and the authorized model path land):
  *   node --experimental-strip-types scripts/gather-live-model.mjs \
  *     --business <businessId> --thread <threadId> \
  *     --file <driveFileId> --calendar <calendarId> \
+ *     --model openai-codex/gpt-5.6-luna --auth-profile <profileId> \
  *     [--allow-live] [--idempotency-key <key>]
- *
- * Without --allow-live (or before Chief assigns the account/recipient and
- * I delivers the authorized model auth path) the run refuses honestly with
- * a typed LIVE_NOT_AUTHORIZED / MODEL_UNCONFIGURED error — no model
- * executes, nothing sends, nothing is read outside the designated sources.
  *
  * Exit codes: 0 proposal prepared, 2 usage, 3 refused (not authorized or
  * model unconfigured), 4 tool/policy failure.
@@ -28,14 +28,16 @@ async function main() {
   const fileId = arg("--file");
   const calendarId = arg("--calendar");
   if (!businessId || !threadId || !fileId || !calendarId) {
-    console.error("usage: gather-live-model.mjs --business <id> --thread <threadId> --file <driveFileId> --calendar <calendarId> [--allow-live] [--idempotency-key <key>]");
+    console.error("usage: gather-live-model.mjs --business <id> --thread <threadId> --file <driveFileId> --calendar <calendarId> --model <provider/model> --auth-profile <profileId> [--allow-live] [--idempotency-key <key>]");
     process.exit(2);
   }
   const { getRuntime } = await import("../src/server/runtime.ts");
-  const { runLiveModelJourney, LiveModelError } = await import("../src/server/live-model/index.ts");
+  const { runLiveExecution, LiveModelError } = await import("../src/server/live-model/index.ts");
   const runtime = getRuntime();
+  const modelRef = arg("--model");
+  const profileId = arg("--auth-profile");
   try {
-    const record = await runLiveModelJourney(
+    const record = await runLiveExecution(
       {
         businessId,
         threadId,
@@ -45,7 +47,13 @@ async function main() {
         allowLive: process.argv.includes("--allow-live"),
         ...(arg("--idempotency-key") === undefined ? {} : { idempotencyKey: arg("--idempotency-key") }),
       },
-      { store: runtime.store, providers: runtime.providers },
+      {
+        store: runtime.store,
+        providers: runtime.providers,
+        ...(modelRef === undefined || profileId === undefined
+          ? {}
+          : { model: { model: modelRef, auth: { provider: modelRef.split("/")[0], mode: "oauth", profileId } } }),
+      },
     );
     console.log(JSON.stringify(record, null, 2));
     process.exit(0);
