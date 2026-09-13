@@ -209,3 +209,130 @@ test("scheduler only invokes the injected sweep: no sends, approvals, or links",
     resetProactiveAutomation();
   }
 });
+
+// ---------- reviewed-defect regressions (D1-D4) ----------
+
+test("refresh during an in-flight sweep keeps overlap protection, then sweeps again (no wedge)", async () => {
+  const slow = deferred();
+  try {
+    registerProactiveBinding({ accountId: ACCOUNT, businessId: BUSINESS, runSweep: slow.run, intervalMs: 60_000 });
+    const first = tickBinding(ACCOUNT);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    let secondRuns = 0;
+    // Re-register mid-flight (host refresh): overlap protection must hold
+    // against the still-running old sweep, and the old completion must not
+    // wedge the fresh binding.
+    const refreshed = registerProactiveBinding({
+      accountId: ACCOUNT, businessId: BUSINESS,
+      runSweep: async () => { secondRuns += 1; },
+      intervalMs: 60_000,
+    });
+    assert.equal(refreshed.inFlight, true, "reports the shared in-flight latch honestly");
+    const skipped = await tickBinding(ACCOUNT);
+    assert.equal(skipped.skippedOverlap, true, "old sweep still holds the latch");
+    slow.release();
+    await first;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    // Old sweep's completion cleared the SHARED latch and wrote nothing to
+    // the new record — the refreshed binding sweeps normally.
+    const next = await tickBinding(ACCOUNT);
+    assert.equal(next.skippedOverlap, false);
+    assert.equal(next.ok, true);
+    assert.equal(secondRuns, 1);
+    assert.equal(next.state?.totalRuns, 1, "old sweep's write was suppressed by the epoch bump");
+    assert.equal(getProactiveBinding(ACCOUNT)?.inFlight, false);
+  } finally {
+    slow.release();
+    resetProactiveAutomation();
+  }
+});
+
+test("stop uses real elapsed time, not the injectable clock, and reports undrained work honestly", async () => {
+  const slow = deferred();
+  try {
+    registerProactiveBinding({
+      accountId: ACCOUNT, businessId: BUSINESS,
+      runSweep: slow.run, intervalMs: 60_000,
+      clock: () => 1000, // frozen business clock — must not govern the drain
+    });
+    const pending = tickBinding(ACCOUNT);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    const startedAt = Date.now();
+    // The sweep never releases before the bound: stop must still settle on
+    // real elapsed time and report the undrained in-flight honestly.
+    const stopped = await stopProactiveAccount(ACCOUNT, 150);
+    assert.ok(Date.now() - startedAt < 5000, "bounded by real time, not the frozen clock");
+    assert.equal(stopped?.status, "stopped");
+    assert.equal(stopped?.inFlight, true, "undrained sweep is reported, not hidden");
+    // Late completion after stop writes nothing to the stopped record.
+    slow.release();
+    await pending;
+    const after = getProactiveBinding(ACCOUNT);
+    assert.equal(after?.totalRuns, 0, "no late counters on a stopped binding");
+    assert.equal(after?.lastRunAt, undefined);
+    // A stopped binding never ticks again.
+    const ticked = await tickBinding(ACCOUNT);
+    assert.equal(ticked.ok, false);
+    assert.equal(ticked.error, "no running binding");
+  } finally {
+    slow.release();
+    resetProactiveAutomation();
+  }
+});
+
+test("revocation during an in-flight sweep cannot be clobbered by its late completion", async () => {
+  const slow = deferred();
+  try {
+    registerProactiveBinding({ accountId: ACCOUNT, businessId: BUSINESS, runSweep: slow.run, intervalMs: 60_000 });
+    const pending = tickBinding(ACCOUNT);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    const revoked = noteProactiveRevocation(ACCOUNT, "connection revoked by provider");
+    assert.equal(revoked?.status, "degraded");
+    slow.release();
+    const done = await pending;
+    // The late completion returns its result but writes nothing over the
+    // revocation state.
+    const state = getProactiveBinding(ACCOUNT);
+    assert.equal(state?.status, "degraded", "late completion cannot resurrect the binding");
+    assert.match(state?.lastError ?? "", /revoked/, "revocation error is not clobbered");
+    assert.equal(state?.totalRuns, 0, "late counters are suppressed");
+    assert.equal(done.ok, true);
+  } finally {
+    resetProactiveAutomation();
+  }
+});
+
+test("health reports the real registered/running/degraded scheduler state per account", async () => {
+  const fx = fixture();
+  try {
+    const runtime = runtimeFor(fx, emptyHistory());
+    const { operatorHealth } = await import("../src/server/operator-runtime/index.ts");
+    const unwired = operatorHealth(runtime);
+    assert.equal(unwired.scheduler.registered, false);
+    assert.equal(unwired.scheduler.status, "pending-registration");
+    startProactiveAccount({ runtime, intervalMs: 60_000 });
+    const running = operatorHealth(runtime);
+    assert.equal(running.scheduler.registered, true);
+    assert.equal(running.scheduler.status, "running");
+    noteProactiveRevocation(ACCOUNT, "provider revoked");
+    const degraded = operatorHealth(runtime);
+    assert.equal(degraded.scheduler.status, "degraded");
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test("scoped listing never leaks bindings for unwired accounts", async () => {
+  try {
+    registerProactiveBinding({ accountId: "unwired-acct", businessId: "foreign-biz", runSweep: async () => {}, intervalMs: 60_000 });
+    registerProactiveBinding({ accountId: ACCOUNT, businessId: BUSINESS, runSweep: async () => {}, intervalMs: 60_000 });
+    const { listProactiveBindingsForAccounts } = await import("../src/server/operator-runtime/index.ts");
+    const scoped = listProactiveBindingsForAccounts([ACCOUNT]);
+    assert.deepEqual(scoped.map((b) => b.accountId), [ACCOUNT], "unwired account filtered out");
+    const empty = listProactiveBindingsForAccounts([]);
+    assert.deepEqual(empty, [], "no authorized accounts -> no entries");
+    assert.equal(listProactiveBindings().length, 2, "raw map still holds both (route applies the scope)");
+  } finally {
+    resetProactiveAutomation();
+  }
+});

@@ -63,9 +63,28 @@ interface BindingRecord extends ProactiveBindingState {
   maxConsecutiveErrors: number;
   clock: () => number;
   timer: ReturnType<typeof setInterval> | undefined;
+  /**
+   * Per-account sweep latch shared across refreshes: a re-registered
+   * binding keeps overlap protection against a still-running old sweep,
+   * and the old sweep's completion clears the shared latch (never a
+   * per-record flag that would wedge the fresh binding forever).
+   */
+  sweepCell: { inFlight: boolean; promise?: Promise<unknown> };
+  /**
+   * Monotonic epoch: bumped on stop/remove. A sweep that completes after
+   * its binding was stopped/degraded writes its outcome nowhere — late
+   * writes can never mutate reported state or restart counters.
+   */
+  epoch: number;
 }
 
 const bindings = new Map<string, BindingRecord>();
+
+/** Real-clock deadline for the bounded stop drain — NEVER the injectable
+ *  business clock (a frozen clock would make the drain spin forever). */
+function realDeadline(ms: number): number {
+  return Date.now() + ms;
+}
 
 function nowIso(record: BindingRecord): string {
   return new Date(record.clock()).toISOString();
@@ -77,7 +96,9 @@ function snapshot(record: BindingRecord): ProactiveBindingState {
     businessId: record.businessId,
     intervalMs: record.intervalMs,
     status: record.status,
-    inFlight: record.inFlight,
+    // The shared per-account latch is the truth — a refreshed record's own
+    // field could be stale while a prior sweep still runs.
+    inFlight: record.sweepCell.inFlight,
     totalRuns: record.totalRuns,
     skippedOverlaps: record.skippedOverlaps,
     consecutiveErrors: record.consecutiveErrors,
@@ -101,13 +122,16 @@ export function registerProactiveBinding(config: ProactiveBindingConfig): Proact
     throw new Error(`intervalMs must be an integer in ${MIN_SWEEP_INTERVAL_MS}..${MAX_SWEEP_INTERVAL_MS}`);
   }
   const existing = bindings.get(config.accountId);
-  if (existing?.timer !== undefined) clearInterval(existing.timer);
+  if (existing?.timer !== undefined) {
+    clearInterval(existing.timer);
+    existing.epoch += 1; // late writes from a prior lifecycle are dead
+  }
   const record: BindingRecord = {
     accountId: config.accountId,
     businessId: config.businessId,
     intervalMs,
     status: "running",
-    inFlight: existing?.inFlight ?? false,
+    inFlight: false, // reported state comes from sweepCell, not this field
     totalRuns: 0,
     skippedOverlaps: 0,
     consecutiveErrors: 0,
@@ -115,6 +139,10 @@ export function registerProactiveBinding(config: ProactiveBindingConfig): Proact
     maxConsecutiveErrors: config.maxConsecutiveErrors ?? DEFAULT_MAX_CONSECUTIVE_ERRORS,
     clock: config.clock ?? Date.now,
     timer: undefined,
+    // Keep overlap protection against a still-running old sweep; the old
+    // sweep's completion clears the shared latch, not a dead record's flag.
+    sweepCell: existing?.sweepCell ?? { inFlight: false },
+    epoch: 0,
   };
   record.timer = setInterval(() => {
     void tickBinding(config.accountId).catch(() => {
@@ -131,15 +159,24 @@ export function removeProactiveBinding(accountId: string): boolean {
   const record = bindings.get(accountId);
   if (!record) return false;
   if (record.timer !== undefined) clearInterval(record.timer);
+  record.epoch += 1; // any in-flight sweep's late writes die with the record
   bindings.delete(accountId);
   return true;
 }
 
 /**
  * Stop a binding's timer without removing it, awaiting any in-flight sweep
- * (bounded drain). The binding reports stopped; restart via re-register.
+ * (bounded drain). The drain deadline is REAL elapsed time (Date.now) —
+ * never the injectable business clock, which may be frozen — and the
+ * returned snapshot honestly reports inFlight when the sweep did not
+ * drain inside the bound. A sweep completing after stop writes nothing:
+ * its epoch is stale, so no late write can mutate the stopped record.
+ * The binding reports stopped; restart via re-register.
+ *
+ * The drain bound is `drainTimeoutMs` of REAL elapsed time (default 30 s)
+ * — independent of the injectable business clock, which may be frozen.
  */
-export async function stopProactiveBinding(accountId: string): Promise<ProactiveBindingState | undefined> {
+export async function stopProactiveBinding(accountId: string, drainTimeoutMs = 30_000): Promise<ProactiveBindingState | undefined> {
   const record = bindings.get(accountId);
   if (!record) return undefined;
   if (record.timer !== undefined) {
@@ -147,17 +184,28 @@ export async function stopProactiveBinding(accountId: string): Promise<Proactive
     record.timer = undefined;
   }
   record.status = "stopped";
-  const deadline = record.clock() + 30_000;
-  while (record.inFlight && record.clock() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, 25));
+  record.epoch += 1;
+  const cell = record.sweepCell;
+  if (cell.inFlight && cell.promise) {
+    const deadline = realDeadline(drainTimeoutMs);
+    await Promise.race([
+      cell.promise.catch(() => {}),
+      new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), Math.max(0, deadline - Date.now()))),
+    ]);
   }
   return snapshot(record);
 }
 
 /**
  * Run exactly one guarded sweep cycle for an account now (timer tick entry
- * point; also the fake-clock seam for tests). Overlapping ticks skip and
- * count instead of running concurrently. Repeated failures degrade the
+ * point; also the fake-clock seam for tests). Overlap protection lives on
+ * the per-account sweep cell — shared across refreshes — so a re-registered
+ * binding still cannot run concurrently with a prior sweep, and that prior
+ * sweep's completion releases the SHARED latch (never a dead record's flag
+ * that would wedge the fresh binding). Completion writes land only when the
+ * record is still current and running: a sweep finishing after stop,
+ * remove, revoke, or refresh writes nothing — no late counters, no clobbered
+ * revocation error, no resurrected status. Repeated failures degrade the
  * binding explicitly (timer stopped, status degraded with the last error)
  * instead of retrying silently forever; re-register to resume.
  */
@@ -166,43 +214,57 @@ export async function tickBinding(accountId: string): Promise<ProactiveSweepResu
   if (!record || record.status !== "running" || record.timer === undefined) {
     return { ok: false, at: new Date().toISOString(), skippedOverlap: false, error: "no running binding", ...(record ? { state: snapshot(record) } : {}) };
   }
-  if (record.inFlight) {
+  const cell = record.sweepCell;
+  if (cell.inFlight) {
     record.skippedOverlaps += 1;
     return { ok: true, at: nowIso(record), skippedOverlap: true, state: snapshot(record) };
   }
-  record.inFlight = true;
+  cell.inFlight = true;
+  const epochAtStart = record.epoch;
+  const running = (async () => record.runSweep())();
+  cell.promise = running;
+  const writeable = () => record.epoch === epochAtStart && record.status === "running";
   try {
-    await record.runSweep();
-    record.totalRuns += 1;
-    record.consecutiveErrors = 0;
-    record.lastRunAt = nowIso(record);
-    record.lastOk = true;
-    record.lastError = undefined;
-    return { ok: true, at: record.lastRunAt, skippedOverlap: false, state: snapshot(record) };
-  } catch (error) {
-    record.totalRuns += 1;
-    record.consecutiveErrors += 1;
-    record.lastRunAt = nowIso(record);
-    record.lastOk = false;
-    record.lastError = error instanceof Error ? error.message : String(error);
-    if (record.consecutiveErrors > record.maxConsecutiveErrors) {
-      if (record.timer !== undefined) {
-        clearInterval(record.timer);
-        record.timer = undefined;
-      }
-      record.status = "degraded";
-      record.degradedAt = record.lastRunAt;
+    await running;
+    if (writeable()) {
+      record.totalRuns += 1;
+      record.consecutiveErrors = 0;
+      record.lastRunAt = nowIso(record);
+      record.lastOk = true;
+      record.lastError = undefined;
     }
-    return { ok: false, at: record.lastRunAt, skippedOverlap: false, error: record.lastError, state: snapshot(record) };
+    return { ok: true, at: nowIso(record), skippedOverlap: false, state: snapshot(record) };
+  } catch (error) {
+    if (writeable()) {
+      record.totalRuns += 1;
+      record.consecutiveErrors += 1;
+      record.lastRunAt = nowIso(record);
+      record.lastOk = false;
+      record.lastError = error instanceof Error ? error.message : String(error);
+      if (record.consecutiveErrors > record.maxConsecutiveErrors) {
+        if (record.timer !== undefined) {
+          clearInterval(record.timer);
+          record.timer = undefined;
+        }
+        record.status = "degraded";
+        record.degradedAt = record.lastRunAt;
+      }
+    }
+    const lastError = record.lastError ?? (error instanceof Error ? error.message : String(error));
+    return { ok: false, at: nowIso(record), skippedOverlap: false, error: lastError, state: snapshot(record) };
   } finally {
-    record.inFlight = false;
+    cell.inFlight = false;
+    cell.promise = undefined;
   }
 }
 
 /**
  * Explicit revocation hook for connection-revoked events: marks the binding
  * degraded and stops its timer at once (no quiet retries against a dead
- * credential). Re-register after the owner reconnects.
+ * credential). An in-flight sweep may still finish — but its completion
+ * writes are suppressed by the epoch bump, so it can never clobber the
+ * revocation error or resurrect the binding. Re-register after the owner
+ * reconnects.
  */
 export function noteProactiveRevocation(accountId: string, message: string): ProactiveBindingState | undefined {
   const record = bindings.get(accountId);
@@ -212,6 +274,7 @@ export function noteProactiveRevocation(accountId: string, message: string): Pro
     record.timer = undefined;
   }
   record.status = "degraded";
+  record.epoch += 1;
   record.lastError = message;
   record.degradedAt = nowIso(record);
   return snapshot(record);
@@ -224,6 +287,17 @@ export function getProactiveBinding(accountId: string): ProactiveBindingState | 
 
 export function listProactiveBindings(): ProactiveBindingState[] {
   return [...bindings.values()].map(snapshot).sort((a, b) => a.accountId.localeCompare(b.accountId));
+}
+
+/**
+ * Bindings filtered to a caller-authorized account set. The proactive
+ * registry is separate from the operator-deps registry — listings for
+ * owners/routes must pass through this scope so an unwired or foreign
+ * account's binding never leaks into a status response.
+ */
+export function listProactiveBindingsForAccounts(accountIds: readonly string[]): ProactiveBindingState[] {
+  const allowed = new Set(accountIds);
+  return listProactiveBindings().filter((binding) => allowed.has(binding.accountId));
 }
 
 /** Test-only reset (stops timers first). */
@@ -275,6 +349,6 @@ export function startProactiveAccount(config: ProactiveHostConfig): ProactiveBin
   });
 }
 
-export function stopProactiveAccount(accountId: string): Promise<ProactiveBindingState | undefined> {
-  return stopProactiveBinding(accountId);
+export function stopProactiveAccount(accountId: string, drainTimeoutMs?: number): Promise<ProactiveBindingState | undefined> {
+  return stopProactiveBinding(accountId, drainTimeoutMs);
 }
