@@ -34,7 +34,18 @@ export function getRuntime(): ServerRuntime {
   // and the service clock, so simulated expiry agrees everywhere.
   const clockMs = (): number => Date.now();
   const store = new GatherStore(databasePath());
-  const connectors = createDemoConnectors({ calendarSlots: demoFixtureSlots(), nowMs: clockMs });
+  // GATHER_DEMO_TIMEOUT_KEYS (comma-separated stable operation keys) marks
+  // writes that complete in the demo world but report an uncertain timeout,
+  // so uncertain/partial recovery can be exercised end-to-end over HTTP.
+  const timeoutKeys = (process.env.GATHER_DEMO_TIMEOUT_KEYS ?? "")
+    .split(",")
+    .map((key) => key.trim())
+    .filter((key) => key.length > 0);
+  const connectors = createDemoConnectors({
+    calendarSlots: demoFixtureSlots(),
+    nowMs: clockMs,
+    timeoutAfterSuccessOperationKeys: timeoutKeys,
+  });
   const deps: BookingServiceDeps = {
     store,
     calendar: new DurableDemoCalendar(store, connectors.calendar, clockMs),
