@@ -12,13 +12,21 @@ stays in the existing approve/retry pipeline with fresh availability.
   identity. A request `availability` field is rejected outright; forged
   `validator`/`validatedAt` values are stripped and replaced with this
   host's citation (`business-operator-host` plus the trusted clock).
+- Candidate intake runs only through the strict host boundary
+  (`intakeOperatorCandidate`, also wired into `POST /api/knowledge/candidates`
+  with no raw serving bypass): every source reference requires a known kind,
+  a bounded non-empty locator, a bounded string label when present, and a
+  boolean fictional flag when present (bounded set size; bounded
+  client-chosen intake ids). The knowledge service re-checks the same shape
+  for direct callers, so malformed provenance never persists.
 - Availability is always fetched fresh through the injected typed
   `CalendarAvailabilityReader` for exactly the hold calendar and window,
-  under a fresh operation key. Slots map to venue-wide offers evidence
-  because the hold decision consumes them at the hold-calendar level
-  (per-room holds on other calendars need their own preparations). A
-  failing reader degrades to explicitly empty evidence — unavailable, never
-  invented — with the failure recorded.
+  under a canonical binding key plus a fresh per-read time/nonce suffix:
+  `operator-prepare:<bookingId>:gather:calendar:availability:<digest>:<now>:<rand>`.
+  The digest binds booking/business/calendar/window for audit; the suffix
+  keeps every read fresh and never cached-reused. A failing reader degrades
+  to explicitly empty evidence — unavailable, never invented — with the
+  failure recorded.
 - Sources and customer/model text can never become approval authority.
   Candidate intake stores `probable`/`uncertain` evidence only (nested
   source objects strictly validated); every decision path records approvals
@@ -64,17 +72,24 @@ with `email = { to, subject, body }`. New error codes: `DENIED` (403),
    states persist nothing.
 4. Persists a `create_provisional_hold` proposal **only** for a feasible
    primary with a known total **and** explicit `expiresAt`, `emailTo`,
-   `emailSubject`, `emailBody`. Anything missing yields explicit
-   `missingForProposal` entries (unknown recipients, dates, prices, or
-   business facts are never invented).
+   `emailSubject`, `emailBody`. The payload carries a validated immutable
+   copy of the reviewed primary's commercial terms (`payload.offer`: lines,
+   totals, deposit, currency, space, guests, consequences, unknown-cost
+   honesty) plus `payload.offerPreparationFingerprint`, all inside the
+   canonical proposal fingerprint — so price-only, deposit-only, or
+   space/terms changes persist as new actions that cannot reuse a prior
+   approval. Anything missing yields explicit `missingForProposal` entries
+   (unknown recipients, dates, prices, or business facts are never invented).
 5. Persistence re-reads the backing knowledge revisions under the write
    transaction: a concurrent correction or review flag aborts with
    `STALE_PROPOSAL` instead of publishing a stale version. Repeating an
    identical persist reuses the existing proposal (fingerprint-bound
-   idempotency, `reused: true`).
+   idempotency, `reused: true`), after re-verifying the found row is live
+   and carries a live status.
 
 The persisted payload carries exactly `startAt/endAt/expiresAt/calendarId`
-plus `emailTo/emailSubject/emailBody` and source references, with the
+plus `emailTo/emailSubject/emailBody`, the validated `offer` commercial
+snapshot, and `offerPreparationFingerprint`, with source references, with the
 proposal version/fingerprint the approve pipeline binds. Approval, hold,
 and send remain owner-gated downstream.
 

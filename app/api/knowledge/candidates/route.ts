@@ -1,6 +1,7 @@
 import { NextResponse, type NextRequest } from "next/server";
-import { getRuntime } from "../../../../src/server/runtime.ts";
-import { KnowledgeService, type IntakeCandidateInput } from "../../../../src/knowledge/service.ts";
+import { getRuntime, ownerId } from "../../../../src/server/runtime.ts";
+import { KnowledgeService } from "../../../../src/knowledge/service.ts";
+import { intakeOperatorCandidate } from "../../../../src/server/business-operator/index.ts";
 import { assertSameOrigin, readHeaders } from "../../../../src/server/validation.ts";
 import { unknownErrorResponse } from "../../_helpers.ts";
 import { collectSources, deploymentMode, knowledgeErrorResponse } from "../_mapper.ts";
@@ -20,8 +21,13 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     const body: unknown = await request.json().catch(() => undefined);
     if (!isRecord(body)) return unknownErrorResponse(new Error("Request body must be a JSON object"));
     const runtime = getRuntime();
-    const service = new KnowledgeService(runtime.store);
-    const candidate = service.intakeCandidate(body as unknown as IntakeCandidateInput);
+    // All candidate intake runs through the strict validated host boundary:
+    // every source reference is kind/locator/shape-checked before anything
+    // persists. There is no raw serving bypass.
+    const candidate = intakeOperatorCandidate(
+      { store: runtime.store, booking: runtime.deps, ownerId: ownerId(), availability: runtime.deps.calendar },
+      body,
+    );
     const found: { fictional?: boolean }[] = []; collectSources(candidate, found);
     return NextResponse.json({ mode: deploymentMode(found), candidate });
   } catch (error) {
