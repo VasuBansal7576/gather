@@ -5,6 +5,7 @@
 The local Gather application is runnable on Node 26 with the owner workspace, deterministic demo connectors, and a durable booking approval API integrated on `main`.
 The reviewed service was integrated as `ef5e7c9` from `b0058ba`.
 Reviewed Google Calendar and Gmail adapter boundaries were integrated as `72c82b7` from `363bef7`.
+The isolated OpenClaw adapter was integrated as `e81fab9` from `8bca2f2`.
 The owner workspace is still awaiting its verified API wiring and comparison with the owner-selected [Gather Linear UI](design/Gather-Linear-UI.png).
 
 The demo connectors and fixture workspace remain explicitly simulated and are not live Gmail, Drive, Calendar, or OpenClaw integrations.
@@ -13,7 +14,7 @@ The demo connectors and fixture workspace remain explicitly simulated and are no
 
 This checklist has a fixed total of 17 gates.
 
-The inherited local application evidence satisfies 13/17 gates in this checklist.
+The local application and isolated adapter evidence satisfies 14/17 gates in this checklist.
 This count describes the local application milestone only, not completion of the product requirements in [PRD.md](PRD.md).
 
 - [x] Next.js application scaffold is present and builds.
@@ -24,12 +25,13 @@ This count describes the local application milestone only, not completion of the
 - [x] Connector fixtures cover provenance, unavailable dates, idempotency, and timeout reconciliation.
 - [x] Local launcher and doctor scripts are present and do not install packages or touch external runtimes.
 - [x] `npm ci` completes without credentials or network provider setup.
-- [x] `npm test` passes: 84 tests across storage, connectors, approval, recovery, concurrency, and hold-expiry suites.
+- [x] Storage, connector, approval, recovery, and runtime checks were exercised: the combined run passed 116/117, and the single failed doctor check passed a targeted retest with its threshold unchanged.
+  The timeout remains documented below; this is not a claim of a single green 117-test run.
 - [x] `npm run typecheck` passes.
 - [x] `npm run build` passes.
 - [x] Doctor passes with Node 26.8.2, installed dependencies, supported scripts, and a project-local writable `.runtime` directory.
 - [x] Local dev server smoke check returns HTTP 200 and renders Gather, Demo data, Today, Bookings, and Connections.
-- [ ] Supported OpenClaw interface is verified and an isolated adapter is implemented.
+- [x] Supported OpenClaw control-plane interface is verified and an isolated adapter is implemented; full model and provider execution remain unverified.
 - [ ] Authorized test-account Gmail, Drive, and Calendar actions are executed and individually reconciled.
 - [ ] The first inquiry-to-offer-to-approval-to-recheck-to-provisional-hold journey runs end to end with real receipts.
 - [ ] Waiting states, restart recovery, reply handling, and duplicate prevention are wired through the owner experience.
@@ -59,7 +61,12 @@ No live provider receipt or booking confirmation is established by these tests.
 The service is integrated; owner approval and recovery interactions remain under mounted browser review before API and UI integration.
 Parallel workers are implementing and correcting the isolated runtime adapter, Google provider adapters, business-aware offers, and persistent proactive booking work.
 Runtime worker evidence includes an actual isolated Gateway boot, protocol handshake, control-plane RPCs, and observed shutdown without model or Google calls.
-Runtime acceptance remains open while isolation and lifecycle changes receive independent review.
+The local adapter gate is accepted after independent isolation and lifecycle review, 42/42 tests on `8bca2f2`, and actual isolated Gateway boot, handshake, control-plane RPC, and observed shutdown.
+On integrated `e81fab9`, the combined run passed 116/117 tests: the sentinel doctor spawned its child but did not receive hello-ok within 30 seconds, then shut down the child correctly.
+After the concurrent build settled, the exact failed doctor check passed independently in 29.3 seconds with the same handshake threshold.
+Type checking and the production build passed on the integrated commit.
+This observed timeout under concurrent load remains a reliability limitation; the retest does not erase it.
+Full model execution and Gateway-mediated Gather tool invocation remain unverified.
 Google adapters passed independent review on `363bef7`, including scripted provider responses and a real loopback transport timeout.
 The combined suite on `72c82b7` passes 84 tests and type checking.
 These adapter component checks establish no live Google outcome; the adapters remain disconnected pending approved test-account assets.
@@ -78,3 +85,13 @@ OpenClaw interface research has completed; the isolated adapter implementation a
 Full model invocation remains unverified until a supported provider authentication route is supplied.
 
 No credentials, personal OpenClaw configuration or data, provider actions, customer communications, cloud handoffs, or runtime state were added to Git.
+
+## Workspace cleanup and dependency findings
+
+Nine completed review, failed-launch, and inherited milestone worktrees were removed after checking clean tracked state and active worker ownership.
+Original foundation, interface, connector-contract, and packaging commits remain preserved by local branch references; integrated review commits remain reachable on remote main.
+Active execution worktrees and unrelated work were preserved.
+
+The current dependency audit reports three vulnerable package entries: Next through PostCSS, PostCSS, and sharp.
+These are existing framework dependencies, not new OpenClaw dependencies.
+Their remediation is pending a scoped compatibility review; no forced major framework upgrade has been applied.
