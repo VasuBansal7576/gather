@@ -1,5 +1,5 @@
-import { GatherWorkspace } from "../src/components/gather";
+import { GatherHostWorkspace } from "../src/host/GatherHostWorkspace";
 
 export default function HomePage() {
-  return <GatherWorkspace />;
+  return <GatherHostWorkspace />;
 }
