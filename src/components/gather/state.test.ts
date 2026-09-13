@@ -68,16 +68,31 @@ test("receipt recovery routes retry vs reconcile honestly", () => {
   assert.equal(receiptRecoveryKind({ status: "failed" }), undefined);
 });
 
-test("approval completes only when the exact version's receipts all succeed", () => {
-  const proposal = { id: "act-1", version: 2 };
+test("approval completes only when every required step for the exact version succeeded", () => {
+  const proposal = { id: "act-1", version: 2, requiredSteps: ["hold" as const, "email" as const] };
   // No receipts — nothing was approved.
   assert.equal(proposalApprovalComplete(proposal, undefined), false);
   assert.equal(proposalApprovalComplete(proposal, []), false);
-  // All steps for the exact action + version succeeded — approved.
+  // All required steps for the exact action + version succeeded — approved.
   assert.equal(proposalApprovalComplete(proposal, [
     { id: "r1", actionId: "act-1", proposalVersion: 2, step: "hold", label: "Provisional hold", status: "succeeded" },
     { id: "r2", actionId: "act-1", proposalVersion: 2, step: "email", label: "Offer email", status: "succeeded" },
   ]), true);
+  // A succeeded hold with NO email receipt is incomplete — the crash-between-
+  // steps state must not read as approved.
+  assert.equal(proposalApprovalComplete(proposal, [
+    { id: "r1", actionId: "act-1", proposalVersion: 2, step: "hold", label: "Provisional hold", status: "succeeded" },
+  ]), false);
+  // Duplicate receipts for only one step still leave the missing step undone.
+  assert.equal(proposalApprovalComplete(proposal, [
+    { id: "r1", actionId: "act-1", proposalVersion: 2, step: "hold", label: "Provisional hold", status: "succeeded" },
+    { id: "r2", actionId: "act-1", proposalVersion: 2, step: "hold", label: "Provisional hold", status: "succeeded" },
+  ]), false);
+  // A versionless receipt cannot complete any version.
+  assert.equal(proposalApprovalComplete(proposal, [
+    { id: "r1", actionId: "act-1", step: "hold", label: "Provisional hold", status: "succeeded" },
+    { id: "r2", actionId: "act-1", step: "email", label: "Offer email", status: "succeeded" },
+  ]), false);
   // Succeeded receipts on an OLDER version do not complete the new proposal.
   assert.equal(proposalApprovalComplete(proposal, [
     { id: "r1", actionId: "act-1", proposalVersion: 1, step: "hold", label: "Provisional hold", status: "succeeded" },
@@ -86,6 +101,16 @@ test("approval completes only when the exact version's receipts all succeed", ()
   // Succeeded receipts on a different action never count.
   assert.equal(proposalApprovalComplete(proposal, [
     { id: "r1", actionId: "act-old", proposalVersion: 2, step: "hold", label: "Provisional hold", status: "succeeded" },
+    { id: "r2", actionId: "act-old", proposalVersion: 2, step: "email", label: "Offer email", status: "succeeded" },
+  ]), false);
+  // A proposal with no declared required steps can never prove completeness.
+  assert.equal(proposalApprovalComplete({ id: "act-1", version: 2 }, [
+    { id: "r1", actionId: "act-1", proposalVersion: 2, step: "hold", label: "Provisional hold", status: "succeeded" },
+    { id: "r2", actionId: "act-1", proposalVersion: 2, step: "email", label: "Offer email", status: "succeeded" },
+  ]), false);
+  assert.equal(proposalApprovalComplete({ id: "act-1", version: 2, requiredSteps: [] }, [
+    { id: "r1", actionId: "act-1", proposalVersion: 2, step: "hold", label: "Provisional hold", status: "succeeded" },
+    { id: "r2", actionId: "act-1", proposalVersion: 2, step: "email", label: "Offer email", status: "succeeded" },
   ]), false);
   // Partial/uncertain/failed receipts keep the proposal un-approved so
   // recovery paths stay visible.

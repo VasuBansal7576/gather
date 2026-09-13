@@ -88,6 +88,17 @@ const STEP_LABEL: Record<"hold" | "email", string> = {
   email: "Offer email",
 };
 
+/**
+ * Executable steps a proposal kind must complete before the approval can read
+ * as done. This is the authoritative step contract — derived from the
+ * ProposedAction kind, matching the steps approveAndExecute runs — never from
+ * consequence prose or whatever receipts happen to exist. An unknown kind
+ * maps to no steps, so its proposals can never show a completed state.
+ */
+const REQUIRED_STEPS_BY_ACTION_KIND: Record<string, ("hold" | "email")[]> = {
+  create_provisional_hold: ["hold", "email"],
+};
+
 function receiptOf(execution: ExecutionDTO, timezone: string | undefined): ActionReceipt {
   const step = stepOf(execution.idempotencyKey);
   const receipt: ActionReceipt = {
@@ -134,6 +145,7 @@ function proposalFor(item: WorkspaceProposalDTO, timezone: string | undefined): 
     version: action.proposalVersion,
     versionLabel: `Version ${action.proposalVersion} · prepared ${formatTimestamp(action.createdAt, timezone)}`,
     fingerprint: action.proposalFingerprint,
+    requiredSteps: REQUIRED_STEPS_BY_ACTION_KIND[action.kind] ?? [],
     total: "Not priced",
     deposit: "Not priced",
     validUntil: consequences ? `Hold would expire ${formatTimestamp(consequences.expiresAt, timezone)}` : "Not specified",
