@@ -21,15 +21,25 @@ Gather owning business-specific durable intake, cursors, and receipts.
 1. Poll the injected inbox (pre-bound to one stable `accountId`; tokens
    arrive inside the poller — this lane never reads credentials).
 2. Atomically persist the raw batch (`intake_batches` + `intake_items`,
-   own `BEGIN IMMEDIATE`).
+   own `BEGIN IMMEDIATE`). The batch durably remains until every item is
+   linked/drained or explicitly parked — never dropped.
 3. Drain in provider order: resolve booking identity through source keys
    (ambiguous → `needs_decision`, open owner decision stays pending,
    nothing auto-links, nothing ingests), then `ledger.ingestEvent` per
-   linked item with a stable `gather:intake:{account}:{message}:{kind}`
-   dedupeKey. Ledger and identity run their own transactions; this layer
-   never nests them.
+   linked item with a stable `gather:intake:{account}:{message}` dedupeKey
+   (no mutable inferred kind — replays collapse even across later
+   reclassification, and content conflicts surface as visible failures,
+   never merges). Replies classify by actual chronology and direction
+   only: a strictly earlier, non-own message makes an item a reply; later
+   messages, unparseable timestamps, and own outbound mail (recorded as
+   `skipped`) never do. Ledger and identity run their own transactions;
+   this layer never nests them.
 4. Commit the cursor checkpoint only after the full drain (at-least-once:
-   replays collapse on dedupeKeys and source keys).
+   replays collapse on dedupeKeys and source keys). A history-404 expiry
+   durably clears the dead cursor first, so the next sweep full-syncs
+   cursor-less instead of replaying expiry. Parked items (`needs_decision`
+   after owner resolution, retried `failed`) re-drive on later sweeps even
+   when the poll returns nothing new, so the mailbox never stalls on them.
 
 Replies stay ordered after the inquiries they answer, so the ledger
 observes inquiry-then-reply and suppresses answered followups; a reply
@@ -41,23 +51,34 @@ Provider payment text is evidence, never proof.
 
 ## Due-work drain (`drainDueWork`)
 
-Lists due work, claims with fencing tokens, and for items linked to a
-proposal (`detail.proposedActionId` host convention) verifies the live
-exact-version approval read-only, then only `retryFailedSteps` (same
-stable idempotency keys) or `reconcileExecution`. It NEVER calls
-`approveAndExecute`: the operator path cannot mint owner approval.
-Items without live approval are reported as `awaitingOwner` and left for
-the owner; claimed leases fence them until expiry. Failed executions
-surface in the durable failure log; nothing resolves as done on failure.
+Selection and execution are both scoped: only waiting items whose booking
+belongs to this runtime's business are claimed, and an item executes only
+for a proposal bound to the same booking with a live exact-version
+approval verified read-only. Immediately before any effect the drain
+revalidates: the row is still claimed by us with a matching fencing
+token, the booking is not paused/cancelled, and no customer reply arrived
+since the claim (a late reply suppresses instead of executing).
+
+Execution is reconcile-only: uncertain steps reconcile (read-only
+provider truth, never a new write). Failed or never-run steps report
+`awaitingOwner` — retrying an old approved offer is not automatically
+authorized follow-up messaging, and resending customer email as an
+automatic consequence of intake timing is never permitted here. The drain
+NEVER calls `approveAndExecute`: the operator path cannot mint owner
+approval. Nothing resolves as done on failure; failures surface in the
+durable failure log.
 
 ## Health and tools
 
 `operatorHealth()` aggregates last sweep, per-account cursor state,
 `waitingByStatus` counts, paused bookings (ledger control table), and
 recent durable failures, always stamped with the host-declared
-`simulation` flag — simulated runs never claim live. MCP exposes three
-read-only live tools (`operator.health`, `operator.waiting`,
-`operator.intake.status`); every result is `authority: "advisory"`.
+`simulation` flag — derived from the injected port provenance and the poll
+result mode, never a bare caller boolean; health without any durable
+evidence assumes simulated rather than live. Simulated runs never claim
+live. MCP exposes three read-only live tools (`operator.health`,
+`operator.waiting`, `operator.intake.status`); every result is
+`authority: "advisory"`.
 There is deliberately no model-invokable approve/control/retry tool.
 
 HTTP (`app/api/operator/`): `GET health`, `GET waiting`, `GET
@@ -68,10 +89,23 @@ until the host wires operator deps — never a fabricated poller.
 ## Account scope and connections
 
 Cursors and source keys bind the stable `accountId`, never a `"me"`
-alias. Account scope resolves from the store's `connected_accounts`
-table first, then the injected connections directory (independently
-owned lane); unknown accounts are denied, never silently bound.
-Token supply stays behind the injected poller port.
+alias: the poller requires it, cursors encode and enforce it, and two
+pollers sharing `"me"` with different stable ids reject each other's
+cursors before any HTTP. Account scope resolves from the store's
+`connected_accounts` table first, then the injected connections
+directory (independently owned lane, keyed by public connected-account
+ids with explicit businessId); unknown accounts are denied, never
+silently bound. Token supply stays behind the injected poller port.
+
+## Scheduler status (explicit, not claimed)
+
+No Gateway schedule/watch registration exists yet: health reports
+`scheduler: { registered: false, status: "pending-registration" }` and
+sweeps run only when the runtime scheduler or a host call invokes them.
+A callable `runOperatorSweep` plus a manual endpoint is not proactive
+execution, and nothing here labels it scheduled or watching. The Gateway
+handshake check reports `mocked` explicitly when its connector is a
+stand-in.
 
 ## Simulation and control-plane evidence
 

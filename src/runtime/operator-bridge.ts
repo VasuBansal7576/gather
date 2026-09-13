@@ -23,6 +23,8 @@ export async function runOperatorSweep(deps: IntakeDeps): Promise<OperatorSweepR
 
 export interface GatewayHandshakeReport {
   reachable: boolean;
+  /** True when `connect` is a stand-in: reported as mocked, never as a live handshake. */
+  mocked: boolean;
   helloVersion?: string;
   error?: string;
 }
@@ -30,18 +32,20 @@ export interface GatewayHandshakeReport {
 /**
  * Actual isolated-Gateway control-plane evidence, reported separately from
  * simulated intake: connects, waits for hello-ok, and disconnects. Never
- * used for business decisions — monitoring signal only.
+ * used for business decisions — monitoring signal only. Callers declare
+ * whether `connect` is mocked; a mocked handshake reports reachable only
+ * as explicitly mocked evidence.
  */
 export async function checkGatewayHandshake(
-  connect: () => Promise<{ hello: { version?: string } | null; close: () => Promise<void> }>,
+  input: { connect: () => Promise<{ hello: { version?: string } | null; close: () => Promise<void> }>; mocked: boolean },
 ): Promise<GatewayHandshakeReport> {
   try {
-    const connection = await connect();
+    const connection = await input.connect();
     const version = connection.hello?.version;
     await connection.close();
-    return { reachable: true, helloVersion: version };
+    return { reachable: true, mocked: input.mocked, helloVersion: version };
   } catch (error) {
-    return { reachable: false, error: error instanceof Error ? error.message : String(error) };
+    return { reachable: false, mocked: input.mocked, error: error instanceof Error ? error.message : String(error) };
   }
 }
 
