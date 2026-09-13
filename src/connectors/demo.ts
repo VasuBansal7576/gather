@@ -486,13 +486,14 @@ export class DemoCalendarConnector implements CalendarAvailabilityReader, Provis
       !validNonEmpty(request.calendarId) ||
       !validTimeRange(request.startAt, request.endAt) ||
       !validNonEmpty(request.expiresAt) ||
-      Date.parse(request.expiresAt) <= Date.parse(request.endAt)
+      !Number.isFinite(Date.parse(request.expiresAt)) ||
+      Date.parse(request.expiresAt) <= Date.parse(this.store.now())
     ) {
       return failure(
         request.operationKey,
         request.sourceReferences,
         "invalid_request",
-        "operationKey, bookingId, calendarId, a valid range, and an expiry after endAt are required",
+        "operationKey, bookingId, calendarId, a valid range, and an unexpired expiresAt (after the connector's current time) are required",
       );
     }
 

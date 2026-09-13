@@ -45,6 +45,32 @@ export interface ProposedActionInput {
   sourceReferences: SourceReference[];
 }
 
+/** Default ownership lease for a reserved pending step execution. */
+export const DEFAULT_CLAIM_LEASE_MS = 120_000;
+
+export interface StepReservationOptions {
+  claimToken?: string;
+  leaseMs?: number;
+  /** Injectable clock (epoch millis) for deterministic crash-recovery tests. */
+  nowMs?: number;
+}
+
+export interface StepReservation {
+  execution: ActionExecution;
+  /** True when this call created the pending row and owns its claim. */
+  created: boolean;
+  /** True when a crashed/leaked pending row was reclaimed; caller owns the new claim. */
+  reclaimed: boolean;
+}
+
+export type ProviderReceiptKind = "hold" | "email";
+
+export interface ProviderReceipt {
+  kind: ProviderReceiptKind;
+  operationKey: string;
+  receipt: Record<string, unknown>;
+}
+
 export interface BookingInput {
   id?: string;
   businessId: string;
@@ -150,7 +176,23 @@ export class GatherStore {
         key TEXT PRIMARY KEY,
         value_json TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS provider_receipts (
+        operation_key TEXT PRIMARY KEY,
+        kind TEXT NOT NULL CHECK (kind IN ('hold', 'email')),
+        receipt_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
     `);
+    // Migrations for databases created before these columns/tables existed.
+    this.ensureColumn("action_executions", "claim_token", "TEXT");
+    this.ensureColumn("action_executions", "claim_expires_at", "TEXT");
+  }
+
+  private ensureColumn(table: string, column: string, ddl: string): void {
+    const info = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+    if (!info.some((col) => col.name === column)) {
+      this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`);
+    }
   }
 
   close(): void {
@@ -315,13 +357,31 @@ export class GatherStore {
     return this.getActionExecution(executionId);
   }
 
-  completeActionExecution(executionId: string, outcome: ActionOutcome): ActionExecution {
+  /**
+   * Complete a pending execution. When a claim token is supplied, the update
+   * is conditional on still holding that claim: an expired in-flight call and
+   * a new owner can never both commit the same row. Without a token (legacy
+   * sync path) the update applies to any pending row.
+   */
+  completeActionExecution(executionId: string, outcome: ActionOutcome, opts: { claimToken?: string } = {}): ActionExecution {
     const timestamp = now();
-    this.db.prepare(`UPDATE action_executions SET status = $status, result_json = $result,
-      error = $error, completed_at = $timestamp WHERE id = $id AND status = 'pending'`).run({
+    if (opts.claimToken === undefined) {
+      this.db.prepare(`UPDATE action_executions SET status = $status, result_json = $result,
+        error = $error, completed_at = $timestamp WHERE id = $id AND status = 'pending'`).run({
+        $status: outcome.status, $result: outcome.result === undefined ? null : JSON.stringify(outcome.result),
+        $error: outcome.error ?? null, $timestamp: timestamp, $id: executionId,
+      });
+      return this.getActionExecution(executionId);
+    }
+    const updated = this.db.prepare(`UPDATE action_executions SET status = $status, result_json = $result,
+      error = $error, completed_at = $timestamp
+      WHERE id = $id AND status = 'pending' AND claim_token = $claim`).run({
       $status: outcome.status, $result: outcome.result === undefined ? null : JSON.stringify(outcome.result),
-      $error: outcome.error ?? null, $timestamp: timestamp, $id: executionId,
+      $error: outcome.error ?? null, $timestamp: timestamp, $id: executionId, $claim: opts.claimToken,
     });
+    if (updated.changes === 0) {
+      throw new Error("Step claim is no longer held: another owner completed, reclaimed, or reconciled this execution");
+    }
     return this.getActionExecution(executionId);
   }
 
@@ -449,11 +509,24 @@ export class GatherStore {
 
   /**
    * Async-safe reservation boundary for real connector interfaces.
+   *
    * Atomically inserts a pending step execution for a stable idempotency key
-   * BEFORE any provider side effect, or returns the existing durable row for
-   * that key. Requires exact-version approval. Never performs I/O itself.
+   * BEFORE any provider side effect, and grants the caller a time-boxed claim
+   * (claim token + expiry) on that pending row. Callers may execute the
+   * provider side effect ONLY when the returned reservation is newly created
+   * or reclaimed after an expired claim. An existing pending row with a live
+   * claim belongs to another in-flight attempt (possibly on a separate store
+   * connection after a crash or under concurrency) and is refused with an
+   * in-progress error instead of being blindly replayed.
+   *
+   * Requires exact-version approval. Never performs I/O itself.
    */
-  reserveStepExecution(proposedActionId: string, proposalVersion: number, idempotencyKey: string): ActionExecution {
+  reserveStepExecution(
+    proposedActionId: string,
+    proposalVersion: number,
+    idempotencyKey: string,
+    opts: StepReservationOptions = {},
+  ): StepReservation {
     const action = this.getProposedAction(proposedActionId);
     if (action.proposalVersion !== proposalVersion) {
       throw new Error("Stale proposal version: approval refers to a different version");
@@ -463,44 +536,96 @@ export class GatherStore {
       $actionId: proposedActionId, $version: action.proposalVersion, $fingerprint: action.proposalFingerprint,
     });
     if (!approval) throw new Error("Action requires approval for its exact current proposal version");
+    const claimToken = opts.claimToken ?? randomUUID();
+    const nowMs = opts.nowMs ?? Date.now();
+    const leaseMs = opts.leaseMs ?? DEFAULT_CLAIM_LEASE_MS;
     const existing = this.getExecutionByIdempotencyKey(idempotencyKey);
     if (existing) {
       if (existing.proposedActionId !== proposedActionId || existing.proposalVersion !== proposalVersion) {
         throw new Error("Idempotency key is bound to a different approved action");
       }
-      return existing;
+      if (existing.status !== "pending") {
+        return { execution: existing, created: false, reclaimed: false };
+      }
+      return this.reclaimOrRejectPending(existing, claimToken, nowMs, leaseMs);
     }
     const latest = this.db.prepare(`SELECT attempt FROM action_executions WHERE proposed_action_id = $actionId
       AND proposal_version = $version ORDER BY attempt DESC LIMIT 1`).get({ $actionId: proposedActionId, $version: proposalVersion });
     const attempt = latest ? Number(row(latest).attempt) + 1 : 1;
     const timestamp = now();
     const id = randomUUID();
-    try {
-      this.db.prepare(`INSERT INTO action_executions (id, proposed_action_id, proposal_version, idempotency_key,
-        attempt, status, started_at) VALUES ($id, $actionId, $version, $key, $attempt, 'pending', $timestamp)`).run({
-        $id: id, $actionId: proposedActionId, $version: proposalVersion, $key: idempotencyKey, $attempt: attempt, $timestamp: timestamp,
-      });
-    } catch (error) {
-      // Lost a race with a concurrent reserver for the same stable key: return the winner.
+    const expiresAt = new Date(nowMs + leaseMs).toISOString();
+    const inserted = this.db.prepare(`INSERT INTO action_executions (id, proposed_action_id, proposal_version, idempotency_key,
+      attempt, status, started_at, claim_token, claim_expires_at)
+      VALUES ($id, $actionId, $version, $key, $attempt, 'pending', $timestamp, $claim, $expires)
+      ON CONFLICT(idempotency_key) DO NOTHING`).run({
+      $id: id, $actionId: proposedActionId, $version: proposalVersion, $key: idempotencyKey, $attempt: attempt,
+      $timestamp: timestamp, $claim: claimToken, $expires: expiresAt,
+    });
+    if (inserted.changes === 0) {
+      // Lost a race with a concurrent reserver on another connection: resolve
+      // against the winner instead of executing twice.
       const winner = this.getExecutionByIdempotencyKey(idempotencyKey);
-      if (winner) return winner;
-      throw error;
+      if (!winner) throw new Error("Step reservation raced but no winner row is visible");
+      if (winner.proposedActionId !== proposedActionId || winner.proposalVersion !== proposalVersion) {
+        throw new Error("Idempotency key is bound to a different approved action");
+      }
+      if (winner.status !== "pending") return { execution: winner, created: false, reclaimed: false };
+      return this.reclaimOrRejectPending(winner, claimToken, nowMs, leaseMs);
     }
-    return this.getActionExecution(id);
+    return { execution: this.getActionExecution(id), created: true, reclaimed: false };
+  }
+
+  /**
+   * Decide ownership of an existing pending row. A live claim means another
+   * attempt is in flight: refuse. An expired (or absent) claim means the
+   * previous owner crashed or leaked: reclaim atomically so only one caller
+   * proceeds.
+   */
+  private reclaimOrRejectPending(
+    pending: ActionExecution,
+    claimToken: string,
+    nowMs: number,
+    leaseMs: number,
+  ): StepReservation {
+    const expiryMs = pending.claimExpiresAt ? Date.parse(pending.claimExpiresAt) : Number.NaN;
+    if (Number.isFinite(expiryMs) && expiryMs > nowMs) {
+      throw new Error("Step execution is already in progress for this idempotency key");
+    }
+    const expiresAt = new Date(nowMs + leaseMs).toISOString();
+    const timestamp = now();
+    const claimed = this.db.prepare(`UPDATE action_executions SET claim_token = $claim, claim_expires_at = $expires,
+      attempt = attempt + 1, started_at = $timestamp
+      WHERE id = $id AND status = 'pending' AND (claim_expires_at IS NULL OR claim_expires_at <= $nowIso)`).run({
+      $claim: claimToken, $expires: expiresAt, $timestamp: timestamp, $id: pending.id, $nowIso: new Date(nowMs).toISOString(),
+    });
+    if (claimed.changes === 0) {
+      const current = this.getActionExecution(pending.id);
+      if (current.status !== "pending") return { execution: current, created: false, reclaimed: false };
+      throw new Error("Step execution is already in progress for this idempotency key");
+    }
+    return { execution: this.getActionExecution(pending.id), created: false, reclaimed: true };
   }
 
   /**
    * Reopen a terminally failed step for retry while keeping the SAME stable
-   * idempotency key. The connector dedupes by that key, so a real provider
-   * never double-applies. Succeeded/uncertain/partial rows are never reopened
-   * here (uncertain must reconcile first).
+   * idempotency key, granting the caller a fresh claim. The connector dedupes
+   * by that key, so a real provider never double-applies. Succeeded/
+   * uncertain/partial rows are never reopened here (uncertain must reconcile
+   * first).
    */
-  reopenFailedStep(executionId: string): ActionExecution {
+  reopenFailedStep(executionId: string, opts: StepReservationOptions = {}): ActionExecution {
     const current = this.getActionExecution(executionId);
     if (current.status !== "failed") throw new Error("Only failed executions can be retried; reconcile uncertain ones first");
     const timestamp = now();
+    const nowMs = opts.nowMs ?? Date.now();
+    const leaseMs = opts.leaseMs ?? DEFAULT_CLAIM_LEASE_MS;
     this.db.prepare(`UPDATE action_executions SET status = 'pending', attempt = attempt + 1,
-      error = NULL, started_at = $timestamp, completed_at = NULL WHERE id = $id`).run({ $timestamp: timestamp, $id: executionId });
+      error = NULL, started_at = $timestamp, completed_at = NULL,
+      claim_token = $claim, claim_expires_at = $expires WHERE id = $id`).run({
+      $timestamp: timestamp, $claim: opts.claimToken ?? randomUUID(),
+      $expires: new Date(nowMs + leaseMs).toISOString(), $id: executionId,
+    });
     return this.getActionExecution(executionId);
   }
 
@@ -509,12 +634,23 @@ export class GatherStore {
    * pending OR already-terminal-uncertain rows; succeeding rows are never
    * overwritten to uncertain.
    */
-  markExecutionUncertain(executionId: string, message: string): ActionExecution {
+  markExecutionUncertain(executionId: string, message: string, opts: { claimToken?: string } = {}): ActionExecution {
     const current = this.getActionExecution(executionId);
     if (current.status === "succeeded") throw new Error("A succeeded step must never be rewritten to uncertain");
     const timestamp = now();
-    this.db.prepare(`UPDATE action_executions SET status = 'uncertain', error = $error,
-      completed_at = COALESCE(completed_at, $timestamp) WHERE id = $id`).run({ $error: message, $timestamp: timestamp, $id: executionId });
+    if (opts.claimToken === undefined) {
+      this.db.prepare(`UPDATE action_executions SET status = 'uncertain', error = $error,
+        completed_at = COALESCE(completed_at, $timestamp) WHERE id = $id`).run({ $error: message, $timestamp: timestamp, $id: executionId });
+      return this.getActionExecution(executionId);
+    }
+    const updated = this.db.prepare(`UPDATE action_executions SET status = 'uncertain', error = $error,
+      completed_at = COALESCE(completed_at, $timestamp)
+      WHERE id = $id AND status = 'pending' AND claim_token = $claim`).run({
+      $error: message, $timestamp: timestamp, $id: executionId, $claim: opts.claimToken,
+    });
+    if (updated.changes === 0) {
+      throw new Error("Step claim is no longer held: another owner completed, reclaimed, or reconciled this execution");
+    }
     return this.getActionExecution(executionId);
   }
 
@@ -528,11 +664,37 @@ export class GatherStore {
       createdAt: String(value.created_at), updatedAt: String(value.updated_at) };
   }
 
+  /**
+   * Durable provider-side receipt log. Demo adapters persist every completed
+   * provider write here (including writes whose response was lost), so
+   * reconciliation after a restart or adapter rebuild reads SQLite instead of
+   * relying on volatile adapter memory. First write wins per operation key.
+   */
+  saveProviderReceipt(kind: ProviderReceiptKind, operationKey: string, receipt: Record<string, unknown>): void {
+    this.db.prepare(`INSERT INTO provider_receipts (operation_key, kind, receipt_json, created_at)
+      VALUES ($key, $kind, $receipt, $timestamp) ON CONFLICT(operation_key) DO NOTHING`).run({
+      $key: operationKey, $kind: kind, $receipt: JSON.stringify(receipt), $timestamp: now(),
+    });
+  }
+
+  getProviderReceipt(operationKey: string): ProviderReceipt | undefined {
+    const found = this.db.prepare("SELECT * FROM provider_receipts WHERE operation_key = $key").get({ $key: operationKey });
+    if (!found) return undefined;
+    const value = row(found);
+    return {
+      kind: value.kind as ProviderReceiptKind,
+      operationKey: String(value.operation_key),
+      receipt: parseJson(value.receipt_json, {}) as Record<string, unknown>,
+    };
+  }
+
   private toActionExecution(value: SqlRow): ActionExecution {
     return { id: String(value.id), proposedActionId: String(value.proposed_action_id), proposalVersion: Number(value.proposal_version),
       idempotencyKey: String(value.idempotency_key), attempt: Number(value.attempt), status: value.status as ActionExecutionStatus,
       result: value.result_json === null ? undefined : parseJson(value.result_json, undefined), error: value.error ? String(value.error) : undefined,
       startedAt: String(value.started_at), completedAt: value.completed_at ? String(value.completed_at) : undefined,
-      reconciledAt: value.reconciled_at ? String(value.reconciled_at) : undefined };
+      reconciledAt: value.reconciled_at ? String(value.reconciled_at) : undefined,
+      claimToken: value.claim_token ? String(value.claim_token) : undefined,
+      claimExpiresAt: value.claim_expires_at ? String(value.claim_expires_at) : undefined };
   }
 }

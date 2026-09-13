@@ -20,12 +20,16 @@ inquiry text can never authorize execution.
 
 `proposalFingerprint` covers exactly `{ bookingId, kind, payload,
 sourceReferences }`. The pipeline executes **only** payload-explicit fields
-(`startAt`, `endAt`, `expiresAt`, `emailTo`, `emailSubject`, `emailBody`) and
-rejects proposals that omit any of them — so the displayed fingerprint covers
-every consequential hold/email field. `GET /api/workspace` exposes per-proposal
-`consequences` previews (resolved with the same function the pipeline uses);
-`consequences: null` plus `consequencesError` means the proposal is incomplete
-and approval will return `INVALID_REQUEST`.
+(`startAt`, `endAt`, `expiresAt`, `calendarId`, `emailTo`, `emailSubject`,
+`emailBody`) and rejects proposals that omit any of them — so the displayed
+fingerprint covers every consequential hold/email field, including the calendar
+target. Changing the calendar target changes the fingerprint and invalidates
+prior approval. `expiresAt` is a provisional-hold expiry: it must lie in the
+future relative to the server clock, and it is legitimately before the event
+(an offer held until next week for an October event). `GET /api/workspace`
+exposes per-proposal `consequences` previews (resolved with the same function
+the pipeline uses); `consequences: null` plus `consequencesError` means the
+proposal is incomplete and approval will return `INVALID_REQUEST`.
 
 ## Endpoints
 
@@ -47,14 +51,32 @@ payment/confirmation step.
 - Step executions are **reserved atomically in SQLite before** any provider
   side effect (`reserveStepExecution`), keyed by a stable idempotency key
   (`stableOperationKey` over `{ proposedActionId, proposalVersion }`) that is
-  identical across retries, reconciliation, and restarts.
+  identical across retries, reconciliation, and restarts. The reservation
+  grants a time-boxed **claim** (`{ execution, created, reclaimed }`); only
+  the claim holder may execute or complete the step. A pending row with a live
+  claim belongs to another in-flight attempt (possibly on a separate store
+  connection) and is refused with retryable `409 CONFLICT` instead of being
+  replayed. Completion writes (`completeActionExecution`,
+  `markExecutionUncertain`) are conditional on the claim token, so an expired
+  in-flight call and a new owner can never both commit.
+- A reclaimed (crashed/leaked) pending attempt is **reconciled by stable key
+  before any further write**: a found provider write heals to `succeeded`
+  without a new side effect; an absent one stays `uncertain` until provider
+  evidence appears — lease expiry never authorizes a blind replay.
+- Availability is re-checked fresh before every new hold write (approve and
+  retry), and the requested range must be **fully covered** by available
+  slots; partial overlap is rejected as `SLOT_UNAVAILABLE`. Retry also
+  re-verifies a live exact-version approval, so stale receipts are never
+  served after the proposal moves on.
 - Uncertainty (throw/timeout) is **persisted as `uncertain` before** any retry
   is allowed; retry of an uncertain step is refused until reconciliation.
-- Success receipts (hold/email provider records) are persisted in
-  `action_executions.result_json`, so a restart reuses them without new
-  provider writes. The demo adapter's in-memory world is volatile and is never
-  the source of truth; simulation restart recovery proves SQLite durability,
-  not a real external provider restart.
+- Provider receipts are persisted twice: per-step results in
+  `action_executions.result_json`, and every completed demo provider write
+  (including writes whose response was lost) in `provider_receipts`. The
+  durable demo wrappers reconcile from SQLite, so restart-while-uncertain
+  recovery survives adapter rebuilds. The demo adapter's in-memory world is
+  volatile and is never the source of truth; simulation restart recovery
+  proves SQLite durability, not a real external provider restart.
 - Failed steps reopen under the **same** idempotency key, so a real provider
   dedupes them.
 

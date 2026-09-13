@@ -37,6 +37,7 @@ function holdPayload(to: string[] = ["guest@example.test"]): Record<string, unkn
     startAt: START,
     endAt: END,
     expiresAt: EXPIRES,
+    calendarId: "demo-calendar-001",
     emailTo: to,
     emailSubject: "DEMO ONLY fictional offer",
     emailBody: "DEMO ONLY fictional hold for the test event.",
@@ -72,7 +73,6 @@ function setup(extraSeed: Parameters<typeof createDemoConnectors>[0] = {}): Setu
     store,
     calendar: connectors.calendar,
     email: connectors.email,
-    calendarId: "demo-calendar-001",
     ownerId: "test-owner",
   };
   const business = store.createBusiness({ name: "Fictional Test Hall", timezone: "UTC" });

@@ -1,6 +1,7 @@
 import { createDemoConnectors, type DemoConnectorSet } from "../connectors/demo.ts";
 import type { BookingServiceDeps } from "./booking-service.ts";
 import { demoFixtureSlots } from "./demo-fixtures.ts";
+import { DurableDemoCalendar, DurableDemoEmail } from "./durable-demo-connectors.ts";
 import { GatherStore } from "./sqlite-store.ts";
 
 /**
@@ -33,9 +34,8 @@ export function getRuntime(): ServerRuntime {
   const connectors = createDemoConnectors({ calendarSlots: demoFixtureSlots() });
   const deps: BookingServiceDeps = {
     store,
-    calendar: connectors.calendar,
-    email: connectors.email,
-    calendarId: "demo-calendar-001",
+    calendar: new DurableDemoCalendar(store, connectors.calendar),
+    email: new DurableDemoEmail(store, connectors.email),
     ownerId: ownerId(),
   };
   cached = { store, connectors, deps };

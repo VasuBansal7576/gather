@@ -8,7 +8,7 @@ export const dynamic = "force-dynamic";
 export async function GET(): Promise<NextResponse> {
   try {
     const runtime = getRuntime();
-    return NextResponse.json(getWorkspace(runtime.store, { ownerId: runtime.deps.ownerId, calendarId: runtime.deps.calendarId }));
+    return NextResponse.json(getWorkspace(runtime.store, { ownerId: runtime.deps.ownerId }));
   } catch (error) {
     return unknownErrorResponse(error);
   }

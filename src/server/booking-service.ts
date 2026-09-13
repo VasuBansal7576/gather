@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { stableOperationKey } from "../connectors/contracts.ts";
 import type {
   CalendarAvailabilityReader,
@@ -5,6 +6,9 @@ import type {
   ProvisionalHoldWriter,
 } from "../connectors/contracts.ts";
 import { GatherStore } from "./sqlite-store.ts";
+import type { StepReservation } from "./sqlite-store.ts";
+
+export type { StepReservation };
 import type {
   ApproveRequestDTO,
   ApproveResponseDTO,
@@ -42,13 +46,22 @@ export interface BookingServiceDeps {
   store: GatherStore;
   calendar: CalendarAvailabilityReader & ProvisionalHoldWriter;
   email: EmailSender;
+  /** Injectable clock (ISO timestamp). Used for provisional-hold expiry checks. */
   now?: () => string;
-  calendarId?: string;
   /**
    * Configured local owner identity (e.g. GATHER_OWNER_ID). Approvals are
    * always recorded under this value; request-supplied identities are ignored.
    */
   ownerId?: string;
+}
+
+/** Claimed-step lease: a crashed pending attempt becomes reclaimable after this. */
+export const STEP_CLAIM_LEASE_MS = 120_000;
+
+function clockMs(deps: BookingServiceDeps): number {
+  if (!deps.now) return Date.now();
+  const parsed = Date.parse(deps.now());
+  return Number.isFinite(parsed) ? parsed : Date.now();
 }
 
 export function ownerIdentity(deps: BookingServiceDeps): string {
@@ -61,6 +74,7 @@ export interface HoldParams {
   startAt: string;
   endAt: string;
   expiresAt: string;
+  calendarId: string;
   emailTo: string[];
   emailSubject: string;
   emailBody: string;
@@ -88,17 +102,31 @@ function str(value: unknown): string | undefined {
  * proposalFingerprint covers exactly { bookingId, kind, payload,
  * sourceReferences }. Derived defaults would execute fields the fingerprint
  * never covered, so they are rejected instead of defaulted.
+ *
+ * expiresAt is a provisional-hold expiry: it must be a valid timestamp in the
+ * future relative to the injected clock. It is deliberately NOT required to
+ * be after the event end — a hold commonly expires before the event starts
+ * (e.g. an offer held until next week for an October event).
  */
-export function resolveHoldParams(actionPayload: Record<string, unknown>): HoldParams {
+export function resolveHoldParams(actionPayload: Record<string, unknown>, opts: { nowMs?: number } = {}): HoldParams {
   const payload = asRecord(actionPayload);
   const startAt = str(payload.startAt);
   const endAt = str(payload.endAt);
   const expiresAt = str(payload.expiresAt);
+  const calendarId = str(payload.calendarId);
   if (!startAt || !endAt || !validRange(startAt, endAt)) {
     throw new ServiceError("INVALID_REQUEST", "Proposal payload must carry an explicit valid startAt/endAt range", false);
   }
-  if (!expiresAt || !Number.isFinite(Date.parse(expiresAt)) || Date.parse(expiresAt) <= Date.parse(endAt)) {
-    throw new ServiceError("INVALID_REQUEST", "Proposal payload must carry an explicit expiresAt after endAt", false);
+  if (!calendarId) {
+    throw new ServiceError("INVALID_REQUEST", "Proposal payload must carry an explicit calendarId (it is part of the approved fingerprint)", false);
+  }
+  const nowMs = opts.nowMs ?? Date.now();
+  const expiryMs = expiresAt ? Date.parse(expiresAt) : Number.NaN;
+  if (!expiresAt || !Number.isFinite(expiryMs)) {
+    throw new ServiceError("INVALID_REQUEST", "Proposal payload must carry an explicit valid expiresAt", false);
+  }
+  if (expiryMs <= nowMs) {
+    throw new ServiceError("INVALID_REQUEST", "Proposal payload expiresAt must be in the future (the hold has already expired)", false);
   }
   const rawTo = payload.emailTo;
   const emailTo = (Array.isArray(rawTo) ? rawTo : []).filter((item): item is string => typeof item === "string" && item.length > 0);
@@ -107,17 +135,20 @@ export function resolveHoldParams(actionPayload: Record<string, unknown>): HoldP
   const emailBody = str(payload.emailBody);
   if (!emailSubject) throw new ServiceError("INVALID_REQUEST", "Proposal payload must carry an explicit emailSubject", false);
   if (!emailBody) throw new ServiceError("INVALID_REQUEST", "Proposal payload must carry an explicit emailBody", false);
-  return { startAt, endAt, expiresAt, emailTo, emailSubject, emailBody };
+  return { startAt, endAt, expiresAt, calendarId, emailTo, emailSubject, emailBody };
 }
 
 /** UI preview of the exact consequences approval would execute (same resolver). */
-export function previewConsequences(actionPayload: Record<string, unknown>): {
+export function previewConsequences(
+  actionPayload: Record<string, unknown>,
+  opts: { nowMs?: number } = {},
+): {
   consequences: import("./dto.ts").ProposalConsequencesDTO | null;
   consequencesError?: string;
 } {
   try {
-    const params = resolveHoldParams(actionPayload);
-    return { consequences: { ...params, calendarId: "demo-calendar-001" } };
+    const params = resolveHoldParams(actionPayload, opts);
+    return { consequences: { ...params } };
   } catch (error) {
     return { consequences: null, consequencesError: error instanceof Error ? error.message : "Incomplete proposal payload" };
   }
@@ -152,19 +183,19 @@ function availabilityKey(startAt: string, endAt: string): string {
 }
 
 /** Read-only workspace aggregation for the owner UI. */
-export function getWorkspace(store: GatherStore, deps?: Pick<BookingServiceDeps, "ownerId" | "calendarId">): WorkspaceDTO {
+export function getWorkspace(store: GatherStore, deps?: Pick<BookingServiceDeps, "ownerId" | "now">): WorkspaceDTO {
   const businesses = store.listBusinesses();
   const connections = store.listConnectedAccounts();
-  const calendarId = deps?.calendarId ?? "demo-calendar-001";
+  const nowMs = deps?.now ? Date.parse(deps.now()) : Date.now();
   const bookings = store.listBookings().map((booking) => {
     const actions = store.listProposedActionsForBooking(booking.id);
     return {
       booking,
       proposals: actions.map((action) => {
-        const preview = previewConsequences(action.payload);
+        const preview = previewConsequences(action.payload, { nowMs });
         return {
           action,
-          consequences: preview.consequences ? { ...preview.consequences, calendarId } : null,
+          consequences: preview.consequences,
           ...(preview.consequencesError ? { consequencesError: preview.consequencesError } : {}),
         };
       }),
@@ -204,35 +235,127 @@ function requireExactApproval(store: GatherStore, input: ApproveRequestDTO) {
   return action;
 }
 
+/**
+ * Reserve a step for execution, mapping store-level ownership races to typed
+ * service errors. The returned reservation carries the caller's claim token;
+ * provider side effects and completion writes must present that token, so an
+ * expired in-flight call and a new owner can never both commit.
+ */
+function reserveStep(
+  deps: BookingServiceDeps,
+  actionId: string,
+  version: number,
+  key: string,
+  step: "hold" | "email",
+): { reservation: StepReservation; claimToken: string } {
+  const claimToken = randomUUID();
+  try {
+    const reservation = deps.store.reserveStepExecution(actionId, version, key, {
+      claimToken,
+      leaseMs: STEP_CLAIM_LEASE_MS,
+      nowMs: clockMs(deps),
+    });
+    return { reservation, claimToken };
+  } catch (error) {
+    if (error instanceof Error && /already in progress/.test(error.message)) {
+      throw new ServiceError("CONFLICT", `${step === "hold" ? "Hold" : "Email"} step is already in progress for this approved proposal; wait or reconcile`, true);
+    }
+    throw error;
+  }
+}
+
+/**
+ * Recover a reclaimed (crashed/leaked) pending attempt. A lease expiry proves
+ * nothing about the external effect, so reconcile by stable operation key
+ * BEFORE any further write. A found write heals to succeeded; an absent one
+ * stays uncertain — it must never be replayed blindly.
+ */
+async function recoverReclaimedHold(
+  deps: BookingServiceDeps,
+  execution: ActionExecution,
+  key: string,
+  claimToken: string,
+): Promise<ActionExecution> {
+  const { store, calendar } = deps;
+  const reconciled = await calendar.reconcileProvisionalHold({ operationKey: key });
+  if (reconciled.status === "succeeded") {
+    // The pending row must pass through uncertain (claim-guarded) before it
+    // can record the reconciled outcome.
+    const pending = store.markExecutionUncertain(
+      execution.id,
+      "Recovered pending hold matched provider evidence on reconcile",
+      { claimToken },
+    );
+    return store.reconcileActionExecution(pending.id, { status: "succeeded", result: { ...reconciled.data, demo: true } });
+  }
+  return store.markExecutionUncertain(
+    execution.id,
+    "Recovered pending hold could not be reconciled against the provider; it remains uncertain until provider evidence appears",
+    { claimToken },
+  );
+}
+
+async function recoverReclaimedEmail(
+  deps: BookingServiceDeps,
+  execution: ActionExecution,
+  key: string,
+  claimToken: string,
+): Promise<ActionExecution> {
+  const { store, email } = deps;
+  const reconciled = await email.reconcileSentEmail({ operationKey: key });
+  if (reconciled.status === "succeeded") {
+    const pending = store.markExecutionUncertain(
+      execution.id,
+      "Recovered pending email matched provider evidence on reconcile",
+      { claimToken },
+    );
+    return store.reconcileActionExecution(pending.id, { status: "succeeded", result: { ...reconciled.data, demo: true } });
+  }
+  return store.markExecutionUncertain(
+    execution.id,
+    "Recovered pending email could not be reconciled against the provider; it remains uncertain until provider evidence appears",
+    { claimToken },
+  );
+}
+
 async function runHoldStep(deps: BookingServiceDeps, actionId: string, version: number, params: HoldParams): Promise<ActionExecution> {
   const { store, calendar } = deps;
   const key = holdOperationKey(actionId, version);
-  let execution = store.reserveStepExecution(actionId, version, key);
+  const { reservation, claimToken } = reserveStep(deps, actionId, version, key, "hold");
+  let execution = reservation.execution;
   if (execution.status === "succeeded") return execution; // never resend
-  if (execution.status === "failed") execution = store.reopenFailedStep(execution.id);
-  if (execution.status === "uncertain" || execution.status === "partial") {
+  if (execution.status === "failed") {
+    execution = store.reopenFailedStep(execution.id, { claimToken, leaseMs: STEP_CLAIM_LEASE_MS, nowMs: clockMs(deps) });
+  } else if (execution.status === "uncertain" || execution.status === "partial") {
     throw new ServiceError("RECONCILE_REQUIRED", "Hold step is uncertain; reconcile before retrying", false);
+  } else if (reservation.reclaimed) {
+    return recoverReclaimedHold(deps, execution, key, claimToken);
+  } else if (!reservation.created) {
+    // Defensive: the store never returns a foreign pending row without throwing,
+    // but never execute without claim ownership.
+    throw new ServiceError("CONFLICT", "Hold step is already in progress for this approved proposal; wait or reconcile", true);
   }
-  // execution is now pending (freshly reserved, reopened, or recovered after crash)
+  // execution is now pending under our claim: only our token can complete it.
+  const claim = { claimToken };
   let outcome;
   try {
     outcome = await calendar.createProvisionalHold({
       operationKey: key,
       bookingId: store.getProposedAction(actionId).bookingId,
-      calendarId: deps.calendarId ?? "demo-calendar-001",
+      calendarId: params.calendarId,
       startAt: params.startAt,
       endAt: params.endAt,
       expiresAt: params.expiresAt,
     });
   } catch (error) {
-    return store.markExecutionUncertain(execution.id, error instanceof Error ? error.message : "Hold outcome was not received");
+    return store.markExecutionUncertain(execution.id, error instanceof Error ? error.message : "Hold outcome was not received", claim);
   }
   if (outcome.status === "succeeded") {
-    return store.completeActionExecution(execution.id, { status: "succeeded", result: { ...outcome.data, demo: true } });
+    return store.completeActionExecution(execution.id, { status: "succeeded", result: { ...outcome.data, demo: true } }, claim);
   }
   if (outcome.status === "uncertain") {
     // Persist uncertainty BEFORE any retry, then attempt one reconciliation read.
-    const pending = store.markExecutionUncertain(execution.id, outcome.error.message);
+    const pending = store.markExecutionUncertain(execution.id, outcome.error.message, claim);
     const reconciled = await calendar.reconcileProvisionalHold({ operationKey: key });
     if (reconciled.status === "succeeded") {
       return store.reconcileActionExecution(pending.id, { status: "succeeded", result: { ...reconciled.data, demo: true } });
@@ -241,24 +364,32 @@ async function runHoldStep(deps: BookingServiceDeps, actionId: string, version: 
   }
   // outcome.status === "failed"
   if (outcome.error.kind === "slot_unavailable" || outcome.error.kind === "conflict") {
-    return store.completeActionExecution(execution.id, { status: "failed", error: outcome.error.message });
+    return store.completeActionExecution(execution.id, { status: "failed", error: outcome.error.message }, claim);
   }
   if (outcome.error.kind === "access_revoked" || outcome.error.kind === "authorization_denied") {
-    const failed = store.completeActionExecution(execution.id, { status: "failed", error: outcome.error.message });
+    const failed = store.completeActionExecution(execution.id, { status: "failed", error: outcome.error.message }, claim);
+    void failed;
     throw new ServiceError("ACCESS_REVOKED", outcome.error.message, false);
   }
-  return store.completeActionExecution(execution.id, { status: "failed", error: outcome.error.message });
+  return store.completeActionExecution(execution.id, { status: "failed", error: outcome.error.message }, claim);
 }
 
 async function runEmailStep(deps: BookingServiceDeps, actionId: string, version: number, params: HoldParams): Promise<ActionExecution> {
   const { store, email } = deps;
   const key = emailOperationKey(actionId, version);
-  let execution = store.reserveStepExecution(actionId, version, key);
+  const { reservation, claimToken } = reserveStep(deps, actionId, version, key, "email");
+  let execution = reservation.execution;
   if (execution.status === "succeeded") return execution; // never resend
-  if (execution.status === "failed") execution = store.reopenFailedStep(execution.id);
-  if (execution.status === "uncertain" || execution.status === "partial") {
+  if (execution.status === "failed") {
+    execution = store.reopenFailedStep(execution.id, { claimToken, leaseMs: STEP_CLAIM_LEASE_MS, nowMs: clockMs(deps) });
+  } else if (execution.status === "uncertain" || execution.status === "partial") {
     throw new ServiceError("RECONCILE_REQUIRED", "Email step is uncertain; reconcile before retrying", false);
+  } else if (reservation.reclaimed) {
+    return recoverReclaimedEmail(deps, execution, key, claimToken);
+  } else if (!reservation.created) {
+    throw new ServiceError("CONFLICT", "Email step is already in progress for this approved proposal; wait or reconcile", true);
   }
+  const claim = { claimToken };
   let outcome;
   try {
     outcome = await email.sendEmail({
@@ -268,13 +399,13 @@ async function runEmailStep(deps: BookingServiceDeps, actionId: string, version:
       body: params.emailBody,
     });
   } catch (error) {
-    return store.markExecutionUncertain(execution.id, error instanceof Error ? error.message : "Email outcome was not received");
+    return store.markExecutionUncertain(execution.id, error instanceof Error ? error.message : "Email outcome was not received", claim);
   }
   if (outcome.status === "succeeded") {
-    return store.completeActionExecution(execution.id, { status: "succeeded", result: { ...outcome.data, demo: true } });
+    return store.completeActionExecution(execution.id, { status: "succeeded", result: { ...outcome.data, demo: true } }, claim);
   }
   if (outcome.status === "uncertain") {
-    const pending = store.markExecutionUncertain(execution.id, outcome.error.message);
+    const pending = store.markExecutionUncertain(execution.id, outcome.error.message, claim);
     const reconciled = await email.reconcileSentEmail({ operationKey: key });
     if (reconciled.status === "succeeded") {
       return store.reconcileActionExecution(pending.id, { status: "succeeded", result: { ...reconciled.data, demo: true } });
@@ -282,11 +413,11 @@ async function runEmailStep(deps: BookingServiceDeps, actionId: string, version:
     return pending;
   }
   if (outcome.error.kind === "access_revoked" || outcome.error.kind === "authorization_denied") {
-    const failed = store.completeActionExecution(execution.id, { status: "failed", error: outcome.error.message });
+    const failed = store.completeActionExecution(execution.id, { status: "failed", error: outcome.error.message }, claim);
     void failed;
     throw new ServiceError("ACCESS_REVOKED", outcome.error.message, false);
   }
-  return store.completeActionExecution(execution.id, { status: "failed", error: outcome.error.message });
+  return store.completeActionExecution(execution.id, { status: "failed", error: outcome.error.message }, claim);
 }
 
 /**
@@ -294,15 +425,41 @@ async function runEmailStep(deps: BookingServiceDeps, actionId: string, version:
  * fresh availability -> durable provisional hold -> durable email.
  * A hold never transitions the booking to confirmed.
  */
-export async function approveAndExecute(deps: BookingServiceDeps, input: ApproveRequestDTO): Promise<ApproveResponseDTO> {
-  const { store, calendar } = deps;
-  const action = requireExactApproval(store, input);
-  const booking = store.getBooking(action.bookingId);
-  const approvedBy = ownerIdentity(deps);
-  const approval = store.approveProposedAction(action.id, approvedBy);
-  const params = resolveHoldParams(action.payload);
+/**
+ * Verify that the action still carries a live exact-version approval. Retry
+ * and reconcile paths must not serve stale receipts after the proposal moved
+ * on: returning an old succeeded step without this check would bypass the
+ * exact-approval gate.
+ */
+function requireLiveApproval(store: GatherStore, actionId: string): void {
+  const action = store.getProposedAction(actionId);
+  const live = store.listApprovals(actionId).some(
+    (approval) =>
+      approval.status === "approved" &&
+      approval.proposalVersion === action.proposalVersion &&
+      approval.proposalFingerprint === action.proposalFingerprint,
+  );
+  if (!live) {
+    throw new ServiceError(
+      "STALE_PROPOSAL",
+      `No live approval for the current proposal version (v${action.proposalVersion}); re-approve the displayed proposal first`,
+      false,
+    );
+  }
+}
 
-  // Fresh availability immediately before the provisional hold.
+/**
+ * Fresh availability immediately before any (new or retried) hold write.
+ * The requested range must be FULLY covered by available slots: a single
+ * partially overlapping open slot is not sufficient. Any overlapping
+ * unavailable slot blocks the hold.
+ */
+async function requireFreshAvailability(
+  deps: BookingServiceDeps,
+  bookingId: string,
+  params: HoldParams,
+): Promise<void> {
+  const { store, calendar } = deps;
   const availability = await calendar.checkAvailability({
     operationKey: availabilityKey(params.startAt, params.endAt),
     startAt: params.startAt,
@@ -311,23 +468,41 @@ export async function approveAndExecute(deps: BookingServiceDeps, input: Approve
   if (availability.status === "failed") {
     const kind = availability.error.kind;
     if (kind === "access_revoked" || kind === "authorization_denied") {
-      store.updateBookingStatus(booking.id, "uncertain");
+      store.updateBookingStatus(bookingId, "uncertain");
       throw new ServiceError("ACCESS_REVOKED", availability.error.message, false);
     }
-    store.updateBookingStatus(booking.id, "failed");
+    store.updateBookingStatus(bookingId, "failed");
     throw new ServiceError("SLOT_UNAVAILABLE", availability.error.message, false);
   }
   if (availability.status === "uncertain") {
-    store.updateBookingStatus(booking.id, "uncertain");
+    store.updateBookingStatus(bookingId, "uncertain");
     throw new ServiceError("UNCERTAIN", "Availability check was uncertain; retry approval", true);
   }
-  const coversOpen = availability.data.slots.some((slot) => slot.available);
-  const blocked = availability.data.slots.some((slot) => !slot.available);
-  if (!coversOpen || blocked) {
-    const reason = availability.data.slots.find((slot) => !slot.available)?.reason ?? "Requested date is unavailable";
-    store.updateBookingStatus(booking.id, "failed");
-    throw new ServiceError("SLOT_UNAVAILABLE", reason, false);
+  const startMs = Date.parse(params.startAt);
+  const endMs = Date.parse(params.endAt);
+  const blocked = availability.data.slots.find((slot) => !slot.available);
+  if (blocked) {
+    store.updateBookingStatus(bookingId, "failed");
+    throw new ServiceError("SLOT_UNAVAILABLE", blocked.reason ?? "Requested date is unavailable", false);
   }
+  const fullyCovered = availability.data.slots.some(
+    (slot) => slot.available && Date.parse(slot.startAt) <= startMs && Date.parse(slot.endAt) >= endMs,
+  );
+  if (!fullyCovered) {
+    store.updateBookingStatus(bookingId, "failed");
+    throw new ServiceError("SLOT_UNAVAILABLE", "No available slot fully covers the requested range", false);
+  }
+}
+
+export async function approveAndExecute(deps: BookingServiceDeps, input: ApproveRequestDTO): Promise<ApproveResponseDTO> {
+  const { store } = deps;
+  const action = requireExactApproval(store, input);
+  const booking = store.getBooking(action.bookingId);
+  const approvedBy = ownerIdentity(deps);
+  const approval = store.approveProposedAction(action.id, approvedBy);
+  const params = resolveHoldParams(action.payload, { nowMs: clockMs(deps) });
+
+  await requireFreshAvailability(deps, booking.id, params);
 
   const holdExecution = await runHoldStep(deps, action.id, action.proposalVersion, params);
   if (holdExecution.status === "failed") {
@@ -373,7 +548,10 @@ export async function retryFailedSteps(deps: BookingServiceDeps, proposedActionI
   const { store } = deps;
   const action = store.getProposedAction(proposedActionId);
   store.getBooking(action.bookingId);
-  const params = resolveHoldParams(action.payload);
+  // Even when every step already succeeded, retry must verify the current
+  // proposal still carries a live exact-version approval.
+  requireLiveApproval(store, action.id);
+  const params = resolveHoldParams(action.payload, { nowMs: clockMs(deps) });
   const holdKey = holdOperationKey(action.id, action.proposalVersion);
   const mailKey = emailOperationKey(action.id, action.proposalVersion);
   const holdExisting = store.getExecutionByIdempotencyKey(holdKey);
@@ -384,10 +562,19 @@ export async function retryFailedSteps(deps: BookingServiceDeps, proposedActionI
   if (holdExisting && holdExisting.status !== "succeeded" && holdExisting.status !== "failed" && holdExisting.status !== "pending") {
     throw new ServiceError("INVALID_REQUEST", "Hold step is not in a retryable state", false);
   }
+  // Fresh availability before any new hold write (skipped only when the hold
+  // already succeeded and no write can occur).
+  if (holdExisting?.status !== "succeeded") {
+    await requireFreshAvailability(deps, action.bookingId, params);
+  }
   // Re-run hold only when it has not already succeeded.
   const hold = holdExisting?.status === "succeeded" ? holdExisting : await runHoldStep(deps, action.id, action.proposalVersion, params);
+  if (hold.status === "uncertain") {
+    store.updateBookingStatus(action.bookingId, "uncertain");
+    throw new ServiceError("RECONCILE_REQUIRED", hold.error ?? "Hold retry is uncertain; reconcile before retrying", false);
+  }
   if (hold.status !== "succeeded") {
-    store.updateBookingStatus(action.bookingId, hold.status === "uncertain" ? "uncertain" : "failed");
+    store.updateBookingStatus(action.bookingId, "failed");
     throw new ServiceError("EXECUTION_FAILED", hold.error ?? "Hold retry did not succeed", false);
   }
   store.updateBookingStatus(action.bookingId, "provisional_hold");
