@@ -75,6 +75,10 @@ export interface IntakeItemRecord {
   sourceKey?: string;
   ledgerEventId?: string;
   error?: string;
+  /** Processing attempts so far (drives the bounded retry budget). */
+  attempts: number;
+  /** Dead-lettered: terminally failed, never auto-retried, visible to the owner. */
+  dead: boolean;
 }
 
 export interface CursorCheckpoint {
@@ -95,6 +99,15 @@ export interface SweepReport {
   needsDecision: string[];
   cursorCommitted: boolean;
   resetRequired: boolean;
+  /**
+   * Re-driven parked work this sweep (crash-stranded, owner-resolved, or
+   * retried failures). Parked outcomes never gate the cursor: the cursor
+   * is the durable capture watermark, not the processing outcome.
+   */
+  resumedDrained: number;
+  resumedFailed: number;
+  /** Items moved to the dead-letter state this sweep (terminal, owner-visible). */
+  deadLettered: string[];
   error?: string;
 }
 
@@ -113,6 +126,8 @@ export interface OperatorAccountHealth {
   lastSweepAt?: string;
   lastError?: string;
   connectionStatus?: string;
+  /** Terminal intake failures awaiting owner attention (never auto-retried). */
+  deadLettered: number;
 }
 
 export interface OperatorHealth {

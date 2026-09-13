@@ -1,6 +1,6 @@
 export { OperatorIntakeStore, type RawIntakeItem } from "./store.ts";
 export { runIntakeSweep, type IntakeDeps, type ThreadReaderPort } from "./intake.ts";
-export { drainDueWork } from "./due-work.ts";
+export { bindWaitingToProposal, drainDueWork } from "./due-work.ts";
 export { operatorHealth } from "./health.ts";
 export { operatorMcpTools } from "./mcp-tools.ts";
 export type {

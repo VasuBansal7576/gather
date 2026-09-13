@@ -1,5 +1,5 @@
-import { emailOperationKey, holdOperationKey, reconcileExecution } from "../booking-service.ts";
-import type { WaitingItem } from "../../coordination/contracts.ts";
+import { emailOperationKey, holdOperationKey, reconcileExecution, ServiceError } from "../booking-service.ts";
+import type { WaitingItem, WaitingKind } from "../../coordination/contracts.ts";
 import type { DueWorkReport, OperatorRuntimeDeps } from "./types.ts";
 import { OperatorIntakeStore } from "./store.ts";
 
@@ -17,6 +17,7 @@ function rowOf(value: unknown): SqlRow | undefined {
 export interface ClaimedWorkItem {
   id: string;
   bookingId: string;
+  kind: WaitingKind;
   claimToken?: string;
   claimedAt?: string;
   detail: Record<string, unknown>;
@@ -35,12 +36,9 @@ export function claimDueItems(
 ): { claimed: ClaimedWorkItem[]; skipped: string[] } {
   const now = nowIso(deps);
   const total = input.limit ?? 50;
-  let bookings: Array<{ id: string }>;
-  try {
-    bookings = deps.store.listBookings(deps.businessId);
-  } catch {
-    return { claimed: [], skipped: [] };
-  }
+  // Store failures must surface as a drain error — never as a healthy
+  // zero-work report. drainDueWork catches this into report.error.
+  const bookings = deps.store.listBookings(deps.businessId);
   const due: WaitingItem[] = [];
   for (const booking of bookings) {
     const items = deps.ledger.listDueWork({ nowIso: now, limit: total, bookingId: booking.id });
@@ -58,6 +56,7 @@ export function claimDueItems(
     claimed: result.claimed.map((item) => ({
       id: item.id,
       bookingId: item.bookingId,
+      kind: item.kind,
       claimToken: item.claimToken,
       claimedAt: item.claimedAt,
       detail: item.detail as Record<string, unknown>,
@@ -132,8 +131,10 @@ async function dispatchOne(deps: OperatorRuntimeDeps, item: ClaimedWorkItem, cla
     return "skipped";
   }
   // 3. Reply since claim? A customer reply between claim and dispatch
-  // suppresses instead of executing.
-  if (replySince(deps, item.bookingId, current.claimedAt ?? current.updatedAt)) {
+  // suppresses a FOLLOWUP instead of executing — and only a followup.
+  // A reply does not answer a change review, deposit check, or resource
+  // check: those kinds are never resolved away by inbound mail.
+  if (current.kind === "followup" && replySince(deps, item.bookingId, current.claimedAt ?? current.updatedAt)) {
     deps.ledger.resolveWaiting({ id: item.id, resolution: "suppressed", note: "operator dispatch: reply arrived after claim", claimToken: item.claimToken });
     return "skipped";
   }
@@ -200,17 +201,19 @@ async function resolveDone(deps: OperatorRuntimeDeps, item: ClaimedWorkItem): Pr
 
 function readWaiting(deps: OperatorRuntimeDeps, id: string): {
   status: string;
+  kind: string;
   claimedBy?: string;
   claimToken?: string;
   claimedAt?: string;
   claimExpiresAt?: string;
   updatedAt: string;
 } | undefined {
-  const found = deps.store.db.prepare("SELECT status, claimed_by, claim_token, claimed_at, claim_expires_at, updated_at FROM coord_waiting WHERE id = $id").get({ $id: id });
+  const found = deps.store.db.prepare("SELECT status, kind, claimed_by, claim_token, claimed_at, claim_expires_at, updated_at FROM coord_waiting WHERE id = $id").get({ $id: id });
   const value = rowOf(found);
   if (!value) return undefined;
   return {
     status: String(value.status),
+    kind: String(value.kind),
     claimedBy: value.claimed_by ? String(value.claimed_by) : undefined,
     claimToken: value.claim_token ? String(value.claim_token) : undefined,
     claimedAt: value.claimed_at ? String(value.claimed_at) : undefined,
@@ -246,6 +249,53 @@ function replySince(deps: OperatorRuntimeDeps, bookingId: string, sinceIso: stri
     }
   }
   return false;
+}
+
+/**
+ * Host handoff: bind a waiting item to the exact proposal it refers to.
+ * This is the ONLY supported producer of `detail.proposedActionId` — the
+ * field the dispatch phase reads. The binding is validated here: the
+ * waiting item must be open (pending or claimed), the action must exist,
+ * belong to the SAME booking, and sit inside this runtime's business.
+ * Existing detail fields are preserved; nothing else about the row
+ * (status, claim, fencing) changes.
+ */
+export function bindWaitingToProposal(
+  deps: OperatorRuntimeDeps,
+  input: { waitingId: string; proposedActionId: string },
+): { waitingId: string; proposedActionId: string } {
+  const found = deps.store.db
+    .prepare("SELECT id, booking_id, kind, status, detail_json FROM coord_waiting WHERE id = $id")
+    .get({ $id: input.waitingId });
+  const item = rowOf(found);
+  if (!item) {
+    throw new ServiceError("NOT_FOUND", `Waiting item not found: ${input.waitingId}`, false);
+  }
+  const status = String(item.status);
+  if (status !== "pending" && status !== "claimed") {
+    throw new ServiceError("INVALID_REQUEST", `Waiting ${input.waitingId} is ${status}; only open work can be bound to a proposal`, false);
+  }
+  let action;
+  try {
+    action = deps.store.getProposedAction(input.proposedActionId);
+  } catch {
+    throw new ServiceError("NOT_FOUND", `Proposed action not found: ${input.proposedActionId}`, false);
+  }
+  const bookingId = String(item.booking_id);
+  if (action.bookingId !== bookingId) {
+    throw new ServiceError("INVALID_REQUEST", `Action ${input.proposedActionId} belongs to booking ${action.bookingId}, not ${bookingId}`, false);
+  }
+  if (bookingBusiness(deps, bookingId) !== deps.businessId) {
+    throw new ServiceError("INVALID_REQUEST", `Waiting ${input.waitingId} is outside business ${deps.businessId}`, false);
+  }
+  const prior = item.detail_json;
+  const detail: Record<string, unknown> =
+    typeof prior === "string" && prior.length > 0 ? (JSON.parse(prior) as Record<string, unknown>) : {};
+  detail.proposedActionId = input.proposedActionId;
+  deps.store.db
+    .prepare("UPDATE coord_waiting SET detail_json = $detail, updated_at = $at WHERE id = $id")
+    .run({ $detail: JSON.stringify(detail), $at: nowIso(deps), $id: input.waitingId });
+  return { waitingId: input.waitingId, proposedActionId: input.proposedActionId };
 }
 
 /** Full drain: claim scoped items, then dispatch each with revalidation. */
