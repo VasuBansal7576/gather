@@ -64,6 +64,9 @@ inputs cannot mint authority: there is no parameter combination on
 ```ts
 import { CoordinationLedger } from "./src/coordination/index.ts";
 const ledger = new CoordinationLedger(gatherStore.db); // same DB, own coord_* tables
+// Optional: { sharedTables: "auto" | "required" | "off" } declares the
+// shared-table integration (default auto); { clock: () => iso } injects the
+// trusted clock for lease-expiry enforcement (defaults to wall clock).
 
 ledger.ingestEvent({       // idempotent intake; safe to retry
   dedupeKey: "email:<message-id>" | "cal:<event-id>:<rev>" | ...,
@@ -97,11 +100,24 @@ UTC for storage and compared as epoch millis, so caller clock shapes
   `{ duplicate: true }` with no side effects, so restarts and redeliveries
   collapse safely. Reusing a key with *different* content (different source,
   timestamps, or payload) throws a conflict instead of silently colliding.
-  The same provider key may serve two bookings as separate rows. Pre-scoped
-  databases (global-unique keys) are migrated automatically with data
-  preserved. Attested calls (`applyOwnerControl`, `recordVerifiedReceipt`)
-  compare stable identity excluding `observedAt` (which defaults to intake
-  time), so retries never conflict with themselves.
+  The same provider key may serve two bookings as separate rows. Attested
+  calls (`applyOwnerControl`, `recordVerifiedReceipt`) compare stable
+  identity excluding `observedAt` (which defaults to intake time), so
+  retries never conflict with themselves.
+- **Atomic scoped-dedupe upgrade:** pre-scoped databases (global-unique
+  keys) migrate automatically with rows, indexes, and FKs preserved, even
+  with `PRAGMA foreign_keys = ON`. The rebuild freezes schema-rewriting
+  pragmas only for its duration (`foreign_keys OFF` so intermediate states
+  never fail, `legacy_alter_table ON` so RENAME never retargets other
+  tables' REFERENCES clauses — plain `foreign_keys = OFF` alone does NOT
+  stop modern SQLite from rewriting references), runs inside one
+  transaction gated on row-count equality and an empty
+  `PRAGMA foreign_key_check` before commit, then always restores the prior
+  pragma settings. Any failure rolls back to the original schema intact
+  and retryable: no half-migration, no dropped work, no permanently
+  disabled foreign keys. Leftover state from the previous non-atomic
+  migrator (stray legacy table, waiting FK retargeted at it) is repaired
+  the same way on open.
 - **Stale revisions:** intake tracks the max non-stale revision per booking.
   An event with a lower revision is stored with `stale: true` and causes no
   side effects. A `change` with an equal or higher revision supersedes prior
@@ -122,6 +138,10 @@ UTC for storage and compared as epoch millis, so caller clock shapes
   reviews invalidate.
 - **Claim leases and fencing:** each claim issues an opaque `claimToken`
   with a lease expiry (default 5 minutes, configurable per claim).
+  Resolving claimed work requires the matching token AND a live lease on
+  the trusted clock (injectable via `clock` for tests): an expired
+  unreleased claim cannot resolve even with the right token — release it
+  and re-claim first, with a meaningful lease-expired error.
   Resolving claimed work requires the matching token; resolving pending
   work with any token throws, so a stale token can never silently close a
   released claim. `releaseStaleClaims` returns expired, unresolved claims to

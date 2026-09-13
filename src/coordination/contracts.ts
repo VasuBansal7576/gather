@@ -214,6 +214,8 @@ export type ControlState = "active" | "paused" | "cancelled";
  */
 export interface LedgerOptions {
   sharedTables?: "auto" | "required" | "off";
+  /** Trusted clock for lease-expiry enforcement (defaults to wall clock). Must return ISO-8601. */
+  clock?: () => string;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -343,6 +345,9 @@ export function assertValidLedgerOptions(value: unknown): asserts value is Ledge
     value.sharedTables !== "off"
   ) {
     throw new Error('sharedTables must be one of auto|required|off when present');
+  }
+  if (value.clock !== undefined && typeof value.clock !== "function") {
+    throw new Error("clock must be a function returning an ISO-8601 timestamp when present");
   }
 }
 
