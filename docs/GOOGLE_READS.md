@@ -13,15 +13,36 @@ account verification has been performed; the live gate is BLOCKED.**
 
 Gmail (`users.history.list` reference; `messages.list`/`get`, `profile`):
 
-- `GET …/users/{userId}/history?startHistoryId&historyTypes=maxResults&pageToken`:
+- `GET …/users/{userId}/history?startHistoryId&historyTypes&labelId&maxResults&pageToken`:
   chronological records, monotonic but non-contiguous `historyId`
   (maxResults ≤ 500), `messagesAdded`/`messagesDeleted` buckets whose
   messages typically carry only `id`/`threadId`, per-response `historyId`
-  (the commit point), `nextPageToken` paging. An invalid or expired
+  (the commit point), `nextPageToken` paging. `labelId` is the documented
+  server-side scope; the documented parameter list has no `q`, so the
+  poller never sends one. The accepted query boundary is therefore
+  exact — absent (unfiltered: the whole mailbox, spam and trash included)
+  or a single system-label filter (`in:inbox`, `in:sent`, `in:trash`,
+  `in:spam`, `in:draft(s)`, `label:<system>`,
+  `is:unread|starred|important`), enforced via `labelId`; any other query
+  is rejected as `invalid_request` before any HTTP call, never silently
+  broadened and never filtered by a local semantic heuristic. Scope
+  acceptance covers `messageAdded` intake only: the poller requests no
+  other history type, so label removals, deletions, and other mailbox
+  mutations are not mirrored — never treat a scoped poll as a complete
+  view of label membership or as capturing all mailbox mutations. An invalid
+  or expired
   `startHistoryId` (valid ≥ a week, sometimes only hours) returns **HTTP
   404 — the documented expiry signal, verified by test, not an assumed
   410** — and the client must full-sync.
-- `GET …/messages?q&maxResults&pageToken` (ids only, ≤100/page requested),
+- `GET …/messages?labelIds&includeSpamTrash&maxResults&pageToken` (ids
+  only, ≤100/page requested): the bootstrap snapshot scopes with the
+  exact provider label parameters, never a `q` search alias. `labelIds`
+  keeps only messages carrying every listed id, and SPAM/TRASH messages
+  are excluded unless `includeSpamTrash=true` — while history has no such
+  exclusion. Snapshots therefore always set `includeSpamTrash=true`, so
+  the snapshot observes exactly the population the delta observes
+  (otherwise existing spam/trash messages would be lost and unfiltered
+  snapshot/delta membership would disagree).
   `GET …/messages/{id}`, `GET …/profile` (`historyId` bootstrap).
 - Quota (Gmail quota doc): `history.list` 2 units, `messages.list` 5,
   `messages.get` 20.
@@ -57,7 +78,10 @@ guide):
   `userId` `"me"` alias, which is identical across accounts: two pollers
   sharing `"me"` with different `accountId` values reject each other's
   cursors (tested). Factory callers serving several accounts must pass
-  distinct `accountId` values.
+  distinct `accountId` values. Only exact scopes are accepted (unfiltered
+  or a single system-label filter); anything else fails `invalid_request`
+  before any HTTP call, so a scoped cursor can never silently return
+  unscoped mail.
 - `nextCursor` never advances the base watermark past unvisited pages or
   un-emitted messages: a capped result resumes the exact page (replayed
   server-side, de-duplicated by message id, so repeats are possible but
