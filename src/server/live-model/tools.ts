@@ -56,22 +56,33 @@ function fail(tool: string, message: string): never {
 const HOLD_VALIDITY_MS = 24 * 60 * 60 * 1000;
 const HOLD_RELEASE_BUFFER_MS = 60 * 60 * 1000;
 
+/** Human-readable local time in the business timezone (never raw UTC ISO). */
+function formatLocal(iso: string, timezone: string): string {
+  return new Intl.DateTimeFormat("en-GB", {
+    dateStyle: "medium",
+    timeStyle: "short",
+    timeZone: timezone,
+  }).format(new Date(iso));
+}
+
 /**
- * The exact body the approval pipeline sends on owner approval — a real
- * offer, not a placeholder: the exact window (with venue timezone), guest
- * count, exact GBP terms, the hold expiry, and explicit provisional terms.
+ * The exact body the approval pipeline sends on owner approval: a real
+ * offer, not a placeholder: the exact window rendered in the business
+ * timezone, guest count, exact GBP terms, the offer validity, and explicit
+ * provisional terms. It promises no automatic slot release (none is wired)
+ * and never implies venue approval alone confirms a booking.
  */
 function renderOfferBody(terms: ProposalTerms, policy: { perPersonGbp: number; currency: string }, timezone: string, expiresAt: string): string {
   return [
-    "GATHER TEST — provisional event offer",
+    "GATHER TEST: provisional event offer",
     "",
-    `Event window: ${terms.startAt} to ${terms.endAt} (${timezone})`,
+    `Event window: ${formatLocal(terms.startAt, timezone)} to ${formatLocal(terms.endAt, timezone)} (${timezone})`,
     `Guests: ${terms.guestCount}`,
     `Total: ${policy.currency} ${terms.totalGbp} (${policy.currency} ${policy.perPersonGbp} per person)`,
-    `Hold expiry: this provisional hold is held until ${expiresAt}, after which the slot is released.`,
+    `Offer validity: this provisional offer is valid until ${formatLocal(expiresAt, timezone)} (${timezone}).`,
     `Notes: ${terms.notes}`,
     "",
-    "This is a provisional offer pending venue confirmation — it is not a confirmed booking.",
+    "This is a provisional offer only. It becomes a confirmed booking only after all of the following: the customer accepts the exact date, time, guest count and price above; the venue approves; and the reservation is verified in the provider system of record. Venue approval alone does not confirm a booking.",
   ].join("\n");
 }
 

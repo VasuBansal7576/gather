@@ -752,12 +752,21 @@ test("generated proposal composes through the real approval pipeline to hold + e
     assert.equal(email.sent.length, 1);
     const sent = email.sent[0]!;
     assert.deepEqual(sent.to, [CONTROLLED_TEST_RECIPIENT]);
-    assert.ok(sent.body.includes("12"), "exact guest count in the rendered offer");
+    assert.ok(sent.body.includes("Guests: 12"), "exact guest count in the rendered offer");
     assert.ok(sent.body.includes("GBP 600"), "exact total in the rendered offer");
     assert.ok(sent.body.includes("Europe/London"), "venue timezone in the rendered offer");
+    // Times render in the business timezone: 18:00 local, never raw UTC ISO.
+    assert.ok(sent.body.includes("18:00"), "event start rendered as 18:00 local");
+    assert.ok(!sent.body.includes("17:00"), "UTC rendering would wrongly show 17:00");
+    assert.ok(!sent.body.includes(SLOT.startAt), "raw ISO timestamp is not the displayed time");
     assert.ok(sent.body.includes("provisional"), "provisional terms in the rendered offer");
-    assert.ok(sent.body.includes("not a confirmed booking"), "explicit non-confirmation terms");
+    assert.ok(sent.body.includes("customer accepts the exact date, time, guest count and price"), "customer acceptance of exact terms required");
+    assert.ok(sent.body.includes("reservation is verified"), "verified reservation required before confirmation");
+    assert.ok(sent.body.includes("Venue approval alone does not confirm a booking"), "venue approval alone never confirms");
+    // No automatic-release promise: no provider release is wired.
+    assert.ok(!/releas/i.test(sent.body), "no automatic release claim in the sent offer");
     assert.ok(!sent.body.includes("Nothing sent"), "the sent body is the offer, not a placeholder");
+    assert.ok(!sent.body.includes("\u2014"), "no em dash in sent copy");
   } finally {
     cleanupFx(fx);
   }
