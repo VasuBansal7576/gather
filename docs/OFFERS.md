@@ -47,6 +47,11 @@ a `feasible` result only.
   Freshness is judged on the trusted `preparedAt` clock:
   `observedAt <= asOf <= preparedAt` must hold and
   `preparedAt - observedAt` must fit the bound, else `stale_availability`.
+- Every claimable space is evaluated and the first fully-clean candidate
+  becomes primary, so a suitable room is never left unused behind a
+  decision-blocked first fit: candidates needing owner decisions are not
+  offered in a clean result. When no clean candidate exists, the first
+  candidate stays primary with its findings, as before.
 - `preparedAt` — caller clock, so identical inputs give byte-identical
   results (covered by test). `requestedVersion` (default 1) and
   `supersedesFingerprint` carry the version chain for approval binding.
@@ -124,11 +129,17 @@ wrote can supply `approvedBy`):
   directly). Unknown keys and malformed values land in `unparseable` —
   never silently dropped, never promoted into offers.
 - Pricing bounds and scoped exceptions are approval-grade: only verified,
-  attributed facts apply. Uncertain or unattributed bounds/exceptions are
+  attributed facts apply, and currency must be an explicit supported code —
+  a verified fact never makes an absent or malformed currency verified, so
+  bounds without one are unparseable and priced lines without applicable
+  bounds throw rather than receiving USD. Uncertain or unattributed bounds/exceptions are
   reported unparseable — an uncertain exception is never treated as
   approved, and cost-completeness attestation requires its own verified
   bounds fact, not `costsComplete: true` beside unrelated price-line
   sources.
+- Fact source arrays are validated as real source objects (kind, locator,
+  label/fictional shape); a malformed element makes its fact unparseable,
+  never silently trusted.
 - Each bounds record validates complete before anything applies, so a
   malformed record cannot partially mutate the book; conflicting bounds and
   conflicting duplicate versions are exposed as unparseable, never
