@@ -11,18 +11,26 @@ binding, replaced on refresh, cleared on remove/stop/degrade.
 Each timer tick runs exactly one guarded cycle for its account: the
 injected sweep body only (normally intake sweep + due-work drain via
 `startProactiveAccount`). Overlap protection is a shared per-account
-latch: overlapping ticks skip and count instead of running concurrently,
-a refresh during an in-flight sweep keeps the latch (the fresh binding
-waits, then sweeps normally — it can never wedge), and a prior sweep's
-completion releases the shared latch without writing stale counters onto
-the new record. Repeated sweep failures degrade the binding
+latch held in a registry independent of binding records: overlapping ticks
+skip and count instead of running concurrently, a refresh — or a remove
+plus re-register — during an in-flight sweep keeps the latch (the fresh
+binding waits, then sweeps normally — it can never wedge and never
+overlaps), and a prior sweep's completion releases the shared latch
+without writing stale counters onto the new record. A body that never
+settles is declared explicitly stuck (degraded with the reason kept, timer
+stopped, ownership and tombstone retained — no forced new body);
+re-register to resume. Repeated sweep failures degrade the binding
 explicitly — timer stopped, status `degraded` with the last error —
 instead of retrying silently forever; re-register to resume. `stop` clears
 the timer and awaits the in-flight sweep on a real elapsed-time deadline
-(default 30 s, never the injectable business clock); the returned state
-honestly reports `inFlight` when the sweep did not drain in time, and a
-sweep finishing after stop/revoke/refresh writes nothing (epoch-guarded)
-— no late counters, no clobbered revocation error, no resurrected status.
+(default 30 s, never the injectable business clock, and the drain timer is
+released on early finish so shutdown never retains the loop); the returned
+state honestly reports `inFlight` when the sweep did not drain in time,
+and a sweep finishing after stop/revoke/refresh writes nothing
+(epoch-guarded) — no late counters, no clobbered revocation error, no
+resurrected status. Rebinding an owned account to another business is
+rejected (remove first); per-account health waiting/paused aggregates are
+scoped to the calling business, never foreign.
 
 The scheduler never sends, approves, holds, or links anything: pause/cancel
 and commercial approval gates stay enforced inside the existing intake and

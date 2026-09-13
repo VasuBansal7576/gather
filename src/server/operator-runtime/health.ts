@@ -14,9 +14,17 @@ function nowIso(deps: OperatorRuntimeDeps): string {
 export function operatorHealth(deps: OperatorRuntimeDeps): OperatorHealth {
   const intake = new OperatorIntakeStore(deps.store.db);
   const db = deps.store.db;
+  // Waiting and paused aggregates are scoped to THIS business via the
+  // bookings join (existing ledger inputs) — a per-account health response
+  // must never leak foreign aggregates. Stages without the shared tables
+  // report empty, not failure.
   const waitingByStatus: Record<string, number> = {};
   try {
-    const rows = db.prepare("SELECT status, COUNT(*) AS n FROM coord_waiting GROUP BY status").all() as Array<Record<string, unknown>>;
+    const rows = db.prepare(
+      `SELECT w.status AS status, COUNT(*) AS n FROM coord_waiting w
+       JOIN bookings b ON b.id = w.booking_id
+       WHERE b.business_id = $biz GROUP BY w.status`,
+    ).all({ $biz: deps.businessId }) as Array<Record<string, unknown>>;
     for (const item of rows) {
       waitingByStatus[String(item.status)] = Number(item.n);
     }
@@ -25,7 +33,11 @@ export function operatorHealth(deps: OperatorRuntimeDeps): OperatorHealth {
   }
   let pausedBookings: string[] = [];
   try {
-    const rows = db.prepare("SELECT booking_id FROM coord_control WHERE state = 'paused'").all() as Array<Record<string, unknown>>;
+    const rows = db.prepare(
+      `SELECT c.booking_id AS booking_id FROM coord_control c
+       JOIN bookings b ON b.id = c.booking_id
+       WHERE c.state = 'paused' AND b.business_id = $biz`,
+    ).all({ $biz: deps.businessId }) as Array<Record<string, unknown>>;
     pausedBookings = rows.map((item) => String(item.booking_id)).sort();
   } catch {
     pausedBookings = [];

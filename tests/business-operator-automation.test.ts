@@ -336,3 +336,133 @@ test("scoped listing never leaks bindings for unwired accounts", async () => {
     resetProactiveAutomation();
   }
 });
+
+// ---------- second-review regressions (timer, overlap, stuck, rebind, scope) ----------
+
+test("stop clears its drain timer when the sweep wins early", async () => {
+  const slow = deferred();
+  const live = new Map<unknown, number>();
+  const realSet = globalThis.setTimeout;
+  const realClear = globalThis.clearTimeout;
+  globalThis.setTimeout = ((fn: (...args: unknown[]) => void, ms?: number, ...rest: unknown[]) => {
+    const handle = realSet(fn, ms as number, ...(rest as []));
+    live.set(handle, ms ?? 0);
+    return handle;
+  }) as typeof setTimeout;
+  globalThis.clearTimeout = ((handle: unknown) => {
+    live.delete(handle);
+    return realClear(handle as never);
+  }) as typeof clearTimeout;
+  try {
+    registerProactiveBinding({ accountId: ACCOUNT, businessId: BUSINESS, runSweep: slow.run, intervalMs: 60_000 });
+    const pending = tickBinding(ACCOUNT);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    const stopping = stopProactiveAccount(ACCOUNT, 60_000);
+    slow.release();
+    await pending;
+    const stopped = await stopping;
+    assert.equal(stopped?.status, "stopped");
+    assert.equal(stopped?.inFlight, false);
+    const lingering = [...live.values()].filter((ms) => ms >= 60_000);
+    assert.deepEqual(lingering, [], "drained stop must not retain the full-bound timer");
+  } finally {
+    slow.release();
+    globalThis.setTimeout = realSet;
+    globalThis.clearTimeout = realClear;
+    resetProactiveAutomation();
+  }
+});
+
+test("remove plus re-register never runs bodies concurrently", async () => {
+  const slow = deferred();
+  try {
+    registerProactiveBinding({ accountId: ACCOUNT, businessId: BUSINESS, runSweep: slow.run, intervalMs: 60_000 });
+    const oldSweep = tickBinding(ACCOUNT);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(removeProactiveBinding(ACCOUNT), true);
+    let newCalls = 0;
+    registerProactiveBinding({
+      accountId: ACCOUNT, businessId: BUSINESS,
+      runSweep: async () => { newCalls += 1; },
+      intervalMs: 60_000,
+    });
+    // The removed lifecycle's body is still unsettled: the fresh binding
+    // must skip, not overlap it.
+    const skipped = await tickBinding(ACCOUNT);
+    assert.equal(skipped.skippedOverlap, true);
+    assert.equal(newCalls, 0, "no concurrent body while the old one runs");
+    slow.release();
+    await oldSweep;
+    const next = await tickBinding(ACCOUNT);
+    assert.equal(next.skippedOverlap, false);
+    assert.equal(newCalls, 1, "fresh body runs once the old one settles");
+  } finally {
+    slow.release();
+    resetProactiveAutomation();
+  }
+});
+
+test("a never-settling sweep is declared stuck, never forever running", async () => {
+  let release!: () => void;
+  const stuck = new Promise<void>((resolve) => { release = resolve; });
+  try {
+    registerProactiveBinding({
+      accountId: ACCOUNT, businessId: BUSINESS,
+      runSweep: () => stuck, intervalMs: 60_000, maxSweepMs: 150,
+    });
+    const pending = tickBinding(ACCOUNT);
+    pending.catch(() => {});
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    const state = getProactiveBinding(ACCOUNT);
+    assert.equal(state?.status, "degraded");
+    assert.match(state?.lastError ?? "", /stuck/);
+    assert.equal(state?.inFlight, true, "ownership retained on the stuck body");
+    const ticked = await tickBinding(ACCOUNT);
+    assert.equal(ticked.ok, false, "stuck binding runs nothing more");
+    release();
+    await pending;
+    const after = getProactiveBinding(ACCOUNT);
+    assert.equal(after?.status, "degraded", "late completion keeps the tombstone");
+    assert.equal(after?.totalRuns, 0, "late completion writes no counters");
+  } finally {
+    release();
+    resetProactiveAutomation();
+  }
+});
+
+test("rebinding an account to another business is rejected while owned", async () => {
+  try {
+    registerProactiveBinding({ accountId: ACCOUNT, businessId: BUSINESS, runSweep: async () => {}, intervalMs: 60_000 });
+    assert.throws(
+      () => registerProactiveBinding({ accountId: ACCOUNT, businessId: "other-biz", runSweep: async () => {}, intervalMs: 60_000 }),
+      /belongs to business/,
+    );
+    const kept = getProactiveBinding(ACCOUNT);
+    assert.equal(kept?.businessId, BUSINESS);
+    assert.equal(kept?.status, "running");
+    // After an explicit remove the account is free to rebind elsewhere.
+    assert.equal(removeProactiveBinding(ACCOUNT), true);
+    const moved = registerProactiveBinding({ accountId: ACCOUNT, businessId: "other-biz", runSweep: async () => {}, intervalMs: 60_000 });
+    assert.equal(moved.businessId, "other-biz");
+  } finally {
+    resetProactiveAutomation();
+  }
+});
+
+test("health scopes waiting and paused aggregates to the calling business", async () => {
+  const fx = fixture();
+  try {
+    const other = fx.store.createBusiness({ name: "Foreign Hall", timezone: "UTC" });
+    const otherBooking = fx.store.createBooking({ businessId: other.id, eventName: "Foreign inquiry", sourceReferences: [] });
+    fx.ledger.ingestEvent({ dedupeKey: "foreign-inq", kind: "inquiry", bookingId: otherBooking.id, sourceId: "t", sourceKind: "email", observedAt: NOW });
+    const pausedBooking = fx.store.createBooking({ businessId: other.id, eventName: "Foreign paused", sourceReferences: [] });
+    fx.ledger.applyOwnerControl({ dedupeKey: "foreign-pause", kind: "pause", bookingId: pausedBooking.id, attestedBy: "test-owner", observedAt: NOW });
+    const runtime = runtimeFor(fx, emptyHistory());
+    const { operatorHealth } = await import("../src/server/operator-runtime/index.ts");
+    const health = operatorHealth(runtime);
+    assert.deepEqual(health.waitingByStatus, {}, "foreign waiting must not leak into this business health");
+    assert.deepEqual(health.pausedBookings, [], "foreign paused bookings must not leak");
+  } finally {
+    fx.cleanup();
+  }
+});
