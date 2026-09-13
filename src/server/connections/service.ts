@@ -106,6 +106,24 @@ export function assertLoopbackRedirectUri(redirectUri: string): string {
   return redirectUri;
 }
 
+/**
+ * Google identity-scope aliases (documented equivalence: the userinfo
+ * endpoints accept either form, and Google may return either form in the
+ * granted scope set — e.g. `email` requested but
+ * `https://www.googleapis.com/auth/userinfo.email` granted). Normalization
+ * applies ONLY to these identity scopes: Gmail/Drive/Calendar data scopes
+ * always compare exactly, so a missing data scope can never hide behind an
+ * alias and the MISSING_SCOPE gate stays strict where it matters.
+ */
+const IDENTITY_SCOPE_ALIASES: ReadonlyMap<string, string> = new Map([
+  ["https://www.googleapis.com/auth/userinfo.email", "email"],
+  ["https://www.googleapis.com/auth/userinfo.profile", "profile"],
+]);
+
+function normalizeIdentityScope(scope: string): string {
+  return IDENTITY_SCOPE_ALIASES.get(scope) ?? scope;
+}
+
 /** Map granted Google scopes onto connected_accounts capability providers. */
 function capabilityProviders(scopes: string[]): ConnectedAccount["provider"][] {
   const granted = new Set(scopes);
@@ -498,8 +516,12 @@ export class ConnectionService {
     } finally {
       this.secrets.delete(session.verifierRef);
     }
-    const granted = new Set(token.scope.split(/\s+/).filter(Boolean));
-    const missing = app.requiredScopes.filter((scope) => !granted.has(scope));
+    const grantedRaw = token.scope.split(/\s+/).filter(Boolean);
+    // Identity aliases are normalized for the coverage check only; stored
+    // scopes and capability mapping keep the provider's raw strings.
+    const granted = new Set(grantedRaw.map(normalizeIdentityScope));
+    const missing = app.requiredScopes
+      .filter((scope) => !granted.has(normalizeIdentityScope(scope)));
     if (missing.length > 0) {
       this.failSession(session.id);
       throw new ConnectionError("MISSING_SCOPE", `Provider did not grant required scope(s): ${missing.join(", ")}`);
@@ -533,7 +555,7 @@ export class ConnectionService {
         `This Google account is already connected to a different business; disconnect it there first`,
       );
     }
-    const grantedScopes = [...granted].sort();
+    const grantedScopes = [...new Set(grantedRaw)].sort();
     // Staged publish: new secrets are written under fresh versioned refs and
     // only become the binding's refs when the DB commit succeeds — a failure
     // anywhere before commit leaves the prior valid binding and its secrets
