@@ -28,6 +28,10 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     // request-supplied actors (including customer or model text) are ignored.
     const { actor: _ignored, kind: _kind, ...params } = body;
     const runtime = getRuntime();
+    // Ownership guard (established local-owner model: every business row in
+    // this store belongs to the configured local owner). Fail closed on
+    // unknown businesses before any decision is recorded.
+    if (typeof params.businessId === "string") runtime.store.getBusiness(params.businessId);
     const result = decideOperator(
       { store: runtime.store, booking: runtime.deps, ownerId: ownerId(), availability: runtime.deps.calendar },
       body.kind as OperatorDecisionKind,
