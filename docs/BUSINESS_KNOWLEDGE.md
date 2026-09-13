@@ -7,10 +7,14 @@ command** can mint the verified `BusinessFact` rows the rest of Gather (and
 the offers adapter) consumes.
 
 This is deliberately a booking-business facts + approval boundary, not a
-generic wiki/graph/memory platform: keys are the shared fact vocabulary
-(`business`, `space`, `policy`, `price_line`, `cost`, `pricing_bounds`,
-`service`, `scoped_exception`) that `adaptBusinessFacts` in the offers lane
-already understands.
+generic wiki/graph/memory platform: intake enforces the shared fact
+vocabulary (`business`, `space`, `policy`, `price_line`, `cost`,
+`pricing_bounds`, `service`, `scoped_exception`) that `adaptBusinessFacts`
+in the offers lane already understands. Any other key — including
+generic wiki-style keys and fresh-evidence-like keys (`freebusy`, `slots`,
+`windows`, `schedule`, plus the reserved `availability*`/`calendar*`) — is
+rejected before any row is written, and corrections to unknown keys are
+refused the same way.
 
 ## Trust model
 
@@ -52,7 +56,11 @@ injected `GatherStore.db`:
   `(business_id, key, subject_id, scope, scope_id)` (partial unique index);
   carries `review_state` for source-change invalidation.
 - `knowledge_decisions` — `command_id` PK makes every mutating call
-  idempotent; replays return the recorded outcome.
+  idempotent; replays return the recorded outcome only when the full
+  canonical request (kind, business, subject, actor) fingerprints
+  identically, otherwise the altered replay is rejected as
+  `command_conflict`. Stored values are canonicalized (key-order
+  insensitive) so identical observations dedupe across revisions.
 
 Confirmed facts themselves are written through the existing
 `store.addBusinessFact` / `listBusinessFacts` path — no duplicate fact
@@ -87,11 +95,20 @@ and stays versioned under that scope — exceptions never silently globalize.
 
 - `businessId`, `timezone` — from the owner-maintained business record;
 - `facts` — a synthesized verified `business` fact (businessId + timezone)
-  plus every active confirmed fact (verified, attributed) in the shape
-  `adaptBusinessFacts` accepts;
-- `reviewFactIds` — confirmed facts whose source changed since approval;
-  callers should gate consequential use;
+  plus every active confirmed fact that is verified, attributed,
+  registry-keyed, and NOT under review. Source-changed facts are withheld
+  here, so a host feeding `facts` straight into `adaptBusinessFacts`
+  cannot use stale pricing (verified end-to-end: the offers adapter
+  fail-closes on the missing bounds instead);
+- `reviewFactIds` — ids of the withheld facts (same set as `withheld`);
+- `withheld` — withheld facts with explicit reconfirmation reasons;
 - `scopedFactCount` — how many included facts are scoped exceptions.
+
+Reconfirmation paths that return a fact to `facts`: `correctFact` (new
+revision, review cleared) or confirming the updated candidate (supersedes
+the flagged revision). Applied decision records keep the confirmed values
+(they mirror the fact rows); every *rejected* decision records scalar
+metadata only — raw candidate values never land in the rejection audit.
 
 Completeness is honest: `pricing_bounds.costsComplete` appears in the
 snapshot only if the owner confirmed a fact whose value actually contains
