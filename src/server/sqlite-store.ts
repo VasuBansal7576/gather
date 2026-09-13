@@ -12,6 +12,7 @@ import type {
   Booking,
   Business,
   BusinessFact,
+  ConnectedAccount,
   ProposedAction,
   SourceReference,
 } from "../domain/contracts.ts";
@@ -136,6 +137,19 @@ export class GatherStore {
       );
       CREATE INDEX IF NOT EXISTS idx_approvals_action ON approvals(proposed_action_id);
       CREATE INDEX IF NOT EXISTS idx_executions_action_version ON action_executions(proposed_action_id, proposal_version);
+      CREATE TABLE IF NOT EXISTS connected_accounts (
+        id TEXT PRIMARY KEY,
+        business_id TEXT NOT NULL REFERENCES businesses(id),
+        provider TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('connected', 'revoked', 'error')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS bookings_meta (
+        key TEXT PRIMARY KEY,
+        value_json TEXT NOT NULL
+      );
     `);
   }
 
@@ -327,6 +341,191 @@ export class GatherStore {
     const found = this.db.prepare("SELECT * FROM action_executions WHERE id = $id").get({ $id: id });
     if (!found) throw new Error(`Action execution not found: ${id}`);
     return this.toActionExecution(row(found));
+  }
+
+  getBooking(id: string): Booking {
+    const found = this.db.prepare("SELECT * FROM bookings WHERE id = $id").get({ $id: id });
+    if (!found) throw new Error(`Booking not found: ${id}`);
+    return this.toBooking(row(found));
+  }
+
+  listBookings(businessId?: string): Booking[] {
+    const rows = businessId === undefined
+      ? this.db.prepare("SELECT * FROM bookings ORDER BY created_at").all()
+      : this.db.prepare("SELECT * FROM bookings WHERE business_id = $businessId ORDER BY created_at").all({ $businessId: businessId });
+    return rows.map((value) => this.toBooking(row(value)));
+  }
+
+  updateBookingStatus(id: string, status: Booking["status"]): Booking {
+    const timestamp = now();
+    const result = this.db.prepare("UPDATE bookings SET status = $status, updated_at = $timestamp WHERE id = $id").run({ $status: status, $timestamp: timestamp, $id: id });
+    if (result.changes === 0) throw new Error(`Booking not found: ${id}`);
+    return this.getBooking(id);
+  }
+
+  getBusiness(id: string): Business {
+    const found = this.db.prepare("SELECT * FROM businesses WHERE id = $id").get({ $id: id });
+    if (!found) throw new Error(`Business not found: ${id}`);
+    const value = row(found);
+    return { id: String(value.id), name: String(value.name), timezone: String(value.timezone),
+      status: value.status as Business["status"], createdAt: String(value.created_at), updatedAt: String(value.updated_at) };
+  }
+
+  listBusinesses(): Business[] {
+    const rows = this.db.prepare("SELECT * FROM businesses ORDER BY created_at").all();
+    return rows.map((value) => this.getBusiness(String(row(value).id)));
+  }
+
+  listProposedActionsForBooking(bookingId: string): ProposedAction[] {
+    const rows = this.db.prepare("SELECT id FROM proposed_actions WHERE booking_id = $bookingId ORDER BY created_at").all({ $bookingId: bookingId });
+    return rows.map((value) => this.getProposedAction(String(row(value).id)));
+  }
+
+  listAllProposedActions(): ProposedAction[] {
+    const rows = this.db.prepare("SELECT id FROM proposed_actions ORDER BY created_at").all();
+    return rows.map((value) => this.getProposedAction(String(row(value).id)));
+  }
+
+  listBusinessFacts(businessId: string): BusinessFact[] {
+    const rows = this.db.prepare("SELECT * FROM business_facts WHERE business_id = $businessId ORDER BY observed_at").all({ $businessId: businessId });
+    return rows.map((value) => {
+      const item = row(value);
+      return { id: String(item.id), businessId: String(item.business_id), key: String(item.key),
+        value: parseJson(item.value_json, undefined) as BusinessFact["value"],
+        confidence: item.confidence as BusinessFact["confidence"],
+        sourceReferences: parseJson(item.source_references_json, []) as SourceReference[],
+        observedAt: String(item.observed_at) };
+    });
+  }
+
+  upsertConnectedAccount(input: { id: string; businessId: string; provider: ConnectedAccount["provider"]; displayName: string; status: ConnectedAccount["status"] }): ConnectedAccount {
+    const timestamp = now();
+    this.db.prepare(`INSERT INTO connected_accounts (id, business_id, provider, display_name, status, created_at, updated_at)
+      VALUES ($id, $businessId, $provider, $displayName, $status, $createdAt, $updatedAt)
+      ON CONFLICT(id) DO UPDATE SET display_name = excluded.display_name, status = excluded.status, updated_at = excluded.updated_at`).run({
+      $id: input.id, $businessId: input.businessId, $provider: input.provider, $displayName: input.displayName,
+      $status: input.status, $createdAt: timestamp, $updatedAt: timestamp,
+    });
+    return this.getConnectedAccount(input.id);
+  }
+
+  getConnectedAccount(id: string): ConnectedAccount {
+    const found = this.db.prepare("SELECT * FROM connected_accounts WHERE id = $id").get({ $id: id });
+    if (!found) throw new Error(`Connected account not found: ${id}`);
+    const value = row(found);
+    return { id: String(value.id), businessId: String(value.business_id), provider: value.provider as ConnectedAccount["provider"],
+      displayName: String(value.display_name), status: value.status as ConnectedAccount["status"],
+      createdAt: String(value.created_at), updatedAt: String(value.updated_at) };
+  }
+
+  listConnectedAccounts(businessId?: string): ConnectedAccount[] {
+    const rows = businessId === undefined
+      ? this.db.prepare("SELECT id FROM connected_accounts ORDER BY created_at").all()
+      : this.db.prepare("SELECT id FROM connected_accounts WHERE business_id = $businessId ORDER BY created_at").all({ $businessId: businessId });
+    return rows.map((value) => this.getConnectedAccount(String(row(value).id)));
+  }
+
+  setConnectedAccountStatus(id: string, status: ConnectedAccount["status"]): ConnectedAccount {
+    const timestamp = now();
+    const result = this.db.prepare("UPDATE connected_accounts SET status = $status, updated_at = $timestamp WHERE id = $id").run({ $status: status, $timestamp: timestamp, $id: id });
+    if (result.changes === 0) throw new Error(`Connected account not found: ${id}`);
+    return this.getConnectedAccount(id);
+  }
+
+  listActionExecutions(actionId: string): ActionExecution[] {
+    const rows = this.db.prepare("SELECT * FROM action_executions WHERE proposed_action_id = $actionId ORDER BY attempt").all({ $actionId: actionId });
+    return rows.map((value) => this.toActionExecution(row(value)));
+  }
+
+  listAllActionExecutions(): ActionExecution[] {
+    const rows = this.db.prepare("SELECT * FROM action_executions ORDER BY started_at").all();
+    return rows.map((value) => this.toActionExecution(row(value)));
+  }
+
+  getExecutionByIdempotencyKey(key: string): ActionExecution | undefined {
+    const found = this.db.prepare("SELECT * FROM action_executions WHERE idempotency_key = $key").get({ $key: key });
+    return found ? this.toActionExecution(row(found)) : undefined;
+  }
+
+  /**
+   * Async-safe reservation boundary for real connector interfaces.
+   * Atomically inserts a pending step execution for a stable idempotency key
+   * BEFORE any provider side effect, or returns the existing durable row for
+   * that key. Requires exact-version approval. Never performs I/O itself.
+   */
+  reserveStepExecution(proposedActionId: string, proposalVersion: number, idempotencyKey: string): ActionExecution {
+    const action = this.getProposedAction(proposedActionId);
+    if (action.proposalVersion !== proposalVersion) {
+      throw new Error("Stale proposal version: approval refers to a different version");
+    }
+    const approval = this.db.prepare(`SELECT id FROM approvals WHERE proposed_action_id = $actionId
+      AND proposal_version = $version AND proposal_fingerprint = $fingerprint AND status = 'approved' LIMIT 1`).get({
+      $actionId: proposedActionId, $version: action.proposalVersion, $fingerprint: action.proposalFingerprint,
+    });
+    if (!approval) throw new Error("Action requires approval for its exact current proposal version");
+    const existing = this.getExecutionByIdempotencyKey(idempotencyKey);
+    if (existing) {
+      if (existing.proposedActionId !== proposedActionId || existing.proposalVersion !== proposalVersion) {
+        throw new Error("Idempotency key is bound to a different approved action");
+      }
+      return existing;
+    }
+    const latest = this.db.prepare(`SELECT attempt FROM action_executions WHERE proposed_action_id = $actionId
+      AND proposal_version = $version ORDER BY attempt DESC LIMIT 1`).get({ $actionId: proposedActionId, $version: proposalVersion });
+    const attempt = latest ? Number(row(latest).attempt) + 1 : 1;
+    const timestamp = now();
+    const id = randomUUID();
+    try {
+      this.db.prepare(`INSERT INTO action_executions (id, proposed_action_id, proposal_version, idempotency_key,
+        attempt, status, started_at) VALUES ($id, $actionId, $version, $key, $attempt, 'pending', $timestamp)`).run({
+        $id: id, $actionId: proposedActionId, $version: proposalVersion, $key: idempotencyKey, $attempt: attempt, $timestamp: timestamp,
+      });
+    } catch (error) {
+      // Lost a race with a concurrent reserver for the same stable key: return the winner.
+      const winner = this.getExecutionByIdempotencyKey(idempotencyKey);
+      if (winner) return winner;
+      throw error;
+    }
+    return this.getActionExecution(id);
+  }
+
+  /**
+   * Reopen a terminally failed step for retry while keeping the SAME stable
+   * idempotency key. The connector dedupes by that key, so a real provider
+   * never double-applies. Succeeded/uncertain/partial rows are never reopened
+   * here (uncertain must reconcile first).
+   */
+  reopenFailedStep(executionId: string): ActionExecution {
+    const current = this.getActionExecution(executionId);
+    if (current.status !== "failed") throw new Error("Only failed executions can be retried; reconcile uncertain ones first");
+    const timestamp = now();
+    this.db.prepare(`UPDATE action_executions SET status = 'pending', attempt = attempt + 1,
+      error = NULL, started_at = $timestamp, completed_at = NULL WHERE id = $id`).run({ $timestamp: timestamp, $id: executionId });
+    return this.getActionExecution(executionId);
+  }
+
+  /**
+   * Persist uncertainty durably BEFORE any retry is allowed. Callable for
+   * pending OR already-terminal-uncertain rows; succeeding rows are never
+   * overwritten to uncertain.
+   */
+  markExecutionUncertain(executionId: string, message: string): ActionExecution {
+    const current = this.getActionExecution(executionId);
+    if (current.status === "succeeded") throw new Error("A succeeded step must never be rewritten to uncertain");
+    const timestamp = now();
+    this.db.prepare(`UPDATE action_executions SET status = 'uncertain', error = $error,
+      completed_at = COALESCE(completed_at, $timestamp) WHERE id = $id`).run({ $error: message, $timestamp: timestamp, $id: executionId });
+    return this.getActionExecution(executionId);
+  }
+
+  private toBooking(value: SqlRow): Booking {
+    return { id: String(value.id), businessId: String(value.business_id), status: value.status as Booking["status"],
+      eventName: String(value.event_name), startAt: value.start_at ? String(value.start_at) : undefined,
+      endAt: value.end_at ? String(value.end_at) : undefined,
+      guestCount: value.guest_count === null ? undefined : Number(value.guest_count),
+      notes: value.notes ? String(value.notes) : undefined,
+      sourceReferences: parseJson(value.source_references_json, []) as SourceReference[],
+      createdAt: String(value.created_at), updatedAt: String(value.updated_at) };
   }
 
   private toActionExecution(value: SqlRow): ActionExecution {

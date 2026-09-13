@@ -1,0 +1,48 @@
+import { createDemoConnectors, type DemoConnectorSet } from "../connectors/demo.ts";
+import type { BookingServiceDeps } from "./booking-service.ts";
+import { demoFixtureSlots } from "./demo-fixtures.ts";
+import { GatherStore } from "./sqlite-store.ts";
+
+/**
+ * Server runtime wiring. Durable claims (businesses, bookings, proposals,
+ * approvals, step executions with stable keys and provider receipts) live in
+ * SQLite. The demo connector's in-memory world is volatile by design and is
+ * never the source of truth for durable claims; execution result receipts
+ * persisted in SQLite survive restarts while demo memory does not.
+ */
+export interface ServerRuntime {
+  store: GatherStore;
+  connectors: DemoConnectorSet;
+  deps: BookingServiceDeps;
+}
+
+let cached: ServerRuntime | null = null;
+
+export function databasePath(): string {
+  return process.env.GATHER_DATABASE_PATH ?? "data/gather.sqlite";
+}
+
+export function ownerId(): string {
+  const value = process.env.GATHER_OWNER_ID ?? "local-owner";
+  return value.trim().length > 0 ? value : "local-owner";
+}
+
+export function getRuntime(): ServerRuntime {
+  if (cached) return cached;
+  const store = new GatherStore(databasePath());
+  const connectors = createDemoConnectors({ calendarSlots: demoFixtureSlots() });
+  const deps: BookingServiceDeps = {
+    store,
+    calendar: connectors.calendar,
+    email: connectors.email,
+    calendarId: "demo-calendar-001",
+    ownerId: ownerId(),
+  };
+  cached = { store, connectors, deps };
+  return cached;
+}
+
+/** Test-only escape hatch to reset the cached runtime between cases. */
+export function resetRuntimeForTests(): void {
+  cached = null;
+}
