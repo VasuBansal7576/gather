@@ -108,13 +108,35 @@ tokens):
   rejected — the adapter never selects an arbitrary runtime. `start()` then
   verifies the executable via `--version` (`OpenClaw x.y.z` required) under
   the minimal env before spawning.
-- **Boot**: spawn `openclaw gateway`. A spawn-level error (missing or
-  unexecutable binary) rejects `start()` immediately — it is never mistaken
-  for a running child. Exit `78` (`EX_CONFIG`) triggers one
+- **Port selection**: no fixed default port. The doctor allocates a
+  per-run loopback port (`bind 127.0.0.1:0`) unless `--port <n>` is given,
+  in which case a preflight bind probe fails fast with `FAIL port
+  preflight` when the port is occupied — without stopping, connecting to,
+  or otherwise touching the foreign listener, and with auth/isolation
+  unchanged (no child spawned).   `allocateLoopbackPort()` /
+  `checkLoopbackPortOccupied()` (`src/runtime/process.ts`) implement the
+  probes. Both are loopback-only by construction (no host parameter, so
+  they cannot bind or probe a non-loopback address); the occupancy probe
+  also validates the port range. A "free" probe only reduces collision
+  probability: the gateway's
+  own bind is authoritative (TOCTOU remains), and an early-exit child is
+  the real collision signal — never the probe result. No earlier
+  load-related failure's root cause is claimed proven; the fixed ports
+  (formerly 19391/19393) were a demonstrated weakness, not an established
+  cause.
+- **Boot**: spawn `openclaw gateway`. `start()` resolving means the CHILD
+  WAS SPAWNED and survived the 1.5 s early-exit window — liveness, not
+  readiness — and logs say exactly that (`child spawned … NOT
+  protocol-ready`). A spawn-level error (missing or unexecutable binary)
+  rejects `start()` immediately — it is never mistaken for a running
+  child. Exit `78` (`EX_CONFIG`) triggers one
   `doctor --fix --yes --non-interactive` repair under the same env and one
   retry. Process survival is not readiness.
 - **Readiness**: `connect()` resolves on `hello-ok` within a caller deadline
-  (default 30 s). The library retries `startup-sidecars` closes internally.
+  (default 30 s, unchanged — the deadline is the readiness signal, not a
+  knob for hiding slow-boot failures). The doctor records it as
+  `protocol-ready (hello-ok)`, a separate record from `child spawned`.
+  The library retries `startup-sidecars` closes internally.
 - **Reconnect**: the client owns backoff/reconnect; the adapter surfaces
   `connecting`/`ready`/`reconnecting`/`closed`.
 - **Facade startup**: `GatherOpenClawRuntime.start()` is single-flight —
@@ -196,25 +218,36 @@ missing/unknown session ids get `404` per the MCP spec.
 ## Verification
 
 - `npm run typecheck` — clean.
-- `npm test` — 42 tests pass. `tests/runtime.test.ts` covers isolation,
-  config materialization, env allowlist rejection, executable validation,
-  collision-proof session keys, mock-transport protocol (connect/hello-ok,
-  malformed responses, wait-status mapping), spawn-error and observed-exit
-  shutdown semantics, facade lifecycle (failed-start MCP rollback, connect-
-  failure cleanup, single-flight concurrent/repeated start, blocked retry
-  after uncertain child exit, running-child-with-dropped-WS guard,
-  start-during-stop ordering), real loopback MCP (auth/Host/Origin,
-  two-session reconnect, simulated labeling), and two real-boot doctor tests
-  (sentinel preservation; SIGTERM mid-run still observing child exit and
-  cleaning only its own directory).
+- `npm test` — all pass. `tests/runtime.test.ts` (37 tests) covers
+  isolation, config materialization, env allowlist rejection, executable
+  validation, loopback port probes (free/held/released; invalid ports
+  rejected; two allocations do not collide), collision-proof session keys, mock-transport protocol
+  (connect/hello-ok, malformed responses, wait-status mapping), spawn-error
+  and observed-exit shutdown semantics, facade lifecycle (failed-start MCP
+  rollback with same-port rebind proving release, connect-failure cleanup,
+  single-flight concurrent/repeated start, blocked retry after uncertain
+  child exit, running-child-with-dropped-WS guard, start-during-stop
+  ordering; MCP ports are ephemeral or per-run allocated, never fixed),
+  real loopback MCP (auth/Host/Origin, two-session reconnect, simulated
+  labeling), and three real-boot doctor tests (sentinel preservation on an
+  auto-allocated port; SIGTERM mid-run on an explicit per-run port still
+  observing child exit and cleaning only its own directory; occupied port
+  failing at preflight with the foreign listener untouched and sentinel
+  preserved).
 - `node scripts/openclaw-doctor.mjs` — actual isolated boot on host
-  `openclaw@2026.9.4`: unique `.runtime/openclaw-doctor-*` root → verified
-  `--version` → spawn → `hello-ok` (protocol 4, 424 methods) → `status`,
-  `sessions.list`, `config.get` (proves `tools.profile=messaging` +
-  `mcp.servers=[gather]` accepted) → observed SIGTERM exit → removes only the
-  directory it created. Contract tests use a mock transport; the doctor and
-  the two end-to-end tests are real-process proofs. No model/provider
-  invocation occurs.
+  `openclaw@2026.9.4` (explicit `--openclaw-bin`, e.g.
+  `/opt/homebrew/bin/openclaw`): unique `.runtime/openclaw-doctor-*` root
+  → `port` record (dynamic allocation or explicit+preflight) → verified
+  `--version` → `child spawned` (liveness past the 1.5 s window, NOT
+  readiness) → `protocol-ready (hello-ok)` (protocol 4, 424 methods,
+  unchanged 30 s deadline) → `status`, `sessions.list`, `config.get`
+  (proves `tools.profile=messaging` + `mcp.servers=[gather]` accepted) →
+  observed SIGTERM exit → removes only the directory it created.
+  Demonstrated: two simultaneous isolated boots on distinct dynamic ports
+  (both full PASS, exit 0), plus a busy-port run failing clear at
+  preflight (exit 1, occupant untouched). Contract tests use a mock
+  transport; the doctor and the three end-to-end tests are real-process
+  proofs. No model/provider invocation occurs.
 
 ## Known limitations
 
@@ -227,6 +260,12 @@ missing/unknown session ids get `404` per the MCP spec.
    channels are intentionally disabled (`OPENCLAW_SKIP_CHANNELS=1`).
 4. `agent` runs require a configured model provider; the doctor verifies
    control-plane only. No live model or Google API call has been made.
+5. Startup reliability is bounded, not proven: dynamic per-run ports remove
+   the fixed-port collision weakness and the busy-port preflight fails
+   fast, but a "free" probe never guarantees the gateway bind succeeds —
+   the bind is authoritative. No root cause is claimed for earlier
+   load-related boot failures; fixed ports and 1.5 s liveness-as-boot were
+   weaknesses, not established causes.
 5. The gateway tool policy constrains *which tools exist*; MCP tool calls
    still flow through OpenClaw's tool-policy layer, which is advisory for
    Gather business authority — the Gather-side approval/action store remains
