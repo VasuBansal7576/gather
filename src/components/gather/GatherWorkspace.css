@@ -105,6 +105,7 @@
   color: var(--gather-gold); font-size: 10px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase;
 }
 .gather-demo-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--gather-gold); }
+.gather-unverified-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--gather-coral, #e07856); }
 
 /* ============ Column 2: triage list ============ */
 .gather-triage {

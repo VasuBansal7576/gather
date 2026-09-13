@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createDemoConnectors } from "../src/connectors/demo.ts";
 import { adaptWorkspace } from "../src/host/adapter.ts";
 import { DtoValidationError, parseWorkspaceDTO, type WorkspaceDTO as ClientWorkspaceDTO } from "../src/host/dto.ts";
@@ -531,4 +534,178 @@ test("an offer on an older proposal version never leaks onto the displayed lates
   assert.equal(proposal.version, 3);
   assert.equal(proposal.offer, undefined);
   assert.equal(proposal.total, "Not priced");
+});
+
+// ---------- dataMode three-state chain: getWorkspace -> DTO -> adapt ----------
+
+const LIVE_SRC = [{ kind: "calendar" as const, locator: "live-cal://slot-1" }];
+
+function liveMeta(operationKey: string) {
+  return { operationKey, mode: { mode: "live" as const, label: "LIVE" as const, fictional: false as const }, simulated: false as const, sourceReferences: LIVE_SRC };
+}
+
+/** Scripted live-shaped connectors (tests only): live metadata + non-fictional provenance. */
+function liveConnectors() {
+  const calendar = {
+    checkAvailability: async (request: { operationKey: string }) => ({
+      status: "succeeded" as const, metadata: liveMeta(request.operationKey),
+      data: { slots: [{ slotId: "live-cover", calendarId: "demo-calendar-001", startAt: "2030-06-12T00:00:00.000Z", endAt: "2030-06-13T00:00:00.000Z", available: true, sourceReferences: LIVE_SRC }], provenance: LIVE_SRC },
+    }),
+    createProvisionalHold: async (request: { operationKey: string; bookingId: string; calendarId: string; startAt: string; endAt: string; expiresAt: string }) => ({
+      status: "succeeded" as const, metadata: liveMeta(request.operationKey),
+      data: {
+        hold: { holdId: `live-hold-${request.operationKey}`, operationKey: request.operationKey, bookingId: request.bookingId, calendarId: request.calendarId, startAt: request.startAt, endAt: request.endAt, expiresAt: request.expiresAt, status: "provisional_hold", createdAt: "2030-01-01T00:00:00.000Z", sourceReferences: LIVE_SRC },
+        provenance: LIVE_SRC,
+      },
+    }),
+    reconcileProvisionalHold: async (request: { operationKey: string }) => ({
+      status: "failed" as const, metadata: liveMeta(request.operationKey),
+      error: { kind: "not_found" as const, message: "no live record", retryable: false as const },
+    }),
+  };
+  const email = {
+    sendEmail: async (request: { operationKey: string; to: string[]; subject: string; body: string }) => ({
+      status: "succeeded" as const, metadata: liveMeta(request.operationKey),
+      data: {
+        sentEmail: { messageId: `live-msg-${request.operationKey}`, operationKey: request.operationKey, to: request.to, cc: [], subject: request.subject, body: request.body, sentAt: "2030-01-01T00:00:00.000Z", sourceReferences: LIVE_SRC },
+        provenance: LIVE_SRC,
+      },
+    }),
+    reconcileSentEmail: async (request: { operationKey: string }) => ({
+      status: "failed" as const, metadata: liveMeta(request.operationKey),
+      error: { kind: "not_found" as const, message: "no live record", retryable: false as const },
+    }),
+  };
+  return { calendar, email };
+}
+
+function realWorld() {
+  const dir = mkdtempSync(join(tmpdir(), "gather-host-"));
+  const store = new GatherStore(join(dir, "gather.sqlite"));
+  const businessId = store.createBusiness({ name: "Real Venue", timezone: "UTC" }).id;
+  return { store, businessId, cleanup: () => { store.close(); rmSync(dir, { recursive: true, force: true }); } };
+}
+
+function seedRealBooking(store: GatherStore, businessId: string, bookingId: string, actionId: string) {
+  const booking = store.createBooking({
+    id: bookingId, businessId, eventName: "Real guest event", status: "pending_approval",
+    startAt: "2030-06-12T17:00:00.000Z", endAt: "2030-06-12T23:00:00.000Z",
+    sourceReferences: [{ kind: "document", locator: "doc://real/booking" }],
+  });
+  const action = store.createProposedAction({
+    id: actionId, bookingId: booking.id, kind: "create_provisional_hold",
+    payload: {
+      startAt: "2030-06-12T17:00:00.000Z", endAt: "2030-06-12T23:00:00.000Z",
+      expiresAt: "2030-06-13T23:00:00.000Z", calendarId: "demo-calendar-001",
+      emailTo: ["guest@example.test"], emailSubject: "Real hold", emailBody: "Real body.",
+    },
+    sourceReferences: [{ kind: "document", locator: "doc://real/proposal" }],
+  });
+  return { booking, action };
+}
+
+test("chain: real booking pending approval with connected account is 'unknown', never demo", () => {
+  const w = realWorld();
+  try {
+    // A real (non-fixture) booking awaiting owner approval, plus a connected
+    // provider account — but zero executed steps, so no live proof exists.
+    seedRealBooking(w.store, w.businessId, "bk-real", "act-real");
+    w.store.upsertConnectedAccount({
+      id: "acct-1", businessId: w.businessId, provider: "gmail",
+      displayName: "venue@gmail.com", status: "connected",
+    });
+    const server = getWorkspace(w.store, { ownerId: "test-owner" });
+    assert.equal(server.mode.kind, "unknown", "server marker: real records without live proof");
+    assert.equal(server.demo, false);
+    // Full chain: server payload -> strict DTO parse -> host adapter.
+    const parsed = parseWorkspaceDTO(JSON.parse(JSON.stringify(server)));
+    assert.equal(parsed.mode.kind, "unknown", "DTO boundary preserves unknown");
+    const view = adaptWorkspace(parsed);
+    assert.equal(view.dataMode, "unknown",
+      "the UI must show the unverified banner — never 'Demo data' on real records, never 'live' without proof");
+    const real = view.bookings.find((booking) => booking.id === "bk-real");
+    assert.ok(real, "the real booking is present in the workspace");
+  } finally {
+    w.cleanup();
+  }
+});
+
+test("chain: mixed fixture + real workspace reports unknown, not demo", () => {
+  const w = realWorld();
+  try {
+    seedRealBooking(w.store, w.businessId, "bk-real", "act-real");
+    w.store.createBooking({
+      id: "bk-fx", businessId: w.businessId, eventName: "Fixture event", status: "pending_approval",
+      startAt: "2030-06-12T17:00:00.000Z", endAt: "2030-06-12T23:00:00.000Z",
+      sourceReferences: [{ kind: "fixture", locator: "demo://fx", fictional: true }],
+    });
+    const parsed = parseWorkspaceDTO(JSON.parse(JSON.stringify(getWorkspace(w.store, { ownerId: "test-owner" }))));
+    const view = adaptWorkspace(parsed);
+    assert.equal(view.dataMode, "unknown", "a fixture among real records must not drag the workspace to demo");
+  } finally {
+    w.cleanup();
+  }
+});
+
+test("chain: all-fixture workspace stays demo; fully live-proven workspace reads live", async () => {
+  const w = realWorld();
+  try {
+    // Fixture-only workspace -> demo.
+    w.store.createBooking({
+      id: "bk-fx", businessId: w.businessId, eventName: "Fixture event", status: "pending_approval",
+      startAt: "2030-06-12T17:00:00.000Z", endAt: "2030-06-12T23:00:00.000Z",
+      sourceReferences: [{ kind: "fixture", locator: "demo://fx", fictional: true }],
+    });
+    const fixtureOnly = adaptWorkspace(parseWorkspaceDTO(JSON.parse(JSON.stringify(getWorkspace(w.store, { ownerId: "test-owner" })))));
+    assert.equal(fixtureOnly.dataMode, "demo");
+
+    // Real booking approved through live-proven connectors -> live.
+    const live = liveConnectors();
+    const { action } = seedRealBooking(w.store, w.businessId, "bk-real", "act-real");
+    const deps: BookingServiceDeps = { store: w.store, calendar: live.calendar as never, email: live.email, ownerId: "test-owner", now: () => new Date().toISOString() };
+    await approveAndExecute(deps, {
+      bookingId: "bk-real", proposedActionId: action.id,
+      proposalVersion: action.proposalVersion, proposalFingerprint: action.proposalFingerprint,
+    });
+    const parsed = parseWorkspaceDTO(JSON.parse(JSON.stringify(getWorkspace(w.store, { ownerId: "test-owner" }))));
+    assert.equal(parsed.mode.kind, "live", "every succeeded step live-proven");
+    const view = adaptWorkspace(parsed);
+    assert.equal(view.dataMode, "live", "positive proof only — live never inferred");
+    const real = view.bookings.find((booking) => booking.id === "bk-real");
+    assert.ok(real?.detail.receipts?.some((receipt) => receipt.detail === "Done — provider receipt recorded"),
+      "live-proven receipts carry the recorded label");
+  } finally {
+    w.cleanup();
+  }
+});
+
+test("receipt labels: missing or malformed proof reads unverified, never simulated", () => {
+  const base = baseWorkspace();
+  base.mode = { kind: "unknown", label: "UNVERIFIED" };
+  base.demo = false;
+  const succeededNoProof = {
+    id: "ex-1", proposedActionId: "act-1", proposalVersion: 2,
+    idempotencyKey: "bk-1:hold:k", status: "succeeded", startedAt: "2026-10-01T00:00:00.000Z",
+    completedAt: "2026-10-01T00:01:00.000Z",
+  };
+  const succeededBadProof = {
+    ...succeededNoProof, id: "ex-2", idempotencyKey: "bk-1:send:k",
+    result: { proof: { mode: "unknown", simulated: false, provenance: [] } },
+  };
+  const succeededSim = {
+    ...succeededNoProof, id: "ex-3", idempotencyKey: "bk-1:send:k2",
+    result: { proof: { mode: "demo", simulated: true, provenance: [{ kind: "fixture", locator: "demo://x", fictional: true }] } },
+  };
+  const dto = {
+    ...base,
+    bookings: [{ ...baseBooking(), executions: [succeededNoProof, succeededBadProof, succeededSim] }],
+  };
+  const parsed = parseWorkspaceDTO(dto);
+  const view = adaptWorkspace(parsed);
+  assert.equal(view.dataMode, "unknown");
+  const receipts = view.bookings[0].detail.receipts ?? [];
+  const byId = new Map(receipts.map((receipt) => [receipt.executionId, receipt.detail]));
+  assert.equal(byId.get("ex-1"), "Done — provider receipt unverified", "proof-absent never claims simulated");
+  assert.equal(byId.get("ex-2"), "Done — provider receipt unverified", "malformed/unknown-mode proof never claims simulated");
+  assert.equal(byId.get("ex-3"), "Done — simulated provider receipt", "positive simulated proof stays labeled simulated");
 });

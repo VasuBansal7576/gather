@@ -96,7 +96,7 @@ Proposals whose required steps are absent or empty can never prove completeness,
 | `loading` | Shows the workspace skeleton while the host resolves data. |
 | `blockedState` | Shows a host-controlled blocked banner above the active view. |
 | `initialView` | Opens `today`, `bookings`, or `connections`. |
-| `dataMode` | `'demo'` keeps the simulation label on custom data that is still simulated; `'live'` hides it. Defaults to `'demo'` when fixtures are in use. |
+| `dataMode` | `'demo'` keeps the simulation label on custom data that is still simulated; `'live'` hides it; `'unknown'` shows the `Unverified data` badge and ribbon for real records whose provider evidence is unproven — never collapsed into demo or upgraded to live. Defaults to `'demo'` when fixtures are in use. |
 | `pendingApprovals` | Proposal fingerprints with an in-flight approval; matching approve controls stay disabled. |
 | `onNavigate` | Receives view changes. |
 | `onSelectBooking` | Receives a selected booking ID. |

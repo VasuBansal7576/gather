@@ -587,7 +587,7 @@ function connectionFor(account: ConnectedAccountDTO): Connection {
 export interface AdaptedWorkspace {
   bookings: BookingSummary[];
   connections: Connection[];
-  dataMode: "demo" | "live";
+  dataMode: "demo" | "live" | "unknown";
   /** Fingerprints with a step execution still pending — approvals in flight. */
   pendingApprovals: string[];
   approvalIdentity: string;
@@ -614,9 +614,14 @@ export function adaptWorkspace(workspace: WorkspaceDTO): AdaptedWorkspace {
       bookingFor(item, index, workspace.businesses.find((business) => business.id === item.booking.businessId) ?? workspace.businesses[0]),
     ),
     connections: workspace.connections.map(connectionFor),
-    // Only a positive live marker renders live; "unknown" evidence fails
-    // closed to the demo presentation rather than implying live data.
-    dataMode: workspace.mode.kind === "live" ? "live" : "demo",
+    // Three-state evidence marker, preserved exactly: only a positive live
+    // marker renders live, only positive fixture evidence renders demo —
+    // "unknown" (real records, unverified provider proof) stays unknown so
+    // real records are never labeled simulated nor upgraded to live.
+    dataMode:
+      workspace.mode.kind === "live" ? "live"
+        : workspace.mode.kind === "demo" ? "demo"
+          : "unknown",
     pendingApprovals: [...pendingApprovals],
     approvalIdentity: workspace.approvalIdentity,
     notice: workspace.notice,
