@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { GatherGatewayConnection } from "./client.ts";
+import type { GatewayRequestChannel } from "./client.ts";
 
 /**
  * Task submission / status / history over documented Gateway RPC methods.
@@ -141,9 +141,9 @@ export interface SessionHistoryEntry {
 }
 
 export class GatherRuntimeTasks {
-  private readonly connection: GatherGatewayConnection;
+  private readonly connection: GatewayRequestChannel;
 
-  constructor(connection: GatherGatewayConnection) {
+  constructor(connection: GatewayRequestChannel) {
     this.connection = connection;
   }
 

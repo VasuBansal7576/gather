@@ -34,6 +34,7 @@ export {
   GatewayRequestFailed,
   type GatherGatewayClientOptions,
   type GatewayConnectionState,
+  type GatewayRequestChannel,
   type GatewayTransport,
   type GatewayTransportFactory,
 } from "./client.ts";
@@ -62,4 +63,7 @@ export {
 export {
   GatherOpenClawRuntime,
   type GatherOpenClawRuntimeOptions,
+  type GatherRuntimeDeps,
+  type RuntimeProcessLike,
+  type RuntimeConnectionLike,
 } from "./openclaw-runtime.ts";

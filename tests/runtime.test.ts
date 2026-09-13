@@ -26,6 +26,8 @@ import {
   writeGatewayConfig,
   type GatewayTransport,
   type SpawnLike,
+  type RuntimeProcessLike,
+  type RuntimeConnectionLike,
 } from "../src/runtime/index.ts";
 import type { GatewayClientOptions } from "@openclaw/gateway-client";
 
@@ -758,45 +760,54 @@ test("MCP boundary rejects wrong paths, bad JSON, short tokens and non-loopback 
 
 // ---------- facade lifecycle (injected seams, no real gateway) ----------
 
-function fakeProcess(behavior: {
+interface FakeProcessBehavior {
   failStart?: string;
-  neverExit?: boolean;
-}) {
+  /** Number of stop() calls that must fail before one succeeds. */
+  stopFails?: number;
+  /** Artificial delay before stop() resolves, to hold stop() in flight. */
+  stopDelayMs?: number;
+}
+
+function fakeProcess(behavior: FakeProcessBehavior = {}) {
   const state = {
-    started: false,
+    startCalls: 0,
     stopCalls: 0,
-    currentState: "stopped" as string,
+    currentState: "stopped" as "stopped" | "running" | "failed" | "stopping",
   };
-  const proc = {
+  let stopFailuresLeft = behavior.stopFails ?? 0;
+  const proc: RuntimeProcessLike = {
     gatewayToken: "fake-token",
     pid: 5555,
-    openclawVersion: null,
     get currentState() {
       return state.currentState;
     },
     async start() {
+      state.startCalls += 1;
       if (behavior.failStart) {
         state.currentState = "failed";
         throw new Error(behavior.failStart);
       }
-      state.started = true;
       state.currentState = "running";
     },
     async stop() {
       state.stopCalls += 1;
-      if (behavior.neverExit) {
+      if (behavior.stopDelayMs) {
+        await new Promise((r) => setTimeout(r, behavior.stopDelayMs));
+      }
+      if (stopFailuresLeft > 0) {
+        stopFailuresLeft -= 1;
         state.currentState = "failed";
         throw new Error("did not exit after SIGKILL");
       }
       state.currentState = "stopped";
     },
   };
-  return { proc: proc as unknown as OpenClawGatewayProcess, state };
+  return { proc, state };
 }
 
-function fakeConnection(behavior: { failConnect?: string }) {
+function fakeConnection(behavior: { failConnect?: string } = {}) {
   const state = { ready: false, closeCalls: 0 };
-  const conn = {
+  const conn: RuntimeConnectionLike = {
     get isReady() {
       return state.ready;
     },
@@ -812,18 +823,16 @@ function fakeConnection(behavior: { failConnect?: string }) {
       state.closeCalls += 1;
       state.ready = false;
     },
-    async request() {
-      return {};
+    async request<T>(): Promise<T> {
+      return {} as T;
     },
   };
-  return { conn: conn as unknown as GatherGatewayConnection, state };
+  return { conn, state };
 }
 
 function runtimeFixture(overrides: {
-  processBehavior?: { failStart?: string; neverExit?: boolean };
-  connectionBehavior?: { failConnect?: string };
-  processFactory?: (count: { n: number }) => OpenClawGatewayProcess;
-  connectionFactory?: () => GatherGatewayConnection;
+  processFactory?: (count: { n: number }) => RuntimeProcessLike;
+  connectionFactory?: () => RuntimeConnectionLike;
   mcpPort?: number;
 } = {}) {
   const directory = mkdtempSync(join(tmpdir(), "gather-facade-test-"));
@@ -841,11 +850,10 @@ function runtimeFixture(overrides: {
         count.n += 1;
         return overrides.processFactory
           ? overrides.processFactory(count)
-          : fakeProcess(overrides.processBehavior ?? {}).proc;
+          : fakeProcess().proc;
       },
       connectionFactory:
-        overrides.connectionFactory ??
-        (() => fakeConnection(overrides.connectionBehavior ?? {}).conn),
+        overrides.connectionFactory ?? (() => fakeConnection().conn),
     },
   );
   return { runtime, count, cleanup: () => rmSync(directory, { recursive: true, force: true }) };
@@ -878,7 +886,7 @@ test("failed start rolls back the MCP boundary the invocation created", async ()
 });
 
 test("connect failure stops the spawned child and tears down MCP", async () => {
-  const proc = fakeProcess({});
+  const proc = fakeProcess();
   const conn = fakeConnection({ failConnect: "ws handshake refused" });
   const { runtime, cleanup } = runtimeFixture({
     processFactory: () => proc.proc,
@@ -901,10 +909,86 @@ test("concurrent and repeated start() produce exactly one startup", async () => 
     const second = runtime.start();
     await Promise.all([first, second]);
     assert.equal(count.n, 1, "one process for two concurrent starts");
-    await assert.rejects(runtime.start(), /already started/);
+    await assert.rejects(runtime.start(), /still owns resources/);
     assert.equal(count.n, 1);
     await runtime.stop();
     assert.equal(runtime.state.process, "stopped");
+    // After an observed stop, a fresh start is allowed again.
+    await runtime.start();
+    assert.equal(count.n, 2);
+    await runtime.stop();
+  } finally {
+    cleanup();
+  }
+});
+
+test("uncertain child exit keeps the process owned: retry start is blocked", async () => {
+  // First process: start ok, connect throws, rollback stop() throws (exit
+  // uncertain) -> process ref must remain owned, and a second start() must
+  // NOT overwrite it with a second process.
+  const flaky = fakeProcess({ stopFails: 1 });
+  const connBehavior: { failConnect?: string } = { failConnect: "ws gone" };
+  const { runtime, count, cleanup } = runtimeFixture({
+    processFactory: () => flaky.proc,
+    connectionFactory: () => fakeConnection(connBehavior).conn,
+    mcpPort: 19773,
+  });
+  try {
+    await assert.rejects(runtime.start(), /ws gone/);
+    assert.equal(count.n, 1);
+    assert.equal(flaky.state.stopCalls, 1, "rollback attempted one stop");
+    // The regression: prior implementation overwrote the process ref here.
+    await assert.rejects(runtime.start(), /still owns resources/);
+    assert.equal(count.n, 1, "no second process while exit is unobserved");
+    assert.equal(flaky.state.stopCalls, 1);
+    // Recovery only through stop(), which retries the child stop and observes
+    // the exit this time.
+    await runtime.stop();
+    assert.equal(flaky.state.stopCalls, 2);
+    assert.equal(runtime.state.process, "stopped");
+    delete connBehavior.failConnect;
+    await runtime.start();
+    assert.equal(count.n, 2);
+    await runtime.stop();
+  } finally {
+    cleanup();
+  }
+});
+
+test("a running child with a disconnected WS still blocks a new start", async () => {
+  const proc = fakeProcess();
+  const conn = fakeConnection();
+  const { runtime, count, cleanup } = runtimeFixture({
+    processFactory: () => proc.proc,
+    connectionFactory: () => conn.conn,
+  });
+  try {
+    await runtime.start();
+    // Simulate a dropped socket: connection ref exists but isReady is false
+    // while the child keeps running — the guard must not rely on isReady.
+    conn.state.ready = false;
+    await assert.rejects(runtime.start(), /still owns resources/);
+    assert.equal(count.n, 1);
+    await runtime.stop();
+  } finally {
+    cleanup();
+  }
+});
+
+test("start() during an in-flight stop() is rejected, then allowed after", async () => {
+  const proc = fakeProcess({ stopDelayMs: 50 });
+  const { runtime, count, cleanup } = runtimeFixture({
+    processFactory: () => proc.proc,
+    mcpPort: 19774,
+  });
+  try {
+    await runtime.start();
+    const stopping = runtime.stop(); // in flight while child stop takes 50ms
+    await assert.rejects(runtime.start(), /stopping/);
+    await stopping;
+    await runtime.start();
+    assert.equal(count.n, 2);
+    await runtime.stop();
   } finally {
     cleanup();
   }

@@ -59,6 +59,16 @@ export type GatewayTransportFactory = (
 const defaultFactory: GatewayTransportFactory = (options) =>
   new GatewayClient(options) as GatewayTransport;
 
+/** Narrow request surface the task layer and tests rely on. */
+export interface GatewayRequestChannel {
+  readonly isReady: boolean;
+  request<T>(
+    method: string,
+    params?: unknown,
+    opts?: { timeoutMs?: number },
+  ): Promise<T>;
+}
+
 export class GatewayRequestFailed extends Error {
   readonly code?: string;
   constructor(method: string, cause: unknown) {
