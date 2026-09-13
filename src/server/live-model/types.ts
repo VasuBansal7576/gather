@@ -92,7 +92,7 @@ export interface PreparedProposal {
   provenance: ToolProvenance;
 }
 
-export type LiveRunStatus = "ok" | "error";
+export type LiveRunStatus = "ok" | "error" | "continuing";
 
 export interface LiveRunStep {
   tool: LiveToolName;

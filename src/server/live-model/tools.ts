@@ -28,6 +28,8 @@ export interface LiveToolPorts {
   documents: DocumentRetriever;
   calendar: CalendarConnector;
   calendarId: string;
+  /** Server-side controlled recipient (never a model argument). */
+  recipient: string;
   now?: () => string;
 }
 
@@ -59,6 +61,9 @@ export interface LiveTools {
 }
 
 export function createLiveTools(ports: LiveToolPorts): LiveTools {
+  if (!ports.recipient || !ports.recipient.trim()) {
+    throw new LiveModelError("INVALID_REQUEST", "live tools require a server-side controlled recipient");
+  }
   const opKey = (tool: string): string => `live-model:${ports.runId}:${tool}`;
   const sameRun = (provenance: ToolProvenance, tool: string): void => {
     if (provenance.runId !== ports.runId || provenance.businessId !== ports.businessId || provenance.accountId !== ports.accountId) {
@@ -182,10 +187,10 @@ export function createLiveTools(ports: LiveToolPorts): LiveTools {
           perPersonGbp: terms.perPersonGbp,
           totalGbp: terms.totalGbp,
           currency: input.policy.currency,
-          emailTo: [],
+          emailTo: [ports.recipient],
           emailSubject: `GATHER TEST proposal: ${terms.guestCount} guests ${terms.startAt}`,
-          emailBody: `GATHER TEST offer (GBP ${terms.totalGbp} total). Controlled recipient bound at owner approval; nothing sent.`,
-          controlledRecipient: "pending-chief-assignment",
+          emailBody: `GATHER TEST offer (GBP ${terms.totalGbp} total) to the controlled test recipient. Nothing sent: owner approval required.`,
+          controlledRecipient: ports.recipient,
           evidence: evidence.map((source) => ({ kind: source.kind, locator: source.locator, label: source.label })),
         },
         sourceReferences: evidence,

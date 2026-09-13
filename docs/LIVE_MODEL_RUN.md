@@ -1,44 +1,56 @@
-# Live-model booking-proposal journey (scaffold, not live)
+# Live-model booking-proposal execution (wired, gated)
 
-Smallest REAL path from an OpenClaw model through Gather tools to a
-Google booking proposal — currently runnable scripted end to end, with
-live execution honestly closed until its three external gates land.
+The model drives the journey by CALLING four registered Gather MCP
+tools — reads and proposal assembly happen inside tool handlers
+against server-side designated sources, never in a hardcoded pipeline
+(the ed7c68c pipeline was replaced; its history stays in git for G's
+review). N's exact model-config commit is consumed (cherry-picked):
+the runner carries an explicit `GatherModelSelection` through
+`modelStatus()`/`requireModelSelection()` with no fallback model.
 
-## What is built (`src/server/live-model/`)
+## What is wired (`src/server/live-model/`)
 
-- `tools.ts` — four narrowly bound tools over already-resolved provider
-  ports: `readInquiry` (designated Gmail thread), `readVenuePolicy`
-  (designated Drive file), `checkAvailability` (owner-bound calendar),
-  `prepareProposal` (exact terms + evidence into booking + `send_offer`
-  action, `pending_approval`). No approve/send/claim tool exists.
-- `controller.ts` — one business, one verified account, one run id;
-  Gmail/Drive/calendar ports must agree on the business or the run
-  refuses. Policy is enforced before any row: exact per-person
-  arithmetic, capacity, and a free slot attested in the same run.
-- `index.ts` — integration hook (`runLiveModelJourney`, `getLiveRun`).
-- `app/api/live-model/run/route.ts` — owner same-origin entry; typed
-  codes (MODEL_UNCONFIGURED 503, LIVE_NOT_AUTHORIZED 409,
-  POLICY_VIOLATION 422, TOOL_FAILURE 502).
+- `mcp-tools.ts` — `gather.read_inquiry`, `gather.read_venue_policy`,
+  `gather.check_availability`, `gather.prepare_proposal` via
+  `defineGatherTool`. Identity (business, account, thread, file,
+  calendar, recipient) is server-side run scope only; tool arguments
+  carry non-identity content alone, so the model cannot forge
+  provenance, redirect sources, or choose recipients.
+- `execution.ts` — `startScopedExecutionHost` (real
+  GatherOpenClawRuntime constructed with the model + tools, loopback
+  MCP boundary; close reaps everything owned) and `runLiveExecution`:
+  live-gate, port resolution with cross-business refusal, MCP tool
+  listing check, planner-driven tool calls over a real MCP client,
+  submit/wait/history on the injected tasks channel, durable run
+  record + per-call tool audit, timeout → `continuing` run id without
+  duplicates, idempotent caller keys (gateway key stable per key).
+- `tools.ts` — policy enforcement reused by the handlers (exact
+  arithmetic, capacity, same-run attested free slot; violations reject
+  pre-write). Proposal payloads name the controlled test recipient
+  (`work.vasu.ai@gmail.com`) server-side and stay `pending_approval`.
+- `app/api/live-model/run/route.ts` — owner same-origin entry with
+  typed codes; `scripts/gather-live-model.mjs` — run command below.
 
-Authority: the model only interprets terms. It cannot approve (owner
-UI `approveAndExecute` does), cannot override policy (violations reject
-pre-write), cannot claim receipts (payloads carry evidence only;
-receipts come from provider dispatch after approval).
+Authority: no approve/send/claim tool exists; owner UI approves only;
+receipts come solely from provider dispatch after approval.
 
-## Exact run command
+## Exact commands
 
-Scripted verification (this is what CI runs):
+Scripted MCP regression (no live requests of any kind):
 
 ```
-node --experimental-strip-types --test tests/live-model-journey.test.ts
+node --experimental-strip-types --test tests/live-model-execution.test.ts
 ```
 
-Live attempt (refuses honestly until the gates land):
+Live attempt (refuses honestly until consent, designation, and the
+authorized model path land):
 
 ```
 node --experimental-strip-types scripts/gather-live-model.mjs \
   --business <businessId> --thread <threadId> \
-  --file <driveFileId> --calendar <calendarId> [--allow-live]
+  --file <driveFileId> --calendar <calendarId> \
+  --model openai-codex/gpt-5.6-luna --auth-profile <profileId> \
+  [--allow-live] [--idempotency-key <key>]
 ```
 
 ## Test facts (explicitly FICTIONAL, reused — never regenerated)
@@ -46,19 +58,18 @@ node --experimental-strip-types scripts/gather-live-model.mjs \
 `/tmp/gather-live-test-seed/`: `inquiry.txt` (12 guests,
 2026-09-18 18:00–20:00 Europe/London, vegetarian x2, budget GBP 650),
 `venue-policy.md` (GBP 50/person, 20 seated, GATHER TEST rules),
-`manifest.json` (`prepared locally; not uploaded or sent`). The
-scripted transports serve exactly these contents; the journey derives
-the exact GBP 600 total from them.
+`manifest.json` (`prepared locally; not uploaded or sent`). Scripted
+transports serve exactly these contents; the journey derives the exact
+GBP 600 total from them.
 
 ## Remaining before any live outcome (no overall completion claimed)
 
-1. **I — authorized model auth path**: no term interpreter is
-   configured, so every live-capable run ends MODEL_UNCONFIGURED.
-2. **Chief — designated account + controlled recipient**: live gate
-   additionally requires the connected account and
-   `GATHER_LIVE_RECIPIENT`; nothing sends or reads live data meanwhile.
-3. **Dependencies**: provider 85027c8 accepted; scheduler bbc residual
-   fix, runtime 497 spawn fix, and proposal 4402 fix still pending
-   elsewhere — this module uses only preserved public contracts and
-   store primitives, and the route/script above are the only new
-   surfaces.
+1. **Astra start handoff + consent**: no live Google/model requests
+   until then (`GATHER_LIVE_CONSENT` + `allowLive` gate).
+2. **I — authorized Codex OAuth** under `main/.runtime/openclaw-live`
+   and the exact Luna auth profile (root/config untouched meanwhile);
+   model-driven (non-scripted) tool calling wires up with that path.
+3. **Dependencies**: provider 85027c8 accepted; scheduler bbc
+   residual, runtime 497 spawn, and proposal 4402 fixes still pending
+   elsewhere — this module uses only preserved public contracts, and
+   the runtime here is constructed, never spawned.

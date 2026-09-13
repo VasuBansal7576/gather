@@ -1,10 +1,17 @@
 export { createLiveTools, type LiveToolPorts, type LiveTools } from "./tools.ts";
+export { createLiveMcpTools, type LiveMcpAuditEntry, type LiveMcpScope } from "./mcp-tools.ts";
 export {
+  CONTROLLED_TEST_RECIPIENT,
+  ensureLiveRunTables,
   getLiveRun,
-  runLiveModelJourney,
-  type LiveJourneyDeps,
-  type TermsExtractor,
-} from "./controller.ts";
+  listToolCalls,
+  runLiveExecution,
+  startScopedExecutionHost,
+  type ExecutionPlanner,
+  type ExecutionPlannerCall,
+  type LiveExecutionOptions,
+  type ScopedExecution,
+} from "./execution.ts";
 export {
   LiveModelError,
   type AvailabilityAttestation,
