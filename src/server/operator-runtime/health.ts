@@ -1,5 +1,6 @@
 import type { OperatorHealth, OperatorRuntimeDeps } from "./types.ts";
 import { OperatorIntakeStore } from "./store.ts";
+import { getProactiveBinding } from "./automation.ts";
 
 function nowIso(deps: OperatorRuntimeDeps): string {
   return deps.now ? deps.now() : new Date().toISOString();
@@ -52,7 +53,15 @@ export function operatorHealth(deps: OperatorRuntimeDeps): OperatorHealth {
     waitingByStatus,
     pausedBookings,
     failures: failures.map((failure) => ({ scope: failure.scope, message: failure.message, at: failure.at })),
-    scheduler: { registered: false, status: "pending-registration" },
+    // Real scheduler state for THIS account's proactive binding — a
+    // registered running/degraded binding must never report
+    // "pending-registration", and an unwired one must never claim to run.
+    scheduler: (() => {
+      const binding = getProactiveBinding(deps.accountId);
+      return binding
+        ? { registered: true, status: binding.status }
+        : { registered: false, status: "pending-registration" };
+    })(),
     lastSweep: undefined,
     lastDueWork: undefined,
   };
