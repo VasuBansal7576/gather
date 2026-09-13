@@ -111,7 +111,7 @@ No credentials, personal OpenClaw configuration or data, provider actions, custo
 
 ## Workspace cleanup and dependency findings
 
-Twenty-one completed review, failed-launch, runtime, dependency-maintenance, knowledge, delivery-evaluator, owner-workspace, setup, connection-service, backup, confirmation-service, and inherited milestone worktrees were removed after checking clean tracked state and active worker ownership.
+Twenty-five completed review, failed-launch, runtime, dependency-maintenance, knowledge, delivery-evaluator, owner-workspace, setup, connection-service, backup, confirmation-service, commercial, extraction-backend, conflict-resolution, and inherited milestone worktrees were removed after checking clean tracked state and active worker ownership.
 Original foundation, interface, connector-contract, and packaging commits remain preserved by local branch references; integrated review commits remain reachable on remote main.
 The completed knowledge commit is additionally preserved at `archive/gather-business-knowledge-640f57b`; its successor worker uses a separate business-operator worktree.
 The completed delivery evaluator is preserved at `archive/gather-delivery-readiness-e626000`; its successor uses a separate booking-delivery worktree.
@@ -119,6 +119,7 @@ The completed owner workspace is preserved at `archive/gather-owner-host-fbafe11
 The setup UI, setup integration review, and connection service are preserved at `archive/gather-setup-ui-57e2518`, `archive/gather-setup-integration-9d65478`, and `archive/gather-connections-db6815f`.
 The completed backup implementation is preserved at `archive/gather-data-recovery-03cafd4`.
 The confirmation service is preserved at `archive/gather-booking-delivery-f7662de`; its successor uses a separate owner-delivery worktree.
+The completed commercial branches and extraction/conflict fixes remain preserved at `archive/gather-business-operator-d015d27`, `archive/gather-commercial-ui-c7bbe5c`, `archive/gather-extraction-backend-62c5316`, and `archive/gather-knowledge-conflicts-c3593e4`.
 Ten fictional HTTP journey evidence files were copied and hash-verified into the main workspace's ignored review directory before removing their completed worktree.
 Active execution worktrees and unrelated work were preserved.
 
@@ -200,3 +201,36 @@ Handoffs distinguish blocked, preliminary and ready states; a preview receives a
 Regression checks include evidence changes in queued microtasks and at the transaction boundary, preventing a stale handoff from being saved.
 Internal evaluation bindings are omitted from HTTP response objects.
 These checks use isolated fixtures and scripted verifier results; actual provider confirmation and the owner-facing delivery screens remain unverified.
+
+## Knowledge, provider dispatch, and current verification
+
+The fictional knowledge evaluation corpus and scorer were integrated at `4e306ce` after 12 focused checks and type checking passed.
+This verifies evaluation tooling, not model quality on real business data.
+Scoped extraction, exact cross-account conflict resolution, and the extraction backend were integrated at `506ce9f` after 69 focused checks and type checking passed.
+Its combined run passed 518 of 519 tests and its production build passed.
+The failure exposed a real concurrent correction rejection-audit lock error; it was reproduced and fixed, not dismissed as a flaky test.
+
+The rejection-audit fix was integrated at `50dc278` after independent review and Astra's 13 focused checks.
+The combined run with the hold-release component passed 542 of 543 tests and the production build passed.
+Its only failure was the previously observed actual isolated Gateway not receiving `hello-ok` within 30 seconds; child shutdown was observed.
+This run passed the corrected knowledge concurrency checks but does not establish overall runtime reliability.
+Independent review also reproduced a pre-account database migration ordering defect; its correction was integrated at `7cf3c7a` after Astra's 26 focused checks passed.
+
+The optional calendar hold-release port was integrated at `8a284a3` after independent review and 20 focused tests, including a real loopback HTTP server serving scripted provider responses.
+This does not establish an actual Google cancellation.
+Cancellation callers must bind release to a durable trusted created-hold receipt; an initial provider `404` alone does not establish prior hold ownership.
+
+Per-business Google provider dispatch was integrated at `7883af0` after independent review, Astra's 22 component tests, 45 integration checks, and type checking passed.
+Real bookings resolve authorized accounts and durable calendar bindings; explicitly simulated fixture bookings retain demo adapters.
+Calendar authority is revalidated after token acquisition immediately before each HTTP dispatch, including reconciliation, so an unbound or replaced connection cannot authorize unsent work through a previously resolved port.
+All these provider checks used scripted responses; no Google account action is claimed.
+
+Astra reran the production demo on the build containing `8a284a3` and the rejection-audit correction: `/setup`, explicit Try demo, enter workspace, open the fictional Clara booking, and approve.
+The UI showed separate simulated hold and email receipts and a provisional booking.
+An actual server restart preserved the exact two execution IDs and provisional status.
+The embedded browser measured 839 pixels with no horizontal overflow; the requested larger viewport did not persist, so this run does not establish a new desktop/mobile screenshot comparison.
+The task-owned browser, server, and disposable database were cleaned up.
+
+The owner has authorized a designated Google test account, fictional seed data, and a fresh isolated Codex subscription login for the requested Luna model.
+OAuth application setup, model authentication, model-to-tool composition, and real end-to-end execution remain pending verification.
+These authorizations and component checks do not increase the fixed 14-of-17 accepted local milestone count or establish a whole-product completion percentage.

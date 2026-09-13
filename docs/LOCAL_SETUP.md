@@ -1,7 +1,7 @@
 # Local setup
 
-Gather's local packaging currently covers the owner application only.
-OpenClaw runtime integration, supported runtime interfaces, credentials, and external app connections remain pending verification.
+Gather's local packaging launches the owner application and its explicit simulated demo.
+An isolated OpenClaw control-plane adapter exists; model execution and real external app connections remain unverified.
 These commands therefore do not constitute a complete one-command Gather product launch.
 
 ## Prerequisites
@@ -11,11 +11,11 @@ These commands therefore do not constitute a complete one-command Gather product
 - The Gather foundation scaffold, including `package.json` and its application files.
 
 The foundation uses Node's built-in `node:sqlite` API, so older Node versions are not supported.
-The current packaging worktree is intentionally a planning scaffold until the foundation change is integrated.
+The application scaffold and launcher are integrated on `main`.
 
 ## First-time local setup
 
-Run these commands from the repository root after the foundation scaffold is available:
+Run these commands from the repository root:
 
 ```sh
 mkdir -p .runtime
@@ -89,4 +89,6 @@ It does not kill, reassign, or probe for another process using that port.
 - If Node.js is too old, install or select Node.js 26 or newer, then rerun the doctor.
 - If a supported npm script is missing, restore the foundation package scripts before launching.
 
-The owner application and the OpenClaw runtime are intentionally separate until the runtime contract and supported interfaces are verified.
+The owner demo does not require OpenClaw or provider credentials.
+The separate isolated OpenClaw doctor has shown an intermittent Gateway handshake timeout; a passing control-plane check does not establish model execution.
+See the [README demonstration](../README.md#run-the-local-demo) for the production build launch and the exact simulated boundary.
