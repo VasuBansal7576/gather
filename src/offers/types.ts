@@ -122,6 +122,9 @@ export interface ServiceCapability {
 }
 
 export interface BusinessKnowledge {
+  businessId: string;
+  /** IANA business timezone, used for local-time alternative placement. */
+  timezone: string;
   spaces: SpaceKnowledge[];
   policies: PolicyRule[];
   scopedExceptions: ScopedException[];
@@ -136,10 +139,12 @@ export interface AvailabilitySlot {
   available: boolean;
   reason?: string;
   /**
-   * Spaces this slot is evidence for. Absent or empty means venue-wide
-   * evidence; when present, only the listed spaces may use the slot, so
-   * Room A availability can never authorize Room B.
+   * Explicit scope: either venue-wide evidence or evidence for named spaces.
+   * There is no silent default — a slot is venue-wide only with
+   * `venueWide: true`, otherwise `spaceIds` must name its spaces, so Room A
+   * evidence can never authorize Room B (and Room B busy never blocks A).
    */
+  venueWide?: boolean;
   spaceIds?: string[];
   sourceReferences: SourceReference[];
 }

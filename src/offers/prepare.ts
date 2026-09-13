@@ -17,6 +17,9 @@ import type {
   OwnerDecisionRequest,
   PolicyRule,
   PriceBook,
+  PriceLine,
+  CostLine,
+  ServiceCapability,
   ProfitabilityAssessment,
   ScopedException,
   SpaceKnowledge,
@@ -97,6 +100,10 @@ function canonicalize(value: unknown): unknown {
     );
   }
   return value;
+}
+
+export function canonicalizeValue(value: unknown): unknown {
+  return canonicalize(value);
 }
 
 function fingerprintOf(value: unknown): string {
@@ -181,7 +188,7 @@ export function readInquiryRequirements(input: unknown): InquiryRequirements {
   };
 }
 
-function readSpace(value: unknown, path: string): SpaceKnowledge {
+export function readSpaceKnowledge(value: unknown, path: string): SpaceKnowledge {
   if (!isRecord(value)) throw new Error(`${path} must be an object`);
   if (!isNonEmptyString(value.spaceId)) throw new Error(`${path}.spaceId must be a non-empty string`);
   if (!isNonEmptyString(value.name)) throw new Error(`${path}.name must be a non-empty string`);
@@ -201,7 +208,7 @@ function readSpace(value: unknown, path: string): SpaceKnowledge {
   };
 }
 
-function readPolicy(value: unknown, path: string): PolicyRule {
+export function readPolicyRule(value: unknown, path: string): PolicyRule {
   if (!isRecord(value)) throw new Error(`${path} must be an object`);
   if (!isNonEmptyString(value.policyId)) throw new Error(`${path}.policyId must be a non-empty string`);
   if (!isNonEmptyString(value.statement)) throw new Error(`${path}.statement must be a non-empty string`);
@@ -257,7 +264,7 @@ function readScope(value: unknown, path: string): ExceptionScope {
   return scope;
 }
 
-function readScopedException(value: unknown, path: string): ScopedException {
+export function readScopedExceptionValue(value: unknown, path: string): ScopedException {
   if (!isRecord(value)) throw new Error(`${path} must be an object`);
   if (!isNonEmptyString(value.exceptionId)) throw new Error(`${path}.exceptionId must be a non-empty string`);
   if (!isNonEmptyString(value.policyId)) throw new Error(`${path}.policyId must be a non-empty string`);
@@ -275,41 +282,58 @@ function readScopedException(value: unknown, path: string): ScopedException {
   };
 }
 
+export function readPriceLine(value: unknown, path: string): PriceLine {
+  if (!isRecord(value)) throw new Error(`${path} must be an object`);
+  if (!isNonEmptyString(value.lineId)) throw new Error(`${path}.lineId must be a non-empty string`);
+  if (!isNonEmptyString(value.label)) throw new Error(`${path}.label must be a non-empty string`);
+  const rawBasis: unknown = value.pricingBasis;
+  if (rawBasis !== "per_event" && rawBasis !== "per_guest" && rawBasis !== "per_hour") {
+    throw new Error(`${path}.pricingBasis must be per_event, per_guest, or per_hour`);
+  }
+  const basis: "per_event" | "per_guest" | "per_hour" = rawBasis;
+  return {
+    lineId: value.lineId,
+    label: value.label,
+    pricingBasis: basis,
+    unitCents: readNonNegativeIntOrNull(value.unitCents, `${path}.unitCents`),
+    confidence: readConfidence(value.confidence, `${path}.confidence`),
+    sourceReferences: readSourceReferences(value.sourceReferences, `${path}.sourceReferences`),
+  };
+}
+
+export function readCostLine(value: unknown, path: string): CostLine {
+  if (!isRecord(value)) throw new Error(`${path} must be an object`);
+  if (!isNonEmptyString(value.costId)) throw new Error(`${path}.costId must be a non-empty string`);
+  if (!isNonEmptyString(value.label)) throw new Error(`${path}.label must be a non-empty string`);
+  return {
+    costId: value.costId,
+    label: value.label,
+    amountCents: readNonNegativeIntOrNull(value.amountCents, `${path}.amountCents`),
+    confidence: readConfidence(value.confidence, `${path}.confidence`),
+    sourceReferences: readSourceReferences(value.sourceReferences, `${path}.sourceReferences`),
+  };
+}
+
+export function readServiceCapability(value: unknown, path: string): ServiceCapability {
+  if (!isRecord(value)) throw new Error(`${path} must be an object`);
+  if (!isNonEmptyString(value.serviceId)) throw new Error(`${path}.serviceId must be a non-empty string`);
+  if (!isNonEmptyString(value.label)) throw new Error(`${path}.label must be a non-empty string`);
+  if (typeof value.available !== "boolean") throw new Error(`${path}.available must be a boolean`);
+  return {
+    serviceId: value.serviceId,
+    label: value.label,
+    available: value.available,
+    sourceReferences: readSourceReferences(value.sourceReferences, `${path}.sourceReferences`),
+  };
+}
+
 function readPriceBook(value: unknown, path: string): PriceBook {
   if (!isRecord(value)) throw new Error(`${path} must be an object`);
   if (!isNonEmptyString(value.currency)) throw new Error(`${path}.currency must be a non-empty string`);
   if (!Array.isArray(value.lines)) throw new Error(`${path}.lines must be an array`);
   if (!Array.isArray(value.costs)) throw new Error(`${path}.costs must be an array`);
-  const lines = value.lines.map((line, index) => {
-    if (!isRecord(line)) throw new Error(`${path}.lines[${index}] must be an object`);
-    if (!isNonEmptyString(line.lineId)) throw new Error(`${path}.lines[${index}].lineId must be a non-empty string`);
-    if (!isNonEmptyString(line.label)) throw new Error(`${path}.lines[${index}].label must be a non-empty string`);
-    const rawBasis: unknown = line.pricingBasis;
-    if (rawBasis !== "per_event" && rawBasis !== "per_guest" && rawBasis !== "per_hour") {
-      throw new Error(`${path}.lines[${index}].pricingBasis must be per_event, per_guest, or per_hour`);
-    }
-    const basis: "per_event" | "per_guest" | "per_hour" = rawBasis;
-    return {
-      lineId: line.lineId,
-      label: line.label,
-      pricingBasis: basis,
-      unitCents: readNonNegativeIntOrNull(line.unitCents, `${path}.lines[${index}].unitCents`),
-      confidence: readConfidence(line.confidence, `${path}.lines[${index}].confidence`),
-      sourceReferences: readSourceReferences(line.sourceReferences, `${path}.lines[${index}].sourceReferences`),
-    };
-  });
-  const costs = value.costs.map((cost, index) => {
-    if (!isRecord(cost)) throw new Error(`${path}.costs[${index}] must be an object`);
-    if (!isNonEmptyString(cost.costId)) throw new Error(`${path}.costs[${index}].costId must be a non-empty string`);
-    if (!isNonEmptyString(cost.label)) throw new Error(`${path}.costs[${index}].label must be a non-empty string`);
-    return {
-      costId: cost.costId,
-      label: cost.label,
-      amountCents: readNonNegativeIntOrNull(cost.amountCents, `${path}.costs[${index}].amountCents`),
-      confidence: readConfidence(cost.confidence, `${path}.costs[${index}].confidence`),
-      sourceReferences: readSourceReferences(cost.sourceReferences, `${path}.costs[${index}].sourceReferences`),
-    };
-  });
+  const lines = value.lines.map((line, index) => readPriceLine(line, `${path}.lines[${index}]`));
+  const costs = value.costs.map((cost, index) => readCostLine(cost, `${path}.costs[${index}]`));
   if (typeof value.costsComplete !== "boolean") {
     throw new Error(`${path}.costsComplete must be an explicit boolean attesting whether the cost ledger is complete`);
   }
@@ -325,32 +349,33 @@ function readPriceBook(value: unknown, path: string): PriceBook {
   };
 }
 
+export function readTimezone(value: unknown, path: string): string {
+  if (!isNonEmptyString(value)) throw new Error(`${path} must be a non-empty IANA timezone name`);
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: value });
+  } catch {
+    throw new Error(`${path} must be a valid IANA timezone name`);
+  }
+  return value;
+}
+
 export function readBusinessKnowledge(input: unknown): BusinessKnowledge {
   if (!isRecord(input)) throw new Error("knowledge must be an object");
+  if (!isNonEmptyString(input.businessId)) throw new Error("knowledge.businessId must be a non-empty string");
   if (!Array.isArray(input.spaces)) throw new Error("knowledge.spaces must be an array");
   if (!Array.isArray(input.policies)) throw new Error("knowledge.policies must be an array");
   if (!Array.isArray(input.scopedExceptions)) throw new Error("knowledge.scopedExceptions must be an array");
   if (!Array.isArray(input.services)) throw new Error("knowledge.services must be an array");
-  const services = input.services.map((service, index) => {
-    if (!isRecord(service)) throw new Error(`knowledge.services[${index}] must be an object`);
-    if (!isNonEmptyString(service.serviceId)) throw new Error(`knowledge.services[${index}].serviceId must be a non-empty string`);
-    if (!isNonEmptyString(service.label)) throw new Error(`knowledge.services[${index}].label must be a non-empty string`);
-    if (typeof service.available !== "boolean") throw new Error(`knowledge.services[${index}].available must be a boolean`);
-    return {
-      serviceId: service.serviceId,
-      label: service.label,
-      available: service.available,
-      sourceReferences: readSourceReferences(service.sourceReferences, `knowledge.services[${index}].sourceReferences`),
-    };
-  });
   return {
-    spaces: input.spaces.map((space, index) => readSpace(space, `knowledge.spaces[${index}]`)),
-    policies: input.policies.map((policy, index) => readPolicy(policy, `knowledge.policies[${index}]`)),
+    businessId: input.businessId,
+    timezone: readTimezone(input.timezone, "knowledge.timezone"),
+    spaces: input.spaces.map((space, index) => readSpaceKnowledge(space, `knowledge.spaces[${index}]`)),
+    policies: input.policies.map((policy, index) => readPolicyRule(policy, `knowledge.policies[${index}]`)),
     scopedExceptions: input.scopedExceptions.map((exception, index) =>
-      readScopedException(exception, `knowledge.scopedExceptions[${index}]`),
+      readScopedExceptionValue(exception, `knowledge.scopedExceptions[${index}]`),
     ),
     priceBook: readPriceBook(input.priceBook, "knowledge.priceBook"),
-    services,
+    services: input.services.map((service, index) => readServiceCapability(service, `knowledge.services[${index}]`)),
     sourceReferences: readSourceReferences(input.sourceReferences, "knowledge.sourceReferences"),
   };
 }
@@ -368,9 +393,19 @@ function readSlot(value: unknown, path: string): AvailabilitySlot {
   };
   const reason = readOptionalNonEmptyString(value.reason, `${path}.reason`);
   if (reason !== undefined) slot.reason = reason;
-  if (value.spaceIds !== undefined) {
-    if (!Array.isArray(value.spaceIds) || !value.spaceIds.every((entry) => isNonEmptyString(entry))) {
-      throw new Error(`${path}.spaceIds must be an array of non-empty strings when present`);
+  /* Explicit scope: venue-wide only with venueWide: true, otherwise the
+     slot must name its spaces. A missing scope is malformed, never
+     silently venue-wide. */
+  if (value.venueWide === true) {
+    if (Array.isArray(value.spaceIds) && (value.spaceIds as unknown[]).length > 0) {
+      throw new Error(`${path} is venue-wide and must not also name spaceIds`);
+    }
+    slot.venueWide = true;
+  } else if (value.venueWide !== undefined && value.venueWide !== false) {
+    throw new Error(`${path}.venueWide must be a boolean when present`);
+  } else {
+    if (!Array.isArray(value.spaceIds) || value.spaceIds.length === 0 || !value.spaceIds.every((entry) => isNonEmptyString(entry))) {
+      throw new Error(`${path} must name a non-empty spaceIds array or set venueWide: true`);
     }
     slot.spaceIds = [...value.spaceIds] as string[];
   }
@@ -512,9 +547,10 @@ function rangesOverlap(leftStart: string, leftEnd: string, rightStart: string, r
   return a < d && b > c;
 }
 
-/** A slot is evidence for a space when it is venue-wide or names the space. */
+/** A slot is evidence for a space when venue-wide or naming the space. */
 function slotServesSpace(slot: AvailabilitySlot, spaceId: string): boolean {
-  return slot.spaceIds === undefined || slot.spaceIds.length === 0 || slot.spaceIds.includes(spaceId);
+  if (slot.venueWide === true) return true;
+  return slot.spaceIds !== undefined && slot.spaceIds.includes(spaceId);
 }
 
 function hoursBetween(start: string, end: string): number {
@@ -698,12 +734,13 @@ function buildCandidate(args: {
   }
 
   /* Window evidence: an available slot must cover the window for THIS space,
-     and any overlapping busy/conflicting evidence blocks the claimed window. */
+     and any overlapping busy/conflicting evidence for THIS space blocks the
+     claimed window. Other spaces' busy evidence is irrelevant here. */
   const covering = availability.slots.filter(
     (slot) => rangeCovers(slot, startAt, endAt) && slotServesSpace(slot, space.spaceId),
   );
   const blockers = availability.slots.filter(
-    (slot) => !slot.available && rangesOverlap(slot.startAt, slot.endAt, startAt, endAt),
+    (slot) => !slot.available && slotServesSpace(slot, space.spaceId) && rangesOverlap(slot.startAt, slot.endAt, startAt, endAt),
   );
   if (covering.length === 0 || blockers.length > 0) {
     const details: string[] = [];
@@ -764,16 +801,26 @@ function buildCandidate(args: {
       });
     }
   }
-  /* Unknown profitability — including an unknown total — is unresolved and keeps the result not ready-to-send. */
+  /* Unknown profitability: commercial permission and profitability knowledge
+     are separate. A known total clearing the floor with no cost-dependent
+     margin rule may be offered with an explicit unknown-profit notice; an
+     unknown total, or a configured margin floor with unknown costs, still
+     needs resolution and keeps the result not ready-to-send. */
+  let profitNotice: string | null = null;
   if (profitability.claim === "unknown") {
-    decisions.push({
-      code: "unknown_profitability",
-      question: priced.totalCents === null
-        ? "The offer total is unknown; establish the missing prices or costs before sending?"
-        : "Profitability is unknown because cost knowledge is incomplete; complete it or accept sending without a profit claim?",
-      context: profitability.explanation,
-      evidence: dedupeSources([knowledge.priceBook.sourceReferences]),
-    });
+    const needsResolution = priced.totalCents === null || knowledge.priceBook.minMarginBps !== null;
+    if (needsResolution) {
+      decisions.push({
+        code: "unknown_profitability",
+        question: priced.totalCents === null
+          ? "The offer total is unknown; establish the missing prices or costs before sending?"
+          : "A margin floor is configured but cost knowledge is incomplete; complete it before sending?",
+        context: profitability.explanation,
+        evidence: dedupeSources([knowledge.priceBook.sourceReferences]),
+      });
+    } else {
+      profitNotice = `Offered under approved pricing without a profit claim: ${profitability.explanation}`;
+    }
   }
 
   /* Budget applies to every candidate: a known over-budget total is never
@@ -811,6 +858,7 @@ function buildCandidate(args: {
     ...policy.scopeNotes,
     ...policy.notes,
     `Pricing boundary: ${profitability.explanation}`,
+    ...(profitNotice === null ? [] : [profitNotice]),
     `Approval must bind offer ${offerId} version ${version}; any change to dates, price, space, or terms needs a new version.`,
   ];
   if (args.alternativeNote !== undefined) consequences.unshift(args.alternativeNote);
@@ -862,12 +910,16 @@ interface CarvedWindow {
   sameClockTime: boolean;
 }
 
-function windowOverlapsBusy(slots: AvailabilitySlot[], start: string, end: string): boolean {
-  return slots.some((slot) => !slot.available && rangesOverlap(slot.startAt, slot.endAt, start, end));
+function windowOverlapsBusy(slots: AvailabilitySlot[], start: string, end: string, spaceId: string): boolean {
+  return slots.some(
+    (slot) => !slot.available && slotServesSpace(slot, spaceId) && rangesOverlap(slot.startAt, slot.endAt, start, end),
+  );
 }
 
-function timeOfDay(when: string): string {
-  return new Date(parseInstant(when)).toISOString().slice(11, 19);
+/** A window is claimable for a space when covered for it and not overlapped by busy evidence for it. */
+function windowClaimableForSpace(slots: AvailabilitySlot[], start: string, end: string, spaceId: string): boolean {
+  const covered = slots.some((slot) => rangeCovers(slot, start, end) && slotServesSpace(slot, spaceId));
+  return covered && !windowOverlapsBusy(slots, start, end, spaceId);
 }
 
 export function formatDuration(durationMs: number): string {
@@ -876,10 +928,77 @@ export function formatDuration(durationMs: number): string {
   return minutes === 0 ? `${hours}h` : `${hours}h ${minutes}m`;
 }
 
+/* ------------------------------------------------------------------ */
+/* Business-timezone wall-clock helpers (DST-safe)                     */
+/* ------------------------------------------------------------------ */
+
+interface WallClock {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+  second: number;
+}
+
+function tzOffsetMs(timeZone: string, instantMs: number): number {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    hour12: false,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  }).formatToParts(new Date(instantMs));
+  const get = (type: string): number => Number(parts.find((part) => part.type === type)?.value ?? NaN);
+  const asUtc = Date.UTC(get("year"), get("month") - 1, get("day"), get("hour") % 24, get("minute"), get("second"));
+  if (!Number.isFinite(asUtc)) throw new Error(`Cannot resolve wall clock in timezone ${timeZone}`);
+  return asUtc - instantMs;
+}
+
+function wallClockIn(timeZone: string, instantMs: number): WallClock {
+  const offset = tzOffsetMs(timeZone, instantMs);
+  const wall = new Date(instantMs + offset);
+  return {
+    year: wall.getUTCFullYear(),
+    month: wall.getUTCMonth() + 1,
+    day: wall.getUTCDate(),
+    hour: wall.getUTCHours(),
+    minute: wall.getUTCMinutes(),
+    second: wall.getUTCSeconds(),
+  };
+}
+
 /**
- * Carve alternative windows that preserve the requested duration. Each
- * available slot first offers the requested clock time on its own dates;
- * only when that does not fit (or collides with busy evidence) does the
+ * Resolve a wall-clock reading to a UTC instant, verifying the round trip.
+ * Returns null across DST gaps or ambiguous fall-back hours, where local
+ * suitability cannot be proven — the caller must then ask instead of guess.
+ */
+function utcFromWallClock(timeZone: string, wall: WallClock): number | null {
+  const guess = Date.UTC(wall.year, wall.month - 1, wall.day, wall.hour, wall.minute, wall.second);
+  const first = guess - tzOffsetMs(timeZone, guess);
+  const second = guess - tzOffsetMs(timeZone, first);
+  const back = wallClockIn(timeZone, second);
+  if (
+    back.year !== wall.year || back.month !== wall.month || back.day !== wall.day ||
+    back.hour !== wall.hour || back.minute !== wall.minute || back.second !== wall.second
+  ) {
+    return null;
+  }
+  return second;
+}
+
+function sameWallClock(left: WallClock, right: WallClock): boolean {
+  return left.hour === right.hour && left.minute === right.minute && left.second === right.second;
+}
+
+/**
+ * Carve alternative windows that preserve the requested duration in
+ * business-local time. Each available slot first offers the requested local
+ * clock time on its own dates; only when that does not fit, collides with
+ * busy evidence, or cannot be proven across a DST transition does the
  * earliest fitting window serve, flagged as a time shift so the host asks
  * instead of silently replacing an evening dinner with a midnight slot.
  */
@@ -887,15 +1006,12 @@ function carveAlternativeWindows(args: {
   requestedStart: string;
   requestedEnd: string;
   slots: AvailabilitySlot[];
+  timeZone: string;
   limit: number;
 }): CarvedWindow[] {
   const durationMs = parseInstant(args.requestedEnd) - parseInstant(args.requestedStart);
   if (!Number.isFinite(durationMs) || durationMs <= 0) return [];
-  const requested = new Date(parseInstant(args.requestedStart));
-  const reqH = requested.getUTCHours();
-  const reqM = requested.getUTCMinutes();
-  const reqS = requested.getUTCSeconds();
-  const reqTod = timeOfDay(args.requestedStart);
+  const requestedWall = wallClockIn(args.timeZone, parseInstant(args.requestedStart));
   const out: CarvedWindow[] = [];
   const ordered = args.slots
     .filter((slot) => slot.available)
@@ -905,25 +1021,41 @@ function carveAlternativeWindows(args: {
     const slotStart = parseInstant(slot.startAt);
     const slotEnd = parseInstant(slot.endAt);
     if (!Number.isFinite(slotStart) || !Number.isFinite(slotEnd) || slotEnd - slotStart < durationMs) continue;
-    const base = new Date(slotStart);
-    let candidate = Date.UTC(base.getUTCFullYear(), base.getUTCMonth(), base.getUTCDate(), reqH, reqM, reqS);
-    let guard = 0;
-    while (candidate < slotStart && guard < 366) {
-      candidate += DAY_MS;
-      guard += 1;
-    }
-    if (candidate + durationMs <= slotEnd) {
+    // Same local clock time on the slot's dates, advancing day by day.
+    const baseWall = wallClockIn(args.timeZone, slotStart);
+    let placedSameClock = false;
+    let sameClockCollidesBusy = false;
+    for (let dayOffset = 0; dayOffset < 366 && !placedSameClock; dayOffset += 1) {
+      const date = new Date(Date.UTC(baseWall.year, baseWall.month - 1, baseWall.day) + dayOffset * DAY_MS);
+      const candidate = utcFromWallClock(args.timeZone, {
+        year: date.getUTCFullYear(),
+        month: date.getUTCMonth() + 1,
+        day: date.getUTCDate(),
+        hour: requestedWall.hour,
+        minute: requestedWall.minute,
+        second: requestedWall.second,
+      });
+      if (candidate === null || candidate < slotStart || candidate + durationMs > slotEnd) continue;
       const startAt = new Date(candidate).toISOString();
       const endAt = new Date(candidate + durationMs).toISOString();
-      if (!windowOverlapsBusy(args.slots, startAt, endAt)) {
-        out.push({ startAt, endAt, sameClockTime: true });
-        continue;
-      }
+      out.push({ startAt, endAt, sameClockTime: true });
+      placedSameClock = true;
+      sameClockCollidesBusy = args.slots.some(
+        (busy) => !busy.available && rangesOverlap(busy.startAt, busy.endAt, startAt, endAt),
+      );
     }
+    /* Offer the earliest fitting window too when no same-clock window fit,
+       or when the same-clock one collides with busy evidence and may be
+       unusable for every space downstream. */
+    if (placedSameClock && !sameClockCollidesBusy) continue;
     const fallbackStart = new Date(slotStart).toISOString();
     const fallbackEnd = new Date(slotStart + durationMs).toISOString();
-    if (!windowOverlapsBusy(args.slots, fallbackStart, fallbackEnd)) {
-      out.push({ startAt: fallbackStart, endAt: fallbackEnd, sameClockTime: timeOfDay(fallbackStart) === reqTod });
+    if (fallbackEnd <= slot.endAt) {
+      out.push({
+        startAt: fallbackStart,
+        endAt: fallbackEnd,
+        sameClockTime: sameWallClock(wallClockIn(args.timeZone, slotStart), requestedWall),
+      });
     }
   }
   return out;
@@ -950,6 +1082,11 @@ export function prepareOffer(input: unknown): OfferPreparationResult {
     version = input.requestedVersion;
   }
   const supersedesFingerprint = readOptionalNonEmptyString(input.supersedesFingerprint, "supersedesFingerprint");
+
+  /* Business scope: knowledge for one business can never authorize offers for another. */
+  if (knowledge.businessId !== inquiry.businessId) {
+    throw new Error(`knowledge.businessId ${knowledge.businessId} does not match inquiry.businessId ${inquiry.businessId}`);
+  }
 
   const missingInformation: MissingItem[] = [];
   const conflicts: ConflictItem[] = [];
@@ -1090,11 +1227,15 @@ export function prepareOffer(input: unknown): OfferPreparationResult {
   const blocked = missingInformation.length > 0;
 
   if (!blocked && validWindow && orderedSpaces.length > 0) {
-    const windowBusy = windowOverlapsBusy(availability.slots, inquiry.startAt, inquiry.endAt);
-    const windowCovered = availability.slots.some((slot) => rangeCovers(slot, inquiry.startAt, inquiry.endAt));
-    if (!windowBusy && windowCovered) {
+    /* Primary path: only spaces whose requested window is covered for them
+       and free of their own busy evidence are attempted, so Room B busy
+       never blocks Room A (and vice versa). */
+    const cleanSpaces = orderedSpaces.filter((space) =>
+      windowClaimableForSpace(availability.slots, inquiry.startAt, inquiry.endAt, space.spaceId),
+    );
+    if (cleanSpaces.length > 0) {
       let primaryPlaced = false;
-      for (const space of orderedSpaces) {
+      for (const space of cleanSpaces) {
         const attempt = buildCandidate({
           inquiry,
           knowledge,
@@ -1117,11 +1258,14 @@ export function prepareOffer(input: unknown): OfferPreparationResult {
       }
     } else {
       const unavailableEvidence = availability.slots.filter((slot) => !slot.available);
+      const anyBusyOverlap = availability.slots.some(
+        (slot) => !slot.available && rangesOverlap(slot.startAt, slot.endAt, inquiry.startAt, inquiry.endAt),
+      );
       conflicts.push({
         code: "requested_date_unavailable",
-        detail: windowBusy
+        detail: anyBusyOverlap
           ? `The requested window ${inquiry.startAt} to ${inquiry.endAt} overlaps busy/conflicting evidence and cannot be claimed as feasible.`
-          : `The requested window ${inquiry.startAt} to ${inquiry.endAt} is not covered by any available slot.`,
+          : `The requested window ${inquiry.startAt} to ${inquiry.endAt} is not covered by any available slot for a fitting space.`,
         evidence: dedupeSources([
           ...unavailableEvidence.map((slot) => slot.sourceReferences),
           availability.sourceReferences,
@@ -1132,11 +1276,21 @@ export function prepareOffer(input: unknown): OfferPreparationResult {
         requestedStart: inquiry.startAt,
         requestedEnd: inquiry.endAt,
         slots: availability.slots,
+        timeZone: knowledge.timezone,
         limit: 3,
       });
+      let placedWindows = 0;
+      const offeredWindows = new Set<string>();
       for (const window of carved) {
-        const space = orderedSpaces[0];
-        if (space === undefined) break;
+        if (offers.length >= 3) break;
+        const windowKey = `${window.startAt}/${window.endAt}`;
+        if (offeredWindows.has(windowKey)) continue;
+        /* First fitting space whose carved window is claimable for it. */
+        const viable = orderedSpaces.filter((space) =>
+          windowClaimableForSpace(availability.slots, window.startAt, window.endAt, space.spaceId),
+        );
+        const space = viable[0];
+        if (space === undefined) continue;
         const attempt = buildCandidate({
           inquiry,
           knowledge,
@@ -1147,16 +1301,18 @@ export function prepareOffer(input: unknown): OfferPreparationResult {
           rank: "alternative",
           version,
           ...(supersedesFingerprint === undefined ? {} : { supersedesFingerprint }),
-          alternativeNote: `Alternative ${window.sameClockTime ? "same time, different date" : "different time"}: the requested window is unavailable; this offer preserves the requested ${formatDuration(durationMs)} duration at ${window.startAt} to ${window.endAt}.`,
+          alternativeNote: `Alternative ${window.sameClockTime ? "same local time, different date" : "different time"}: the requested window is unavailable; this offer preserves the requested ${formatDuration(durationMs)} duration at ${window.startAt} to ${window.endAt} (${knowledge.timezone}).`,
         });
         conflicts.push(...attempt.conflicts.filter((conflict) => conflict.code !== "requested_date_unavailable"));
         ownerDecisions.push(...attempt.decisions);
         if (attempt.candidate !== undefined) {
           offers.push(attempt.candidate);
+          offeredWindows.add(windowKey);
+          placedWindows += 1;
           if (!window.sameClockTime) {
             ownerDecisions.push({
               code: "alternative_time_shift",
-              question: `The only fitting window is ${window.startAt} to ${window.endAt}, outside the requested clock time; ask the customer before sending?`,
+              question: `The only fitting window is ${window.startAt} to ${window.endAt}, outside the requested local clock time; ask the customer before sending?`,
               context: "No suitable-time alternative was evidenced, so the shifted time needs an explicit decision instead of silently replacing the request.",
               evidence: dedupeSources([availability.sourceReferences]),
             });
@@ -1164,10 +1320,10 @@ export function prepareOffer(input: unknown): OfferPreparationResult {
         }
         if (primaryProfitability === undefined) primaryProfitability = attempt.profitability;
       }
-      if (carved.length === 0) {
+      if (placedWindows === 0) {
         conflicts.push({
           code: "no_alternative_slots",
-          detail: "No available alternative window fitting the requested duration was evidenced, so no alternative can be offered.",
+          detail: "No available alternative window fitting the requested duration was evidenced for a fitting space, so no alternative can be offered.",
           evidence: [...availability.sourceReferences],
         });
       }
@@ -1190,14 +1346,15 @@ export function prepareOffer(input: unknown): OfferPreparationResult {
       currency: knowledge.priceBook.currency,
     });
 
-  /* feasible means ready-to-send: a primary candidate with a known,
-     claimed-profitable total and no unresolved missing, conflict, or owner
-     decision — including policy, confidence, budget, time-shift, and
-     unknown-profitability decisions. */
+  /* feasible means ready-to-send: a primary candidate with a known total
+     and no unresolved missing, conflict, or owner decision. Profitability
+     may be claimed-profitable, or explicitly unknown with notice when no
+     cost-dependent margin rule exists (any unknown case needing resolution
+     always raises a decision above, which already blocks feasibility). */
   const status: OfferStatus =
     primary !== undefined &&
     primary.totalKnown &&
-    primary.profitabilityClaimed &&
+    (primary.profitabilityClaimed || profitability.claim === "unknown") &&
     missingInformation.length === 0 &&
     conflicts.length === 0 &&
     ownerDecisions.length === 0
