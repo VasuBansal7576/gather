@@ -210,6 +210,34 @@ function unsettledExecutions(store: GatherStore, actionId: string): string[] {
     .map((execution) => execution.id);
 }
 
+interface BookingHoldCoverage {
+  holds: SucceededHold[];
+  unverified: string[];
+  unsettled: string[];
+}
+
+/**
+ * Every durable trusted outstanding hold across ALL of the booking's
+ * proposals — current and superseded. Cancellation verification must
+ * release each of these before flipping to verified: a hold executed
+ * under a since-superseded proposal is still a live provider event owned
+ * by Gather, and scoping discovery to the current action would verify
+ * cancellation while it leaks. Execution evidence (idempotency keys with
+ * exact hold receipts) is read from the durable store, never assumed.
+ */
+function bookingHoldCoverage(store: GatherStore, bookingId: string): BookingHoldCoverage {
+  const holds: SucceededHold[] = [];
+  const unverified: string[] = [];
+  const unsettled: string[] = [];
+  for (const action of store.listProposedActionsForBooking(bookingId)) {
+    const scoped = succeededHolds(store, action.id);
+    holds.push(...scoped.holds);
+    unverified.push(...scoped.unverified);
+    unsettled.push(...unsettledExecutions(store, action.id));
+  }
+  return { holds, unverified, unsettled };
+}
+
 /** Re-read currency + lifecycle after an await; anything that moved aborts. */
 function assertBindingAfterWait(store: GatherStore, lifecycle: RevisionLifecycleStore, bookingId: string, actionId: string, cancelState: BookingLifecycle["cancelState"] | null): void {
   const current = store.getCurrentProposalAction(bookingId);
@@ -331,6 +359,13 @@ export function requestCancellation(
       note: "Cancellation is already externally verified; the booking stays cancelled.",
     };
   }
+  // The other half of the pause/request exclusion: a paused booking cannot
+  // be requested (verification would refuse the paused booking while resume
+  // would refuse the requested one — a deadlock). The owner resumes first,
+  // then requests; due work stays suppressed throughout both states.
+  if (lifecycle.isPaused(booking.id)) {
+    throw new ServiceError("BOOKING_PAUSED", "Booking is paused by owner control; resume before requesting cancellation", true);
+  }
   const outcome = runCommand(lifecycle, "cancellation_request", booking.id, binding.commandId,
     { kind: "cancellation_request", binding, note },
     () => {
@@ -415,7 +450,9 @@ export async function verifyCancellation(deps: RevisionsDeps, request: Cancellat
 
   // Attempt releases first (when a port is wired), then evaluate every
   // condition in one pass so the blocked response names the full set.
-  const { holds, unverified } = succeededHolds(store, action.id);
+  // Discovery spans every proposal on the booking — current and
+  // superseded — so no outstanding hold escapes verification.
+  const { holds, unverified, unsettled } = bookingHoldCoverage(store, booking.id);
   if (deps.holdRelease !== undefined) {
     for (const hold of holds) {
       if (lifecycle.getRelease(hold.operationKey)?.status === "released") continue;
@@ -424,7 +461,6 @@ export async function verifyCancellation(deps: RevisionsDeps, request: Cancellat
     }
   }
   const blocked: BlockedCondition[] = [];
-  const unsettled = unsettledExecutions(store, action.id);
   if (unsettled.length > 0) {
     blocked.push({
       code: "actions_not_settled",
@@ -484,7 +520,7 @@ export async function verifyCancellation(deps: RevisionsDeps, request: Cancellat
   const response: CancellationVerifyResponse = {
     commandId: binding.commandId, status: "verified", booking: store.getBooking(booking.id),
     cancellationScope: "external_verified",
-    note: "Cancellation externally verified: every hold released, every action settled, and refund obligations cleared or waived. The booking is now cancelled.",
+    note: "Cancellation externally verified: every hold released across all proposals on the booking, every action settled, and refund obligations cleared or waived. The booking is now cancelled.",
   };
   lifecycle.recordCommand(binding.commandId, booking.id, "cancellation_verify",
     canonicalRequestHash({ kind: "cancellation_verify", binding, waiver: request.waiver }),
@@ -572,6 +608,14 @@ export function pauseBooking(deps: RevisionsDeps, binding: RevisionBinding, note
   const { booking } = requireRevisionBinding(store, binding);
   if (booking.status === "cancelled") {
     throw new ServiceError("INVALID_REQUEST", "Booking is cancelled (terminal); pausing a cancelled booking is refused", false);
+  }
+  // Pause and cancellation-request are mutually exclusive: a requested
+  // booking already stopped due work and invalidated its authority, so
+  // pausing it could only strand the booking (verify refuses paused
+  // bookings while resume refuses requested ones). Refuse explicitly so
+  // the owner verifies cancellation instead.
+  if (lifecycle.getLifecycle(booking.id).cancelState !== "none") {
+    throw new ServiceError("INVALID_REQUEST", "Booking cancellation is already requested; pausing a cancellation-terminal booking is refused — verify cancellation instead", false);
   }
   const outcome = runCommand(lifecycle, "pause", booking.id, binding.commandId,
     { kind: "pause", binding, note },

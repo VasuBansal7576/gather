@@ -439,6 +439,54 @@ test("cancel verify with release proof and waiver completes externally verified 
   }
 });
 
+test("cancel verify releases holds across superseded proposals before verifying", async () => {
+  const calls: string[] = [];
+  const w = world(scriptedRelease("succeeded", calls));
+  try {
+    confirmFacts(w);
+    const booking = w.store.createBooking({
+      businessId: w.businessId, eventName: "E", status: "pending_approval", sourceReferences: SRC("demo://cancel/x"),
+    });
+    const { buildBookingOffer, persistPreparedProposal } = await import("../src/server/business-operator/index.ts");
+    const firstBuilt = await buildBookingOffer(w.operatorDeps, { bookingId: booking.id, inquiry: inquiry(w), calendarId: CAL } as never);
+    const first = persistPreparedProposal(w.operatorDeps, firstBuilt, { email: email(), expiresAt: EXPIRES });
+    assert.ok(!("missing" in first));
+    if ("missing" in first) throw new Error("unreachable");
+    const identity = {
+      bookingId: booking.id, proposedActionId: first.action.id,
+      proposalVersion: first.action.proposalVersion, proposalFingerprint: first.action.proposalFingerprint,
+    };
+    const executed = await approveAndExecute(w.deps.booking, identity);
+    assert.equal(executed.hold.execution.status, "succeeded");
+    const v1Hold = executed.hold.execution.result as { hold?: { holdId?: unknown } };
+    const v1HoldId = v1Hold.hold?.holdId;
+    assert.ok(typeof v1HoldId === "string", "v1 must carry a durable hold receipt");
+    // Revise onto a different calendar: the v1 hold no longer overlap-gates,
+    // so v2 becomes current while the v1 provider hold is still outstanding.
+    const revised = await requestRevision(w.deps, {
+      binding: bindingOf(w, booking.id, "cmd-rev-x"),
+      inquiry: inquiry(w), calendarId: "demo-calendar-002", email: email(), expiresAt: EXPIRES,
+    });
+    assert.equal(revised.status, "revised");
+    requestCancellation(w.deps, bindingOf(w, booking.id, "cmd-cancel-x"));
+    const verified = await verifyCancellation(w.deps, { binding: bindingOf(w, booking.id, "cmd-verify-x") });
+    assert.equal(verified.status, "verified");
+    assert.equal(verified.cancellationScope, "external_verified");
+    // Regression pin: the superseded v1 hold must have been released through
+    // the port — verifying with zero port calls would leak the live hold.
+    assert.ok(calls.length > 0, "the port must have been called for the superseded hold");
+    const v1Key = w.store.listActionExecutions(first.action.id).find((item) => item.idempotencyKey.includes(":create-provisional-hold:"))?.idempotencyKey;
+    assert.ok(v1Key, "v1 must have a durable hold execution key");
+    const record = w.store.db.prepare("SELECT status, receipt_json FROM hold_release_records WHERE hold_operation_key = $key").get({ $key: v1Key }) as { status: string; receipt_json: string } | null;
+    assert.ok(record, "a durable release record must exist for the superseded hold");
+    assert.equal(record.status, "released");
+    assert.ok(String(record.receipt_json).includes(v1HoldId as string), "the release receipt must name the v1 hold");
+    assert.equal(w.store.getBooking(booking.id).status, "cancelled");
+  } finally {
+    w.cleanup();
+  }
+});
+
 test("cancel verify is refused before any request and on stale bindings", async () => {
   const w = world();
   try {
@@ -622,7 +670,28 @@ test("pause is stale-gated, duplicate-safe, and terminal against cancellation", 
     assert.equal(first.duplicate, undefined);
     const replayed = pauseBooking(w.deps, bindingOf(w, booking.id, "cmd-pause-dup"));
     assert.equal(replayed.duplicate, true);
-    requestCancellation(w.deps, bindingOf(w, booking.id, "cmd-pause-cancel"));
+    // A paused booking cannot be cancellation-requested (verification would
+    // refuse the paused booking while resume would refuse the requested
+    // one): the owner resumes first, keeping due work suppressed throughout.
+    try {
+      requestCancellation(w.deps, bindingOf(w, booking.id, "cmd-pause-cancel"));
+      assert.fail("expected BOOKING_PAUSED");
+    } catch (error) {
+      assert.ok(error instanceof ServiceError && error.code === "BOOKING_PAUSED");
+      assert.equal(error.retryable, true);
+    }
+    const resumed = resumeBooking(w.deps, bindingOf(w, booking.id, "cmd-pause-resume"));
+    assert.equal(resumed.status, "resumed");
+    const requested = requestCancellation(w.deps, bindingOf(w, booking.id, "cmd-pause-cancel"));
+    assert.equal(requested.status, "request_received");
+    // A requested booking refuses pause: due work already stopped and
+    // authority already invalidated, so pausing could only strand it.
+    try {
+      pauseBooking(w.deps, bindingOf(w, booking.id, "cmd-pause-late"));
+      assert.fail("expected INVALID_REQUEST");
+    } catch (error) {
+      assert.ok(error instanceof ServiceError && error.code === "INVALID_REQUEST");
+    }
     try {
       resumeBooking(w.deps, bindingOf(w, booking.id, "cmd-resume-dead"));
       assert.fail("expected INVALID_REQUEST");
