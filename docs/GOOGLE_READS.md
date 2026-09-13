@@ -52,7 +52,12 @@ guide):
   account identity, the query filter, the base watermark, and — for an
   uncompleted page — its continuation token plus already-emitted ids. A
   cursor presented for another account or query, or a legacy v1 cursor, fails
-  `invalid_request` before any HTTP call.
+  `invalid_request` before any HTTP call. The bound identity is the
+  poller's required `accountId` — the actual configured account, never the
+  `userId` `"me"` alias, which is identical across accounts: two pollers
+  sharing `"me"` with different `accountId` values reject each other's
+  cursors (tested). Factory callers serving several accounts must pass
+  distinct `accountId` values.
 - `nextCursor` never advances the base watermark past unvisited pages or
   un-emitted messages: a capped result resumes the exact page (replayed
   server-side, de-duplicated by message id, so repeats are possible but
@@ -100,7 +105,11 @@ body); such parts are now skipped with an explicit flag. A bounded reader,
 `readInquiryThread` (identical bodies) and adds a per-message completeness
 record with stable codes (`malformed-base64-part`, `unsupported-charset`,
 `attachment-skipped`, `snippet-fallback`, `no-text-content`); non-UTF-8
-charsets are never decoded as UTF-8. Intake must treat `complete: false` as
+charsets are never decoded as UTF-8. Sibling scanning continues after the
+first usable text is selected, so skipped attachments later in the part
+list are still flagged. Base64 payloads decode with fatal UTF-8: truly
+invalid byte sequences are flagged `malformed-base64-part`, while a valid
+literal U+FFFD stays text. Intake must treat `complete: false` as
 "decide, do not assume a full body." Source bodies remain evidence, never
 authority, and nothing here registers a host.
 
@@ -108,7 +117,9 @@ authority, and nothing here registers a host.
 
 The 2 MiB Drive cap is a correctness bound enforced after buffering by
 default; a server that ignores `Range` still buffers fully before the length
-check. `createFetchTransport({ maxBytes })` adds a true streaming cap that
+check. All cap comparisons use encoded bytes (`Buffer.byteLength`), never
+UTF-16 units, and over-cap bodies fail closed rather than being sliced
+(so no truncation can split a Unicode code point). `createFetchTransport({ maxBytes })` adds a true streaming cap that
 counts bytes as chunks arrive and aborts past the cap
 (`TransportBodyTooLargeError`, mapped by the retriever to fail-closed
 over-cap); it is opt-in and backward compatible, and timeout/uncertain-write

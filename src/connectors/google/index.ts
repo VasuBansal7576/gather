@@ -16,7 +16,7 @@ export * from "./errors.ts";
 export { GoogleCalendarConnector, googleEventIdFor, type GoogleCalendarOptions, type HoldScope, type HoldScopeResolver } from "./calendar.ts";
 export { GoogleGmailConnector, gmailMessageIdFor, escapeGmailQuery, type GoogleGmailOptions, type SentExpectation, type SentExpectationResolver } from "./gmail.ts";
 export { GoogleDocumentRetriever, DEFAULT_DOCUMENT_BYTE_CAP, type GoogleDocumentsOptions } from "./documents.ts";
-export { GmailInboxPoller, encodeCursor, type InboxChange, type InboxDelta, type PollInboxOptions } from "./incremental.ts";
+export { GmailInboxPoller, encodeCursor, type GmailInboxPollerOptions, type InboxChange, type InboxDelta, type PollInboxOptions } from "./incremental.ts";
 
 export interface GoogleConnectorSet {
   calendar: GoogleCalendarConnector;
@@ -42,6 +42,13 @@ export interface GoogleConnectorFactoryOptions extends GoogleAdapterOptions {
    * reconcile identity (recipients, subject, body, thread).
    */
   resolveSentExpectation?: SentExpectationResolver;
+  /**
+   * Stable account scope identity for inbox cursors. Must identify the
+   * actual configured account — defaults to `userId ?? "me"` only for
+   * single-account use; deployments serving several accounts through the
+   * `"me"` alias must pass distinct values or cursors will not separate.
+   */
+  accountId?: string;
 }
 
 /**
@@ -72,6 +79,6 @@ export function createGoogleConnectors(options: GoogleConnectorFactoryOptions): 
     calendar: new GoogleCalendarConnector(calendarOptions),
     gmail: new GoogleGmailConnector(gmailOptions),
     documents: new GoogleDocumentRetriever(shared),
-    inbox: new GmailInboxPoller(shared),
+    inbox: new GmailInboxPoller({ ...shared, accountId: options.accountId ?? options.userId ?? "me" }),
   };
 }

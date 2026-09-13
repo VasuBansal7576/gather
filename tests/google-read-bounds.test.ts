@@ -6,6 +6,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { GoogleGmailConnector } from "../src/connectors/google/gmail.ts";
+import { GoogleDocumentRetriever } from "../src/connectors/google/documents.ts";
 import { GmailInboxPoller, encodeCursor } from "../src/connectors/google/incremental.ts";
 import { createFetchTransport, TransportBodyTooLargeError } from "../src/connectors/google/transport.ts";
 import type { GoogleHttpRequest, GoogleHttpResponse, GoogleHttpTransport } from "../src/connectors/google/transport.ts";
@@ -46,7 +47,7 @@ test("capped two-page delta resumes the exact second page", async () => {
       nextPageToken: "second",
     });
   });
-  const poll = new GmailInboxPoller({ transport, tokens: () => Promise.resolve("t") });
+  const poll = new GmailInboxPoller({ transport, tokens: () => Promise.resolve("t"), accountId: "me" });
   const first = await poll.pollInbox("op-cap-1", { cursor: boundCursor("9000"), maxPages: 1 });
   assert.equal(first.status, "succeeded");
   if (first.status !== "succeeded") return;
@@ -73,7 +74,7 @@ test("mid-page message cap resumes within the same page without loss", async () 
     ],
   };
   const { transport } = scripted(() => json(200, page));
-  const poll = new GmailInboxPoller({ transport, tokens: () => Promise.resolve("t") });
+  const poll = new GmailInboxPoller({ transport, tokens: () => Promise.resolve("t"), accountId: "me" });
   const first = await poll.pollInbox("op-mid-1", { cursor: boundCursor("1"), maxMessages: 2 });
   assert.equal(first.status, "succeeded");
   if (first.status !== "succeeded") return;
@@ -89,12 +90,12 @@ test("mid-page message cap resumes within the same page without loss", async () 
 
 test("cursors bound to another account or query are rejected without HTTP", async () => {
   const { transport, log } = scripted(() => json(200, {}));
-  const otherAccount = new GmailInboxPoller({ transport, tokens: () => Promise.resolve("t"), userId: "someone@example.test" });
+  const otherAccount = new GmailInboxPoller({ transport, tokens: () => Promise.resolve("t"), userId: "someone@example.test", accountId: "someone@example.test" });
   const foreign = await otherAccount.pollInbox("op-bind-1", { cursor: boundCursor("5") });
   assert.equal(foreign.status, "failed");
   if (foreign.status !== "failed") return;
   assert.equal(foreign.error.kind, "invalid_request");
-  const poll = new GmailInboxPoller({ transport, tokens: () => Promise.resolve("t") });
+  const poll = new GmailInboxPoller({ transport, tokens: () => Promise.resolve("t"), accountId: "me" });
   const scoped = await poll.pollInbox("op-bind-2", { cursor: encodeCursor("5", { account: "me", query: "from:x" }), query: "from:y" });
   assert.equal(scoped.status, "failed");
   if (scoped.status !== "failed") return;
@@ -114,7 +115,7 @@ test("bootstrap catch-up returns arrivals during the snapshot", async () => {
     }
     return json(200, { messages: [{ id: "m-old", threadId: "t-old" }] });
   });
-  const poll = new GmailInboxPoller({ transport, tokens: () => Promise.resolve("t") });
+  const poll = new GmailInboxPoller({ transport, tokens: () => Promise.resolve("t"), accountId: "me" });
   const result = await poll.pollInbox("op-boot-1", {});
   assert.equal(result.status, "succeeded");
   if (result.status !== "succeeded") return;
@@ -192,6 +193,86 @@ test("clean bodies report complete with identical text to the plain reader", asy
   assert.equal(bounded.data.completeness.complete, true);
   assert.equal(bounded.data.thread.messages[0]?.body, "Hello, world");
   assert.equal(bounded.data.thread.messages[0]?.body, plain.data.thread.messages[0]?.body);
+});
+
+test("same userId alias across two accounts still rejects foreign cursors", async () => {
+  const { transport, log } = scripted(() => json(200, {
+    historyId: "5001",
+    history: [{ id: "5001", messagesAdded: [{ message: { id: "m-1", threadId: "t-1" } }] }],
+  }));
+  const tokens = () => Promise.resolve("t");
+  const pollA = new GmailInboxPoller({ transport, tokens, userId: "me", accountId: "acct-A" });
+  // Mint a cursor bound to acct-A through a real poll.
+  const minted = await pollA.pollInbox("op-acct-2", { cursor: encodeCursor("5000", { account: "acct-A" }) });
+  assert.equal(minted.status, "succeeded");
+  if (minted.status !== "succeeded") return;
+  assert.ok(minted.data.nextCursor !== undefined);
+  const callsBefore = log.length;
+  // Same "me" alias, different stable account: rejected before any HTTP.
+  const pollB = new GmailInboxPoller({ transport, tokens, userId: "me", accountId: "acct-B" });
+  const foreign = await pollB.pollInbox("op-acct-3", { cursor: minted.data.nextCursor });
+  assert.equal(foreign.status, "failed");
+  if (foreign.status !== "failed") return;
+  assert.equal(foreign.error.kind, "invalid_request");
+  assert.equal(log.length, callsBefore);
+});
+
+test("skipped siblings after the chosen text are still flagged", async () => {
+  const { reader } = boundedReader(() => json(200, threadWithParts([
+    { mimeType: "text/plain", body: { data: b64url("Hello") } },
+    { mimeType: "application/pdf", filename: "menu.pdf", body: {} },
+  ])));
+  const result = await reader.readThreadBounded({ operationKey: "op-sib", threadId: "thr-1" });
+  assert.equal(result.status, "succeeded");
+  if (result.status !== "succeeded") return;
+  assert.equal(result.data.thread.messages[0]?.body, "Hello");
+  const issues = result.data.completeness.messages[0]?.issues ?? [];
+  assert.ok(issues.includes("attachment-skipped"), `expected attachment flag, got ${issues.join(",")}`);
+  assert.equal(result.data.completeness.complete, false);
+});
+
+test("valid replacement characters stay text; truly invalid UTF-8 is flagged", async () => {
+  const legit = boundedReader(() => json(200, threadWithParts([
+    { mimeType: "text/plain", body: { data: b64url("100�% legit � char") } },
+  ])));
+  const good = await legit.reader.readThreadBounded({ operationKey: "op-uni-1", threadId: "thr-1" });
+  assert.equal(good.status, "succeeded");
+  if (good.status !== "succeeded") return;
+  assert.equal(good.data.thread.messages[0]?.body, "100�% legit � char");
+  assert.equal(good.data.completeness.complete, true);
+
+  const invalidBytes = Buffer.from([0xff, 0xfe, 0x41]).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+  const corrupt = boundedReader(() => json(200, threadWithParts([
+    { mimeType: "text/plain", body: { data: invalidBytes } },
+  ])));
+  const bad = await corrupt.reader.readThreadBounded({ operationKey: "op-uni-2", threadId: "thr-1" });
+  assert.equal(bad.status, "succeeded");
+  if (bad.status !== "succeeded") return;
+  assert.ok((bad.data.completeness.messages[0]?.issues ?? []).includes("malformed-base64-part"));
+  assert.equal(bad.data.completeness.complete, false);
+});
+
+test("document caps count bytes, never UTF-16 units or split code points", async () => {
+  // "é" is 1 UTF-16 unit but 2 bytes: 5 of them are 10 bytes (at cap),
+  // 6 of them are 12 bytes (over a 10-byte cap).
+  const atCap = "é".repeat(5);
+  const overCap = "é".repeat(6);
+  assert.equal(atCap.length, 5);
+  assert.equal(Buffer.byteLength(overCap, "utf-8"), 12);
+  const world = (text: string) => scripted((req) => {
+    if (req.url.includes("alt=media")) return { status: 200, headers: {}, text };
+    return json(200, { id: "doc-mb", name: "m.txt", mimeType: "text/plain", capabilities: { canDownload: true } });
+  });
+  const fitting = world(atCap);
+  const fitReader = new GoogleDocumentRetriever({ transport: fitting.transport, tokens: () => Promise.resolve("t"), byteCap: 10 });
+  const fit = await fitReader.retrieveDocument({ operationKey: "op-mb-1", documentId: "doc-mb" });
+  assert.equal(fit.status, "succeeded");
+  if (fit.status !== "succeeded") return;
+  assert.equal(fit.data.document.text, atCap);
+  const overflowing = world(overCap);
+  const overReader = new GoogleDocumentRetriever({ transport: overflowing.transport, tokens: () => Promise.resolve("t"), byteCap: 10 });
+  const over = await overReader.retrieveDocument({ operationKey: "op-mb-2", documentId: "doc-mb" });
+  assert.equal(over.status, "failed");
 });
 
 test("streaming byte cap aborts over-cap bodies; default path buffers as before", async () => {

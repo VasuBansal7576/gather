@@ -36,7 +36,7 @@ function scripted(handler: (req: GoogleHttpRequest) => GoogleHttpResponse | Prom
 
 function poller(handler: (req: GoogleHttpRequest) => GoogleHttpResponse | Promise<GoogleHttpResponse>, userId = "me") {
   const { transport, log } = scripted(handler);
-  return { poller: new GmailInboxPoller({ transport, tokens: () => Promise.resolve("t"), userId }), log };
+  return { poller: new GmailInboxPoller({ transport, tokens: () => Promise.resolve("t"), userId, accountId: userId }), log };
 }
 
 function boundCursor(historyId: string, scope: { query?: string; pageToken?: string; seen?: string[] } = {}): string {

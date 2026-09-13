@@ -233,11 +233,28 @@ function parseIdList(body: unknown): { ids: Array<{ id: string; threadId?: strin
   return out;
 }
 
-export class GmailInboxPoller {
-  private readonly options: GoogleAdapterOptions;
+export interface GmailInboxPollerOptions extends GoogleAdapterOptions {
+  /**
+   * Stable account scope identity bound into every minted cursor and
+   * enforced on every presented cursor. Must identify the actual
+   * configured account — never the `userId` alias (`"me"`), which is
+   * identical across accounts and cannot separate their cursors.
+   */
+  accountId: string;
+}
 
-  constructor(options: GoogleAdapterOptions) {
+export class GmailInboxPoller {
+  private readonly options: GmailInboxPollerOptions;
+
+  constructor(options: GmailInboxPollerOptions) {
+    if (options.accountId.trim().length === 0) {
+      throw new Error("GmailInboxPoller requires a non-empty stable accountId scope");
+    }
     this.options = options;
+  }
+
+  private accountId(): string {
+    return this.options.accountId;
   }
 
   private userId(): string {
@@ -266,7 +283,7 @@ export class GmailInboxPoller {
     }
     // Binding check before any HTTP: a cursor minted for another account or
     // query must never poll this mailbox.
-    if (decoded.account !== this.userId() || (decoded.query ?? undefined) !== (options.query ?? undefined)) {
+    if (decoded.account !== this.accountId() || (decoded.query ?? undefined) !== (options.query ?? undefined)) {
       return { status: "failed", metadata: liveMetadata(operationKey, []), error: invalidRequest("Cursor is bound to a different account or query; reset with a cursor-less full sync") };
     }
     return this.deltaSync(operationKey, decoded, options.query, maxPages, maxMessages);
@@ -387,8 +404,8 @@ export class GmailInboxPoller {
         resetRequired: false,
         changes,
         nextCursor: advanced
-          ? encodeCursor(latestHistoryId, { account: this.userId(), ...(query === undefined ? {} : { query }) })
-          : this.continuationCursor(cursor.base, this.userId(), query, resumeToken, seen),
+          ? encodeCursor(latestHistoryId, { account: this.accountId(), ...(query === undefined ? {} : { query }) })
+          : this.continuationCursor(cursor.base, this.accountId(), query, resumeToken, seen),
         truncated,
         provenance,
       },
@@ -407,7 +424,7 @@ export class GmailInboxPoller {
     let truncated = false;
     let latestHistoryId: string | undefined;
     let pagesLeft = maxPages;
-    const account = this.userId();
+    const account = this.accountId();
     // Phase 0: pre-list watermark. Arrivals during the snapshot below are
     // caught by the catch-up delta instead of being skipped by a
     // post-list-only cursor.

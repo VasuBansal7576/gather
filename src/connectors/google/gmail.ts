@@ -53,15 +53,15 @@ function base64UrlEncodeText(text: string): string {
 /**
  * Strict base64url decode: malformed alphabets or lengths are rejected
  * instead of silently accepted (Buffer otherwise strips invalid characters
- * and yields mojibake), and undecodable byte sequences are rejected rather
- * than passed through as replacement characters.
+ * and yields mojibake), and non-UTF-8 byte sequences are rejected via fatal
+ * decoding rather than passed through as replacement characters. A valid
+ * literal U+FFFD in the source text decodes exactly and stays text.
  */
 function base64UrlDecodeStrict(data: string): string | undefined {
   if (!/^[A-Za-z0-9\-_]*$/.test(data) || data.length % 4 === 1) return undefined;
   try {
-    const text = Buffer.from(data.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf-8");
-    if (text.includes("�")) return undefined;
-    return text;
+    const bytes = Buffer.from(data.replace(/-/g, "+").replace(/_/g, "/"), "base64");
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
   } catch {
     return undefined;
   }
@@ -194,14 +194,19 @@ function extractTextWithIssues(part: unknown): { text?: string; issues: string[]
   } else if (filename !== undefined && filename.length > 0) {
     return { issues: ["attachment-skipped"] };
   }
+  // Siblings keep scanning even after usable text is selected: skipped
+  // content after the chosen part must still be flagged, or completeness
+  // silently under-reports. The first decodable text still wins the body.
   const issues: string[] = [];
+  let text: string | undefined;
   const parts = part.parts;
   if (Array.isArray(parts)) {
     for (const child of parts) {
       const found = extractTextWithIssues(child);
       issues.push(...found.issues);
-      if (found.text !== undefined) return { text: found.text, issues };
+      if (text === undefined && found.text !== undefined) text = found.text;
     }
+    if (text !== undefined) return { text, issues };
   }
   return { issues };
 }

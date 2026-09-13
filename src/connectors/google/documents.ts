@@ -237,7 +237,10 @@ export class GoogleDocumentRetriever implements DocumentRetriever {
       const error = mapGoogleHttpError(response.status, safeParseJson(response.text), "retrieveDocument");
       return { status: "failed", metadata: liveMetadata(request.operationKey, []), error };
     }
-    if (response.text.length > cap) {
+    // Byte-exact accounting: UTF-16 length understates multibyte bodies, so
+    // the bound is enforced on encoded bytes and bodies are never sliced
+    // mid-code-point (over-cap fails closed instead of truncating).
+    if (Buffer.byteLength(response.text, "utf-8") > cap) {
       return {
         status: "failed",
         metadata: liveMetadata(request.operationKey, []),
@@ -253,7 +256,7 @@ export class GoogleDocumentRetriever implements DocumentRetriever {
     mimeType: string,
     text: string,
   ): ConnectorResult<RetrieveDocumentResponse> {
-    if (text.length > this.byteCap()) {
+    if (Buffer.byteLength(text, "utf-8") > this.byteCap()) {
       return {
         status: "failed",
         metadata: liveMetadata(request.operationKey, []),
