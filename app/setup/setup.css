@@ -1,0 +1,389 @@
+/* Setup journey styles — scoped under .setup-shell. Inherits the host
+   page background (#0b0b0e) and base text color from globals.css. */
+
+.setup-shell {
+  min-height: 100vh;
+  max-width: 880px;
+  margin: 0 auto;
+  padding: 40px 24px 64px;
+  color: #ececf0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, "Helvetica Neue", Arial, sans-serif;
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.setup-shell button,
+.setup-shell input {
+  font: inherit;
+}
+
+.setup-header .setup-brand {
+  font-weight: 700;
+  font-size: 15px;
+  letter-spacing: 0.01em;
+}
+
+.setup-header h1 {
+  font-size: 27px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  margin: 12px 0 4px;
+  color: #f4f4f8;
+}
+
+.setup-muted {
+  color: #a7a7b3;
+  margin: 0 0 8px;
+}
+
+.setup-steps {
+  display: flex;
+  gap: 8px;
+  list-style: none;
+  padding: 16px 0 4px;
+  margin: 0;
+}
+
+.setup-step {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  border: 1px solid #26262e;
+  border-radius: 999px;
+  color: #a7a7b3;
+  background: #101014;
+}
+
+.setup-step-number {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: #26262e;
+  color: #ececf0;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.setup-step.is-current {
+  border-color: #a495fd;
+  color: #ececf0;
+}
+
+.setup-step.is-current .setup-step-number {
+  background: #a495fd;
+  color: #14141a;
+}
+
+.setup-step.is-done .setup-step-number {
+  background: #3ddc84;
+  color: #0b0f0c;
+}
+
+.setup-status {
+  min-height: 24px;
+  margin: 8px 0;
+  color: #cfcfe0;
+}
+
+.setup-main {
+  display: grid;
+  gap: 16px;
+  margin-top: 12px;
+}
+
+.setup-panel {
+  background: #131318;
+  border: 1px solid #26262e;
+  border-radius: 12px;
+  padding: 24px;
+}
+
+.setup-panel h2 {
+  font-size: 19px;
+  font-weight: 650;
+  margin: 0 0 8px;
+  color: #f4f4f8;
+}
+
+.setup-panel h3 {
+  font-size: 14px;
+  font-weight: 600;
+  margin: 20px 0 8px;
+}
+
+.setup-panel.is-demo {
+  border-style: dashed;
+}
+
+.setup-choices {
+  list-style: none;
+  padding: 0;
+  margin: 12px 0;
+  display: grid;
+  gap: 8px;
+}
+
+.setup-choice {
+  width: 100%;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 16px;
+  border: 1px solid #26262e;
+  border-radius: 10px;
+  background: #101014;
+  color: #ececf0;
+  cursor: pointer;
+  text-align: left;
+  font-size: 14px;
+}
+
+.setup-choice:hover {
+  border-color: #a495fd;
+}
+
+.setup-form {
+  border-top: 1px solid #26262e;
+  margin-top: 8px;
+  padding-top: 4px;
+}
+
+.setup-field {
+  display: grid;
+  gap: 6px;
+  margin: 12px 0;
+}
+
+.setup-field span {
+  font-weight: 600;
+  color: #cfcfe0;
+}
+
+.setup-field input {
+  padding: 10px 12px;
+  border: 1px solid #26262e;
+  border-radius: 8px;
+  background: #0b0b0e;
+  color: #ececf0;
+  font-size: 14px;
+  max-width: 420px;
+}
+
+.setup-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 10px 20px;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  border: 1px solid transparent;
+  text-decoration: none;
+}
+
+.setup-button.is-primary {
+  background: #a495fd;
+  color: #14141a;
+}
+
+.setup-button.is-primary:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
+
+.setup-button.is-secondary {
+  background: transparent;
+  color: #ececf0;
+  border-color: #3a3a46;
+}
+
+.setup-button.is-secondary:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
+
+.setup-button.is-danger {
+  background: #3a1d22;
+  color: #f3b8c0;
+  border-color: #6e2b34;
+}
+
+.setup-text-button {
+  background: none;
+  border: none;
+  color: #a495fd;
+  font-size: 13px;
+  cursor: pointer;
+  padding: 4px 0;
+}
+
+.setup-text-button.is-danger {
+  color: #e57f8d;
+}
+
+.setup-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.setup-card {
+  border: 1px solid #26262e;
+  border-radius: 10px;
+  padding: 18px;
+  margin: 12px 0;
+  background: #101014;
+}
+
+.setup-card-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+.setup-card-top h3 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.setup-pill {
+  display: inline-block;
+  padding: 3px 12px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  background: #26262e;
+  color: #cfcfe0;
+  white-space: nowrap;
+}
+
+.setup-pill.is-ok {
+  background: rgba(61, 220, 132, 0.14);
+  color: #7de8ab;
+}
+
+.setup-pill.is-attention {
+  background: rgba(255, 176, 32, 0.14);
+  color: #ffcf7d;
+}
+
+.setup-accounts {
+  list-style: none;
+  padding: 0;
+  margin: 12px 0;
+  display: grid;
+  gap: 8px;
+}
+
+.setup-account {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid #26262e;
+  border-radius: 8px;
+}
+
+.setup-account div {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.setup-notice {
+  border: 1px solid #26262e;
+  border-radius: 10px;
+  padding: 14px 16px;
+  margin: 12px 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.setup-notice strong {
+  display: block;
+  margin-bottom: 4px;
+}
+
+.setup-notice p {
+  margin: 0;
+  color: #cfcfe0;
+}
+
+.setup-notice.is-error {
+  border-color: #6e2b34;
+  background: rgba(110, 43, 52, 0.12);
+}
+
+.setup-notice.is-ok {
+  border-color: #1f6b44;
+  background: rgba(61, 220, 132, 0.08);
+}
+
+.setup-dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  z-index: 50;
+}
+
+.setup-dialog {
+  max-width: 480px;
+  width: 100%;
+  background: #131318;
+  border: 1px solid #3a3a46;
+  border-radius: 12px;
+  padding: 24px;
+}
+
+.setup-dialog h2 {
+  margin: 0 0 8px;
+  font-size: 18px;
+}
+
+.setup-shell button:focus-visible,
+.setup-shell a:focus-visible,
+.setup-shell input:focus-visible {
+  outline: 2px solid #a495fd;
+  outline-offset: 2px;
+}
+
+@media (max-width: 720px) {
+  .setup-shell {
+    padding: 24px 16px 48px;
+  }
+
+  .setup-header h1 {
+    font-size: 23px;
+  }
+
+  .setup-steps {
+    flex-wrap: wrap;
+  }
+
+  .setup-panel {
+    padding: 18px 16px;
+  }
+
+  .setup-choice {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+}
