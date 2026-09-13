@@ -68,6 +68,21 @@ export type {
   ServiceCapability,
   SpaceKnowledge,
 } from "./types.ts";
-export { prepareOffer, readAvailabilityEvidence, readBusinessKnowledge, readInquiryRequirements, formatMoney, formatDuration } from "./prepare.ts";
-export type { AdaptableFact, AdaptedKnowledge, AvailabilityBuildInput } from "./adapters.ts";
+export {
+  prepareOffer,
+  readAvailabilityEvidence,
+  readBusinessKnowledge,
+  readCostLine,
+  readInquiryRequirements,
+  readPolicyRule,
+  readPriceLine,
+  readServiceCapability,
+  readSpaceKnowledge,
+  readScopedExceptionValue,
+  readTimezone,
+  formatMoney,
+  formatDuration,
+  canonicalizeValue,
+} from "./prepare.ts";
+export type { AdaptableFact, AdaptedKnowledge, AdaptScope, AvailabilityBuildInput } from "./adapters.ts";
 export { adaptBusinessFacts, buildAvailabilityEvidence } from "./adapters.ts";
