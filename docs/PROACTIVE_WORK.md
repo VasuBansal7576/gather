@@ -117,7 +117,12 @@ UTC for storage and compared as epoch millis, so caller clock shapes
   and retryable: no half-migration, no dropped work, no permanently
   disabled foreign keys. Leftover state from the previous non-atomic
   migrator (stray legacy table, waiting FK retargeted at it) is repaired
-  the same way on open.
+  the same way on open, with exactness gates: every waiting column —
+  including live claim tokens, lease expiries, and resolution metadata —
+  is copied verbatim (NULL only where the legacy table predates the
+  column), every merged event row must have a field-identical twin, and a
+  same-identity conflict aborts atomically with both original tables
+  preserved instead of silently dropping one side.
 - **Stale revisions:** intake tracks the max non-stale revision per booking.
   An event with a lower revision is stored with `stale: true` and causes no
   side effects. A `change` with an equal or higher revision supersedes prior
