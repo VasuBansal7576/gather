@@ -227,6 +227,10 @@ export async function requestRevision(deps: RevisionsDeps, request: RevisionRequ
   const { store } = deps;
   const lifecycle = new RevisionLifecycleStore(store);
   const binding = request.binding;
+  const hashMaterial = { kind: "revision", binding, inquiry: request.inquiry, calendarId: request.calendarId, email: request.email, expiresAt: request.expiresAt };
+  const hash = canonicalRequestHash(hashMaterial);
+  const replay = lifecycle.replayOrOwn(binding.commandId, binding.bookingId, "revision", hash);
+  if (replay) return { ...(replay.response as unknown as RevisionResponse), duplicate: true } as RevisionResponse;
   const { booking, action } = requireRevisionBinding(store, binding);
   requireBookingWritable(store, booking.id);
   const op = operatorDeps(deps);
@@ -264,7 +268,7 @@ export async function requestRevision(deps: RevisionsDeps, request: RevisionRequ
       note: "Revision refused: the obsolete hold would conflict with the new terms. Nothing was persisted and no approval changed.",
     };
     lifecycle.recordCommand(binding.commandId, booking.id, "revision",
-      canonicalRequestHash({ kind: "revision", binding, inquiry: request.inquiry, calendarId: request.calendarId, email: request.email, expiresAt: request.expiresAt }),
+      hash,
       "blocked", response as unknown as Record<string, unknown>);
     return response;
   }
@@ -285,7 +289,7 @@ export async function requestRevision(deps: RevisionsDeps, request: RevisionRequ
       note: "Revision refused: the revised offer cannot persist under current evidence. Audit and receipts are untouched.",
     };
     lifecycle.recordCommand(binding.commandId, booking.id, "revision",
-      canonicalRequestHash({ kind: "revision", binding, inquiry: request.inquiry, calendarId: request.calendarId, email: request.email, expiresAt: request.expiresAt }),
+      hash,
       "blocked", response as unknown as Record<string, unknown>);
     return response;
   }
@@ -305,7 +309,7 @@ export async function requestRevision(deps: RevisionsDeps, request: RevisionRequ
       : "Revised proposal published as the new current proposal through the existing prepare path; the old action is superseded, its approval invalidated, and a new owner approval is required. Nothing was sent and no hold was created.",
   };
   lifecycle.recordCommand(binding.commandId, booking.id, "revision",
-    canonicalRequestHash({ kind: "revision", binding, inquiry: request.inquiry, calendarId: request.calendarId, email: request.email, expiresAt: request.expiresAt }),
+    hash,
     "succeeded", response as unknown as Record<string, unknown>);
   return response;
 }
@@ -377,6 +381,9 @@ export async function verifyCancellation(deps: RevisionsDeps, request: Cancellat
   const { store } = deps;
   const lifecycle = new RevisionLifecycleStore(store);
   const binding = request.binding;
+  const hash = canonicalRequestHash({ kind: "cancellation_verify", binding, waiver: request.waiver });
+  const replay = lifecycle.replayOrOwn(binding.commandId, binding.bookingId, "cancellation_verify", hash);
+  if (replay) return { ...(replay.response as unknown as CancellationVerifyResponse), duplicate: true } as CancellationVerifyResponse;
   const current = store.getCurrentProposalAction(binding.bookingId);
   if (!current) {
     throw new ServiceError("NOT_FOUND", `No proposed action exists for booking ${binding.bookingId}; nothing can be verified`, false);
@@ -431,13 +438,19 @@ export async function verifyCancellation(deps: RevisionsDeps, request: Cancellat
     });
   }
   const stillOut = holds.filter((hold) => lifecycle.getRelease(hold.operationKey)?.status !== "released");
-  if (stillOut.length > 0) {
-    blocked.push({
-      code: "release_unverified",
-      detail: deps.holdRelease === undefined
-        ? `Holds ${stillOut.map((hold) => hold.holdId).join(", ")} have no verified release and no hold-release port is wired; cancellation stays requested, never verified.`
-        : `Holds ${stillOut.map((hold) => hold.holdId).join(", ")} are not yet verified released; cancellation stays requested.`,
-    });
+  for (const hold of stillOut) {
+    const record = lifecycle.getRelease(hold.operationKey);
+    blocked.push(record?.status === "uncertain"
+      ? {
+        code: "release_uncertain",
+        detail: `Release of hold ${hold.holdId} is uncertain (the delete may have applied); reconcile the release before cancellation can verify — never retry blindly.`,
+      }
+      : {
+        code: "release_unverified",
+        detail: deps.holdRelease === undefined
+          ? `Holds ${stillOut.map((item) => item.holdId).join(", ")} have no verified release and no hold-release port is wired; cancellation stays requested, never verified.`
+          : `Hold ${hold.holdId} is not yet verified released; cancellation stays requested.`,
+      });
   }
   // Deposit/refund: with no payment provider, a deposit implicated by a
   // sent offer (configured deposit + any executed step) can only clear via
@@ -462,7 +475,7 @@ export async function verifyCancellation(deps: RevisionsDeps, request: Cancellat
       note: "Cancellation verified as NOT complete: the booking stays in requested state with its prior status — never force-set to cancelled.",
     };
     lifecycle.recordCommand(binding.commandId, booking.id, "cancellation_verify",
-      canonicalRequestHash({ kind: "cancellation_verify", binding, waiver: request.waiver }),
+      hash,
       "blocked", response as unknown as Record<string, unknown>);
     return response;
   }
