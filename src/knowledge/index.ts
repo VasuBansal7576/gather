@@ -2,6 +2,7 @@ export {
   KnowledgeService,
   KnowledgeError,
   KnowledgeDeniedError,
+  runWithBusyRetry,
   type IntakeCandidateInput,
   type CandidateView,
   type DecisionCommand,
