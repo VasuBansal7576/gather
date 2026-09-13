@@ -3,7 +3,7 @@ import { getRuntime } from "../../../../src/server/runtime.ts";
 import { KnowledgeService, type IntakeCandidateInput } from "../../../../src/knowledge/service.ts";
 import { assertSameOrigin, readHeaders } from "../../../../src/server/validation.ts";
 import { unknownErrorResponse } from "../../_helpers.ts";
-import { knowledgeErrorResponse } from "../_mapper.ts";
+import { collectSources, deploymentMode, knowledgeErrorResponse } from "../_mapper.ts";
 
 export const dynamic = "force-dynamic";
 
@@ -22,7 +22,8 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     const runtime = getRuntime();
     const service = new KnowledgeService(runtime.store);
     const candidate = service.intakeCandidate(body as unknown as IntakeCandidateInput);
-    return NextResponse.json({ demo: true, candidate });
+    const found: { fictional?: boolean }[] = []; collectSources(candidate, found);
+    return NextResponse.json({ mode: deploymentMode(found), candidate });
   } catch (error) {
     try {
       return knowledgeErrorResponse(error);
@@ -41,7 +42,8 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
     const runtime = getRuntime();
     const service = new KnowledgeService(runtime.store);
     const candidates = service.listCandidates(businessId, status ? { status } : {});
-    return NextResponse.json({ demo: true, candidates });
+    const found: { fictional?: boolean }[] = []; collectSources(candidates, found);
+    return NextResponse.json({ mode: deploymentMode(found), candidates });
   } catch (error) {
     try {
       return knowledgeErrorResponse(error);

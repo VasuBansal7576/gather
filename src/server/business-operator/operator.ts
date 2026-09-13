@@ -1,8 +1,10 @@
 import { proposalFingerprint } from "../../domain/proposals.ts";
 import type { SourceReference } from "../../domain/contracts.ts";
+import { randomUUID } from "node:crypto";
 import { getActiveIdentityLink, ensureBookingIdentityTables } from "../../identity/store.ts";
 import { KnowledgeService } from "../../knowledge/service.ts";
 import type { IntakeCandidateInput } from "../../knowledge/service.ts";
+import type { CalendarAvailabilityReader } from "../../connectors/contracts.ts";
 import { adaptBusinessFacts, buildAvailabilityEvidence } from "../../offers/adapters.ts";
 import { prepareOffer } from "../../offers/prepare.ts";
 import type { OfferPreparationResult } from "../../offers/index.ts";
@@ -34,6 +36,12 @@ export interface OperatorDeps {
   booking: BookingServiceDeps;
   /** Host-derived local owner identity; request-supplied actors are ignored. */
   ownerId: string;
+  /**
+   * Typed injected availability port the host fetched-approval path reads.
+   * Always an approved provider port (scripted fakes in tests); the request
+   * itself can never supply availability evidence.
+   */
+  availability: CalendarAvailabilityReader;
 }
 
 function clockMs(deps: OperatorDeps): number {
@@ -54,11 +62,42 @@ function ownerActor(deps: OperatorDeps): { kind: "owner"; id: string } {
   return { kind: "owner", id: deps.ownerId };
 }
 
+/**
+ * Strict nested source validation before anything reaches owner decisions:
+ * every element must be a real source object (known kind, locator, typed
+ * optionals). Malformed provenance is rejected here, never laundered into
+ * verified authority downstream.
+ */
+function readStrictSources(value: unknown, path: string): SourceReference[] {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new ServiceError("INVALID_REQUEST", `${path} must be a non-empty array`, false);
+  }
+  return value.map((entry, index) => {
+    const where = `${path}[${index}]`;
+    if (!isRecord(entry)) throw new ServiceError("INVALID_REQUEST", `${where} must be an object`, false);
+    if (typeof entry.kind !== "string" || !KNOWN_SOURCE_KINDS.has(entry.kind)) {
+      throw new ServiceError("INVALID_REQUEST", `${where} has an unknown kind`, false);
+    }
+    if (!nonEmptyString(entry.locator)) throw new ServiceError("INVALID_REQUEST", `${where} needs a locator`, false);
+    if (entry.label !== undefined && typeof entry.label !== "string") {
+      throw new ServiceError("INVALID_REQUEST", `${where}.label must be a string`, false);
+    }
+    if (entry.fictional !== undefined && typeof entry.fictional !== "boolean") {
+      throw new ServiceError("INVALID_REQUEST", `${where}.fictional must be a boolean`, false);
+    }
+    return entry as unknown as SourceReference;
+  });
+}
+
 /** Attributable candidate intake from explicit connector evidence. */
 export function intakeOperatorCandidate(deps: OperatorDeps, input: unknown): ReturnType<KnowledgeService["intakeCandidate"]> {
   if (!isRecord(input)) throw new ServiceError("INVALID_REQUEST", "Candidate intake requires a JSON object", false);
   const service = new KnowledgeService(deps.store);
-  return service.intakeCandidate(input as unknown as IntakeCandidateInput);
+  const candidate = { ...(input as Record<string, unknown>) };
+  if (candidate.sourceReferences !== undefined) {
+    candidate.sourceReferences = readStrictSources(candidate.sourceReferences, "sourceReferences");
+  }
+  return service.intakeCandidate(candidate as unknown as IntakeCandidateInput);
 }
 
 export type OperatorDecisionKind = "confirm" | "correct" | "reject" | "exception";
@@ -97,10 +136,13 @@ export function decideOperator(deps: OperatorDeps, kind: OperatorDecisionKind, p
         throw new ServiceError("INVALID_REQUEST", "correct requires a positive integer expectedRevision", false);
       }
       if (!isRecord(params.value)) throw new ServiceError("INVALID_REQUEST", "correct requires an object value", false);
+      const correctSources = params.sourceReferences === undefined
+        ? undefined
+        : readStrictSources(params.sourceReferences, "sourceReferences");
       return service.correctFact({
         businessId: requireBusinessId(params), actor, key, expectedRevision, value: params.value,
         ...(nonEmptyString(params.subjectId) ? { subjectId: params.subjectId as string } : {}),
-        ...(params.sourceReferences !== undefined ? { sourceReferences: params.sourceReferences as SourceReference[] } : {}),
+        ...(correctSources === undefined ? {} : { sourceReferences: correctSources }),
         ...(typeof params.commandId === "string" ? { commandId: params.commandId } : {}),
       });
     }
@@ -135,6 +177,189 @@ function requireBusinessId(params: Record<string, unknown>): string {
   return businessId;
 }
 
+/** Server-side validator identity: citations always name this host, never the request. */
+const HOST_VALIDATOR = "business-operator-host";
+
+/** Freshness bound for host-fetched availability evidence. */
+const AVAILABILITY_FRESHNESS_MS = 5 * 60 * 1000;
+
+interface ValidatedInquiry {
+  inquiryId: string;
+  businessId: string;
+  eventType: string;
+  startAt: string;
+  endAt: string;
+  guestCount: number;
+  serviceRequirements: string[];
+  budgetCents?: { min?: number; max?: number };
+  customerId?: string;
+  preferredSpaceId?: string;
+  sourceReferences: SourceReference[];
+  validatedAt: string;
+  validator: string;
+}
+
+/**
+ * Validate raw inquiry content server-side. Structural failures throw
+ * INVALID_REQUEST naming the path; semantically empty values pass through
+ * so prepareOffer reports them as explicit missing decisions. Any
+ * request-supplied validator/validatedAt is stripped and replaced with this
+ * host's citation — raw requests can never establish trusted evidence.
+ */
+function validateInquiryContent(deps: OperatorDeps, content: unknown, nowIso: string): ValidatedInquiry {
+  if (!isRecord(content)) throw new ServiceError("INVALID_REQUEST", "inquiry must be an object", false);
+  const fail = (detail: string): never => {
+    throw new ServiceError("INVALID_REQUEST", `inquiry.${detail}`, false);
+  };
+  const inquiryId = nonEmptyString(content.inquiryId);
+  if (!inquiryId) fail("inquiryId must be a non-empty string");
+  const businessId = nonEmptyString(content.businessId);
+  if (!businessId) fail("businessId must be a non-empty string");
+  if (typeof content.eventType !== "string") fail("eventType must be a string");
+  if (typeof content.startAt !== "string") fail("startAt must be a string");
+  if (typeof content.endAt !== "string") fail("endAt must be a string");
+  if (typeof content.guestCount !== "number") fail("guestCount must be a number");
+  if (!Array.isArray(content.serviceRequirements) || !content.serviceRequirements.every((s) => typeof s === "string")) {
+    fail("serviceRequirements must be a string array");
+  }
+  const out: ValidatedInquiry = {
+    inquiryId: inquiryId as string,
+    businessId: businessId as string,
+    eventType: content.eventType as string,
+    startAt: content.startAt as string,
+    endAt: content.endAt as string,
+    guestCount: content.guestCount as number,
+    serviceRequirements: [...(content.serviceRequirements as string[])],
+    sourceReferences: readInquirySources(content.sourceReferences),
+    validatedAt: nowIso,
+    validator: HOST_VALIDATOR,
+  };
+  if (content.budgetCents !== undefined) {
+    if (!isRecord(content.budgetCents)) fail("budgetCents must be an object when present");
+    const budget = content.budgetCents as Record<string, unknown>;
+    const parsedBudget: { min?: number; max?: number } = {};
+    for (const field of ["min", "max"] as const) {
+      const entry: unknown = budget[field];
+      if (entry === undefined || entry === null) continue;
+      if (typeof entry === "number" && Number.isInteger(entry) && entry >= 0) {
+        parsedBudget[field] = entry;
+      } else {
+        fail(`budgetCents.${field} must be a non-negative integer or null`);
+      }
+    }
+    out.budgetCents = parsedBudget;
+  }
+  const customerId = content.customerId;
+  if (customerId !== undefined) {
+    if (!nonEmptyString(customerId)) fail("customerId must be a non-empty string when present");
+    out.customerId = customerId as string;
+  }
+  const preferredSpaceId = content.preferredSpaceId;
+  if (preferredSpaceId !== undefined) {
+    if (!nonEmptyString(preferredSpaceId)) fail("preferredSpaceId must be a non-empty string when present");
+    out.preferredSpaceId = preferredSpaceId as string;
+  }
+  return out;
+}
+
+const KNOWN_SOURCE_KINDS = new Set(["connected_account", "document", "email", "calendar", "manual", "fixture"]);
+
+function readInquirySources(value: unknown): SourceReference[] {
+  if (!Array.isArray(value)) throw new ServiceError("INVALID_REQUEST", "inquiry.sourceReferences must be an array", false);
+  return value.map((entry, index) => {
+    if (!isRecord(entry)) throw new ServiceError("INVALID_REQUEST", `inquiry.sourceReferences[${index}] must be an object`, false);
+    if (typeof entry.kind !== "string" || !KNOWN_SOURCE_KINDS.has(entry.kind)) {
+      throw new ServiceError("INVALID_REQUEST", `inquiry.sourceReferences[${index}] has an unknown kind`, false);
+    }
+    if (!nonEmptyString(entry.locator)) {
+      throw new ServiceError("INVALID_REQUEST", `inquiry.sourceReferences[${index}] needs a locator`, false);
+    }
+    if (entry.label !== undefined && typeof entry.label !== "string") {
+      throw new ServiceError("INVALID_REQUEST", `inquiry.sourceReferences[${index}].label must be a string`, false);
+    }
+    if (entry.fictional !== undefined && typeof entry.fictional !== "boolean") {
+      throw new ServiceError("INVALID_REQUEST", `inquiry.sourceReferences[${index}].fictional must be a boolean`, false);
+    }
+    return entry as unknown as SourceReference;
+  });
+}
+
+interface FetchedAvailability {
+  /** Evidence input for buildAvailabilityEvidence (honest, possibly empty). */
+  input: Record<string, unknown>;
+  readerSimulated: boolean | null;
+  failure?: string;
+  fresh: boolean;
+}
+
+/**
+ * Fetch fresh availability through the injected calendar port for exactly
+ * the hold calendar and window. Slots are mapped to venue-wide offers
+ * evidence because the hold decision consumes them at the hold-calendar
+ * level for the requested window (per-room holds on other calendars need
+ * their own preparations). A failing reader degrades to empty evidence —
+ * explicitly unavailable, never invented — with the failure recorded.
+ */
+async function fetchAvailability(
+  deps: OperatorDeps,
+  bookingId: string,
+  calendarId: string,
+  startAt: string,
+  endAt: string,
+  nowIso: string,
+): Promise<FetchedAvailability> {
+  const operationKey = `operator-prepare:${bookingId}:${randomUUID().slice(0, 8)}`;
+  let result;
+  try {
+    result = await deps.availability.checkAvailability({ operationKey, calendarId, startAt, endAt });
+  } catch (error) {
+    return {
+      input: emptyEvidence(calendarId, nowIso),
+      readerSimulated: null,
+      failure: error instanceof Error ? error.message : "Availability read threw before responding",
+      fresh: false,
+    };
+  }
+  if (result.status !== "succeeded") {
+    return {
+      input: emptyEvidence(calendarId, nowIso),
+      readerSimulated: null,
+      failure: `${result.error.kind}: ${result.error.message}`,
+      fresh: false,
+    };
+  }
+  return {
+    input: {
+      calendarId,
+      observedAt: nowIso,
+      asOf: nowIso,
+      maxFreshnessMs: AVAILABILITY_FRESHNESS_MS,
+      slots: result.data.slots.map((slot) => ({
+        startAt: slot.startAt,
+        endAt: slot.endAt,
+        available: slot.available,
+        ...(slot.reason === undefined ? {} : { reason: slot.reason }),
+        venueWide: true,
+        sourceReferences: slot.sourceReferences,
+      })),
+      sourceReferences: result.data.provenance,
+    },
+    readerSimulated: result.metadata.simulated,
+    fresh: true,
+  };
+}
+
+function emptyEvidence(calendarId: string, nowIso: string): Record<string, unknown> {
+  return {
+    calendarId,
+    observedAt: nowIso,
+    asOf: nowIso,
+    maxFreshnessMs: AVAILABILITY_FRESHNESS_MS,
+    slots: [],
+    sourceReferences: [{ kind: "manual", locator: "gather://operator/availability-unavailable", label: "Host reports no availability observations" }],
+  };
+}
+
 export interface BuiltOffer {
   offer: OfferPreparationResult;
   /** Snapshot fact ids backing this offer (for the stale re-check at persist). */
@@ -142,22 +367,35 @@ export interface BuiltOffer {
   businessId: string;
   bookingId: string;
   calendarId: string;
+  /** Null when the reader could not serve (degraded to empty evidence). */
+  readerSimulated: boolean | null;
+  readerFailure?: string;
+  availabilityFresh: boolean;
 }
-
 /**
  * Build a booking offer from trusted current state without persisting
- * anything: exact matched booking, confirmed current knowledge (withheld
- * facts excluded by the snapshot), validated inquiry, and freshly supplied
- * account-scoped availability. Unknown recipients, dates, prices, or
- * business facts surface as the offer's own missing/conflict/decision
- * entries — never invented values.
+ * anything: exact matched booking, server-validated inquiry, confirmed
+ * current knowledge (withheld facts excluded by the snapshot), and freshly
+ * fetched account-scoped availability. Unknown recipients, dates, prices,
+ * or business facts surface as the offer's own missing/conflict/decision
+ * entries — never invented values. The request can never supply
+ * availability evidence, provenance, or validator identity: slots come only
+ * from the injected reader, provenance only from observed sources, and the
+ * validator stamp is always this host.
  */
-export function buildBookingOffer(deps: OperatorDeps, request: OperatorPrepareRequest): BuiltOffer {
+export async function buildBookingOffer(deps: OperatorDeps, request: OperatorPrepareRequest): Promise<BuiltOffer> {
   if (!isRecord(request as unknown)) throw new ServiceError("INVALID_REQUEST", "Prepare requires a JSON object", false);
   const bookingId = nonEmptyString(request.bookingId);
   const calendarId = nonEmptyString(request.calendarId);
   if (!bookingId) throw new ServiceError("INVALID_REQUEST", "bookingId is required", false);
   if (!calendarId) throw new ServiceError("INVALID_REQUEST", "calendarId is required", false);
+  if ((request as unknown as Record<string, unknown>).availability !== undefined) {
+    throw new ServiceError(
+      "INVALID_REQUEST",
+      "Availability evidence is host-fetched, never request-supplied: omit availability; the operator reads the injected calendar port",
+      false,
+    );
+  }
   let booking;
   try {
     booking = deps.store.getBooking(bookingId);
@@ -175,8 +413,15 @@ export function buildBookingOffer(deps: OperatorDeps, request: OperatorPrepareRe
       throw new ServiceError("CROSS_BOOKING", "Active identity link points at a different booking; refusing cross-booking preparation", false);
     }
   }
+  const nowMs = clockMs(deps);
+  const nowIso = new Date(nowMs).toISOString();
+  const inquiry = validateInquiryContent(deps, request.inquiry, nowIso);
+  if (inquiry.businessId !== booking.businessId) {
+    throw new ServiceError("CROSS_BOOKING", "Inquiry business does not match the booking business; refusing cross-booking preparation", false);
+  }
   const service = new KnowledgeService(deps.store);
-  const snapshot = service.snapshotForOffers(booking.businessId);  let adapted;
+  const snapshot = service.snapshotForOffers(booking.businessId);
+  let adapted;
   try {
     adapted = adaptBusinessFacts(snapshot.facts, { businessId: booking.businessId });
   } catch (error) {
@@ -189,28 +434,20 @@ export function buildBookingOffer(deps: OperatorDeps, request: OperatorPrepareRe
       false,
     );
   }
+  const fetched = await fetchAvailability(deps, bookingId, calendarId, inquiry.startAt, inquiry.endAt, nowIso);
   let availability;
   try {
-    availability = buildAvailabilityEvidence(request.availability);
+    availability = buildAvailabilityEvidence(fetched.input);
   } catch (error) {
     throw new ServiceError("INVALID_REQUEST", `Availability evidence is malformed: ${error instanceof Error ? error.message : "bad shape"}`, false);
-  }
-  if (availability.calendarId !== calendarId) {
-    throw new ServiceError("INVALID_REQUEST", "Availability evidence must scope the hold calendar", false);
-  }
-  if (isRecord(request.inquiry)) {
-    const inquiryBusiness = request.inquiry.businessId;
-    if (typeof inquiryBusiness === "string" && inquiryBusiness !== booking.businessId) {
-      throw new ServiceError("CROSS_BOOKING", "Inquiry business does not match the booking business; refusing cross-booking preparation", false);
-    }
   }
   let offer: OfferPreparationResult;
   try {
     offer = prepareOffer({
-      inquiry: request.inquiry,
+      inquiry,
       knowledge: adapted.knowledge,
       availability,
-      preparedAt: deps.booking.now ? deps.booking.now() : new Date().toISOString(),
+      preparedAt: nowIso,
       ...(request.requestedVersion === undefined ? {} : { requestedVersion: request.requestedVersion }),
       ...(request.supersedesFingerprint === undefined ? {} : { supersedesFingerprint: request.supersedesFingerprint }),
     });
@@ -226,6 +463,9 @@ export function buildBookingOffer(deps: OperatorDeps, request: OperatorPrepareRe
     businessId: booking.businessId,
     bookingId: booking.id,
     calendarId,
+    readerSimulated: fetched.readerSimulated,
+    ...(fetched.failure === undefined ? {} : { readerFailure: fetched.failure }),
+    availabilityFresh: fetched.fresh,
   };
 }
 
@@ -370,21 +610,49 @@ function verifySnapshotCurrent(deps: OperatorDeps, built: BuiltOffer): void {
 }
 
 /**
+ * Correlate the result mode from the actual availability port and the
+ * accepted facts: live requires a live (non-simulated) reader response AND
+ * zero fictional sources anywhere; anything else stays explicitly demo with
+ * fixture content preserved as labeled. Simulated evidence is never passed
+ * as live.
+ */
+export function deriveMode(readerSimulated: boolean | null, sources: SourceReference[]): OperatorPrepareResult["mode"] {
+  const fictional = sources.some((source) => source.fictional === true);
+  if (readerSimulated === false && !fictional) {
+    return { kind: "live", label: "LIVE", fictional: false, simulated: false };
+  }
+  return { kind: "demo", label: "DEMO ONLY", fictional, simulated: true };
+}
+
+/**
  * One-call prepare: build the offer and, when feasible and fully specified,
  * persist the exact proposal. Never approves, sends, or holds.
  */
-export function prepareBookingProposal(deps: OperatorDeps, request: OperatorPrepareRequest): OperatorPrepareResult {
-  const built = buildBookingOffer(deps, request);
+export async function prepareBookingProposal(deps: OperatorDeps, request: OperatorPrepareRequest): Promise<OperatorPrepareResult> {
+  const built = await buildBookingOffer(deps, request);
   const persisted = persistPreparedProposal(deps, built, { email: request.email, expiresAt: request.expiresAt });
   const proposal = "missing" in persisted ? null : persisted;
+  const missingForProposal = "missing" in persisted ? persisted.missing : [];
+  if (built.readerFailure !== undefined) {
+    missingForProposal.unshift({ code: "availability_unavailable", detail: `Fresh availability could not be read: ${built.readerFailure}.` });
+  }
+  const sources: SourceReference[] = [
+    ...built.offer.evidence.inquiry,
+    ...built.offer.evidence.business,
+    ...built.offer.evidence.availability,
+    ...built.offer.evidence.pricing,
+  ];
+  const mode = deriveMode(built.readerSimulated, sources);
   return {
-    demo: true,
-    mode: { kind: "demo", label: "DEMO ONLY", fictional: true, simulated: true },
+    mode,
     bookingId: built.bookingId,
     businessId: built.businessId,
+    availabilityFresh: built.availabilityFresh,
     offer: built.offer,
     proposal,
-    missingForProposal: "missing" in persisted ? persisted.missing : [],
-    notice: "DEMO ONLY: preparation only. Approval, hold, and send run through the existing approve/retry pipeline with fresh availability.",
+    missingForProposal,
+    notice: mode.kind === "live"
+      ? "Preparation only, from live provider evidence and attested facts. Approval, hold, and send run through the existing approve/retry pipeline with fresh availability."
+      : "DEMO ONLY: preparation only. Approval, hold, and send run through the existing approve/retry pipeline with fresh availability.",
   };
 }

@@ -13,9 +13,11 @@ import type { OfferPreparationResult } from "../../offers/index.ts";
 import type { ProposalConsequencesDTO } from "../dto.ts";
 
 /**
- * Public operator contract. All timestamps are ISO strings; all fixture
- * content must stay explicitly labeled by its sources (the operator never
- * relabels provenance).
+ * Public operator contract. Inquiry content arrives in the request and is
+ * validated server-side; availability evidence is always host-fetched and
+ * can never arrive in the request. All timestamps are ISO strings; all
+ * fixture content keeps its source labels (the operator never relabels
+ * provenance).
  */
 
 export interface OperatorPrepareEmail {
@@ -24,15 +26,27 @@ export interface OperatorPrepareEmail {
   body: string;
 }
 
+/** Raw inquiry content supplied for server-side validation (never trusted as-is). */
+export interface OperatorInquiryContent {
+  inquiryId?: unknown;
+  eventType?: unknown;
+  startAt?: unknown;
+  endAt?: unknown;
+  guestCount?: unknown;
+  serviceRequirements?: unknown;
+  budgetCents?: unknown;
+  customerId?: unknown;
+  preferredSpaceId?: unknown;
+  sourceReferences?: unknown;
+}
+
 export interface OperatorPrepareRequest {
   /** Explicit booking identity under test. Optional sourceKey resolves via the active identity link. */
   bookingId: string;
   sourceKey?: string;
-  /** Host-validated inquiry requirements (validator/validatedAt identify the validator). */
-  inquiry: unknown;
-  /** Freshly fetched, account-scoped calendar observations for the hold calendar. */
-  availability: unknown;
-  /** Explicit hold calendar. Must equal availability.calendarId. */
+  /** Inquiry content to validate server-side (validator identity is always host-derived). */
+  inquiry: OperatorInquiryContent;
+  /** Explicit hold calendar. Fresh evidence is fetched for exactly this calendar. */
   calendarId: string;
   /** Explicit hold expiry (future-dated). Never defaulted. */
   expiresAt?: string;
@@ -54,11 +68,19 @@ export interface PersistedProposal {
   reused: boolean;
 }
 
+/** Mode correlated from the actual availability port and accepted facts. */
+export interface OperatorMode {
+  kind: "demo" | "live";
+  label: string;
+  fictional: boolean;
+  simulated: boolean;
+}
+
 export interface OperatorPrepareResult {
-  demo: true;
-  mode: { kind: "demo"; label: "DEMO ONLY"; fictional: true; simulated: true };
+  mode: OperatorMode;
   bookingId: string;
   businessId: string;
+  availabilityFresh: boolean;
   offer: OfferPreparationResult;
   proposal: PersistedProposal | null;
   /** Present when the offer cannot be persisted yet; resolve instead of sending. */
