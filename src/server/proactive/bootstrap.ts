@@ -229,6 +229,12 @@ export async function refreshProactiveHost(drainTimeoutMs = 5000): Promise<Proac
     errors.push({ scope: "list-businesses", message: errMessage(error) });
   }
   for (const business of businesses) {
+    // A pause/unconfigure/ineligible branch above awaits per account; a
+    // disable landing inside any of those awaits must stop this refresh
+    // from reaching the next business's registration — the registration
+    // itself performs a fresh token read. The post-loop drain then stops
+    // anything already managed.
+    if (isDisabled()) break;
     try {
       if (business.status !== "active") {
         for (const [accountId, meta] of managed) {
