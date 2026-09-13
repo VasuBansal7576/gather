@@ -412,6 +412,27 @@ function ProposalPanel({
           </div>
         ))}
       </div>
+      {proposal.offer ? (
+        <div className="gather-offer-detail">
+          <div className="gather-offer-scope"><Icon name="pin" size={13} /><strong>{proposal.offer.spaceName}</strong><span>{proposal.offer.guestCount} guests</span></div>
+          {proposal.offer.terms.length > 0 ? (
+            <ul className="gather-offer-terms">
+              {proposal.offer.terms.map((term) => <li key={term}>{term}</li>)}
+            </ul>
+          ) : null}
+          {proposal.offer.unknownCosts.length > 0 || proposal.offer.unknownPrices.length > 0 ? (
+            <p className="gather-offer-unknown">
+              Not fully priced — unknown {[...proposal.offer.unknownPrices, ...proposal.offer.unknownCosts].join(", ")}. No profit is claimed.
+            </p>
+          ) : null}
+          {proposal.offer.note ? <p className="gather-offer-note">{proposal.offer.note}</p> : null}
+        </div>
+      ) : null}
+      {proposal.offerInvalid ? (
+        <p className="gather-action-note is-error" role="alert">
+          The offer on this proposal could not be verified — pricing cannot be reviewed, so it must not be approved.
+        </p>
+      ) : null}
       <div className="gather-proposal-total">
         <div><span className="gather-total-label">Total</span><strong>{proposal.total}</strong></div>
         <div className="gather-total-context"><span>{proposal.deposit}</span><span>{proposal.validUntil}</span></div>
@@ -427,6 +448,9 @@ function ProposalPanel({
         <details className="gather-technical-details">
           <summary>Technical identifiers</summary>
           <p>Proposal <strong>{proposal.id}</strong> · version <strong>{proposal.version}</strong> · fingerprint <code>{proposal.fingerprint}</code></p>
+          {proposal.offer?.preparationFingerprint ? (
+            <p>Offer preparation <code>{proposal.offer.preparationFingerprint}</code></p>
+          ) : null}
         </details>
       </div>
       {proposal.emailPreview ? (
@@ -448,6 +472,7 @@ function ApprovalFooter({
   approvalFailed,
   approvalComplete,
   canApprove,
+  offerInvalid,
   canEdit,
   onApprove,
   onEdit,
@@ -457,11 +482,13 @@ function ApprovalFooter({
   /** True only when every receipt scoped to this exact action/version succeeded. */
   approvalComplete: boolean;
   canApprove: boolean;
+  /** The payload carried an offer snapshot that failed validation — approval is impossible to review meaningfully. */
+  offerInvalid?: boolean;
   canEdit: boolean;
   onApprove: () => void;
   onEdit: () => void;
 }) {
-  const approveDisabled = approvalPending || approvalComplete || !canApprove;
+  const approveDisabled = approvalPending || approvalComplete || !canApprove || offerInvalid === true;
   return (
     <div className="gather-review-footer">
       <div className="gather-review-actions">
@@ -470,23 +497,25 @@ function ApprovalFooter({
           className={`gather-approve-button ${approvalComplete ? 'is-complete' : ''}`}
           disabled={approveDisabled}
           aria-disabled={approveDisabled}
-          title={approvalComplete ? 'This exact proposal version is already approved — receipts for each step are shown above' : canApprove ? undefined : 'Approval is not available in this workspace yet'}
+          title={approvalComplete ? 'This exact proposal version is already approved — receipts for each step are shown above' : offerInvalid ? 'The offer snapshot could not be verified — this proposal cannot be approved' : canApprove ? undefined : 'Approval is not available in this workspace yet'}
           onClick={onApprove}
         >
           <Icon name={approvalComplete ? 'check' : approvalPending ? 'clock' : approvalFailed ? 'refresh' : 'send'} size={16} />{approvalComplete ? 'Proposal approved' : approvalPending ? 'Approval sent — waiting' : approvalFailed ? 'Try approval again' : 'Approve proposal'}
         </button>
         <button type="button" className="gather-secondary-button" disabled={!canEdit} aria-disabled={!canEdit} title={canEdit ? undefined : 'Editing is not available in this workspace yet'} onClick={onEdit}><Icon name="edit" size={15} />Edit offer</button>
       </div>
-      <p className={`gather-action-note ${approvalFailed ? 'is-error' : ''}`} role={approvalFailed ? 'alert' : 'status'}>
+      <p className={`gather-action-note ${approvalFailed || offerInvalid ? 'is-error' : ''}`} role={approvalFailed || offerInvalid ? 'alert' : 'status'}>
         {approvalComplete
           ? 'Approved — each step\'s outcome is in the receipts above. A hold is not a confirmed booking.'
-          : approvalFailed
-            ? 'The approval request did not go through. Nothing was sent — you can try again.'
-            : approvalPending
-              ? 'The approval request is on its way. This is not confirmed.'
-              : canApprove
-                ? 'A sent request is not a hold, and a hold is not a confirmed booking.'
-                : 'Approval and editing are not available in this workspace yet.'}
+          : offerInvalid
+            ? 'The offer on this proposal could not be verified — do not approve it.'
+            : approvalFailed
+              ? 'The approval request did not go through. Nothing was sent — you can try again.'
+              : approvalPending
+                ? 'The approval request is on its way. This is not confirmed.'
+                : canApprove
+                  ? 'A sent request is not a hold, and a hold is not a confirmed booking.'
+                  : 'Approval and editing are not available in this workspace yet.'}
       </p>
     </div>
   );
@@ -733,6 +762,7 @@ function BookingDetailPanel({
         approvalFailed={approvalFailed}
         approvalComplete={approvalComplete}
         canApprove={canApprove}
+        offerInvalid={proposal.offerInvalid}
         canEdit={canEdit}
         onApprove={() => onApprove(booking)}
         onEdit={() => onEdit(booking)}
