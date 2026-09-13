@@ -1,9 +1,12 @@
-# Booking approval API (DEMO ONLY)
+# Booking approval API
 
-Local, durable booking-approval service backed by SQLite and deterministic
-demo connectors. Every response is explicitly marked
-`{ "demo": true, "mode": { "kind": "demo", "label": "DEMO ONLY", ... } }`.
-Nothing here calls a live provider; receipts are simulated.
+Local, durable booking-approval service backed by SQLite and injectable
+connectors. Every response carries an evidence-derived marker:
+`{ "demo": true, "mode": { "kind": "demo" } }` only when the booking's
+sources are all explicit fixtures; `kind: "live"` when every succeeded step
+carries positive provider proof; and `kind: "unknown"` (`demo: false`) for
+real bookings whose receipts are unproven — never a blanket demo claim over
+real records.
 
 Typed contract: `src/server/dto.ts` (UI should import these types).
 Service functions (injectable clock/connectors): `src/server/booking-service.ts`.
@@ -161,11 +164,16 @@ at the last-created action, preserving the old confirmation behavior.
 Every completed step result embeds the serving connector's proof
 (`{ mode, simulated, provenance }`) taken from its response metadata — it is
 read back, never re-derived. A receipt reads as live only on positive proof:
-live mode, explicitly not simulated, non-empty provenance, zero fictional
-refs. Missing/malformed proof (legacy rows, unknown connectors), simulated
-results, and fixture refs all fail closed to demo, and completion notes name
-the actual proof per step instead of blanket-claiming simulated. Fixture
-receipts are never upgraded to live, at the service or at display.
+live mode, explicitly not simulated, and a non-empty provenance list whose
+every entry is a valid non-fixture source ref (supported kind + non-empty
+locator). Missing proof reads as "unverified" — never as simulated — while
+simulated-mode proofs read as simulated, and completion notes name the
+actual proof per step. Fixture receipts are never upgraded to live, at the
+service or at display.
+
+Reconciliation revalidates the durable current-proposal authority AFTER the
+provider call returns and before any state mutation: a proposal superseded
+mid-await keeps its execution uncertain and never moves the booking status.
 
 ## Errors
 
