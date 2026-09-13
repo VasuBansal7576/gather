@@ -63,7 +63,11 @@ export interface ProactiveHostOptions {
    * simulated provenance so fixtures are never mistaken for live mail.
    */
   provenance?: { simulated: boolean; label: string };
-  /** Kill-switch: GATHER_PROACTIVE_DISABLE=1 (or true here) registers nothing. */
+  /**
+   * Kill-switch: GATHER_PROACTIVE_DISABLE=1 (or true here) registers nothing
+   * and drains already-managed bindings on every ensure/refresh. Durable
+   * state and operator wiring survive so re-enable resumes cleanly.
+   */
   disabled?: boolean;
 }
 
@@ -124,6 +128,23 @@ export function getExtractionAssemblyHook(): ExtractionAssemblyHook | undefined 
 
 export function isWatching(binding: ProactiveBindingState | undefined): boolean {
   return binding !== undefined && binding.status === "running" && binding.lastOk === true;
+}
+
+/**
+ * Emergency pause, honored on EVERY ensure/refresh — not just the first
+ * bootstrap. `options.disabled` is refreshed by the caller's latest ensure;
+ * the env kill-switch is re-read per call so `GATHER_PROACTIVE_DISABLE=1`
+ * set after bootstrap still takes effect.
+ */
+function isDisabled(): boolean {
+  return context?.disabled === true || process.env.GATHER_PROACTIVE_DISABLE === "1";
+}
+
+/** Stop every managed timer while keeping durable state and operator wiring. */
+async function pauseAllManaged(drainTimeoutMs: number): Promise<void> {
+  for (const accountId of [...managed.keys()]) {
+    await stopManaged(accountId, "paused", drainTimeoutMs);
+  }
 }
 
 function nowIso(): string {
@@ -193,6 +214,15 @@ export async function refreshProactiveHost(drainTimeoutMs = 5000): Promise<Proac
   }
   const eligible = new Set<string>();
   let businesses: Array<{ id: string; status: string }> = [];
+  if (isDisabled()) {
+    // Disabled before any registration: drain managed timers, keep durable
+    // rows and operator deps so re-enable resumes without re-onboarding.
+    await pauseAllManaged(drainTimeoutMs);
+    refreshErrors.length = 0;
+    refreshErrors.push(...errors);
+    refreshedAt = nowIso();
+    return buildReport(providerConfigured);
+  }
   try {
     businesses = store.listBusinesses().map((business) => ({ id: business.id, status: business.status }));
   } catch (error) {
@@ -266,6 +296,11 @@ export async function refreshProactiveHost(drainTimeoutMs = 5000): Promise<Proac
     } catch (error) {
       errors.push({ scope: `account:${accountId}`, message: errMessage(error) });
     }
+  }
+  // A disable that landed while this refresh was in flight must not leave
+  // freshly registered timers running: drain again before reporting.
+  if (isDisabled()) {
+    await pauseAllManaged(drainTimeoutMs);
   }
   refreshErrors.length = 0;
   refreshErrors.push(...errors);
@@ -376,15 +411,13 @@ export function proactiveHostStatus(): ProactiveHostReport {
  */
 export function ensureProactiveHost(options: ProactiveHostOptions): void {
   context = options;
-  if (bootstrapped) {
-    void refreshProactiveHost().catch(() => undefined);
-    return;
+  if (!bootstrapped) {
+    bootstrapped = true;
+    startedAt = options.now ? options.now() : new Date().toISOString();
   }
-  bootstrapped = true;
-  startedAt = options.now ? options.now() : new Date().toISOString();
-  if (options.disabled === true || process.env.GATHER_PROACTIVE_DISABLE === "1") {
-    return;
-  }
+  // refreshProactiveHost gates on the disable switch itself, so every call
+  // — initial bootstrap, later ensures, and route-triggered refreshes —
+  // honors the emergency pause uniformly.
   void refreshProactiveHost().catch(() => undefined);
 }
 
