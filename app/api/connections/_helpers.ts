@@ -7,6 +7,7 @@ const STATUS_BY_CODE: Record<string, number> = {
   INVALID_REQUEST: 400,
   REPLAY: 409,
   NOT_FOUND: 404,
+  STALE: 409,
   CROSS_BUSINESS: 409,
   ACCESS_REVOKED: 409,
   EXCHANGE_FAILED: 502,
@@ -23,7 +24,7 @@ export function connectionErrorResponse(error: unknown): NextResponse {
   }
   if (error instanceof ConnectionError) {
     return NextResponse.json(
-      { code: error.code, message: error.message, retryable: error.code === "EXCHANGE_FAILED" },
+      { code: error.code, message: error.message, retryable: error.retryable },
       { status: STATUS_BY_CODE[error.code] ?? 500 },
     );
   }

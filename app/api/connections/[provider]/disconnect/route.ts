@@ -12,7 +12,8 @@ export async function POST(req: Request, ctx: { params: Promise<{ provider: stri
     if (provider !== "google") throw new ValidationError(`Unsupported provider: ${provider}`);
     const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
     const accountId = parseId(body.accountId, "accountId");
-    const result = await getConnectionService().disconnect(accountId);
+    const businessId = parseId(body.businessId, "businessId");
+    const result = await getConnectionService().disconnect({ accountId, businessId });
     return NextResponse.json(result);
   } catch (error) {
     return connectionErrorResponse(error);

@@ -20,9 +20,16 @@ contract below.
 - `connection_auth_sessions`: single-use OAuth sessions — hashed state,
   PKCE verifier reference, expiry (10 min), business scope.
 - `connection_accounts`: one row per verified provider identity
-  (`UNIQUE(provider, account_key)`), linking the capability rows.
-- `connection_token_meta`: token *references* — secret-store keys and the
-  access-token expiry; never token material.
+  (`UNIQUE(provider, account_key)`), linking the capability rows. A
+  monotonic `revision` fences every binding change — disconnect, revoke,
+  refresh — so in-flight refreshes can never resurrect deleted secrets or
+  return a token for a binding that changed mid-exchange (also makes
+  cross-process refreshes fail closed rather than double-commit).
+- `connection_token_meta`: token *references* — versioned secret-store
+  keys and the access-token expiry; never token material. New secrets are
+  staged under fresh refs and published only on DB commit; superseded
+  refs are deleted after commit, and a reauthorization that omits a new
+  refresh token preserves the previously granted one.
 
 All state lives in the injected GatherStore SQLite database. No second
 database, no credential form, no assumed hardcoded account.
@@ -37,8 +44,16 @@ database, no credential form, no assumed hardcoded account.
   `BEGIN IMMEDIATE` — a replayed or unknown state is `REPLAY`.
 - **Loopback-only redirects**: the configured `redirectUri` must be an
   `http://localhost|127.0.0.1|[::1]` URL ending exactly in
-  `/api/connections/google/callback`; anything else makes the connection
-  `unavailable` instead of redirecting the owner elsewhere.
+  `/api/connections/google/callback` with no userinfo, query, or
+  fragment; anything else makes the connection `unavailable` instead of
+  redirecting the owner elsewhere.
+- **Structural provider errors**: transport failures classify by the
+  OAuth `error` code only — `invalid_grant`/`unauthorized_client` mark
+  the connection `revoked` (`ACCESS_REVOKED`); anything else stays
+  retryable `EXCHANGE_FAILED`. Provider description text never surfaces —
+  it may carry sensitive material. Production requests are bounded by a
+  10 s timeout and a 64 KiB response cap, and `expires_in` must be a
+  positive finite number.
 - **Verified identity**: the account key comes from the provider's userinfo
   endpoint called with the fresh access token — never from callback text.
   An account already bound to a different business is `CROSS_BUSINESS`.
@@ -59,11 +74,16 @@ database, no credential form, no assumed hardcoded account.
 - `getConnections(businessId)` → `ConnectionsSummaryDTO`
 - `startAuthorization({ businessId, provider, displayName? })` → `{ authorizationUrl, expiresAt }`
 - `completeAuthorization({ code, state })` → `AuthorizationCompleteDTO` (async; transport calls)
-- `accessToken(connectionId)` → fresh access token (async; refreshes)
-- `disconnect(connectionId)` → `{ disconnected: true }` (accepts connection or connected-account id)
+- `providerReadiness()` → `{provider, status:'available'|'unavailable', unavailableReason?}`
+- `accessToken({accountId, businessId})` → fresh access token (async; refreshes).
+  `accountId` accepts the connection id OR a public connected_accounts id
+  from the DTO; `businessId` scopes the lookup explicitly.
+- `disconnect({accountId, businessId})` → `{ disconnected: true }` —
+  same resolution and scope rules.
 - Errors: `ConnectionError` — `UNAVAILABLE`, `INVALID_REQUEST`, `REPLAY`,
-  `NOT_FOUND`, `CROSS_BUSINESS`, `ACCESS_REVOKED`, `EXCHANGE_FAILED`,
-  `MISSING_SCOPE`.
+  `NOT_FOUND`, `STALE`, `CROSS_BUSINESS`, `ACCESS_REVOKED`,
+  `EXCHANGE_FAILED`, `MISSING_SCOPE`; `providerError` carries structural
+  OAuth codes and `retryable` flags transient failures.
 
 ## Host wiring (documented handoff — shared runtime.ts unchanged)
 
@@ -72,10 +92,21 @@ it borrows `getRuntime().store`, reads provider app metadata from
 `GATHER_GOOGLE_CLIENT_ID` / `GATHER_GOOGLE_CLIENT_SECRET` /
 `GATHER_GOOGLE_REDIRECT_URI` / `GATHER_GOOGLE_SCOPES`, injects
 `FetchOAuthTransport`, and defaults secrets to `KeychainSecretStore`
-(macOS `security` CLI, `service=gather-connections-<workspaceHash>` — it
-can only touch entries it created) or `EnvSecretStore` when
-`GATHER_SECRETS=env`. A different host injects its own
-`SecretStore`/`OAuthTransport` via `createConnectionService` instead.
+or `EnvSecretStore` when `GATHER_SECRETS=env`. A different host injects
+its own `SecretStore`/`OAuthTransport` via `createConnectionService`
+instead. Internal diagnostics: `GATHER_*` variable names and the
+`security`/`swift` binaries are host-operations detail — the owner-facing
+DTOs only ever say "Google connection is unavailable in this
+installation".
+
+`KeychainSecretStore` namespaces to
+`service=gather-connections-<workspaceHash>` — it can only touch entries
+it created. Writes go through a native SecItem boundary (`swift -e`
+helper) with the secret on stdin — never argv — because
+`security add-generic-password -w` would expose it to `ps`. Reads and
+deletes use `security` (argv carries only the service name and account
+key). The command runner is injectable (`KeychainRunner`), which is how
+tests assert the argv hygiene without ever touching a real keychain.
 
 ## Routes
 
@@ -95,8 +126,8 @@ can only touch entries it created) or `EnvSecretStore` when
   `/setup?businessId=...&connectionError=CODE` — the redirect target is
   server-owned (`/setup`) and preserves the session's business context;
   `?format=json` returns the result body for scripted flows.
-- `POST /api/connections/google/disconnect` `{accountId}` →
-  `{disconnected:true}` (same-origin guarded)
+- `POST /api/connections/google/disconnect` `{accountId, businessId}` →
+  `{disconnected:true}` (same-origin guarded; business scope is explicit)
 
 Error bodies everywhere are `{ code, message, retryable }` with codes from
 `ConnectionError` plus `CROSS_ORIGIN_DENIED`/`INVALID_REQUEST`.
