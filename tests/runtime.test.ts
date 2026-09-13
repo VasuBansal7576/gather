@@ -448,6 +448,64 @@ test("connect rejects honestly when the listener never appears", async () => {
   assert.equal(connection.currentState, "closed");
 });
 
+test("close() racing a late-accepting probe never creates or starts a transport", async () => {
+  // The probe's final attempt resolves true AFTER close() ran — the factory
+  // and start() must still not run, or a dead connection resurrects.
+  let probeCalls = 0;
+  let factoryCalled = false;
+  let transportStarted = false;
+  const connection = new GatherGatewayConnection(
+    { url: FAKE_WS_URL, token: "t" },
+    {
+      probeListener: async () => {
+        probeCalls += 1;
+        if (probeCalls === 1) return false; // first probe refused
+        // Second probe: close lands while this await is in flight, then
+        // accept arrives — must NOT reach the factory below.
+        await new Promise((r) => setTimeout(r, 30));
+        return true;
+      },
+      transportFactory: (options) => {
+        factoryCalled = true;
+        const transport = fakeTransportFactory({ hello: true }).factory(options);
+        const innerStart = transport.start;
+        transport.start = () => { transportStarted = true; innerStart(); };
+        return transport;
+      },
+    },
+  );
+  const pending = connection.connect({ timeoutMs: 10000 });
+  setTimeout(() => void connection.close(), 10).unref();
+  await assert.rejects(pending, /closed/);
+  // Let the second probe's resolution land.
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(factoryCalled, false, "transport factory ran after close");
+  assert.equal(transportStarted, false, "transport.start ran after close");
+});
+
+test("concurrent connect calls produce at most one transport", async () => {
+  // Two connects before the transport is allocated: the second must reject
+  // immediately and exactly one transport may exist.
+  let factoryCalls = 0;
+  const connection = new GatherGatewayConnection(
+    { url: FAKE_WS_URL, token: "t" },
+    {
+      probeListener: async () => { await new Promise((r) => setTimeout(r, 20)); return true; },
+      transportFactory: (options) => {
+        factoryCalls += 1;
+        return fakeTransportFactory({ hello: true }).factory(options);
+      },
+    },
+  );
+  const first = connection.connect({ timeoutMs: 5000 });
+  const second = connection.connect({ timeoutMs: 5000 });
+  await assert.rejects(second, /already started/);
+  await first;
+  assert.equal(factoryCalls, 1);
+  assert.equal(connection.isReady, true);
+  await connection.close();
+});
+
 test("close during the listener probe aborts connect promptly", async () => {
   const probe = createServer();
   const port = await new Promise<number>((resolvePort) => {
