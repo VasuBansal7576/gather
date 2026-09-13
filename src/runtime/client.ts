@@ -109,7 +109,10 @@ export class GatherGatewayConnection {
   private transport: GatewayTransport | null = null;
   private hello: HelloOk | null = null;
   private state: GatewayConnectionState = "disconnected";
+  private connectInFlight = false;
   private readyResolve: ((hello: HelloOk) => void) | null = null;
+  private readyReject: ((error: Error) => void) | null = null;
+  private readyTimer: NodeJS.Timeout | null = null;
 
   constructor(
     options: GatherGatewayClientOptions,
@@ -171,7 +174,16 @@ export class GatherGatewayConnection {
    * owns socket reconnect/backoff once the transport starts.
    */
   async connect(opts: { timeoutMs?: number } = {}): Promise<HelloOk> {
-    if (this.transport) throw new Error("connection already started");
+    if (this.transport || this.connectInFlight) throw new Error("connection already started");
+    this.connectInFlight = true;
+    try {
+      return await this.connectInner(opts);
+    } finally {
+      this.connectInFlight = false;
+    }
+  }
+
+  private async connectInner(opts: { timeoutMs?: number }): Promise<HelloOk> {
     const timeoutMs = opts.timeoutMs ?? 30000;
     const deadlineMs = Date.now() + timeoutMs;
     this.setState("connecting");
@@ -184,6 +196,11 @@ export class GatherGatewayConnection {
     } catch (error) {
       this.setState("closed");
       throw error;
+    }
+    // close() may have landed during the final probe await: never create or
+    // start a transport for a closed connection.
+    if (this.state === "closed") {
+      throw new Error("connection closed while waiting for the gateway listener");
     }
 
     this.transport = this.factory({
@@ -215,15 +232,24 @@ export class GatherGatewayConnection {
     });
 
     const ready = new Promise<HelloOk>((resolvePromise, rejectPromise) => {
-      const deadline = setTimeout(() => {
+      this.readyTimer = setTimeout(() => {
         this.readyResolve = null;
+        this.readyReject = null;
         rejectPromise(
           new Error(`gateway hello-ok not received within ${timeoutMs}ms`),
         );
       }, Math.max(1, deadlineMs - Date.now()));
       this.readyResolve = (hello) => {
-        clearTimeout(deadline);
+        if (this.readyTimer) clearTimeout(this.readyTimer);
+        this.readyTimer = null;
+        this.readyReject = null;
         resolvePromise(hello);
+      };
+      this.readyReject = (error) => {
+        if (this.readyTimer) clearTimeout(this.readyTimer);
+        this.readyTimer = null;
+        this.readyResolve = null;
+        rejectPromise(error);
       };
     });
 
@@ -259,6 +285,9 @@ export class GatherGatewayConnection {
 
   async close(opts: { timeoutMs?: number } = {}): Promise<void> {
     this.setState("closed");
+    // Reject an in-flight hello wait promptly instead of letting it run out
+    // the shared deadline.
+    this.readyReject?.(new Error("gateway connection closed"));
     const transport = this.transport;
     this.transport = null;
     this.hello = null;
