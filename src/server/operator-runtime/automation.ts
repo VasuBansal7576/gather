@@ -22,6 +22,8 @@ export const DEFAULT_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
 export const MIN_SWEEP_INTERVAL_MS = 30 * 1000;
 export const MAX_SWEEP_INTERVAL_MS = 24 * 60 * 60 * 1000;
 export const DEFAULT_MAX_CONSECUTIVE_ERRORS = 5;
+/** Real-time bound for one sweep body before it is declared stuck (degraded). */
+export const DEFAULT_MAX_SWEEP_MS = 10 * 60 * 1000;
 
 export type ProactiveBindingStatus = "running" | "stopped" | "degraded";
 
@@ -39,6 +41,8 @@ export interface ProactiveBindingConfig {
   runSweep: () => Promise<unknown>;
   intervalMs?: number;
   maxConsecutiveErrors?: number;
+  /** Real-time bound for one sweep before it is declared stuck. Never the business clock. */
+  maxSweepMs?: number;
   clock?: () => number;
 }
 
@@ -61,15 +65,17 @@ export interface ProactiveBindingState {
 interface BindingRecord extends ProactiveBindingState {
   runSweep: () => Promise<unknown>;
   maxConsecutiveErrors: number;
+  maxSweepMs: number;
   clock: () => number;
   timer: ReturnType<typeof setInterval> | undefined;
   /**
-   * Per-account sweep latch shared across refreshes: a re-registered
-   * binding keeps overlap protection against a still-running old sweep,
-   * and the old sweep's completion clears the shared latch (never a
-   * per-record flag that would wedge the fresh binding forever).
+   * Per-account sweep latch from the SHARED registry below — never a fresh
+   * object per lifecycle. A re-registered (or remove + re-registered)
+   * binding keeps overlap protection against a still-running old sweep
+   * body, and that old completion clears the shared latch. A fresh latch
+   * per lifecycle would let the new body overlap the old one.
    */
-  sweepCell: { inFlight: boolean; promise?: Promise<unknown> };
+  sweepCell: SweepCell;
   /**
    * Monotonic epoch: bumped on stop/remove. A sweep that completes after
    * its binding was stopped/degraded writes its outcome nowhere — late
@@ -78,7 +84,30 @@ interface BindingRecord extends ProactiveBindingState {
   epoch: number;
 }
 
+interface SweepCell {
+  inFlight: boolean;
+  promise?: Promise<unknown>;
+}
+
 const bindings = new Map<string, BindingRecord>();
+
+/**
+ * Per-account latch registry, independent of binding-record lifecycles.
+ * removeProactiveBinding drops the record but keeps the cell until the
+ * orphan body settles, so a re-register cannot start overlapping work.
+ * Cells for accounts with no live binding are released when the orphan
+ * completion is observed.
+ */
+const sweepCells = new Map<string, SweepCell>();
+
+function cellFor(accountId: string): SweepCell {
+  let cell = sweepCells.get(accountId);
+  if (!cell) {
+    cell = { inFlight: false };
+    sweepCells.set(accountId, cell);
+  }
+  return cell;
+}
 
 /** Real-clock deadline for the bounded stop drain — NEVER the injectable
  *  business clock (a frozen clock would make the drain spin forever). */
@@ -121,7 +150,15 @@ export function registerProactiveBinding(config: ProactiveBindingConfig): Proact
   if (!Number.isInteger(intervalMs) || intervalMs < MIN_SWEEP_INTERVAL_MS || intervalMs > MAX_SWEEP_INTERVAL_MS) {
     throw new Error(`intervalMs must be an integer in ${MIN_SWEEP_INTERVAL_MS}..${MAX_SWEEP_INTERVAL_MS}`);
   }
+  if (config.maxSweepMs !== undefined && (!Number.isInteger(config.maxSweepMs) || config.maxSweepMs <= 0)) {
+    throw new Error("maxSweepMs must be a positive integer when present");
+  }
   const existing = bindings.get(config.accountId);
+  if (existing && existing.businessId !== config.businessId) {
+    throw new Error(
+      `Proactive binding for account ${config.accountId} belongs to business ${existing.businessId}; remove it before rebinding to ${config.businessId}`,
+    );
+  }
   if (existing?.timer !== undefined) {
     clearInterval(existing.timer);
     existing.epoch += 1; // late writes from a prior lifecycle are dead
@@ -137,11 +174,12 @@ export function registerProactiveBinding(config: ProactiveBindingConfig): Proact
     consecutiveErrors: 0,
     runSweep: config.runSweep,
     maxConsecutiveErrors: config.maxConsecutiveErrors ?? DEFAULT_MAX_CONSECUTIVE_ERRORS,
+    maxSweepMs: config.maxSweepMs ?? DEFAULT_MAX_SWEEP_MS,
     clock: config.clock ?? Date.now,
     timer: undefined,
-    // Keep overlap protection against a still-running old sweep; the old
-    // sweep's completion clears the shared latch, not a dead record's flag.
-    sweepCell: existing?.sweepCell ?? { inFlight: false },
+    // Registry latch, never a fresh object: overlap protection survives
+    // refresh AND remove/re-register until the old body settles.
+    sweepCell: cellFor(config.accountId),
     epoch: 0,
   };
   record.timer = setInterval(() => {
@@ -188,10 +226,17 @@ export async function stopProactiveBinding(accountId: string, drainTimeoutMs = 3
   const cell = record.sweepCell;
   if (cell.inFlight && cell.promise) {
     const deadline = realDeadline(drainTimeoutMs);
-    await Promise.race([
-      cell.promise.catch(() => {}),
-      new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), Math.max(0, deadline - Date.now()))),
-    ]);
+    let drainTimer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<"timeout">((resolve) => {
+      drainTimer = setTimeout(() => resolve("timeout"), Math.max(0, deadline - Date.now()));
+    });
+    try {
+      await Promise.race([cell.promise.catch(() => {}), timeout]);
+    } finally {
+      // Never retain the drain timer past the wait: an early sweep finish
+      // must not hold the event loop for the whole bound after shutdown.
+      if (drainTimer !== undefined) clearTimeout(drainTimer);
+    }
   }
   return snapshot(record);
 }
@@ -224,6 +269,34 @@ export async function tickBinding(accountId: string): Promise<ProactiveSweepResu
   const running = (async () => record.runSweep())();
   cell.promise = running;
   const writeable = () => record.epoch === epochAtStart && record.status === "running";
+  // Real-time stuck watchdog (never the business clock): a body that never
+  // settles is declared explicitly stuck — degraded with the reason kept —
+  // instead of running forever. Ownership and the tombstone are retained
+  // (no forced new body); a late completion still clears the shared latch
+  // but writes nothing. Re-register to resume.
+  let settled = false;
+  let watchdog: ReturnType<typeof setTimeout> | undefined;
+  const armWatchdog = (): void => {
+    watchdog = setTimeout(() => {
+      if (settled || cell.promise !== running) return;
+      // Attribute the stuck state to the live record sharing this latch
+      // when there is one (e.g. a refresh that inherited it); otherwise to
+      // the captured record. Either way the tombstone is reachable.
+      const current = bindings.get(accountId);
+      const target = current && current.sweepCell === cell ? current : record;
+      target.lastRunAt = nowIso(target);
+      target.lastOk = false;
+      target.lastError = `sweep body did not settle within ${record.maxSweepMs}ms; treated as stuck (ownership retained, re-register to resume)`;
+      if (target.timer !== undefined) {
+        clearInterval(target.timer);
+        target.timer = undefined;
+      }
+      target.status = "degraded";
+      target.degradedAt = target.lastRunAt;
+    }, record.maxSweepMs);
+    watchdog.unref?.();
+  };
+  armWatchdog();
   try {
     await running;
     if (writeable()) {
@@ -253,8 +326,11 @@ export async function tickBinding(accountId: string): Promise<ProactiveSweepResu
     const lastError = record.lastError ?? (error instanceof Error ? error.message : String(error));
     return { ok: false, at: nowIso(record), skippedOverlap: false, error: lastError, state: snapshot(record) };
   } finally {
+    settled = true;
+    if (watchdog !== undefined) clearTimeout(watchdog);
     cell.inFlight = false;
     cell.promise = undefined;
+    if (!bindings.has(accountId)) sweepCells.delete(accountId);
   }
 }
 
@@ -306,6 +382,7 @@ export function resetProactiveAutomation(): void {
     if (record.timer !== undefined) clearInterval(record.timer);
   }
   bindings.clear();
+  sweepCells.clear();
 }
 
 // ---------------------------------------------------------------------------
