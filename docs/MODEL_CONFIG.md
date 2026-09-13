@@ -11,7 +11,8 @@ outside this lane.
 Exactly one owner-authorized ref, enforced in code
 (`GATHER_SUPPORTED_MODELS` in `src/runtime/config.ts`):
 
-- `openai-codex/gpt-5.6-luna` via the Codex subscription ONLY.
+- `openai/gpt-5.6-luna` via the owner OAuth subscription ONLY
+  (verified actual: provider `openai`, profile `openai:bansalv8198@gmail.com`).
 - No alternate model, no `fallbacks` chain, no API-key fallback.
 
 ## Exact API (for the live-model runner)
@@ -26,10 +27,10 @@ const runtime = new GatherOpenClawRuntime({
   rootDir: "<repo>/.runtime/openclaw",
   gatewayPort: 18789,
   model: {
-    model: "openai-codex/gpt-5.6-luna",
+    model: "openai/gpt-5.6-luna",
     auth: {
-      profileId: "<authorized-profile-id>", // metadata only, never a secret
-      provider: "openai-codex",              // must equal the model ref provider
+      profileId: "openai:bansalv8198@gmail.com", // metadata only, never a secret
+      provider: "openai",              // must equal the model ref provider
       mode: "oauth",                         // literal: api_key is unrepresentable
       email: "bansalv8198@gmail.com",        // optional, selection surfaces
       // displayName?: string                // optional, selection surfaces
@@ -39,7 +40,7 @@ const runtime = new GatherOpenClawRuntime({
 
 // Gate before live-model runs:
 runtime.modelStatus();
-// → { ready: true, model: "openai-codex/gpt-5.6-luna" }
+// → { ready: true, model: "openai/gpt-5.6-luna" }
 // → { ready: false, reason: "MODEL_NOT_CONFIGURED: ..." } when absent
 runtime.requireModelSelection(); // throws MODEL_NOT_CONFIGURED when absent
 ```
@@ -48,7 +49,7 @@ runtime.requireModelSelection(); // throws MODEL_NOT_CONFIGURED when absent
 
 `buildGatewayConfig` writes exactly these supported fields:
 
-- `agents.defaults.model = "openai-codex/gpt-5.6-luna"` — a bare
+- `agents.defaults.model = "openai/gpt-5.6-luna"` — a bare
   string, never the primary+fallbacks object.
 - `auth.profiles.<profileId> = { provider, mode: "oauth", email?,
   displayName? }` and `auth.order.<provider> = [<profileId>]` —
