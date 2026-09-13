@@ -35,6 +35,8 @@ export interface AvailabilityQuery {
 export interface ResourceQuery {
   businessId: string;
   bookingId: string;
+  proposalVersion: number;
+  proposalFingerprint: string;
   resourceIds: string[];
 }
 
@@ -197,6 +199,8 @@ export async function evaluateBookingReadiness(raw: unknown): Promise<ReadinessD
           input.verifiers.fetchResourceCommitments({
             businessId: input.businessId,
             bookingId: input.booking.id,
+            proposalVersion: input.proposal.proposalVersion,
+            proposalFingerprint: input.proposal.proposalFingerprint,
             resourceIds: [...new Set(requiredResourceIds)],
           }),
         )

@@ -115,8 +115,13 @@ export interface ResourceCommitment {
   resolver: "resource_registry";
   bookingId: string;
   resourceId: string;
+  /** Exact accepted proposal this commitment binds to; stale revisions are rejected. */
+  proposalVersion: number;
+  proposalFingerprint: string;
   status: "committed" | "requested" | "rejected" | "revoked" | "expired";
-  validUntil?: string;
+  /** Actual commitment coverage window; must cover the event window. */
+  startAt: string;
+  endAt: string;
   responsible?: string;
   observedAt: string;
   sourceRefs: SourceReference[];
@@ -139,6 +144,8 @@ export interface OwnerWaiver {
   bookingId: string;
   condition: ConditionKind;
   proposalVersion: number;
+  /** Exact accepted fingerprint; version alone never scopes a waiver. */
+  proposalFingerprint: string;
   waivedBy: string;
   waivedAt: string;
   reason: string;
@@ -359,4 +366,26 @@ export function assertValidHandoffInput(value: unknown): asserts value is BuildH
   if (!isRecord(value.decision.binding)) throw new Error("decision.binding must be an object");
   if (!Array.isArray(value.decision.conditions)) throw new Error("decision.conditions must be an array");
   if (!isRecord(value.booking) || !isRecord(value.proposal)) throw new Error("booking and proposal must be objects");
+}
+
+/**
+ * Booking snapshot and accepted proposal must describe the same event
+ * window: availability evaluates the proposal window while handoff and
+ * lifecycle guards read the booking snapshot, so a mismatch is a binding
+ * defect and evaluation is rejected, never averaged.
+ */
+export function requireConsistentWindows(
+  booking: { startAt?: string; endAt?: string },
+  payload: Record<string, unknown>,
+): void {
+  if (!isIso(booking.startAt) || !isIso(booking.endAt)) return;
+  const payloadStart: unknown = payload.startAt;
+  const payloadEnd: unknown = payload.endAt;
+  if (!isIso(payloadStart) || !isIso(payloadEnd)) return;
+  if (
+    new Date(Date.parse(booking.startAt)).toISOString() !== new Date(Date.parse(payloadStart)).toISOString() ||
+    new Date(Date.parse(booking.endAt)).toISOString() !== new Date(Date.parse(payloadEnd)).toISOString()
+  ) {
+    throw new Error("Binding mismatch: booking snapshot window differs from the accepted proposal window; reconcile before confirming");
+  }
 }
