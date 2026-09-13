@@ -2,6 +2,7 @@ import { EventEmitter } from "node:events";
 import { execFileSync, spawn } from "node:child_process";
 import { request as httpRequest } from "node:http";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -15,9 +16,11 @@ import {
   GatherRuntimeTasks,
   GatewayRequestFailed,
   OpenClawGatewayProcess,
+  allocateLoopbackPort,
   bookingSessionKey,
   buildGatewayChildEnv,
   buildGatewayConfig,
+  checkLoopbackPortOccupied,
   defineGatherTool,
   ensureLayoutDirectories,
   resolveGatherOpenClawLayout,
@@ -28,6 +31,7 @@ import {
   type SpawnLike,
   type RuntimeProcessLike,
   type RuntimeConnectionLike,
+  type RuntimeMcpBoundaryLike,
 } from "../src/runtime/index.ts";
 import type { GatewayClientOptions } from "@openclaw/gateway-client";
 
@@ -35,13 +39,65 @@ import type { GatewayClientOptions } from "@openclaw/gateway-client";
 
 const TEST_MCP_TOKEN = "gather-mcp-test-token-0123456789abcdef";
 
+// No fixed loopback ports anywhere in this file: every bound port is
+// OS-allocated per run (bind 127.0.0.1:0). A "free" probe result only reduces
+// collision probability — the eventual bind is authoritative (TOCTOU
+// remains), which the occupied-port regressions below exercise directly.
 function fixtureLayout() {
   const directory = mkdtempSync(join(tmpdir(), "gather-runtime-test-"));
+  // Config/env-only fixture: this port is never bound here, so a per-run
+  // unique placeholder (pid + counter) suffices; real binds always use
+  // freeLoopbackPort() below.
+  const port = 32000 + ((process.pid + fixturePortCounter++) % 20000);
   return {
-    layout: resolveGatherOpenClawLayout({ rootDir: join(directory, "openclaw"), port: 19199 }),
+    layout: resolveGatherOpenClawLayout({ rootDir: join(directory, "openclaw"), port }),
     cleanup: () => rmSync(directory, { recursive: true, force: true }),
   };
 }
+let fixturePortCounter = 0;
+
+/** OS-allocate a currently-free loopback port (bind 127.0.0.1:0, release). */
+async function freeLoopbackPort(): Promise<number> {
+  return allocateLoopbackPort();
+}
+
+/** Hold a loopback port with a real listener (simulates a foreign occupant). */
+async function holdLoopbackPort(port: number, host = "127.0.0.1"): Promise<Server> {
+  const server = createServer();
+  await new Promise<void>((resolvePromise, rejectPromise) => {
+    server.once("error", rejectPromise);
+    server.listen(port, host, () => resolvePromise());
+  });
+  return server;
+}
+
+async function closeServer(server: Server): Promise<void> {
+  await new Promise<void>((resolvePromise) => server.close(() => resolvePromise()));
+}
+
+/**
+ * Explicit absolute binary for real-boot tests. The task host provides
+ * /opt/homebrew/bin/openclaw; `which` is only a fallback because PATH can
+ * differ per launcher. Never declare "not installed" from PATH alone.
+ */
+function resolveTestBinary(): string | null {
+  const explicit = "/opt/homebrew/bin/openclaw";
+  try {
+    if (existsSync(explicit)) return explicit;
+  } catch {
+    // fall through to which
+  }
+  try {
+    const found = execFileSync("which", ["openclaw"], { encoding: "utf8" }).trim();
+    return found || null;
+  } catch {
+    return null;
+  }
+}
+
+// Placeholder URL for mock-transport tests: the fake transport never dials,
+// so no port here is ever bound. Kept as a constant to make that explicit.
+const FAKE_WS_URL = "ws://127.0.0.1:1";
 
 // ---------- isolation ----------
 
@@ -169,6 +225,57 @@ test("executable resolution: no bare PATH commands, explicit paths validated", (
   assert.equal(explicit.source, "explicit");
 });
 
+// ---------- loopback port allocation / occupancy probes ----------
+
+test("allocated loopback port is bindable; probe reports free-held-released faithfully", async () => {
+  const port = await freeLoopbackPort();
+  assert.equal(await checkLoopbackPortOccupied(port), false);
+  // A port we can actually bind is the only meaningful "free" evidence.
+  const server = await holdLoopbackPort(port);
+  try {
+    assert.equal(await checkLoopbackPortOccupied(port), true);
+  } finally {
+    await closeServer(server);
+  }
+  assert.equal(await checkLoopbackPortOccupied(port), false);
+});
+
+test("occupancy probe rejects non-port inputs instead of probing them", async () => {
+  for (const bad of [0, -1, 70000, 1.5, Number.NaN]) {
+    await assert.rejects(checkLoopbackPortOccupied(bad), /invalid loopback port/);
+  }
+});
+
+test("occupancy probe catches a wildcard-bound occupant, not just loopback", async () => {
+  // SO_REUSEADDR lets a 127.0.0.1 probe coexist with a 0.0.0.0 listener —
+  // the probe must check the wildcard address too or it reports FREE for
+  // an occupied port.
+  const port = await freeLoopbackPort();
+  const wildcard = await holdLoopbackPort(port, "0.0.0.0");
+  try {
+    assert.equal(await checkLoopbackPortOccupied(port), true, "0.0.0.0-bound occupant must be detected");
+  } finally {
+    await closeServer(wildcard);
+  }
+  assert.equal(await checkLoopbackPortOccupied(port), false);
+});
+
+test("two per-run allocations do not collide", async () => {
+  const first = await freeLoopbackPort();
+  const second = await freeLoopbackPort();
+  // Sequential allocate-release may legitimately recycle the same port, so
+  // hold the first while allocating the second: they must differ.
+  const held = await holdLoopbackPort(first);
+  try {
+    const third = await freeLoopbackPort();
+    assert.notEqual(third, first);
+    assert.equal(await checkLoopbackPortOccupied(third), false);
+    assert.equal(second >= 1 && second <= 65535, true);
+  } finally {
+    await closeServer(held);
+  }
+});
+
 // ---------- session / idempotency keys ----------
 
 test("per-booking session keys are deterministic and cannot alias distinct bookings", () => {
@@ -246,7 +353,7 @@ test("connect resolves on hello-ok and presents operator role, token and scopes"
   const { factory } = fakeTransportFactory({ hello: true });
   let captured: GatewayClientOptions | null = null;
   const connection = new GatherGatewayConnection(
-    { url: "ws://127.0.0.1:19199", token: "gather-gw-test" },
+    { url: FAKE_WS_URL, token: "gather-gw-test" },
     {
       transportFactory: (options) => {
         captured = options;
@@ -267,7 +374,7 @@ test("connect resolves on hello-ok and presents operator role, token and scopes"
 test("connect rejects when hello-ok never arrives", async () => {
   const { factory } = fakeTransportFactory({ hello: false });
   const connection = new GatherGatewayConnection(
-    { url: "ws://127.0.0.1:19199", token: "t" },
+    { url: FAKE_WS_URL, token: "t" },
     { transportFactory: factory },
   );
   await assert.rejects(connection.connect({ timeoutMs: 50 }), /hello-ok not received/);
@@ -278,7 +385,7 @@ test("a socket close after readiness surfaces a reconnecting state", async () =>
   let closeHandler: ((code: number, reason: string) => void) | undefined;
   const states: string[] = [];
   const connection = new GatherGatewayConnection(
-    { url: "ws://127.0.0.1:19199", token: "t", onStateChange: (s) => states.push(s) },
+    { url: FAKE_WS_URL, token: "t", onStateChange: (s) => states.push(s) },
     {
       transportFactory: (options) => {
         closeHandler = options.onClose;
@@ -298,7 +405,7 @@ test("submitTask calls the agent RPC with sessionKey, idempotencyKey and no deli
     respond: () => ({ runId: "run-1", acceptedAt: 1700000000000 }),
   });
   const connection = new GatherGatewayConnection(
-    { url: "ws://127.0.0.1:19199", token: "t" },
+    { url: FAKE_WS_URL, token: "t" },
     { transportFactory: factory },
   );
   await connection.connect({ timeoutMs: 1000 });
@@ -323,7 +430,7 @@ test("malformed agent responses are rejected, never trusted", async () => {
   for (const bad of [null, "nope", {}, { runId: 42 }, { runId: "r1" }, { runId: "r1", acceptedAt: "soon" }]) {
     const { factory } = fakeTransportFactory({ hello: true, respond: () => bad });
     const connection = new GatherGatewayConnection(
-      { url: "ws://127.0.0.1:19199", token: "t" },
+      { url: FAKE_WS_URL, token: "t" },
       { transportFactory: factory },
     );
     await connection.connect({ timeoutMs: 1000 });
@@ -342,7 +449,7 @@ test("agent.wait timeout is wait-only and never proves the run stopped", async (
     respond: (method) => (method === "agent.wait" ? { status: "timeout" } : {}),
   });
   const connection = new GatherGatewayConnection(
-    { url: "ws://127.0.0.1:19199", token: "t" },
+    { url: FAKE_WS_URL, token: "t" },
     { transportFactory: factory },
   );
   await connection.connect({ timeoutMs: 1000 });
@@ -367,7 +474,7 @@ test("terminal and unrecognized wait statuses map faithfully", async () => {
       respond: (method) => (method === "agent.wait" ? given : {}),
     });
     const connection = new GatherGatewayConnection(
-      { url: "ws://127.0.0.1:19199", token: "t" },
+      { url: FAKE_WS_URL, token: "t" },
       { transportFactory: factory },
     );
     await connection.connect({ timeoutMs: 1000 });
@@ -386,7 +493,7 @@ test("malformed chat.history responses are rejected", async () => {
     respond: () => ({ messages: "not-an-array" }),
   });
   const connection = new GatherGatewayConnection(
-    { url: "ws://127.0.0.1:19199", token: "t" },
+    { url: FAKE_WS_URL, token: "t" },
     { transportFactory: factory },
   );
   await connection.connect({ timeoutMs: 1000 });
@@ -403,7 +510,7 @@ test("non-timeout RPC failures are wrapped as GatewayRequestFailed", async () =>
     },
   });
   const connection = new GatherGatewayConnection(
-    { url: "ws://127.0.0.1:19199", token: "t" },
+    { url: FAKE_WS_URL, token: "t" },
     { transportFactory: factory },
   );
   await connection.connect({ timeoutMs: 1000 });
@@ -515,6 +622,71 @@ test("stop() escalates to SIGKILL and never reports stopped without an observed 
     await assert.rejects(process.stop(50, 50), /did not exit after SIGKILL/);
     assert.equal(process.currentState, "failed");
     assert.deepEqual(child.killed, ["SIGTERM", "SIGKILL"]);
+  } finally {
+    cleanup();
+  }
+});
+
+/** Gateway child exits 78; the spawned "doctor" child is the repair. */
+function repairSpawn(gateway: () => FakeChild, doctor: FakeChild) {
+  const spawned: string[][] = [];
+  const spawnFn = ((_command: string, args: string[]) => {
+    spawned.push(args);
+    return args.includes("doctor") ? doctor : gateway();
+  }) as unknown as SpawnLike;
+  return { spawnFn, spawned };
+}
+
+test("a hung doctor repair is bounded: deadline kills the tracked repair child and start rejects", async () => {
+  const { layout, cleanup } = fixtureLayout();
+  try {
+    ensureLayoutDirectories(layout);
+    const doctorChild = new FakeChild(true); // exits when killed
+    const { spawnFn } = repairSpawn(() => {
+      const child = new FakeChild(true);
+      queueMicrotask(() => child.emit("exit", 78, null));
+      return child;
+    }, doctorChild);
+    const process = new OpenClawGatewayProcess(
+      { layout, executable: { command: "/bin/sh" } },
+      { spawnFn, skipExecutableVerification: true, repairTimeoutMs: 60 },
+    );
+    const startedAt = Date.now();
+    await assert.rejects(process.start(), /doctor --fix exceeded 60ms/);
+    assert.ok(Date.now() - startedAt < 5000, "repair is bounded, never hangs start()");
+    assert.equal(process.currentState, "failed");
+    assert.ok(doctorChild.killed.includes("SIGTERM"), "hung repair child is terminated at the deadline");
+    await process.stop(500, 200);
+    assert.equal(process.currentState, "stopped");
+  } finally {
+    cleanup();
+  }
+});
+
+test("stop() during an in-flight repair kills the tracked repair child and cannot wedge", async () => {
+  const { layout, cleanup } = fixtureLayout();
+  try {
+    ensureLayoutDirectories(layout);
+    const doctorChild = new FakeChild(true);
+    const { spawnFn } = repairSpawn(() => {
+      const child = new FakeChild(true);
+      queueMicrotask(() => child.emit("exit", 78, null));
+      return child;
+    }, doctorChild);
+    const process = new OpenClawGatewayProcess(
+      { layout, executable: { command: "/bin/sh" } },
+      // 60s real deadline: the stop(), not the timer, must kill the repair.
+      { spawnFn, skipExecutableVerification: true, repairTimeoutMs: 60000 },
+    );
+    const starting = process.start();
+    while (process.currentState !== "repairing") {
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 5));
+    }
+    const stopping = process.stop(500, 200);
+    await assert.rejects(starting, /after doctor repair|after repair retry|exceeded/);
+    await stopping;
+    assert.ok(doctorChild.killed.includes("SIGKILL"), "stop() reached and killed the repair child");
+    assert.ok(["stopped", "failed"].includes(process.currentState));
   } finally {
     cleanup();
   }
@@ -830,20 +1002,25 @@ function fakeConnection(behavior: { failConnect?: string } = {}) {
   return { conn, state };
 }
 
-function runtimeFixture(overrides: {
+async function runtimeFixture(overrides: {
   processFactory?: (count: { n: number }) => RuntimeProcessLike;
   connectionFactory?: () => RuntimeConnectionLike;
+  mcpBoundaryFactory?: () => RuntimeMcpBoundaryLike;
   mcpPort?: number;
+  gatewayPort?: number;
 } = {}) {
   const directory = mkdtempSync(join(tmpdir(), "gather-facade-test-"));
   const count = { n: 0 };
   const runtime = new GatherOpenClawRuntime(
     {
       rootDir: join(directory, "openclaw"),
-      gatewayPort: 19511,
+      // Fake child never binds this port; per-run unique placeholder keeps
+      // parallel runs from sharing even the config value.
+      gatewayPort: overrides.gatewayPort ?? (await freeLoopbackPort()),
       mcpTools: [simulatedAvailabilityTool()],
-      // Fixed port: a leaked first listener would fail the second bind.
-      mcpPort: overrides.mcpPort ?? 19771,
+      // Ephemeral by default. Tests that must prove a leaked listener was
+      // released pass one per-run allocated port and rebind the SAME port.
+      mcpPort: overrides.mcpPort ?? 0,
     },
     {
       processFactory: () => {
@@ -854,6 +1031,7 @@ function runtimeFixture(overrides: {
       },
       connectionFactory:
         overrides.connectionFactory ?? (() => fakeConnection().conn),
+      mcpBoundaryFactory: overrides.mcpBoundaryFactory,
     },
   );
   return { runtime, count, cleanup: () => rmSync(directory, { recursive: true, force: true }) };
@@ -861,10 +1039,13 @@ function runtimeFixture(overrides: {
 
 test("failed start rolls back the MCP boundary the invocation created", async () => {
   const behaviors = { proc: { failStart: "spawn denied" as string | undefined }, conn: {} };
-  const { runtime, cleanup } = runtimeFixture({
+  // Per-run allocated port, rebound after rollback: proves the first
+  // listener was actually released rather than orphaned.
+  const mcpPort = await freeLoopbackPort();
+  const { runtime, cleanup } = await runtimeFixture({
     processFactory: () => fakeProcess(behaviors.proc).proc,
     connectionFactory: () => fakeConnection(behaviors.conn).conn,
-    mcpPort: 19772,
+    mcpPort,
   });
   try {
     await assert.rejects(runtime.start(), /spawn denied/);
@@ -885,10 +1066,54 @@ test("failed start rolls back the MCP boundary the invocation created", async ()
   }
 });
 
+test("a failed MCP close keeps ownership: error surfaces, release only after observed close", async () => {
+  const proc = fakeProcess();
+  const connBehavior: { failConnect?: string } = { failConnect: "ws gone" };
+  let closeCalls = 0;
+  let failCloses = 1;
+  const boundary: RuntimeMcpBoundaryLike = {
+    toolNames: ["check_availability"],
+    listen: async () => ({ url: "http://127.0.0.1:0/mcp", port: 1 }),
+    close: async () => {
+      closeCalls += 1;
+      if (closeCalls <= failCloses) throw new Error("mcp close exploded");
+    },
+  };
+  const { runtime, cleanup } = await runtimeFixture({
+    processFactory: () => proc.proc,
+    connectionFactory: () => fakeConnection(connBehavior).conn,
+    mcpBoundaryFactory: () => boundary,
+  });
+  try {
+    // The original start failure propagates; the close failure does NOT
+    // mask it — but ownership is retained, not dropped.
+    await assert.rejects(runtime.start(), /ws gone/);
+    assert.equal(closeCalls, 1);
+    // The runtime still owns the boundary: a new start is refused, not
+    // silently allowed over a possibly-live listener.
+    await assert.rejects(runtime.start(), /still owns resources.*mcp=listening/s);
+    // stop() retries the close; a persistent failure rejects AND keeps
+    // ownership (the ref is never dropped on error).
+    failCloses = 2;
+    await assert.rejects(runtime.stop(), /mcp close exploded/);
+    await assert.rejects(runtime.start(), /still owns resources/);
+    // Once the close is observed, the boundary releases and lifecycle
+    // resumes.
+    await runtime.stop();
+    assert.equal(closeCalls, 3);
+    delete connBehavior.failConnect;
+    await runtime.start();
+    await runtime.stop();
+    assert.equal(runtime.mcpUrl, null);
+  } finally {
+    cleanup();
+  }
+});
+
 test("connect failure stops the spawned child and tears down MCP", async () => {
   const proc = fakeProcess();
   const conn = fakeConnection({ failConnect: "ws handshake refused" });
-  const { runtime, cleanup } = runtimeFixture({
+  const { runtime, cleanup } = await runtimeFixture({
     processFactory: () => proc.proc,
     connectionFactory: () => conn.conn,
   });
@@ -903,7 +1128,7 @@ test("connect failure stops the spawned child and tears down MCP", async () => {
 });
 
 test("concurrent and repeated start() produce exactly one startup", async () => {
-  const { runtime, count, cleanup } = runtimeFixture();
+  const { runtime, count, cleanup } = await runtimeFixture();
   try {
     const first = runtime.start();
     const second = runtime.start();
@@ -928,10 +1153,9 @@ test("uncertain child exit keeps the process owned: retry start is blocked", asy
   // NOT overwrite it with a second process.
   const flaky = fakeProcess({ stopFails: 1 });
   const connBehavior: { failConnect?: string } = { failConnect: "ws gone" };
-  const { runtime, count, cleanup } = runtimeFixture({
+  const { runtime, count, cleanup } = await runtimeFixture({
     processFactory: () => flaky.proc,
     connectionFactory: () => fakeConnection(connBehavior).conn,
-    mcpPort: 19773,
   });
   try {
     await assert.rejects(runtime.start(), /ws gone/);
@@ -958,7 +1182,7 @@ test("uncertain child exit keeps the process owned: retry start is blocked", asy
 test("a running child with a disconnected WS still blocks a new start", async () => {
   const proc = fakeProcess();
   const conn = fakeConnection();
-  const { runtime, count, cleanup } = runtimeFixture({
+  const { runtime, count, cleanup } = await runtimeFixture({
     processFactory: () => proc.proc,
     connectionFactory: () => conn.conn,
   });
@@ -977,9 +1201,8 @@ test("a running child with a disconnected WS still blocks a new start", async ()
 
 test("start() during an in-flight stop() is rejected, then allowed after", async () => {
   const proc = fakeProcess({ stopDelayMs: 50 });
-  const { runtime, count, cleanup } = runtimeFixture({
+  const { runtime, count, cleanup } = await runtimeFixture({
     processFactory: () => proc.proc,
-    mcpPort: 19774,
   });
   try {
     await runtime.start();
@@ -995,19 +1218,28 @@ test("start() during an in-flight stop() is rejected, then allowed after", async
 });
 
 // ---------- actual isolated gateway boot (doctor end-to-end) ----------
+//
+// No fixed ports: each doctor run gets a per-run dynamically allocated
+// loopback port (doctor default --port auto, or an explicitly allocated port
+// passed via --port). A "free" probe never proves the port stays free
+// (TOCTOU) — the gateway bind is authoritative — so a dedicated busy-port
+// test below proves the occupied case fails clear. No load-related root
+// cause is claimed: these tests only remove the fixed-port weakness and
+// prove busy ports fail safe.
+
+function doctorLeftovers(projectDir: string): string[] {
+  return execFileSync("ls", ["-A", join(projectDir, ".runtime")], { encoding: "utf8" })
+    .split("\n")
+    .filter((name) => name.startsWith("openclaw-doctor-"));
+}
 
 test(
   "doctor: real isolated boot preserves pre-existing .runtime state (sentinel)",
   { timeout: 90000 },
   async () => {
-    let binary: string | null = null;
-    try {
-      binary = execFileSync("which", ["openclaw"], { encoding: "utf8" }).trim() || null;
-    } catch {
-      binary = null;
-    }
+    const binary = resolveTestBinary();
     if (!binary) {
-      console.log("SKIP: openclaw binary not installed; doctor boot not run");
+      console.log("SKIP: no openclaw binary (explicit /opt/homebrew/bin/openclaw or PATH); doctor boot not run");
       return;
     }
 
@@ -1020,23 +1252,26 @@ test(
     writeFileSync(configBefore, '{"gateway":{"mode":"local"}}\n');
 
     try {
+      // No --port flag: the doctor allocates its own per-run loopback port.
       const output = execFileSync(
         process.execPath,
-        [join(process.cwd(), "scripts", "openclaw-doctor.mjs"), "--port", "19391"],
+        [join(process.cwd(), "scripts", "openclaw-doctor.mjs"), "--openclaw-bin", binary],
         { cwd: projectDir, encoding: "utf8", timeout: 80000, env: { ...process.env, GATHER_OPENCLAW_BIN: binary } },
       );
-      assert.match(output, /PASS gateway boot/);
-      assert.match(output, /PASS hello-ok/);
+      // Staging is explicit: child-spawned (liveness) is NOT readiness;
+      // only protocol-ready (hello-ok) proves the gateway is up. The
+      // hello-ok deadline is unchanged at 30 s — not raised to hide failure.
+      assert.match(output, /PASS port/);
+      assert.match(output, /PASS child spawned/);
+      assert.match(output, /PASS protocol-ready \(hello-ok\)/);
       assert.match(output, /PASS shutdown/);
+      assert.doesNotMatch(output, /FAIL/);
 
       // Sentinel: pre-existing state untouched; doctor dir removed.
       assert.equal(readFileSync(join(realState, "sentinel.txt"), "utf8"), "pre-existing gather state\n");
       assert.equal(readFileSync(configBefore, "utf8"), '{"gateway":{"mode":"local"}}\n');
       assert.equal(existsSync(join(realState, "openclaw-doctor-marker")), false);
-      const leftovers = execFileSync("ls", ["-A", join(projectDir, ".runtime")], { encoding: "utf8" })
-        .split("\n")
-        .filter((name) => name.startsWith("openclaw-doctor-"));
-      assert.deepEqual(leftovers, [], "doctor-owned dir must be removed after verified shutdown");
+      assert.deepEqual(doctorLeftovers(projectDir), [], "doctor-owned dir must be removed after verified shutdown");
     } finally {
       rmSync(projectDir, { recursive: true, force: true });
     }
@@ -1047,14 +1282,9 @@ test(
   "doctor: SIGTERM mid-run still observes child exit and preserves sentinel",
   { timeout: 90000 },
   async () => {
-    let binary: string | null = null;
-    try {
-      binary = execFileSync("which", ["openclaw"], { encoding: "utf8" }).trim() || null;
-    } catch {
-      binary = null;
-    }
+    const binary = resolveTestBinary();
     if (!binary) {
-      console.log("SKIP: openclaw binary not installed; doctor signal run not run");
+      console.log("SKIP: no openclaw binary (explicit /opt/homebrew/bin/openclaw or PATH); doctor signal run not run");
       return;
     }
 
@@ -1063,23 +1293,34 @@ test(
     mkdirSync(join(realState, "state"), { recursive: true });
     writeFileSync(join(realState, "sentinel.txt"), "pre-existing gather state\n");
 
+    // Explicit per-run allocated port: exercises the preflight-free path
+    // while avoiding every fixed port (including 19391, held by another run).
+    const port = await freeLoopbackPort();
     try {
       const result = await new Promise<{ code: number | null; signal: string | null; output: string }>(
         (resolvePromise, rejectPromise) => {
           const child = spawn(
             process.execPath,
-            [join(process.cwd(), "scripts", "openclaw-doctor.mjs"), "--port", "19393"],
+            [
+              join(process.cwd(), "scripts", "openclaw-doctor.mjs"),
+              "--openclaw-bin",
+              binary,
+              "--port",
+              String(port),
+            ],
             {
               cwd: projectDir,
-              env: { ...process.env, GATHER_OPENCLAW_BIN: binary! },
+              env: { ...process.env, GATHER_OPENCLAW_BIN: binary },
             },
           );
           let output = "";
           let signaled = false;
           child.stdout.on("data", (chunk: Buffer) => {
             output += chunk.toString("utf8");
-            // Signal while the run is in flight — gateway is up, later RPCs pending.
-            if (!signaled && output.includes("PASS gateway boot")) {
+            // Signal while the run is in flight — child is spawned,
+            // later RPCs pending. Trigger on the spawn record, NOT on
+            // readiness: readiness may never arrive under load.
+            if (!signaled && output.includes("PASS child spawned")) {
               signaled = true;
               child.kill("SIGTERM");
             }
@@ -1100,10 +1341,97 @@ test(
         readFileSync(join(realState, "sentinel.txt"), "utf8"),
         "pre-existing gather state\n",
       );
-      const leftovers = execFileSync("ls", ["-A", join(projectDir, ".runtime")], { encoding: "utf8" })
-        .split("\n")
-        .filter((name) => name.startsWith("openclaw-doctor-"));
-      assert.deepEqual(leftovers, [], "doctor-owned dir must be removed after observed signal shutdown");
+      assert.deepEqual(doctorLeftovers(projectDir), [], "doctor-owned dir must be removed after observed signal shutdown");
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "doctor: occupied port fails at preflight without touching the foreign listener",
+  { timeout: 90000 },
+  async () => {
+    const binary = resolveTestBinary();
+    if (!binary) {
+      console.log("SKIP: no openclaw binary (explicit /opt/homebrew/bin/openclaw or PATH); busy-port run not run");
+      return;
+    }
+
+    // Foreign occupant on a per-run allocated port: the doctor must fail
+    // clear, leave the occupant listening, and preserve sentinel state.
+    const busyPort = await freeLoopbackPort();
+    const occupant = await holdLoopbackPort(busyPort);
+    const projectDir = mkdtempSync(join(tmpdir(), "gather-doctor-busy-"));
+    const realState = join(projectDir, ".runtime", "openclaw");
+    mkdirSync(join(realState, "state"), { recursive: true });
+    writeFileSync(join(realState, "sentinel.txt"), "pre-existing gather state\n");
+
+    try {
+      let output = "";
+      let exitCode: number | null = null;
+      try {
+        output = execFileSync(
+          process.execPath,
+          [
+            join(process.cwd(), "scripts", "openclaw-doctor.mjs"),
+            "--openclaw-bin",
+            binary,
+            "--port",
+            String(busyPort),
+          ],
+          { cwd: projectDir, encoding: "utf8", timeout: 80000, env: { ...process.env, GATHER_OPENCLAW_BIN: binary } },
+        );
+      } catch (error) {
+        // execFileSync throws on nonzero exit; the doctor output is what matters.
+        const err = error as { stdout?: string; status?: number };
+        output = typeof err.stdout === "string" ? err.stdout : String(error);
+        exitCode = err.status ?? 1;
+      }
+      assert.match(output, /FAIL port preflight/);
+      assert.match(output, new RegExp(`port ${busyPort} is already occupied`));
+      assert.match(output, /not stopping/);
+      assert.doesNotMatch(output, /PASS child spawned/);
+      assert.doesNotMatch(output, /PASS protocol-ready/);
+      // The foreign listener was never stopped or taken over.
+      assert.equal(await checkLoopbackPortOccupied(busyPort), true);
+      // Sentinel preserved; only the doctor-owned dir was cleaned.
+      assert.equal(readFileSync(join(realState, "sentinel.txt"), "utf8"), "pre-existing gather state\n");
+      assert.deepEqual(doctorLeftovers(projectDir), [], "doctor-owned dir must be removed after preflight failure");
+      assert.notEqual(exitCode, 0);
+    } finally {
+      await closeServer(occupant);
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "doctor: bare --port flag fails preflight instead of silently allocating",
+  { timeout: 90000 },
+  async () => {
+    const binary = resolveTestBinary();
+    if (!binary) {
+      console.log("SKIP: no openclaw binary (explicit /opt/homebrew/bin/openclaw or PATH); bare-port run not run");
+      return;
+    }
+    const projectDir = mkdtempSync(join(tmpdir(), "gather-doctor-bareport-"));
+    try {
+      let output = "";
+      try {
+        output = execFileSync(
+          process.execPath,
+          [join(process.cwd(), "scripts", "openclaw-doctor.mjs"), "--openclaw-bin", binary, "--port"],
+          { cwd: projectDir, encoding: "utf8", timeout: 80000, env: { ...process.env, GATHER_OPENCLAW_BIN: binary } },
+        );
+      } catch (error) {
+        const err = error as { stdout?: string };
+        output = typeof err.stdout === "string" ? err.stdout : String(error);
+      }
+      assert.match(output, /FAIL port preflight/);
+      assert.match(output, /--port requires a value/);
+      assert.doesNotMatch(output, /PASS child spawned/);
+      assert.deepEqual(doctorLeftovers(projectDir), [], "doctor-owned dir must be removed after preflight failure");
     } finally {
       rmSync(projectDir, { recursive: true, force: true });
     }
