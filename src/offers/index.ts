@@ -7,26 +7,36 @@
  *   re-validates shape (input is `unknown` at the boundary) but does not
  *   parse free text.
  * - Fetch availability FRESH immediately before calling: `observedAt` must
- *   be within `maxFreshnessMs` of `asOf`, or the result is `blocked` with
- *   `stale_availability` instead of an offer. Recheck again immediately
- *   before any provisional hold; this result is never a hold.
+ *   not postdate `asOf`, `asOf` must not postdate the trusted `preparedAt`
+ *   clock, and `preparedAt - observedAt` must fit `maxFreshnessMs`, or the
+ *   result is `blocked` with `stale_availability` instead of an offer.
+ *   Recheck again immediately before any provisional hold; this result is
+ *   never a hold.
  * - Supply attributable business knowledge (spaces, policies, scoped
- *   exceptions, price book, services) with source references. Unknown or
- *   incomplete prices/costs are expressed as `null`, never invented.
- * - Bind owner approval to the exact returned `version` + `fingerprint`.
- *   Any change to dates, price, space, or terms requires a new call with an
- *   incremented `requestedVersion` and the previous `supersedesFingerprint`.
- * - Never present a `profitability.claim` of `unknown` as profitable, and
- *   never send an `alternatives`/`blocked` result as an offer.
- * - Pass a caller clock as `preparedAt` for deterministic, replayable
- *   results: identical inputs always produce byte-identical results.
+ *   exceptions, price book, services) with source references. Unknown
+ *   prices/costs are `null`, never invented. Facts below `verified`
+ *   confidence, or with empty provenance, yield explicit owner decisions.
+ * - Attest cost-ledger completeness via `priceBook.costsComplete`: an
+ *   empty or partial ledger without this source-backed flag keeps
+ *   profitability `unknown` (genuine zero-cost businesses attest `true`).
+ * - Bind owner approval to the exact returned `version` + `fingerprint`
+ *   and only when `status` is `feasible` (ready-to-send). Any change to
+ *   dates, price, space, or terms requires a new call with an incremented
+ *   `requestedVersion` and the previous `supersedesFingerprint`.
+ * - Never present an `alternatives`/`blocked` result, an `unknown`
+ *   profitability, or a decision-pending candidate as ready or profitable.
  *
  * WHAT THIS MODULE GUARANTEES:
  * - Pure and deterministic: no I/O, no network, no LLM, no new graph.
- * - Capacity, service, policy (with scoped-only exceptions), pricing floor,
- *   and margin boundaries are enforced from evidence.
- * - Every consequential number cites its sources in `evidence` and each
- *   candidate carries concrete `consequences` for approval review.
+ * - Capacity, service, policy (with scoped-only exceptions), space-bound
+ *   availability with busy-overlap blocks, pricing floor, margin, and
+ *   positive-profit (> 0) boundaries are enforced from evidence.
+ * - Floor permission is independent of cost knowledge; margin permission
+ *   and profit claims need a complete ledger.
+ * - Alternatives preserve the requested duration (same clock time when
+ *   evidenced, otherwise flagged as a time shift); budget binds every
+ *   candidate, never just the primary.
+ * - Money renders in proper currency units via `formatMoney`.
  */
 
 export type {
@@ -58,6 +68,6 @@ export type {
   ServiceCapability,
   SpaceKnowledge,
 } from "./types.ts";
-export { prepareOffer, readAvailabilityEvidence, readBusinessKnowledge, readInquiryRequirements } from "./prepare.ts";
+export { prepareOffer, readAvailabilityEvidence, readBusinessKnowledge, readInquiryRequirements, formatMoney, formatDuration } from "./prepare.ts";
 export type { AdaptableFact, AdaptedKnowledge, AvailabilityBuildInput } from "./adapters.ts";
 export { adaptBusinessFacts, buildAvailabilityEvidence } from "./adapters.ts";
