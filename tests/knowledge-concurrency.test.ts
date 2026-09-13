@@ -382,3 +382,117 @@ test("altered provenance cannot replay as an identical correction", () => {
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test("pre-account legacy database migrates with rows retained and constraints intact", () => {
+  // Actual pre-account fixture: the exact schema the constructor created
+  // before account scoping, with old candidate/revision/decision rows.
+  // Previously the constructor died here with "no such column: account_id"
+  // because the account index was created before the column migration.
+  const directory = mkdtempSync(join(tmpdir(), "gather-kb-legacy-"));
+  const path = join(directory, "k.sqlite");
+  const setup = new GatherStore(path);
+  const businessId = setup.createBusiness({ name: "Fictional Hall", timezone: "UTC" }).id;
+  const fact = setup.addBusinessFact({
+    businessId, key: "space", value: spaceValue("Legacy"),
+    confidence: "probable", sourceReferences: [DOC],
+  });
+  setup.close();
+  const legacy = new GatherStore(path);
+  try {
+    legacy.db.exec(`
+      CREATE TABLE knowledge_candidates (
+        id TEXT PRIMARY KEY, business_id TEXT NOT NULL, key TEXT NOT NULL,
+        subject_id TEXT NOT NULL DEFAULT '', value_json TEXT NOT NULL,
+        confidence TEXT NOT NULL CHECK (confidence IN ('probable', 'uncertain')),
+        source_references_json TEXT NOT NULL, source_locator TEXT NOT NULL,
+        source_revision TEXT, observed_at TEXT NOT NULL, ingested_at TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('pending', 'confirmed', 'rejected', 'stale')),
+        confirmed_fact_id TEXT, note TEXT
+      );
+      CREATE INDEX idx_knowledge_candidates_key
+        ON knowledge_candidates(business_id, key, subject_id, status);
+      CREATE TABLE knowledge_revisions (
+        id TEXT PRIMARY KEY, fact_id TEXT NOT NULL, business_id TEXT NOT NULL,
+        key TEXT NOT NULL, subject_id TEXT NOT NULL DEFAULT '', revision INTEGER NOT NULL,
+        value_json TEXT NOT NULL, scope TEXT NOT NULL CHECK (scope IN ('global', 'booking', 'customer')),
+        scope_id TEXT, status TEXT NOT NULL CHECK (status IN ('active', 'superseded')),
+        review_state TEXT NOT NULL DEFAULT 'none' CHECK (review_state IN ('none', 'review')),
+        approved_by TEXT NOT NULL, approved_at TEXT NOT NULL, candidate_id TEXT,
+        source_references_json TEXT NOT NULL
+      );
+      CREATE UNIQUE INDEX idx_knowledge_active_revision
+        ON knowledge_revisions(business_id, key, subject_id, scope, COALESCE(scope_id, ''))
+        WHERE status = 'active';
+      CREATE TABLE knowledge_decisions (
+        command_id TEXT PRIMARY KEY, kind TEXT NOT NULL, business_id TEXT NOT NULL,
+        actor_kind TEXT NOT NULL, actor_id TEXT NOT NULL,
+        outcome TEXT NOT NULL CHECK (outcome IN ('applied', 'duplicate', 'rejected')),
+        detail_json TEXT NOT NULL, created_at TEXT NOT NULL
+      );
+      INSERT INTO knowledge_candidates
+        (id, business_id, key, subject_id, value_json, confidence, source_references_json, source_locator, observed_at, ingested_at, status)
+        VALUES ('legacy-cand-1', '${businessId}', 'space', 'room-legacy', '{}', 'probable', '[]', 'legacy://cand-1',
+          '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z', 'pending');
+      INSERT INTO knowledge_revisions
+        (id, fact_id, business_id, key, subject_id, revision, value_json, scope, scope_id, status, review_state, approved_by, approved_at, candidate_id, source_references_json)
+        VALUES ('legacy-rev-1', '${fact.id}', '${businessId}', 'space', 'room-legacy', 1, '{}',
+          'global', NULL, 'active', 'none', 'fictional-owner-1', '2026-01-01T00:00:00.000Z', 'legacy-cand-1', '[]');
+      INSERT INTO knowledge_decisions
+        (command_id, kind, business_id, actor_kind, actor_id, outcome, detail_json, created_at)
+        VALUES ('legacy-cmd-1', 'confirm', '${businessId}', 'owner', 'fictional-owner-1', 'applied', '{}', '2026-01-01T00:00:00.000Z');
+    `);
+  } finally {
+    legacy.close();
+  }
+  const migrated = new GatherStore(path);
+  try {
+    // Repeated initialization must be safe: construct twice against the
+    // migrated database.
+    const first = new KnowledgeService(migrated);
+    const second = new KnowledgeService(migrated);
+    void second;
+    // All old rows retained with legacy account readback.
+    const candidates = first.listCandidates(businessId);
+    assert.equal(candidates.length, 1);
+    assert.equal(candidates[0]?.id, "legacy-cand-1");
+    assert.equal(candidates[0]?.status, "pending");
+    const facts = first.listFacts(businessId);
+    assert.equal(facts.length, 1);
+    assert.equal(facts[0]?.revision, 1);
+    const decisions = first.listDecisions(businessId);
+    assert.equal(decisions.length, 1);
+    assert.equal(decisions[0]?.commandId, "legacy-cmd-1");
+    const legacyAccount = (migrated.db.prepare("SELECT account_id FROM knowledge_candidates WHERE id = 'legacy-cand-1'").get() as { account_id: string }).account_id;
+    assert.equal(legacyAccount, "");
+    // Old account-blind unique index replaced by the account-scoped one.
+    const indexes = (migrated.db.prepare("SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'knowledge_revisions'").all() as Array<{ name: string; sql: string }>);
+    assert.ok(!indexes.some((row) => row.name === "idx_knowledge_active_revision"), "old account-blind index must be gone");
+    const scoped = indexes.find((row) => row.name === "idx_knowledge_active_revision_account");
+    assert.ok(scoped, "account-scoped unique index must exist");
+    assert.match(scoped.sql, /account_id/);
+    assert.match(scoped.sql, /WHERE status = 'active'/);
+    const candidateIndexes = (migrated.db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'knowledge_candidates'").all() as Array<{ name: string }>).map((row) => row.name);
+    assert.ok(candidateIndexes.includes("idx_knowledge_candidates_account"), "candidates account index must exist after migration");
+    // Genuine constraints still bite: correcting the migrated revision
+    // applies once, and a repeat against the old revision is stale — the
+    // migration hid no conflict.
+    const applied = first.correctFact({
+      businessId, actor: OWNER, key: "space", subjectId: "room-legacy", expectedRevision: 1,
+      value: spaceValue("Legacy2"), sourceReferences: [DOC],
+    });
+    assert.equal(applied.revision.revision, 2);
+    let code = "";
+    try {
+      first.correctFact({
+        businessId, actor: OWNER, key: "space", subjectId: "room-legacy", expectedRevision: 1,
+        value: spaceValue("Legacy3"), sourceReferences: [DOC],
+      });
+    } catch (error) {
+      code = (error as { code?: string }).code ?? "";
+    }
+    assert.equal(code, "stale_version", "post-migration versioning must still reject stale corrections");
+  } finally {
+    migrated.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});

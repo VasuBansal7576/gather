@@ -279,8 +279,10 @@ export class KnowledgeService {
       );
       CREATE INDEX IF NOT EXISTS idx_knowledge_decisions_business
         ON knowledge_decisions(business_id, created_at);
-      CREATE INDEX IF NOT EXISTS idx_knowledge_candidates_account
-        ON knowledge_candidates(business_id, account_id, key, subject_id, status);
+      -- NOTE: idx_knowledge_candidates_account is created in the migration
+      -- block below, AFTER ensureColumn adds account_id. Creating it here
+      -- breaks pre-account legacy databases (no such column: account_id),
+      -- because CREATE TABLE IF NOT EXISTS is a no-op for them.
       CREATE TABLE IF NOT EXISTS knowledge_conflict_resolutions (
         id TEXT PRIMARY KEY,
         business_id TEXT NOT NULL,
@@ -297,17 +299,20 @@ export class KnowledgeService {
         ON knowledge_conflict_resolutions(business_id, key, subject_id, scope, COALESCE(scope_id, ''));
     `);
     });
-    // Migrate pre-account databases in place: add the columns, then replace
-    // the account-blind active-revision uniqueness with the account-scoped
-    // one (the old index would otherwise forbid two accounts holding the
-    // same key). Legacy rows read back as account ''.
-    // Runs inside transact (bounded busy retries): concurrent first-start
-    // constructors otherwise race this DDL outside any retry and surface
-    // raw "database is locked" from migration instead of from test logic.
-    // Every statement here is idempotent, so full retries are safe.
+    // Migrate pre-account databases in place: add the columns FIRST, then
+    // create the account indexes that reference them, then replace the
+    // account-blind active-revision uniqueness with the account-scoped one
+    // (the old index would otherwise forbid two accounts holding the same
+    // key). Legacy rows read back as account ''. All inside one transact
+    // (bounded busy retries) so concurrent first-start constructors stay
+    // serialized and no half-migrated state is visible. Every statement
+    // here is idempotent, so full retries are safe.
     this.transact(() => {
       this.ensureColumn("knowledge_candidates", "account_id", "TEXT NOT NULL DEFAULT ''");
       this.ensureColumn("knowledge_revisions", "account_id", "TEXT NOT NULL DEFAULT ''");
+      this.store.db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_knowledge_candidates_account
+          ON knowledge_candidates(business_id, account_id, key, subject_id, status)`);
       this.store.db.exec("DROP INDEX IF EXISTS idx_knowledge_active_revision");
       this.store.db.exec(`
         CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_active_revision_account
