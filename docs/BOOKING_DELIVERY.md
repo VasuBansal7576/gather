@@ -21,9 +21,12 @@ A delivery layer on top of the reviewed `src/delivery` evaluator
   (read-only), `confirmBooking` (guarded, idempotent, atomic),
   `handoffForBooking` (revised operational handoff).
 - Routes:
-  - `GET  /api/bookings/[bookingId]/readiness`
-  - `POST /api/bookings/[bookingId]/confirm`
-  - `GET  /api/bookings/[bookingId]/handoff`
+  - `GET  /api/bookings/[bookingId]/readiness` — read-only evaluation
+  - `POST /api/bookings/[bookingId]/confirm` — guarded transition
+  - `GET  /api/bookings/[bookingId]/handoff` — read-only handoff view;
+    reports the latest persisted revision, never creates one
+  - `POST /api/bookings/[bookingId]/handoff` — explicit build command;
+    persists a new numbered revision
 
 ## Persisted, attributable evidence
 
@@ -69,20 +72,48 @@ proposalFingerprint, confirmKey }` only. In order:
      drift throws retryable `CONFLICT` and rolls back;
    - re-checks the durable hold-conflict set for the payload window —
      a window claimed mid-flight refuses with `SLOT_UNAVAILABLE`;
+   - when the decision can confirm, requires a `succeeded` execution
+     under the canonical operation key for every declared step of the
+     exact approved version — for `create_provisional_hold`, the hold
+     AND the email (`holdOperationKey`/`emailOperationKey`). Missing,
+     versionless, superseded-version, `pending`, `partial`,
+     `uncertain`, or `failed` steps refuse with `CONFLICT` (retryable
+     while a step is still in flight) and roll the command back;
    - persists the evaluated decision bound to the action/version/
      fingerprint and finishes the command row, atomically with the
      booking transition.
 6. **Transition** — `bookings.status = 'confirmed'` only when the
    decision is `ready` AND `liveReady` (all cited evidence
-   non-fictional). Otherwise the command is persisted `blocked` with
+   non-fictional) AND every required step execution succeeded.
+   Otherwise the command is persisted `blocked` with
    the full decision — a hold alone, a payment link, missing evidence,
    or demo provenance never confirms.
 
+Every response derives `demo` from the evaluated decision's provenance:
+`true` unless all cited evidence is live. A live-ready confirmation is
+never mislabeled demo, and a blocked demo-evidence command never claims
+live readiness.
+
 ## Handoff
 
-`GET .../handoff` builds `buildHandoff` against the latest persisted
-decision for the current action version (or a fresh evaluation when
-none exists) and persists each build as a numbered revision.
+`GET .../handoff` is read-only: it evaluates fresh through the verifier
+boundary (a persisted decision is never reused — its availability
+evidence could be stale) and reports the latest persisted revision
+number, or `null`. `POST .../handoff` is the explicit build command that
+persists a new numbered revision.
+
+Both paths report `state`:
+
+- `ready` — a live approval exists for the exact current version, the
+  fresh decision is `ready` + `liveReady`, and the booking is
+  `confirmed`.
+- `preliminary` — the approval is live but the booking is not yet
+  confirmed, readiness is blocked, or provenance is not live; `reason`
+  says which.
+- `blocked` — no live approval for the current version, or evaluation
+  could not run (e.g. no persisted policy); `handoff` is `null` and
+  `reason` is explicit. A blocked build persists nothing.
+
 Services, responsibilities, timings, and outstanding items come only
 from the accepted payload + decision evidence — nothing is invented.
 
@@ -96,16 +127,24 @@ The default runtime wires the demo calendar adapter, so its
 attestations are fictional and `confirm` will report `blocked` — the
 guarded path is exercised in tests with injected live-marked fakes.
 
+An expired in-progress confirm command is reclaimable only once: the
+reclaim is a conditional update on `updated_at`, and a caller whose
+update matched zero rows (a competing reclaimer committed first) is
+re-classified against the winner's row — `conflict`, `in_progress`, or
+`replay` — never `owned`.
+
 ## Verified
 
-- `tests/booking-delivery.test.ts` — 11 tests: live confirm +
+- `tests/booking-delivery.test.ts` — 16 tests: live confirm +
   persisted decision, canonical replay, key conflict and in-progress
   concurrency, stale version + invalidated approval, fixture
   provenance block, missing/revoked/refunded evidence, hold-alone
-  block, fail-closed drift revalidation, handoff revisions, restart
-  persistence, read-only readiness + cancelled booking.
-- Full suite: 325 tests pass; `npm run typecheck` clean;
-  `npm run build` compiles all three routes.
+  block, fail-closed drift revalidation, handoff state + read-only
+  GET + numbered POST revisions, unapproved handoff block, restart
+  persistence, read-only readiness + cancelled booking, required
+  hold/email execution gate (missing/incomplete/superseded-version
+  steps), and single-claim lease reclaim.
+- `npm run typecheck` clean; `npm run build` compiles all routes.
 
 ## Left for live integration
 

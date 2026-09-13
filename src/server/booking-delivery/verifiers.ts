@@ -57,14 +57,10 @@ export class StoreDeliveryVerifiers implements DeliveryVerifiers {
   }
 
   fetchAcceptanceSync(query: AcceptanceQuery): AcceptanceRecord[] {
-    // Scoped to the exact accepted binding; the evaluator re-checks anyway.
-    return this.delivery
-      .listAcceptance(query.businessId, query.bookingId)
-      .filter(
-        (record) =>
-          record.proposalVersion === query.proposalVersion &&
-          record.proposalFingerprint === query.proposalFingerprint,
-      );
+    // Business/booking scoped only — version binding stays with the
+    // evaluator, which must see records for other versions to report a
+    // cross-version conflict instead of a bare "missing".
+    return this.delivery.listAcceptance(query.businessId, query.bookingId);
   }
 
   async fetchAcceptance(query: AcceptanceQuery): Promise<AcceptanceRecord[]> {

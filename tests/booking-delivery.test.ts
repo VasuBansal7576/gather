@@ -1,4 +1,5 @@
 import { mkdtempSync, rmSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import assert from "node:assert/strict";
@@ -10,12 +11,13 @@ import type {
   ConnectorMetadata,
   ConnectorResult,
 } from "../src/connectors/contracts.ts";
-import { ServiceError } from "../src/server/booking-service.ts";
+import { emailOperationKey, holdOperationKey, ServiceError } from "../src/server/booking-service.ts";
 import {
   confirmBooking,
   confirmRequestHash,
   handoffForBooking,
   readinessForBooking,
+  recordHandoff,
 } from "../src/server/booking-delivery/service.ts";
 import type { BookingDeliveryDeps } from "../src/server/booking-delivery/service.ts";
 import { DeliveryStore } from "../src/server/booking-delivery/store.ts";
@@ -192,6 +194,29 @@ function seedLiveEvidence(s: Setup): void {
   });
 }
 
+/**
+ * Seed the approved proposal's canonical step executions (the durable rows
+ * approveAndExecute writes under the hold/email operation keys). A status of
+ * undefined seeds no row — confirming then fails the missing-step gate.
+ */
+function seedExecutedSteps(s: Setup, statuses: { hold?: string; email?: string } = { hold: "succeeded", email: "succeeded" }): void {
+  const insert = (key: string, status: string): void => {
+    s.store.db.prepare(`INSERT INTO action_executions
+      (id, proposed_action_id, proposal_version, idempotency_key, attempt, status, started_at, completed_at)
+      VALUES ($id, $actionId, $version, $key, 1, $status, $started, $completed)`).run({
+      $id: randomUUID(),
+      $actionId: s.actionId,
+      $version: s.version,
+      $key: key,
+      $status: status,
+      $started: NOW,
+      $completed: status === "pending" ? null : NOW,
+    });
+  };
+  if (statuses.hold) insert(holdOperationKey(s.actionId, s.version), statuses.hold);
+  if (statuses.email) insert(emailOperationKey(s.actionId, s.version), statuses.email);
+}
+
 function confirmInput(s: Setup, confirmKey = "cmd-1") {
   return {
     bookingId: s.bookingId,
@@ -206,14 +231,18 @@ test("guarded confirm: full live evidence transitions the booking to confirmed a
   const s = setup();
   try {
     seedLiveEvidence(s);
+    seedExecutedSteps(s);
     const readiness = await readinessForBooking(s.deps, s.bookingId);
     assert.equal(readiness.decision.ready, true);
     assert.equal(readiness.decision.liveReady, true);
     assert.equal(readiness.decision.provenance, "live");
+    // The demo/live marker is derived from the evidence, not hardcoded.
+    assert.equal(readiness.demo, false);
 
     const response = await confirmBooking(s.deps, confirmInput(s));
     assert.equal(response.confirmedBooking, true);
     assert.equal(response.command.status, "confirmed");
+    assert.equal(response.demo, false);
     assert.equal(s.store.getBooking(s.bookingId).status, "confirmed");
 
     // The evaluated decision is durably persisted against the binding.
@@ -230,6 +259,7 @@ test("canonical replay: the same confirm key returns the persisted command witho
   const s = setup();
   try {
     seedLiveEvidence(s);
+    seedExecutedSteps(s);
     const first = await confirmBooking(s.deps, confirmInput(s));
     const second = await confirmBooking(s.deps, confirmInput(s));
     assert.equal(second.command.status, "confirmed");
@@ -245,6 +275,7 @@ test("same confirm key bound to different inputs conflicts; in-progress commands
   const s = setup();
   try {
     seedLiveEvidence(s);
+    seedExecutedSteps(s);
     await confirmBooking(s.deps, confirmInput(s));
     await assert.rejects(
       confirmBooking(s.deps, { ...confirmInput(s), proposalFingerprint: "f".repeat(64) }),
@@ -349,6 +380,7 @@ test("fixture provenance can never confirm a real booking: ready but not live-re
     assert.equal(readiness.decision.ready, true);
     assert.equal(readiness.decision.liveReady, false);
     assert.equal(readiness.decision.provenance, "demo");
+    assert.equal(readiness.demo, true);
 
     const response = await confirmBooking(s.deps, confirmInput(s));
     assert.equal(response.confirmedBooking, false);
@@ -461,21 +493,60 @@ test("stale-proof revalidation fails closed: proposal drift and evidence drift a
   }
 });
 
-test("handoff ties services, responsibilities, and outstanding items to the accepted version with revisions", async () => {
+test("handoff requires a live approval and confirmed binding; GET is read-only, POST builds numbered revisions", async () => {
   const s = setup();
   try {
     seedLiveEvidence(s);
+    seedExecutedSteps(s);
+
+    // Approved but not yet confirmed → preliminary, and no revision exists.
+    const pre = await handoffForBooking(s.deps, s.bookingId);
+    assert.equal(pre.state, "preliminary");
+    assert.equal(pre.revision, null);
+    assert.ok(pre.reason?.includes("not confirmed"));
+
     await confirmBooking(s.deps, confirmInput(s));
-    const first = await handoffForBooking(s.deps, s.bookingId);
-    assert.equal(first.revision, 1);
-    assert.equal(first.handoff.binding.proposalVersion, s.version);
-    assert.equal(first.handoff.binding.proposalFingerprint, s.fingerprint);
-    assert.equal(first.handoff.ready, true);
-    assert.deepEqual(first.handoff.services.map((svc) => svc.name), ["Plated dinner"]);
-    assert.deepEqual(first.handoff.responsibilities.map((entry) => entry.party), ["House captain"]);
-    assert.equal(first.handoff.event.guestCount, 80);
-    const second = await handoffForBooking(s.deps, s.bookingId);
-    assert.equal(second.revision, 2);
+
+    // GET is read-only: repeated reads never create revisions.
+    const read = await handoffForBooking(s.deps, s.bookingId);
+    assert.equal(read.state, "ready");
+    assert.equal(read.revision, null);
+    assert.equal(read.demo, false);
+    assert.equal(read.handoff?.binding.proposalVersion, s.version);
+    assert.equal(read.handoff?.binding.proposalFingerprint, s.fingerprint);
+    assert.equal(read.handoff?.ready, true);
+    assert.deepEqual(read.handoff?.services.map((svc) => svc.name), ["Plated dinner"]);
+    assert.deepEqual(read.handoff?.responsibilities.map((entry) => entry.party), ["House captain"]);
+    assert.equal(read.handoff?.event.guestCount, 80);
+    const readAgain = await handoffForBooking(s.deps, s.bookingId);
+    assert.equal(readAgain.revision, null);
+
+    // POST builds numbered revisions; GET then reports the latest.
+    const built = await recordHandoff(s.deps, s.bookingId);
+    assert.equal(built.revision, 1);
+    const builtAgain = await recordHandoff(s.deps, s.bookingId);
+    assert.equal(builtAgain.revision, 2);
+    const afterBuild = await handoffForBooking(s.deps, s.bookingId);
+    assert.equal(afterBuild.revision, 2);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("handoff is explicitly blocked when the proposal has no live approval", async () => {
+  const s = setup();
+  try {
+    seedLiveEvidence(s);
+    s.store.db.prepare("UPDATE approvals SET status = 'invalidated' WHERE proposed_action_id = $id").run({ $id: s.actionId });
+    const view = await handoffForBooking(s.deps, s.bookingId);
+    assert.equal(view.state, "blocked");
+    assert.equal(view.handoff, null);
+    assert.equal(view.revision, null);
+    assert.match(view.reason ?? "", /no live owner approval/i);
+    // A blocked build persists nothing.
+    const built = await recordHandoff(s.deps, s.bookingId);
+    assert.equal(built.state, "blocked");
+    assert.equal(built.revision, null);
   } finally {
     s.cleanup();
   }
@@ -485,8 +556,9 @@ test("restart persistence: decisions, commands, and handoff revisions survive a 
   const s = setup();
   try {
     seedLiveEvidence(s);
+    seedExecutedSteps(s);
     await confirmBooking(s.deps, confirmInput(s));
-    await handoffForBooking(s.deps, s.bookingId);
+    await recordHandoff(s.deps, s.bookingId);
     s.store.close();
 
     const reopened = new GatherStore(s.path);
@@ -496,8 +568,11 @@ test("restart persistence: decisions, commands, and handoff revisions survive a 
     assert.equal(replay.command.status, "confirmed");
     assert.match(replay.note, /replay/i);
     assert.equal(reopened.getBooking(s.bookingId).status, "confirmed");
-    const handoff = await handoffForBooking(deps2, s.bookingId);
-    assert.equal(handoff.revision, 2);
+    const built = await recordHandoff(deps2, s.bookingId);
+    assert.equal(built.revision, 2);
+    const read = await handoffForBooking(deps2, s.bookingId);
+    assert.equal(read.revision, 2);
+    assert.equal(read.state, "ready");
     reopened.close();
   } finally {
     s.cleanup();
@@ -516,6 +591,135 @@ test("readiness is read-only and a cancelled booking can never be confirmed", as
     assert.equal(response.confirmedBooking, false);
     assert.ok(response.decision?.blockedBy.some((entry) => entry.includes("cancelled")));
     assert.equal(s.store.getBooking(s.bookingId).status, "cancelled");
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("confirm requires succeeded hold AND email executions for the exact approved version", async () => {
+  const s = setup();
+  try {
+    seedLiveEvidence(s);
+    // No executions at all — the reproduced defect: everything else verified,
+    // but the approved steps never ran. Confirmation must refuse.
+    await assert.rejects(
+      confirmBooking(s.deps, confirmInput(s, "cmd-none")),
+      (error: unknown) => error instanceof ServiceError && error.code === "CONFLICT" && /hold/i.test(error.message),
+    );
+    assert.notEqual(s.store.getBooking(s.bookingId).status, "confirmed");
+
+    // Hold succeeded but the email step never ran — still refused.
+    seedExecutedSteps(s, { hold: "succeeded" });
+    await assert.rejects(
+      confirmBooking(s.deps, confirmInput(s, "cmd-no-email")),
+      (error: unknown) => error instanceof ServiceError && error.code === "CONFLICT" && /email/i.test(error.message),
+    );
+    assert.notEqual(s.store.getBooking(s.bookingId).status, "confirmed");
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("pending, failed, and uncertain step executions all refuse confirmation", async () => {
+  for (const statuses of [
+    { hold: "succeeded", email: "pending" },
+    { hold: "succeeded", email: "uncertain" },
+    { hold: "succeeded", email: "partial" },
+    { hold: "failed", email: "succeeded" },
+  ]) {
+    const s = setup();
+    try {
+      seedLiveEvidence(s);
+      seedExecutedSteps(s, statuses);
+      const emailPending = statuses.email === "pending" || statuses.email === "uncertain" || statuses.email === "partial";
+      await assert.rejects(
+        confirmBooking(s.deps, confirmInput(s)),
+        (error: unknown) =>
+          error instanceof ServiceError &&
+          error.code === "CONFLICT" &&
+          error.retryable === emailPending,
+      );
+      assert.notEqual(s.store.getBooking(s.bookingId).status, "confirmed");
+    } finally {
+      s.cleanup();
+    }
+  }
+});
+
+test("executions for a superseded version never satisfy the current proposal", async () => {
+  const s = setup();
+  try {
+    seedLiveEvidence(s);
+    // Executions exist for v1 only — then the proposal is replaced (v2).
+    seedExecutedSteps(s);
+    s.store.replaceProposedAction(s.actionId, { kind: "create_provisional_hold", payload: payload(), sourceReferences: [liveRef("proposal://v2")] });
+    const v2 = s.store.getProposedAction(s.actionId);
+    s.store.approveProposedAction(s.actionId, "test-owner");
+    // Re-bind the evidence to the new version.
+    s.delivery.recordAcceptance({
+      businessId: s.businessId,
+      bookingId: s.bookingId,
+      proposalVersion: v2.proposalVersion,
+      proposalFingerprint: v2.proposalFingerprint,
+      acceptedAt: "2030-05-01T10:00:00.000Z",
+      sourceRefs: [liveRef("acceptance://v2")],
+    });
+    s.delivery.recordResourceCommitment({
+      businessId: s.businessId,
+      bookingId: s.bookingId,
+      resourceId: "room-a",
+      proposalVersion: v2.proposalVersion,
+      proposalFingerprint: v2.proposalFingerprint,
+      status: "committed",
+      startAt: "2030-06-12T16:00:00.000Z",
+      endAt: "2030-06-13T00:00:00.000Z",
+      observedAt: "2030-05-01T11:30:00.000Z",
+      sourceRefs: [liveRef("registry://v2")],
+    });
+    await assert.rejects(
+      confirmBooking(s.deps, {
+        bookingId: s.bookingId,
+        proposedActionId: s.actionId,
+        proposalVersion: v2.proposalVersion,
+        proposalFingerprint: v2.proposalFingerprint,
+        confirmKey: "cmd-v2",
+      }),
+      (error: unknown) => error instanceof ServiceError && error.code === "CONFLICT" && /no hold execution|no email execution/i.test(error.message),
+    );
+    assert.notEqual(s.store.getBooking(s.bookingId).status, "confirmed");
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("an expired in-progress lease is reclaimable exactly once", async () => {
+  const s = setup();
+  try {
+    const requestHash = confirmRequestHash(confirmInput(s));
+    const base = {
+      confirmKey: "cmd-lease",
+      bookingId: s.bookingId,
+      proposedActionId: s.actionId,
+      proposalVersion: s.version,
+      proposalFingerprint: s.fingerprint,
+      requestHash,
+      leaseMs: 120_000,
+    };
+    const first = s.delivery.reserveConfirmCommand({ ...base, nowMs: Date.parse(NOW) });
+    assert.equal(first.kind, "owned");
+    // Expire the lease: a later caller reclaims it.
+    s.delivery.db.prepare("UPDATE delivery_confirm_commands SET updated_at = $t WHERE confirm_key = 'cmd-lease'").run({
+      $t: new Date(Date.parse(NOW) - 200_000).toISOString(),
+    });
+    const reclaimed = s.delivery.reserveConfirmCommand({ ...base, nowMs: Date.parse(NOW) });
+    assert.equal(reclaimed.kind, "owned");
+    // Align the reclaimed row's persisted timestamp with the injected clock:
+    // reserveConfirmCommand writes wall-clock updated_at while the test clock
+    // is fixed at NOW.
+    s.delivery.db.prepare("UPDATE delivery_confirm_commands SET updated_at = $t WHERE confirm_key = 'cmd-lease'").run({ $t: NOW });
+    // The reclaimed row is live again: the next caller sees in-progress.
+    const next = s.delivery.reserveConfirmCommand({ ...base, nowMs: Date.parse(NOW) });
+    assert.equal(next.kind, "in_progress");
   } finally {
     s.cleanup();
   }

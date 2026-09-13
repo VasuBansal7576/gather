@@ -4,7 +4,7 @@ import type { AcceptedProposal, BookingSnapshot, OperationalHandoff, ReadinessDe
 import { buildHandoff } from "../../delivery/handoff.ts";
 import { evaluateBookingReadiness } from "../../delivery/verifiers.ts";
 import type { Booking, ProposedAction } from "../../domain/contracts.ts";
-import { holdOperationKey, ServiceError } from "../booking-service.ts";
+import { emailOperationKey, holdOperationKey, ServiceError } from "../booking-service.ts";
 import type { GatherStore } from "../sqlite-store.ts";
 import { DeliveryStore } from "./store.ts";
 import { CollectingVerifiers, StoreDeliveryVerifiers } from "./verifiers.ts";
@@ -38,7 +38,8 @@ export interface ConfirmRequestDTO {
 }
 
 export interface ConfirmResponseDTO {
-  demo: true;
+  /** True only when the evaluated evidence is not live provenance — a live-ready confirmation is never mislabeled demo. */
+  demo: boolean;
   command: { confirmKey: string; status: "confirmed" | "blocked" | "failed" };
   booking: Booking;
   /** The evaluated decision for this command; null when the command failed before evaluation completed. */
@@ -49,17 +50,33 @@ export interface ConfirmResponseDTO {
 }
 
 export interface ReadinessResponseDTO {
-  demo: true;
+  demo: boolean;
   booking: Booking;
   binding: ReadinessDecision["binding"];
   decision: ReadinessDecision;
 }
 
+export type HandoffState = "ready" | "preliminary" | "blocked";
+
 export interface HandoffResponseDTO {
-  demo: true;
+  demo: boolean;
   booking: Booking;
-  revision: number;
-  handoff: OperationalHandoff;
+  /**
+   * Numbered revision of the persisted handoff this view corresponds to.
+   * GET is read-only: it reports the latest persisted revision (null when
+   * none) and never creates one. POST builds and persists a new revision.
+   */
+  revision: number | null;
+  /**
+   * `ready` requires a live approval for the current exact proposal
+   * version, a freshly evaluated ready+live-ready decision, and a
+   * confirmed booking. `preliminary` means the approval is live but the
+   * binding has not fully confirmed. `blocked` means the proposal has no
+   * live approval or evaluation could not run — `reason` is explicit.
+   */
+  state: HandoffState;
+  reason?: string;
+  handoff: OperationalHandoff | null;
 }
 
 /** Lease on an in-progress confirm command before it becomes reclaimable. */
@@ -97,6 +114,52 @@ function snapshotProposal(action: ProposedAction, booking: Booking): AcceptedPro
     payload: action.payload,
     sourceReferences: action.sourceReferences,
   };
+}
+
+/** Responses are demo-marked unless every cited evidence item was live. */
+function demoOf(provenance: ReadinessDecision["provenance"] | undefined): boolean {
+  return provenance !== "live";
+}
+
+/**
+ * Executable steps the approved proposal must have durably completed before
+ * confirmation — the authoritative contract is the action kind, matching the
+ * steps approveAndExecute runs under their canonical operation keys. A hold
+ * alone never confirms, and neither does an approval whose hold or email
+ * step never ran, is still pending, or failed/uncertain.
+ */
+const REQUIRED_EXECUTION_STEPS: Record<string, readonly { step: "hold" | "email"; key: (actionId: string, version: number) => string }[]> = {
+  create_provisional_hold: [
+    { step: "hold", key: holdOperationKey },
+    { step: "email", key: emailOperationKey },
+  ],
+};
+
+/**
+ * Require a succeeded execution under the canonical operation key for every
+ * required step of the exact approved proposal version. Runs inside the
+ * commit transaction so a step that completes mid-flight is seen, and a
+ * mid-flight version bump was already fenced by the binding snapshot.
+ */
+function requireCompletedExecutions(deps: BookingDeliveryDeps, action: ProposedAction): void {
+  const requiredSteps = REQUIRED_EXECUTION_STEPS[action.kind];
+  if (requiredSteps === undefined) {
+    throw new ServiceError("CONFLICT", `Proposal kind ${action.kind} has no declared execution steps; confirmation cannot verify it`, false);
+  }
+  for (const { step, key } of requiredSteps) {
+    const execution = deps.store.getExecutionByIdempotencyKey(key(action.id, action.proposalVersion));
+    if (execution?.status === "succeeded") continue;
+    if (execution && (execution.status === "pending" || execution.status === "uncertain" || execution.status === "partial")) {
+      throw new ServiceError("CONFLICT", `Required ${step} execution is still ${execution.status} for proposal v${action.proposalVersion}; reconcile it before confirming`, true);
+    }
+    throw new ServiceError(
+      "CONFLICT",
+      execution
+        ? `Required ${step} execution ${execution.status} for proposal v${action.proposalVersion}; re-run the approved step before confirming`
+        : `No ${step} execution exists for the approved proposal v${action.proposalVersion}; the approved steps must durably complete before confirmation`,
+      false,
+    );
+  }
 }
 
 /** Canonical request hash binding a confirm key to its exact inputs. */
@@ -158,7 +221,7 @@ export async function readinessForBooking(deps: BookingDeliveryDeps, bookingId: 
   const booking = deps.store.getBooking(bookingId);
   const action = currentAction(deps.store, bookingId);
   const decision = await evaluateForAction(deps, booking, action);
-  return { demo: true, booking, binding: decision.binding, decision };
+  return { demo: demoOf(decision.provenance), booking, binding: decision.binding, decision };
 }
 
 interface BindingSnapshot {
@@ -248,11 +311,12 @@ export async function confirmBooking(deps: BookingDeliveryDeps, input: ConfirmRe
   if (reservation.kind === "replay") {
     const command = reservation.command;
     const persisted = command.response ?? {};
+    const persistedDecision = persisted.decision as ReadinessDecision | undefined;
     return {
-      demo: true,
+      demo: demoOf(persistedDecision?.provenance),
       command: { confirmKey: command.confirmKey, status: command.status as "confirmed" | "blocked" | "failed" },
       booking: store.getBooking(command.bookingId),
-      decision: (persisted.decision as ReadinessDecision | undefined) ?? null,
+      decision: persistedDecision ?? null,
       confirmedBooking: command.status === "confirmed",
       note: `Canonical replay of confirm command ${command.confirmKey}.`,
     };
@@ -294,12 +358,17 @@ export async function confirmBooking(deps: BookingDeliveryDeps, input: ConfirmRe
           throw new ServiceError("SLOT_UNAVAILABLE", `The window became durably held while confirmation was in flight (record ${conflict}); confirmation refused`, false);
         }
       }
-      const decisionId = delivery.insertDecision(decision, action.id);
       const canConfirm = decision.ready && decision.liveReady;
-      const status = canConfirm ? "confirmed" : "blocked";
       if (canConfirm) {
+        // The approved steps themselves must be durably complete: confirmation
+        // requires a succeeded hold AND email execution for the exact version —
+        // a hold alone, a missing step, or a pending/failed/uncertain step
+        // never confirms.
+        requireCompletedExecutions(deps, action);
         store.updateBookingStatus(booking.id, "confirmed");
       }
+      const decisionId = delivery.insertDecision(decision, action.id);
+      const status = canConfirm ? "confirmed" : "blocked";
       const response: Record<string, unknown> = {
         command: { confirmKey: input.confirmKey, status },
         decision,
@@ -310,7 +379,7 @@ export async function confirmBooking(deps: BookingDeliveryDeps, input: ConfirmRe
       return { canConfirm };
     });
     return {
-      demo: true,
+      demo: demoOf(decision.provenance),
       command: { confirmKey: input.confirmKey, status: outcome.canConfirm ? "confirmed" : "blocked" },
       booking: store.getBooking(booking.id),
       decision,
@@ -332,22 +401,83 @@ export async function confirmBooking(deps: BookingDeliveryDeps, input: ConfirmRe
 }
 
 /**
- * Operational handoff for the booking's current accepted proposal. Uses
- * the latest persisted decision for the exact version when one exists,
- * otherwise evaluates fresh through the verifier boundary. Every build is
- * persisted as a numbered revision tied to the accepted version identity.
+ * Evaluate the current handoff view. Freshness is enforced by evaluating
+ * through the verifier boundary on every call — a persisted decision is
+ * never reused, because its availability evidence can be stale. A live
+ * approval for the exact current version is required before any handoff is
+ * produced; without one the view is explicitly blocked.
  */
-export async function handoffForBooking(deps: BookingDeliveryDeps, bookingId: string): Promise<HandoffResponseDTO> {
-  const { store, delivery } = deps;
+async function evaluateHandoff(
+  deps: BookingDeliveryDeps,
+  bookingId: string,
+): Promise<Omit<HandoffResponseDTO, "revision">> {
+  const { store } = deps;
   const booking = store.getBooking(bookingId);
   const action = currentAction(store, bookingId);
-  const persisted = delivery.latestDecisionForAction(action.id, action.proposalVersion);
-  const decision = persisted ?? (await evaluateForAction(deps, booking, action));
+  const approvalLive = store.listApprovals(action.id).some(
+    (approval) =>
+      approval.status === "approved" &&
+      approval.proposalVersion === action.proposalVersion &&
+      approval.proposalFingerprint === action.proposalFingerprint,
+  );
+  const current = store.getBooking(booking.id);
+  if (!approvalLive) {
+    return {
+      demo: true,
+      booking: current,
+      state: "blocked",
+      reason: `No live owner approval for the current proposal v${action.proposalVersion}; an operational handoff is only prepared for the approved proposal`,
+      handoff: null,
+    };
+  }
+  let decision: ReadinessDecision;
+  try {
+    decision = await evaluateForAction(deps, booking, action);
+  } catch (error) {
+    return {
+      demo: true,
+      booking: current,
+      state: "blocked",
+      reason: `Handoff evaluation unavailable: ${error instanceof Error ? error.message : "unknown error"}`,
+      handoff: null,
+    };
+  }
   const handoff = buildHandoff({
     decision,
-    booking: snapshotBooking(booking),
-    proposal: snapshotProposal(action, booking),
+    booking: snapshotBooking(current),
+    proposal: snapshotProposal(action, current),
   });
-  const revision = delivery.insertHandoffRevision(action.id, handoff);
-  return { demo: true, booking: store.getBooking(booking.id), revision: revision.revision, handoff };
+  if (decision.ready && decision.liveReady && current.status === "confirmed") {
+    return { demo: demoOf(decision.provenance), booking: current, state: "ready", handoff };
+  }
+  const reason = !decision.ready
+    ? `Handoff is preliminary: the proposal is approved but readiness is blocked (${decision.blockedBy.join("; ") || "conditions unmet"})`
+    : !decision.liveReady
+      ? "Handoff is preliminary: the proposal is approved and ready on demo evidence, but live provenance has not been verified"
+      : "Handoff is preliminary: the proposal is approved and live-ready, but the booking is not confirmed yet";
+  return { demo: demoOf(decision.provenance), booking: current, state: "preliminary", reason, handoff };
+}
+
+/**
+ * Read-only operational handoff for the booking's current proposal (GET).
+ * Never persists: reports the latest previously built revision, or null.
+ */
+export async function handoffForBooking(deps: BookingDeliveryDeps, bookingId: string): Promise<HandoffResponseDTO> {
+  const view = await evaluateHandoff(deps, bookingId);
+  const latest = deps.delivery.latestHandoff(currentAction(deps.store, bookingId).id);
+  return { ...view, revision: latest?.revision ?? null };
+}
+
+/**
+ * Build and persist a new numbered handoff revision (POST). The revision is
+ * created only when an evaluated handoff exists; a blocked view persists
+ * nothing and reports the same explicit state.
+ */
+export async function recordHandoff(deps: BookingDeliveryDeps, bookingId: string): Promise<HandoffResponseDTO> {
+  const view = await evaluateHandoff(deps, bookingId);
+  if (view.handoff === null) {
+    return { ...view, revision: deps.delivery.latestHandoff(currentAction(deps.store, bookingId).id)?.revision ?? null };
+  }
+  const revision = deps.delivery.insertHandoffRevision(currentAction(deps.store, bookingId).id, view.handoff);
+  return { ...view, revision: revision.revision };
 }
