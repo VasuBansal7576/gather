@@ -38,6 +38,11 @@ import {
  *   for an uncompleted page — its continuation token plus the ids already
  *   emitted from it. A cursor presented for another account or query, or a
  *   legacy v1 cursor, is rejected before any HTTP call.
+ * - Query scope is exact, never heuristic: absent (unfiltered) or a single
+ *   system-label filter enforced server-side (`labelId` on history calls,
+ *   `q` on the messages.list snapshot). `users.history.list` documents no
+ *   `q` parameter, so arbitrary queries are rejected as `invalid_request`
+ *   before any HTTP call instead of being silently broadened.
  * - `nextCursor` NEVER advances the base watermark past unvisited pages or
  *   un-emitted messages: a capped result resumes the exact page (replayed
  *   server-side, de-duplicated by message id, so repeats are possible but
@@ -73,10 +78,19 @@ export interface PollInboxOptions {
   /** Opaque cursor from a previous poll. Absent = bounded full sync. */
   cursor?: string;
   /**
-   * Optional Gmail search query narrowing both paths. Passed through as
-   * search syntax (operators allowed); fragments built from untrusted input
-   * must first pass through `escapeGmailQuery` (see gmail.ts) — never
-   * interpolate raw inquiry text into `q`.
+   * Optional scope narrowing both paths. `users.history.list` (the delta
+   * path) documents `maxResults`, `pageToken`, `startHistoryId`, `labelId`,
+   * and `historyTypes` — it has NO `q` parameter, so an arbitrary Gmail
+   * search string must never be sent there: the server would ignore it and
+   * silently broaden the result. The accepted boundary is therefore exact:
+   * absent (unfiltered) or a single system-label filter (e.g. `in:inbox`,
+   * `in:sent`, `in:trash`, `in:spam`, `in:draft(s)`, `label:<system>`,
+   * `is:unread|starred|important`), enforced server-side via `labelId` on
+   * history calls and via `q` on the `messages.list` snapshot (which does
+   * support `q`). Any other query is rejected as `invalid_request` before
+   * any HTTP call — never silently broadened. Fragments built from
+   * untrusted input must first pass through `escapeGmailQuery`
+   * (see gmail.ts) — never interpolate raw inquiry text into `q`.
    */
   query?: string;
   /** Maximum history/list pages per poll (default 5). */
@@ -101,6 +115,47 @@ export interface InboxCursorScope {
   pageToken?: string;
   /** Message ids already emitted from the uncompleted page. */
   seen?: string[];
+}
+
+/**
+ * Exact query-scope boundary for inbox polling.
+ *
+ * `users.history.list` has no `q` parameter, so only scopes with an exact
+ * server-side equivalent are accepted: absent (unfiltered) or a single
+ * system-label filter, returned as the `labelId` to send on history calls.
+ * Returns `undefined` for unfiltered, the label id for a label scope, or
+ * `null` when the query has no exact history-list equivalent and must be
+ * rejected rather than silently broadened. Matching is case-insensitive on
+ * the trimmed single token; anything compound (whitespace, extra operators,
+ * negation, quoting) is unsupported — local re-evaluation of full Gmail
+ * search syntax is not exact (stemming, indexing lag), so a semantic or
+ * heuristic filter must never stand in for server scoping.
+ */
+export function resolveHistoryLabelScope(query: string | undefined): string | undefined | null {
+  if (query === undefined) return undefined;
+  const token = query.trim().toLowerCase();
+  if (token.length === 0 || /\s/.test(token)) return null;
+  const table: Record<string, string> = {
+    "in:inbox": "INBOX",
+    "in:sent": "SENT",
+    "in:trash": "TRASH",
+    "in:spam": "SPAM",
+    "in:draft": "DRAFT",
+    "in:drafts": "DRAFT",
+    "label:inbox": "INBOX",
+    "label:sent": "SENT",
+    "label:trash": "TRASH",
+    "label:spam": "SPAM",
+    "label:draft": "DRAFT",
+    "label:drafts": "DRAFT",
+    "label:unread": "UNREAD",
+    "label:starred": "STARRED",
+    "label:important": "IMPORTANT",
+    "is:unread": "UNREAD",
+    "is:starred": "STARRED",
+    "is:important": "IMPORTANT",
+  };
+  return table[token] ?? null;
 }
 
 export function encodeCursor(historyId: string, scope: InboxCursorScope = {}): string {
@@ -274,8 +329,15 @@ export class GmailInboxPoller {
     if (!Number.isInteger(maxPages) || maxPages < 1 || !Number.isInteger(maxMessages) || maxMessages < 1) {
       return { status: "failed", metadata: liveMetadata(operationKey, []), error: invalidRequest("maxPages and maxMessages must be positive integers") };
     }
+    // Scope check before any HTTP on either path: history.list has no `q`,
+    // so a query without an exact labelId equivalent cannot be enforced and
+    // is rejected instead of silently returning unscoped changes.
+    const labelId = resolveHistoryLabelScope(options.query);
+    if (labelId === null) {
+      return { status: "failed", metadata: liveMetadata(operationKey, []), error: invalidRequest("Query has no exact Gmail history scope (supported: unfiltered or a single system-label filter such as in:inbox); refusing to poll unscoped rather than silently broadening") };
+    }
     if (options.cursor === undefined) {
-      return this.fullSync(operationKey, options.query, maxPages, maxMessages);
+      return this.fullSync(operationKey, options.query, labelId, maxPages, maxMessages);
     }
     const decoded = decodeCursor(options.cursor);
     if (decoded === undefined) {
@@ -286,7 +348,7 @@ export class GmailInboxPoller {
     if (decoded.account !== this.accountId() || (decoded.query ?? undefined) !== (options.query ?? undefined)) {
       return { status: "failed", metadata: liveMetadata(operationKey, []), error: invalidRequest("Cursor is bound to a different account or query; reset with a cursor-less full sync") };
     }
-    return this.deltaSync(operationKey, decoded, options.query, maxPages, maxMessages);
+    return this.deltaSync(operationKey, decoded, options.query, labelId, maxPages, maxMessages);
   }
 
   /**
@@ -341,6 +403,7 @@ export class GmailInboxPoller {
     operationKey: string,
     cursor: DecodedCursor,
     query: string | undefined,
+    labelId: string | undefined,
     maxPages: number,
     maxMessages: number,
   ): Promise<ConnectorResult<InboxDelta>> {
@@ -356,7 +419,10 @@ export class GmailInboxPoller {
         const url = withQuery(`${GMAIL_BASE_URL}/users/${encodeURIComponent(this.userId())}/history`, {
           startHistoryId: cursor.base,
           historyTypes: "messageAdded",
-          ...(query === undefined ? {} : { q: query }),
+          // The only supported server scoping: history.list documents
+          // labelId, not q. Never send q here — the server ignores unknown
+          // parameters and would silently broaden the result.
+          ...(labelId === undefined ? {} : { labelId }),
           maxResults: "500",
           pageToken,
         });
@@ -415,6 +481,7 @@ export class GmailInboxPoller {
   private async fullSync(
     operationKey: string,
     query: string | undefined,
+    labelId: string | undefined,
     maxPages: number,
     maxMessages: number,
   ): Promise<ConnectorResult<InboxDelta>> {
@@ -450,7 +517,9 @@ export class GmailInboxPoller {
       data: { resetRequired: false, changes, nextCursor: cursor, truncated, provenance },
     });
     try {
-      // Phase 1: bounded id snapshot.
+      // Phase 1: bounded id snapshot. messages.list documents `q`, so the
+      // accepted (label-mappable or absent) scope is enforced server-side
+      // here exactly.
       let pageToken: string | undefined;
       while (pagesLeft > 0) {
         pagesLeft -= 1;
@@ -488,7 +557,7 @@ export class GmailInboxPoller {
       // instead of being skipped by a post-list cursor.
       let catchupResume: string | undefined;
       if (watermark !== undefined && pagesLeft > 0) {
-        const caught = await this.catchUp(operationKey, watermark, query, pagesLeft, maxMessages, seen, changes);
+        const caught = await this.catchUp(operationKey, watermark, labelId, pagesLeft, maxMessages, seen, changes);
         if (caught.resetRequired) {
           return { status: "succeeded", metadata: liveMetadata(operationKey, provenance), data: { resetRequired: true, changes: [], truncated: false, provenance } };
         }
@@ -536,7 +605,7 @@ export class GmailInboxPoller {
   private async catchUp(
     operationKey: string,
     watermark: string,
-    query: string | undefined,
+    labelId: string | undefined,
     pagesLeft: number,
     maxMessages: number,
     seen: Set<string>,
@@ -551,7 +620,8 @@ export class GmailInboxPoller {
       const url = withQuery(`${GMAIL_BASE_URL}/users/${encodeURIComponent(this.userId())}/history`, {
         startHistoryId: watermark,
         historyTypes: "messageAdded",
-        ...(query === undefined ? {} : { q: query }),
+        // Same contract as deltaSync: labelId only, never q.
+        ...(labelId === undefined ? {} : { labelId }),
         maxResults: "500",
         pageToken,
       });

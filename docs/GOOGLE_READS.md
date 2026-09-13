@@ -13,11 +13,19 @@ account verification has been performed; the live gate is BLOCKED.**
 
 Gmail (`users.history.list` reference; `messages.list`/`get`, `profile`):
 
-- `GET …/users/{userId}/history?startHistoryId&historyTypes=maxResults&pageToken`:
+- `GET …/users/{userId}/history?startHistoryId&historyTypes&labelId&maxResults&pageToken`:
   chronological records, monotonic but non-contiguous `historyId`
   (maxResults ≤ 500), `messagesAdded`/`messagesDeleted` buckets whose
   messages typically carry only `id`/`threadId`, per-response `historyId`
-  (the commit point), `nextPageToken` paging. An invalid or expired
+  (the commit point), `nextPageToken` paging. `labelId` is the ONLY
+  server-side scope: this endpoint documents NO `q` parameter, so the
+  poller never sends one (an unknown parameter would be ignored and the
+  result silently broadened). The accepted query boundary is therefore
+  exact — absent (unfiltered) or a single system-label filter (`in:inbox`,
+  `in:sent`, `in:trash`, `in:spam`, `in:draft(s)`, `label:<system>`,
+  `is:unread|starred|important`), enforced via `labelId`; any other query
+  is rejected as `invalid_request` before any HTTP call, never silently
+  broadened. An invalid or expired
   `startHistoryId` (valid ≥ a week, sometimes only hours) returns **HTTP
   404 — the documented expiry signal, verified by test, not an assumed
   410** — and the client must full-sync.
@@ -57,7 +65,10 @@ guide):
   `userId` `"me"` alias, which is identical across accounts: two pollers
   sharing `"me"` with different `accountId` values reject each other's
   cursors (tested). Factory callers serving several accounts must pass
-  distinct `accountId` values.
+  distinct `accountId` values. Only exact scopes are accepted (unfiltered
+  or a single system-label filter); anything else fails `invalid_request`
+  before any HTTP call, so a scoped cursor can never silently return
+  unscoped mail.
 - `nextCursor` never advances the base watermark past unvisited pages or
   un-emitted messages: a capped result resumes the exact page (replayed
   server-side, de-duplicated by message id, so repeats are possible but
