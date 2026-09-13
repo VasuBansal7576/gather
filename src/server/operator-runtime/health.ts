@@ -46,6 +46,7 @@ export function operatorHealth(deps: OperatorRuntimeDeps): OperatorHealth {
         lastSweepAt: latest?.updatedAt,
         lastError: failures[0]?.message,
         connectionStatus: connection?.status,
+        deadLettered: intake.listDeadLettered(deps.accountId, 100).length,
       },
     ],
     waitingByStatus,

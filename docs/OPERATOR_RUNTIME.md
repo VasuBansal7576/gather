@@ -21,25 +21,36 @@ Gather owning business-specific durable intake, cursors, and receipts.
 1. Poll the injected inbox (pre-bound to one stable `accountId`; tokens
    arrive inside the poller — this lane never reads credentials).
 2. Atomically persist the raw batch (`intake_batches` + `intake_items`,
-   own `BEGIN IMMEDIATE`). The batch durably remains until every item is
+   own `BEGIN IMMEDIATE`). Each `(accountId, messageId)` owns exactly one
+   canonical item row across all batches — a replayed poll change dedupes
+   to that row instead of minting a new one, so failed rows can never
+   grow unboundedly. The batch durably remains until every item is
    linked/drained or explicitly parked — never dropped.
 3. Drain in provider order: resolve booking identity through source keys
    (ambiguous → `needs_decision`, open owner decision stays pending,
    nothing auto-links, nothing ingests), then `ledger.ingestEvent` per
    linked item with a stable `gather:intake:{account}:{message}` dedupeKey
    (no mutable inferred kind — replays collapse even across later
-   reclassification, and content conflicts surface as visible failures,
-   never merges). Replies classify by actual chronology and direction
-   only: a strictly earlier, non-own message makes an item a reply; later
-   messages, unparseable timestamps, and own outbound mail (recorded as
-   `skipped`) never do. Ledger and identity run their own transactions;
-   this layer never nests them.
-4. Commit the cursor checkpoint only after the full drain (at-least-once:
-   replays collapse on dedupeKeys and source keys). A history-404 expiry
-   durably clears the dead cursor first, so the next sweep full-syncs
-   cursor-less instead of replaying expiry. Parked items (`needs_decision`
-   after owner resolution, retried `failed`) re-drive on later sweeps even
-   when the poll returns nothing new, so the mailbox never stalls on them.
+   reclassification, and content conflicts surface as dead-lettered
+   failures, never merges). Replies classify by actual chronology and
+   direction only: a strictly earlier, non-own message makes an item a
+   reply; later messages, unparseable timestamps, and own outbound mail
+   (recorded as `skipped`) never do. Ledger and identity run their own
+   transactions; this layer never nests them.
+4. Commit the cursor checkpoint once the batch is durably persisted —
+   the cursor is the capture watermark, NOT the processing outcome. A
+   permanently failing source therefore can never wedge intake or force
+   infinite replay. Processing outcome is tracked per item: unsettled
+   rows (`received`/`linked` after a crash), `needs_decision`, and
+   `failed` rows inside the retry budget (`attempts`, bounded by
+   `MAX_INTAKE_ATTEMPTS = 5`) re-drive on later sweeps even when the poll
+   returns nothing new. Exhausted or permanent failures (e.g. dedupe
+   content conflicts) dead-letter (`dead = 1`): terminal, excluded from
+   retries, and surfaced in `listDeadLettered`/health — never silently
+   dropped. A history-404 expiry durably clears the dead cursor first,
+   so the next sweep full-syncs cursor-less instead of replaying expiry,
+   and `settleReceivedBatches` retires crashed 'received' batches once
+   their items resolve.
 
 Replies stay ordered after the inquiries they answer, so the ledger
 observes inquiry-then-reply and suppresses answered followups; a reply
@@ -54,13 +65,20 @@ Provider payment text is evidence, never proof.
 Selection scopes before the limit: due work is listed per booking of this
 runtime's business (a supported ledger query), merged oldest-first and
 capped — a full page of foreign-business rows can never starve this
-business, and foreign rows are never even read. An item executes only for
-a proposal bound to the same booking with a live exact-version approval
-verified read-only. Immediately before any effect the drain revalidates:
+business, and foreign rows are never even read. A store failure listing
+bookings surfaces as a drain error, never a healthy empty report. An item
+executes only for a proposal bound to the same booking with a live
+exact-version approval verified read-only — and the binding is set only
+through `bindWaitingToProposal`, the host handoff API that validates the
+waiting item is open, the action belongs to the SAME booking, and the
+booking sits inside this runtime's business (raw detail writes are not a
+supported path). Immediately before any effect the drain revalidates:
 the row is still claimed by us with a matching fencing token under a live
-lease, the booking is not paused/cancelled, and no customer reply arrived
-since the claim (ledger receipt ordering with a same-clock inclusive
-fence — a late reply suppresses instead of executing).
+lease, the booking is not paused/cancelled, and — for `followup` items
+only — no customer reply arrived since the claim (ledger receipt ordering
+with a same-clock inclusive fence — a late reply suppresses instead of
+executing). A reply never retires a `change_review`, `deposit_check`, or
+`resource_check`: inbound mail does not answer those obligations.
 
 Completion is durable-or-nothing: an item resolves done only after every
 exact required step for the current proposal version (hold AND email
@@ -126,8 +144,21 @@ behavior, which stay blocked pending owner assets.
 
 ## Manual limits
 
-Cursor-less bootstraps replay; consumers de-duplicate by message id.
-Indefinite provider uncertainty stays uncertain (reconcile, don't force).
-Single-business runtime binding per operator instance; multi-business
-deployments need one binding each. Expiry sweeps and absence-attested
+Cursor-less bootstraps replay; consumers de-duplicate by message id
+(intake additionally dedupes to one canonical item row per
+account+message). Indefinite provider uncertainty stays uncertain
+(reconcile, don't force). Failed intake work dead-letters after
+`MAX_INTAKE_ATTEMPTS` — it is owner-visible, never auto-retried, and a
+dead-lettered message is never reprocessed on later replays (a
+reclassification that would change the event kind surfaces as a
+dead-lettered conflict, not a silent rewrite).
+
+Operator deps registration is a bounded per-account registry
+(`setOperatorDeps` keyed by stable `accountId`, at most
+`MAX_OPERATOR_BINDINGS = 32`): one binding serves the existing routes;
+with several, callers must name the account via `getOperatorDepsFor` —
+`getOperatorDeps()` returns null rather than guessing a business. The
+shared `app/api/operator/*` routes do not take an account parameter yet,
+so multi-account deployments still need per-account route addressing or
+one host process per account. Expiry sweeps and absence-attested
 re-execution remain unbuilt by design, not faked.

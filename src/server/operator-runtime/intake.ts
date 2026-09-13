@@ -50,16 +50,27 @@ function isSimulated(deps: IntakeDeps, pollMode: string | undefined): boolean {
   return deps.inbox.provenance.simulated || pollMode !== "live";
 }
 
+/** Bounded retries before a failed item dead-letters — parked work never wedges intake. */
+export const MAX_INTAKE_ATTEMPTS = 5;
+
 /**
  * One intake sweep: poll → atomically persist the raw batch → drain in
- * observed order → commit the cursor only after the drain completes →
- * re-drive previously parked items. Replies are detected by actual
- * chronology and direction (never thread length): a message is a reply
- * only when an earlier, non-own message precedes it; own outbound mail is
- * recorded as skipped, never ingested as a customer reply. Ambiguous
- * identity parks items as needs_decision without auto-linking, and parked
- * items drain later once the owner resolves them — the mailbox never
- * stalls on them.
+ * observed order → commit the cursor → re-drive previously parked items.
+ *
+ * Watermark model: the cursor is the durable CAPTURE watermark. Every
+ * polled change is persisted to `intake_items` atomically before any
+ * processing, and each (account, messageId) owns exactly one canonical
+ * row forever — replays dedupe to it instead of minting new rows, so a
+ * permanently failing source can never wedge the cursor or grow failed
+ * rows unboundedly. Processing outcome lives per-item: unsettled rows
+ * ('received'/'linked'), 'needs_decision', and 'failed' rows inside the
+ * retry budget re-drive on later sweeps; items that exhaust
+ * MAX_INTAKE_ATTEMPTS dead-letter (terminal, owner-visible, never
+ * auto-retried). Replies are detected by actual chronology and direction
+ * (never thread length): a message is a reply only when an earlier,
+ * non-own message precedes it; own outbound mail is recorded as skipped,
+ * never ingested as a customer reply. Ambiguous identity parks items as
+ * needs_decision without auto-linking.
  */
 export async function runIntakeSweep(deps: IntakeDeps): Promise<SweepReport> {
   const intake = new OperatorIntakeStore(deps.store.db);
@@ -78,6 +89,9 @@ export async function runIntakeSweep(deps: IntakeDeps): Promise<SweepReport> {
     needsDecision: [],
     cursorCommitted: false,
     resetRequired: false,
+    resumedDrained: 0,
+    resumedFailed: 0,
+    deadLettered: [],
   };
   if (poll.status !== "succeeded") {
     intake.recordFailure(deps.accountId, "poll", poll.error.message);
@@ -106,23 +120,29 @@ export async function runIntakeSweep(deps: IntakeDeps): Promise<SweepReport> {
   base.drained = drained.drained;
   base.duplicates = drained.duplicates;
   base.needsDecision.push(...drained.needsDecision);
-  // Re-drive older parked items (previous batches, post-restart, or newly
-  // owner-resolved) — but never items this sweep just handled.
+  base.deadLettered.push(...drained.deadLettered);
+  // The batch is durably captured: commit the cursor regardless of
+  // processing outcome. Failed items are parked with a retry budget, so
+  // the watermark never depends on whether a source message is healthy.
+  intake.markBatch(batch.id, drained.failed === 0 ? "drained" : "failed");
+  if (poll.data.nextCursor !== undefined) {
+    intake.commitCursor(deps.accountId, poll.data.nextCursor, undefined);
+    base.cursorCommitted = true;
+  }
+  if (drained.failed > 0) {
+    base.error = `${drained.failed} item(s) failed to drain; parked for bounded retry`;
+  }
+  // Re-drive parked items (crash-stranded, owner-resolved, retried
+  // failures) — but never items this sweep just handled.
   const handled = new Set(intake.listItems(batch.id).map((item) => item.id));
   const resumed = await resumeParkedItems(deps, intake, handled);
-  base.drained += resumed.drained;
+  base.resumedDrained = resumed.drained;
+  base.resumedFailed = resumed.failed;
   base.duplicates += resumed.duplicates;
   base.needsDecision.push(...resumed.needsDecision);
-  if (drained.failed + resumed.failed === 0) {
-    intake.markBatch(batch.id, "drained");
-    if (poll.data.nextCursor !== undefined) {
-      intake.commitCursor(deps.accountId, poll.data.nextCursor, undefined);
-      base.cursorCommitted = true;
-    }
-  } else {
-    intake.markBatch(batch.id, "failed");
-    base.error = `${drained.failed + resumed.failed} item(s) failed to drain; cursor not committed`;
-  }
+  base.deadLettered.push(...resumed.deadLettered);
+  // Crash recovery bookkeeping: settle batches whose items all resolved.
+  intake.settleReceivedBatches(deps.accountId);
   return base;
 }
 
@@ -130,7 +150,7 @@ async function drainBatch(
   deps: IntakeDeps,
   intake: OperatorIntakeStore,
   batchId: string,
-): Promise<{ drained: number; duplicates: number; needsDecision: string[]; failed: number }> {
+): Promise<{ drained: number; duplicates: number; needsDecision: string[]; failed: number; deadLettered: string[] }> {
   // Provider order is chronological; the stable sort keeps it. Replies stay
   // after the inquiries they answer so the ledger observes inquiry-then-
   // reply and suppresses answered followups.
@@ -139,6 +159,7 @@ async function drainBatch(
   let duplicates = 0;
   let failed = 0;
   const needsDecision: string[] = [];
+  const deadLettered: string[] = [];
   for (const item of items) {
     try {
       const outcome = await drainItem(deps, intake, item);
@@ -147,32 +168,54 @@ async function drainBatch(
       } else if (outcome === "needs_decision") {
         drained += 1;
         needsDecision.push(item.messageId);
+      } else if (outcome === "dead") {
+        deadLettered.push(item.messageId);
       } else {
         drained += 1;
       }
     } catch (error) {
       failed += 1;
-      intake.updateItem(item.id, { status: "failed", error: error instanceof Error ? error.message : String(error) });
+      if (markItemFailed(intake, item, error)) deadLettered.push(item.messageId);
     }
   }
-  return { drained, duplicates, needsDecision, failed };
+  return { drained, duplicates, needsDecision, failed, deadLettered };
 }
 
 /**
- * Re-drive previously parked items (needs_decision after owner resolution,
- * failed after restart) even when the latest poll returned nothing new.
- * Bounded per sweep; still-parked items simply wait for the next pass.
+ * Record a failed drain attempt against the canonical item row: the
+ * retry budget ticks up, and an item that exhausts it dead-letters
+ * (terminal, surfaced via listDeadLettered/health — never retried and
+ * never silently dropped).
+ */
+function markItemFailed(intake: OperatorIntakeStore, item: IntakeItemRecord, error: unknown): boolean {
+  intake.bumpAttempts(item.id);
+  const dead = item.attempts + 1 >= MAX_INTAKE_ATTEMPTS;
+  intake.updateItem(item.id, {
+    status: "failed",
+    error: error instanceof Error ? error.message : String(error),
+    dead,
+  });
+  return dead;
+}
+
+/**
+ * Re-drive previously parked items (crash-stranded 'received'/'linked',
+ * 'needs_decision' awaiting owner resolution, retryable 'failed') even
+ * when the latest poll returned nothing new. Bounded per sweep; items
+ * that exhaust their retry budget dead-letter instead of retrying
+ * forever, and dead-lettered items are never touched again.
  */
 async function resumeParkedItems(
   deps: IntakeDeps,
   intake: OperatorIntakeStore,
   excludeItemIds: Set<string> = new Set(),
-): Promise<{ drained: number; duplicates: number; needsDecision: string[]; failed: number }> {
+): Promise<{ drained: number; duplicates: number; needsDecision: string[]; failed: number; deadLettered: string[] }> {
   const parked = intake.listParked(deps.accountId, 50).filter((item) => !excludeItemIds.has(item.id));
   let drained = 0;
   let duplicates = 0;
   let failed = 0;
   const needsDecision: string[] = [];
+  const deadLettered: string[] = [];
   for (const item of parked) {
     try {
       const outcome = await drainItem(deps, intake, item);
@@ -180,15 +223,17 @@ async function resumeParkedItems(
         duplicates += 1;
       } else if (outcome === "needs_decision") {
         needsDecision.push(item.messageId);
+      } else if (outcome === "dead") {
+        deadLettered.push(item.messageId);
       } else {
         drained += 1;
       }
     } catch (error) {
       failed += 1;
-      intake.updateItem(item.id, { status: "failed", error: error instanceof Error ? error.message : String(error) });
+      if (markItemFailed(intake, item, error)) deadLettered.push(item.messageId);
     }
   }
-  return { drained, duplicates, needsDecision, failed };
+  return { drained, duplicates, needsDecision, failed, deadLettered };
 }
 
 interface ThreadView {
@@ -206,7 +251,7 @@ async function loadThread(deps: IntakeDeps, item: IntakeItemRecord): Promise<Thr
   return { thread, mine: thread.messages[mineIndex], mineIndex };
 }
 
-async function drainItem(deps: IntakeDeps, intake: OperatorIntakeStore, item: IntakeItemRecord): Promise<"drained" | "duplicate" | "needs_decision"> {
+async function drainItem(deps: IntakeDeps, intake: OperatorIntakeStore, item: IntakeItemRecord): Promise<"drained" | "duplicate" | "needs_decision" | "dead"> {
   const store: GatherStore = deps.store;
   const ledger: CoordinationLedger = deps.ledger;
 
@@ -297,13 +342,16 @@ async function drainItem(deps: IntakeDeps, intake: OperatorIntakeStore, item: In
     });
   } catch (error) {
     if (error instanceof Error && /dedupe key reuse with different content/.test(error.message)) {
+      // Content conflicts are permanent: dead-letter immediately instead
+      // of burning the retry budget on a doomed ingest.
       intake.updateItem(item.id, {
         status: "failed",
         bookingId: proposed.bookingId,
         sourceKey: proposed.sourceKey,
         error: `dedupe conflict: ${error.message}`,
+        dead: true,
       });
-      return "drained";
+      return "dead";
     }
     throw error;
   }

@@ -16,11 +16,18 @@ import type { GoogleHttpRequest, GoogleHttpResponse, GoogleHttpTransport } from 
 import { GmailInboxPoller, encodeCursor } from "../src/connectors/google/incremental.ts";
 import { GatherStore } from "../src/server/sqlite-store.ts";
 import { emailOperationKey, holdOperationKey } from "../src/server/booking-service.ts";
-import { drainDueWork } from "../src/server/operator-runtime/due-work.ts";
+import { bindWaitingToProposal, drainDueWork } from "../src/server/operator-runtime/due-work.ts";
 import { operatorHealth } from "../src/server/operator-runtime/health.ts";
-import { runIntakeSweep, type IntakeDeps, type ThreadReaderPort } from "../src/server/operator-runtime/intake.ts";
+import { MAX_INTAKE_ATTEMPTS, runIntakeSweep, type IntakeDeps, type ThreadReaderPort } from "../src/server/operator-runtime/intake.ts";
 import { operatorMcpTools } from "../src/server/operator-runtime/mcp-tools.ts";
 import { OperatorIntakeStore } from "../src/server/operator-runtime/store.ts";
+import {
+  getOperatorDeps,
+  getOperatorDepsFor,
+  listOperatorAccounts,
+  resetOperatorDeps,
+  setOperatorDeps,
+} from "../src/server/operator-runtime/host.ts";
 
 const ACCOUNT = "acct-operator-1";
 const NOW = "2030-06-01T00:00:00.000Z";
@@ -245,20 +252,16 @@ test("uncertain approved work reconciles and resolves as done", async () => {
       observedAt: NOW,
     });
     assert.ok(ingested.createdWaiting.length >= 1);
-    // Host links the due item to the approved proposal (detail convention)
-    // and makes it due now.
-    for (const item of ingested.createdWaiting) {
-      fx.store.db.prepare("UPDATE coord_waiting SET detail_json = $detail, due_at = $due WHERE id = $id").run({
-        $detail: JSON.stringify({ proposedActionId: action.id }),
-        $due: NOW,
-        $id: item.id,
-      });
-    }
+    // Host links the due item to the approved proposal through the
+    // supported handoff API (never raw detail_json writes).
     const base = depsFor(fx, historyTransport([]));
     const deps: IntakeDeps = {
       ...base,
       booking: { ...base.booking, calendar: demo.calendar, email: demo.email },
     };
+    for (const item of ingested.createdWaiting) {
+      bindWaitingToProposal(deps, { waitingId: item.id, proposedActionId: action.id });
+    }
     const report = await drainDueWork(deps);
     // Uncertain reconciled (read-only provider truth, no new write); with
     // every required step succeeded the item resolves done, with no new
@@ -307,14 +310,10 @@ test("failed-send work waits for the owner; the operator never resends email", a
       sourceKind: "email",
       observedAt: NOW,
     });
-    for (const item of ingested.createdWaiting) {
-      fx.store.db.prepare("UPDATE coord_waiting SET detail_json = $detail, due_at = $due WHERE id = $id").run({
-        $detail: JSON.stringify({ proposedActionId: action.id }),
-        $due: NOW,
-        $id: item.id,
-      });
-    }
     const deps = depsFor(fx, historyTransport([]));
+    for (const item of ingested.createdWaiting) {
+      bindWaitingToProposal(deps, { waitingId: item.id, proposedActionId: action.id });
+    }
     let sends = 0;
     const realSend = deps.booking.email.sendEmail.bind(deps.booking.email);
     deps.booking.email.sendEmail = async (request) => {
@@ -595,16 +594,18 @@ test("same message reclassified after thread growth ingests exactly once", async
     const first = await runIntakeSweep(depsFor(fx, historyFor(["m-grow"]), threads));
     assert.equal(first.drained, 1);
     // Thread grows with a reply; the already-drained message replays (cursor
-    // reuse after a crash): stable identity collapses it to a duplicate with
-    // no content-conflict throw, and the new reply ingests.
+    // reuse after a crash): stable identity dedupes it to the canonical row
+    // (never re-ingested, no content-conflict throw), and the new reply drains.
     link("m-reply");
     threadMessages = ["m-grow", "m-reply"];
     const replay = await runIntakeSweep({
       ...depsFor(fx, historyFor(["m-grow", "m-reply"]), threads),
     });
-    assert.equal(replay.duplicates, 1);
+    assert.equal(replay.duplicates, 0);
     assert.equal(replay.drained, 1);
     assert.equal(replay.error, undefined);
+    const ledgerRows = fx.store.db.prepare("SELECT COUNT(*) AS n FROM coord_events").get() as { n: number };
+    assert.equal(ledgerRows.n, 2, "exactly one event per message — no double ingest");
   } finally {
     fx.cleanup();
   }
@@ -637,7 +638,7 @@ test("parked items drain after owner resolution even with an empty poll", async 
     const empty = depsFor(fx, historyTransport([]), threads);
     const second = await runIntakeSweep(empty);
     assert.equal(second.polled, 0);
-    assert.equal(second.drained, 1);
+    assert.equal(second.resumedDrained, 1, "the parked item re-drives once the owner resolved identity");
     assert.deepEqual(second.needsDecision, []);
     const intake = new OperatorIntakeStore(fx.store.db);
     assert.ok(intake.listItems(first.batchId!).some((item) => item.messageId === "m-park" && item.status === "ingested"));
@@ -672,7 +673,7 @@ test("due work is scoped to the runtime business and booking", async () => {
   }
 });
 
-test("reply between claim and dispatch suppresses instead of executing", async () => {
+test("reply between claim and dispatch suppresses the followup instead of executing", async () => {
   const fx = fixture();
   try {
     const action = fx.store.createProposedAction({
@@ -694,25 +695,20 @@ test("reply between claim and dispatch suppresses instead of executing", async (
     const holdKey = holdOperationKey(action.id, 1);
     const reserved = fx.store.reserveStepExecution(action.id, 1, holdKey, { claimToken: "t", leaseMs: 60000, nowMs: Date.parse(NOW) });
     fx.store.markExecutionUncertain(reserved.execution.id, "fixture");
-    const ingested = fx.ledger.ingestEvent({
-      dedupeKey: "k-change-race",
-      kind: "change",
+    // A due followup is the claimable work (inquiry observed 3 days ago).
+    const inquiry = fx.ledger.ingestEvent({
+      dedupeKey: "k-inq-race",
+      kind: "inquiry",
       bookingId: fx.bookingId,
       sourceId: "m-race",
       sourceKind: "email",
-      observedAt: NOW,
+      observedAt: "2030-05-29T00:00:00.000Z",
     });
-    for (const item of ingested.createdWaiting) {
-      fx.store.db.prepare("UPDATE coord_waiting SET detail_json = $detail, due_at = $due WHERE id = $id").run({
-        $detail: JSON.stringify({ proposedActionId: action.id }),
-        $due: NOW,
-        $id: item.id,
-      });
-    }
+    const followupId = inquiry.createdWaiting[0]!.id;
     const deps = depsFor(fx, historyTransport([]));
     const { claimDueItems, dispatchClaimedItems } = await import("../src/server/operator-runtime/due-work.ts");
     const { claimed } = claimDueItems(deps);
-    assert.equal(claimed.length, 1);
+    assert.deepEqual(claimed.map((item) => item.id), [followupId]);
     // A customer reply lands after the claim but before dispatch.
     fx.ledger.ingestEvent({
       dedupeKey: "k-reply-race",
@@ -725,6 +721,7 @@ test("reply between claim and dispatch suppresses instead of executing", async (
     const result = await dispatchClaimedItems(deps, claimed);
     assert.deepEqual(result.reconciled, []);
     assert.deepEqual(result.awaitingOwner, []);
+    assert.equal(waitingStatus(fx, followupId), "suppressed");
     // The execution was NOT reconciled: suppression won the race.
     assert.equal(fx.store.getActionExecution(reserved.execution.id).status, "uncertain");
   } finally {
@@ -752,7 +749,7 @@ function approvedHoldAction(fx: Fixture, id: string) {
   return action;
 }
 
-function linkWaitingToAction(fx: Fixture, actionId: string): string {
+function linkWaitingToAction(fx: Fixture, deps: IntakeDeps, actionId: string): string {
   const ingested = fx.ledger.ingestEvent({
     dedupeKey: `k-link-${actionId}`,
     kind: "change",
@@ -763,11 +760,7 @@ function linkWaitingToAction(fx: Fixture, actionId: string): string {
   });
   assert.ok(ingested.createdWaiting.length >= 1);
   for (const item of ingested.createdWaiting) {
-    fx.store.db.prepare("UPDATE coord_waiting SET detail_json = $detail, due_at = $due WHERE id = $id").run({
-      $detail: JSON.stringify({ proposedActionId: actionId }),
-      $due: NOW,
-      $id: item.id,
-    });
+    bindWaitingToProposal(deps, { waitingId: item.id, proposedActionId: actionId });
   }
   return ingested.createdWaiting[0]!.id;
 }
@@ -783,8 +776,9 @@ test("pending-only executions never resolve done", async () => {
     const action = approvedHoldAction(fx, "a-op-pending");
     // Reserved but never completed: provider truth unknown.
     fx.store.reserveStepExecution(action.id, 1, holdOperationKey(action.id, 1), { claimToken: "t", leaseMs: 60000, nowMs: Date.parse(NOW) });
-    const waitingId = linkWaitingToAction(fx, action.id);
-    const report = await drainDueWork(depsFor(fx, historyTransport([])));
+    const deps = depsFor(fx, historyTransport([]));
+    const waitingId = linkWaitingToAction(fx, deps, action.id);
+    const report = await drainDueWork(deps);
     assert.deepEqual(report.reconciled, []);
     assert.deepEqual(report.awaitingOwner, [waitingId]);
     assert.equal(waitingStatus(fx, waitingId), "claimed", "stays open, never resolved done");
@@ -800,8 +794,9 @@ test("hold-only success without any email receipt never resolves done", async ()
     const action = approvedHoldAction(fx, "a-op-holdonly");
     const reserved = fx.store.reserveStepExecution(action.id, 1, holdOperationKey(action.id, 1), { claimToken: "t", leaseMs: 60000, nowMs: Date.parse(NOW) });
     fx.store.completeActionExecution(reserved.execution.id, { status: "succeeded", result: { hold: { holdId: "h-1" } } });
-    const waitingId = linkWaitingToAction(fx, action.id);
-    const report = await drainDueWork(depsFor(fx, historyTransport([])));
+    const deps = depsFor(fx, historyTransport([]));
+    const waitingId = linkWaitingToAction(fx, deps, action.id);
+    const report = await drainDueWork(deps);
     assert.deepEqual(report.reconciled, []);
     assert.deepEqual(report.awaitingOwner, [waitingId]);
     assert.equal(waitingStatus(fx, waitingId), "claimed", "missing email leg stays open");
@@ -827,8 +822,8 @@ test("superseded proposal versions never resolve or execute", async () => {
       },
       sourceReferences: [],
     });
-    const waitingId = linkWaitingToAction(fx, action.id);
     const deps = depsFor(fx, historyTransport([]));
+    const waitingId = linkWaitingToAction(fx, deps, action.id);
     let sends = 0;
     const realSend = deps.booking.email.sendEmail.bind(deps.booking.email);
     deps.booking.email.sendEmail = async (request) => {
@@ -845,17 +840,23 @@ test("superseded proposal versions never resolve or execute", async () => {
   }
 });
 
-test("same-clock reply suppresses instead of executing", async () => {
+test("same-clock reply suppresses a pending followup instead of executing", async () => {
   const fx = fixture();
   try {
-    const action = approvedHoldAction(fx, "a-op-sameclock");
-    const reserved = fx.store.reserveStepExecution(action.id, 1, holdOperationKey(action.id, 1), { claimToken: "t", leaseMs: 60000, nowMs: Date.parse(NOW) });
-    fx.store.markExecutionUncertain(reserved.execution.id, "fixture");
-    const waitingId = linkWaitingToAction(fx, action.id);
+    // A followup due NOW (inquiry observed 3 days ago).
+    const inquiry = fx.ledger.ingestEvent({
+      dedupeKey: "k-inq-sameclock",
+      kind: "inquiry",
+      bookingId: fx.bookingId,
+      sourceId: "m-inq-sc",
+      sourceKind: "email",
+      observedAt: "2030-05-29T00:00:00.000Z",
+    });
+    const followupId = inquiry.createdWaiting[0]!.id;
     const deps = depsFor(fx, historyTransport([]));
     const { claimDueItems, dispatchClaimedItems } = await import("../src/server/operator-runtime/due-work.ts");
     const { claimed } = claimDueItems(deps);
-    assert.equal(claimed.length, 1);
+    assert.deepEqual(claimed.map((item) => item.id), [followupId]);
     // Reply ingested in the SAME clock tick as the claim: receipt ordering
     // still suppresses instead of executing.
     fx.ledger.ingestEvent({
@@ -869,8 +870,35 @@ test("same-clock reply suppresses instead of executing", async () => {
     const result = await dispatchClaimedItems(deps, claimed);
     assert.deepEqual(result.reconciled, []);
     assert.deepEqual(result.awaitingOwner, []);
-    assert.equal(fx.store.getActionExecution(reserved.execution.id).status, "uncertain", "untouched by suppression");
-    assert.equal(waitingStatus(fx, waitingId), "suppressed");
+    assert.equal(waitingStatus(fx, followupId), "suppressed");
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test("a reply never suppresses a claimed change_review — review work is kept", async () => {
+  const fx = fixture();
+  try {
+    const action = approvedHoldAction(fx, "a-op-nosupp");
+    const deps = depsFor(fx, historyTransport([]));
+    const waitingId = linkWaitingToAction(fx, deps, action.id);
+    const { claimDueItems, dispatchClaimedItems } = await import("../src/server/operator-runtime/due-work.ts");
+    const { claimed } = claimDueItems(deps);
+    assert.deepEqual(claimed.map((item) => item.id), [waitingId]);
+    assert.equal(claimed[0]!.kind, "change_review");
+    // A customer reply lands after the claim: it answers a followup, NOT a
+    // change review — the review must survive, never resolve 'suppressed'.
+    fx.ledger.ingestEvent({
+      dedupeKey: "k-reply-nosupp",
+      kind: "reply",
+      bookingId: fx.bookingId,
+      sourceId: "m-reply-nosupp",
+      sourceKind: "email",
+      observedAt: NOW,
+    });
+    await dispatchClaimedItems(deps, claimed);
+    assert.notEqual(waitingStatus(fx, waitingId), "suppressed", "change_review is never suppressed by a reply");
+    assert.equal(waitingStatus(fx, waitingId), "claimed");
   } finally {
     fx.cleanup();
   }
@@ -907,6 +935,190 @@ test("other-business queue saturation cannot starve this business", async () => 
     assert.ok(claimed.some((item) => item.bookingId === fx.bookingId), "own business work is claimed despite saturation");
     assert.ok(claimed.every((item) => item.bookingId === fx.bookingId), "nothing foreign is ever claimed here");
   } finally {
+    fx.cleanup();
+  }
+});
+
+test("a permanently failing source dead-letters bounded and never wedges the cursor", async () => {
+  const fx = fixture();
+  try {
+    const throwingThreads = {
+      readThread: async (): Promise<never> => {
+        throw new Error("provider exploded");
+      },
+    };
+    const deps = depsFor(fx, historyTransport([{ id: "m-poison", threadId: "t-poison" }]), throwingThreads);
+    const sweeps = [];
+    for (let index = 0; index < 7; index += 1) {
+      sweeps.push(await runIntakeSweep(deps));
+    }
+    const intake = new OperatorIntakeStore(fx.store.db);
+    // The cursor is the durable capture watermark: it commits every sweep
+    // even while the poisoned source keeps failing.
+    assert.ok(sweeps.every((sweep) => sweep.cursorCommitted), "cursor commits despite the failing item");
+    // Exactly ONE canonical item row for the message — replays dedupe to
+    // it instead of minting a new failed row per sweep.
+    const allItems = sweeps.flatMap((sweep) => intake.listItems(sweep.batchId!));
+    assert.equal(allItems.filter((item) => item.messageId === "m-poison").length, 1);
+    // Bounded retries then dead-letter; dead items leave the parked set.
+    const dead = intake.listDeadLettered(ACCOUNT);
+    assert.deepEqual(dead.map((item) => item.messageId), ["m-poison"]);
+    assert.equal(dead[0]!.attempts, MAX_INTAKE_ATTEMPTS);
+    assert.deepEqual(intake.listParked(ACCOUNT).map((item) => item.messageId), []);
+    assert.ok(sweeps.some((sweep) => sweep.deadLettered.includes("m-poison")));
+    // Owner-visible in health, never silently dropped.
+    const health = operatorHealth(deps);
+    assert.equal(health.accounts[0]!.deadLettered, 1);
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test("crash-stranded received items resume and their batch settles", async () => {
+  const fx = fixture();
+  try {
+    const intake = new OperatorIntakeStore(fx.store.db);
+    // Simulated crash: batch persisted, item still 'received', no drain.
+    const stale = intake.persistBatch({
+      accountId: ACCOUNT,
+      items: [{ messageId: "m-crash", threadId: "t-crash", observedAt: NOW }],
+      simulation: true,
+    });
+    const threads = {
+      readThread: async (threadId: string) => ({
+        threadId,
+        subject: "Dinner",
+        messages: [{ id: "m-crash", threadId, from: "guest@example.test", to: [], subject: "D", body: "hi", receivedAt: NOW, sourceReferences: [] }],
+        sourceReferences: [],
+      }),
+    };
+    const sweep = await runIntakeSweep(depsFor(fx, historyTransport([]), threads));
+    assert.equal(sweep.polled, 0);
+    const item = intake.listItems(stale.id)[0]!;
+    assert.equal(item.status, "needs_decision", "stranded item is re-driven, not left 'received' forever");
+    assert.equal(intake.getBatch(stale.id).status, "drained", "crashed batch settles once its items resolve");
+    assert.deepEqual(sweep.needsDecision, ["m-crash"]);
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test("a broken store surfaces a drain error instead of a silent empty report", async () => {
+  const fx = fixture();
+  try {
+    const deps = depsFor(fx, historyTransport([]));
+    (deps.store as { listBookings: unknown }).listBookings = () => {
+      throw new Error("db corrupt");
+    };
+    const report = await drainDueWork(deps);
+    assert.equal(report.error, "db corrupt");
+    assert.deepEqual(report.claimed, []);
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test("bindWaitingToProposal validates booking and business scope and preserves detail", async () => {
+  const fx = fixture();
+  try {
+    const deps = depsFor(fx, historyTransport([]));
+    const action = approvedHoldAction(fx, "a-op-bind");
+    const otherBooking = fx.store.createBooking({ businessId: fx.businessId, eventName: "Other event", sourceReferences: [] });
+    const wrongAction = fx.store.createProposedAction({
+      id: "a-op-wrong-booking",
+      bookingId: otherBooking.id,
+      kind: "create_provisional_hold",
+      payload: {
+        startAt: "2030-07-12T17:00:00.000Z",
+        endAt: "2030-07-12T23:00:00.000Z",
+        expiresAt: "2030-07-13T23:00:00.000Z",
+        calendarId: "demo-calendar-001",
+        emailTo: ["guest@example.test"],
+        emailSubject: "s",
+        emailBody: "b",
+      },
+      sourceReferences: [],
+    });
+    const ingested = fx.ledger.ingestEvent({
+      dedupeKey: "k-bind-1",
+      kind: "change",
+      bookingId: fx.bookingId,
+      sourceId: "m-bind",
+      sourceKind: "email",
+      observedAt: NOW,
+    });
+    const waitingId = ingested.createdWaiting[0]!.id;
+    assert.throws(() => bindWaitingToProposal(deps, { waitingId, proposedActionId: "nope" }), /not found/i);
+    assert.throws(() => bindWaitingToProposal(deps, { waitingId, proposedActionId: wrongAction.id }), /belongs to booking/i);
+    // Foreign business: a waiting item on another business's booking cannot
+    // be bound through this runtime's deps.
+    const foreignBusiness = fx.store.createBusiness({ name: "Foreign", timezone: "UTC" });
+    const foreignBooking = fx.store.createBooking({ businessId: foreignBusiness.id, eventName: "Foreign", sourceReferences: [] });
+    const foreignAction = fx.store.createProposedAction({
+      id: "a-op-foreign",
+      bookingId: foreignBooking.id,
+      kind: "create_provisional_hold",
+      payload: {
+        startAt: "2030-07-12T17:00:00.000Z",
+        endAt: "2030-07-12T23:00:00.000Z",
+        expiresAt: "2030-07-13T23:00:00.000Z",
+        calendarId: "demo-calendar-001",
+        emailTo: ["guest@example.test"],
+        emailSubject: "s",
+        emailBody: "b",
+      },
+      sourceReferences: [],
+    });
+    const foreign = fx.ledger.ingestEvent({
+      dedupeKey: "k-bind-foreign",
+      kind: "change",
+      bookingId: foreignBooking.id,
+      sourceId: "m-bind-f",
+      sourceKind: "email",
+      observedAt: NOW,
+    });
+    assert.throws(
+      () => bindWaitingToProposal(deps, { waitingId: foreign.createdWaiting[0]!.id, proposedActionId: foreignAction.id }),
+      /outside business/i,
+    );
+    // Correct binding: detail merges, recommended action preserved.
+    bindWaitingToProposal(deps, { waitingId, proposedActionId: action.id });
+    const row = fx.store.db.prepare("SELECT detail_json FROM coord_waiting WHERE id = $id").get({ $id: waitingId }) as { detail_json: string };
+    const detail = JSON.parse(row.detail_json) as Record<string, unknown>;
+    assert.equal(detail.proposedActionId, action.id);
+    assert.equal(detail.recommendedAction, "review_booking_change_and_reapprove");
+    // Terminal work refuses rebinding.
+    fx.ledger.resolveWaiting({ id: waitingId, resolution: "done" });
+    assert.throws(() => bindWaitingToProposal(deps, { waitingId, proposedActionId: action.id }), /only open work/i);
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test("operator deps registry is bounded and multi-account addressing is explicit", () => {
+  resetOperatorDeps();
+  const fx = fixture();
+  try {
+    const deps = depsFor(fx, historyTransport([]));
+    assert.equal(getOperatorDeps(), null);
+    setOperatorDeps(deps);
+    assert.equal(getOperatorDeps(), deps, "a single binding is served as before");
+    const second: IntakeDeps = { ...deps, accountId: "acct-second" };
+    setOperatorDeps(second);
+    assert.equal(getOperatorDeps(), null, "ambiguous multi-account wiring never guesses a business");
+    assert.equal(getOperatorDepsFor("acct-second"), second);
+    assert.deepEqual(listOperatorAccounts(), [ACCOUNT, "acct-second"]);
+    for (let index = 0; index < 30; index += 1) {
+      setOperatorDeps({ ...deps, accountId: `acct-fill-${index}` });
+    }
+    assert.throws(
+      () => setOperatorDeps({ ...deps, accountId: "acct-overflow" }),
+      /registry is full/i,
+    );
+    // Re-registering an existing account does not consume capacity.
+    setOperatorDeps({ ...deps, accountId: "acct-second" });
+  } finally {
+    resetOperatorDeps();
     fx.cleanup();
   }
 });

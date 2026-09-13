@@ -59,6 +59,8 @@ export class OperatorIntakeStore {
         source_key TEXT,
         ledger_event_id TEXT,
         error TEXT,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        dead INTEGER NOT NULL DEFAULT 0,
         UNIQUE (batch_id, message_id)
       );
       CREATE TABLE IF NOT EXISTS cursor_checkpoints (
@@ -78,6 +80,17 @@ export class OperatorIntakeStore {
       CREATE INDEX IF NOT EXISTS idx_intake_items_status ON intake_items(status);
       CREATE INDEX IF NOT EXISTS idx_intake_failures_account ON intake_failures(account_id, created_at);
     `);
+    // Legacy tables predate retry bookkeeping — add the columns in place.
+    this.ensureColumn("intake_items", "attempts", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("intake_items", "dead", "INTEGER NOT NULL DEFAULT 0");
+  }
+
+  private ensureColumn(table: string, column: string, type: string): void {
+    const info = this.db.prepare(`PRAGMA table_info(${table})`).all() as SqlRow[];
+    const names = new Set(info.map((entry) => String(row(entry).name)));
+    if (!names.has(column)) {
+      this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+    }
   }
 
   /** Durably record a poll/drain failure for health visibility. Own transaction. */
@@ -125,6 +138,11 @@ export class OperatorIntakeStore {
          VALUES ($id, $batch, $message, $thread, $observed, 'received')`,
       );
       for (const item of input.items) {
+        // Stable source dedupe: one canonical item row per (account,
+        // messageId) across ALL batches. A replayed poll change reuses the
+        // durable row — bounded rows, single retry counter, and its parked
+        // state (received/needs_decision/failed/dead) drives reprocessing.
+        if (this.findItemByMessage(input.accountId, item.messageId)) continue;
         insertItem.run({
           $id: `ii_${randomUUID().replace(/-/g, "").slice(0, 20)}`,
           $batch: batchId, $message: item.messageId, $thread: item.threadId ?? null, $observed: item.observedAt,
@@ -153,20 +171,39 @@ export class OperatorIntakeStore {
     return rows.map((value) => toItem(row(value)));
   }
 
+  /** The canonical item row for one provider message under this account, if any. */
+  findItemByMessage(accountId: string, messageId: string): IntakeItemRecord | undefined {
+    const found = this.db.prepare(
+      `SELECT items.* FROM intake_items AS items
+       JOIN intake_batches AS batches ON batches.id = items.batch_id
+       WHERE batches.account_id = $account AND items.message_id = $message
+       ORDER BY items.observed_at, items.id LIMIT 1`,
+    ).get({ $account: accountId, $message: messageId });
+    return found ? toItem(row(found)) : undefined;
+  }
+
   updateItem(id: string, patch: {
     status: IntakeItemStatus;
     bookingId?: string;
     sourceKey?: string;
     ledgerEventId?: string;
     error?: string;
+    /** Terminal failure: the item leaves the retry set and waits in the dead-letter state. */
+    dead?: boolean;
   }): void {
     this.db.prepare(
       `UPDATE intake_items SET status = $status, booking_id = $booking, source_key = $source,
-        ledger_event_id = $event, error = $error WHERE id = $id`,
+        ledger_event_id = $event, error = $error, dead = COALESCE($dead, dead) WHERE id = $id`,
     ).run({
       $status: patch.status, $booking: patch.bookingId ?? null, $source: patch.sourceKey ?? null,
-      $event: patch.ledgerEventId ?? null, $error: patch.error ?? null, $id: id,
+      $event: patch.ledgerEventId ?? null, $error: patch.error ?? null,
+      $dead: patch.dead === undefined ? null : patch.dead ? 1 : 0, $id: id,
     });
+  }
+
+  /** Record one processing attempt on a parked item (drives the retry bound). */
+  bumpAttempts(id: string): void {
+    this.db.prepare("UPDATE intake_items SET attempts = attempts + 1 WHERE id = $id").run({ $id: id });
   }
 
   markBatch(id: string, status: "drained" | "failed"): void {
@@ -202,18 +239,59 @@ export class OperatorIntakeStore {
   }
 
   /**
-   * Parked items (needs_decision/failed) across all batches for one
-   * account, oldest first, bounded. Re-driven after owner resolution or
-   * restart even when the next poll returns nothing new.
+   * Unsettled or retryable items across all batches for one account,
+   * oldest first, bounded. Covers crash-stranded 'received'/'linked'
+   * rows, 'needs_decision' rows awaiting owner resolution, and 'failed'
+   * rows still inside their retry budget — dead-lettered items
+   * (dead = 1) are terminal and never re-driven.
    */
   listParked(accountId: string, limit = 50): IntakeItemRecord[] {
     const rows = this.db.prepare(
       `SELECT items.* FROM intake_items AS items
        JOIN intake_batches AS batches ON batches.id = items.batch_id
-       WHERE batches.account_id = $account AND items.status IN ('needs_decision', 'failed')
+       WHERE batches.account_id = $account AND items.dead = 0
+         AND (items.status IN ('received', 'linked', 'needs_decision') OR items.status = 'failed')
        ORDER BY items.observed_at, items.message_id LIMIT $limit`,
     ).all({ $account: accountId, $limit: limit });
     return rows.map((value) => toItem(row(value)));
+  }
+
+  /** Dead-lettered items for owner visibility — terminal failures, never auto-retried. */
+  listDeadLettered(accountId: string, limit = 50): IntakeItemRecord[] {
+    const rows = this.db.prepare(
+      `SELECT items.* FROM intake_items AS items
+       JOIN intake_batches AS batches ON batches.id = items.batch_id
+       WHERE batches.account_id = $account AND items.dead = 1
+       ORDER BY items.observed_at, items.message_id LIMIT $limit`,
+    ).all({ $account: accountId, $limit: limit });
+    return rows.map((value) => toItem(row(value)));
+  }
+
+  /**
+   * Settle crashed batches: a 'received' batch with no unsettled items
+   * ('received'/'linked') flips to 'drained', or 'failed' when it holds
+   * dead-lettered/failed work. Returns the number of batches settled.
+   */
+  settleReceivedBatches(accountId: string): number {
+    const result = this.db.prepare(
+      `UPDATE intake_batches SET status = $status, updated_at = $at
+       WHERE account_id = $account AND status = 'received'
+         AND NOT EXISTS (
+           SELECT 1 FROM intake_items WHERE batch_id = intake_batches.id AND status IN ('received', 'linked')
+         )
+         AND EXISTS (
+           SELECT 1 FROM intake_items WHERE batch_id = intake_batches.id AND status IN ('failed') AND dead = 1
+         )`,
+    ).run({ $status: "failed", $at: nowIso(), $account: accountId });
+    const failed = Number(result.changes);
+    const drained = this.db.prepare(
+      `UPDATE intake_batches SET status = 'drained', updated_at = $at
+       WHERE account_id = $account AND status = 'received'
+         AND NOT EXISTS (
+           SELECT 1 FROM intake_items WHERE batch_id = intake_batches.id AND status IN ('received', 'linked')
+         )`,
+    ).run({ $at: nowIso(), $account: accountId });
+    return failed + Number(drained.changes);
   }
 
   latestBatch(accountId: string): IntakeBatchRecord | undefined {
@@ -258,6 +336,8 @@ function toItem(value: SqlRow): IntakeItemRecord {
     sourceKey: value.source_key ? String(value.source_key) : undefined,
     ledgerEventId: value.ledger_event_id ? String(value.ledger_event_id) : undefined,
     error: value.error ? String(value.error) : undefined,
+    attempts: typeof value.attempts === "number" ? value.attempts : 0,
+    dead: Number(value.dead) === 1,
   };
 }
 
