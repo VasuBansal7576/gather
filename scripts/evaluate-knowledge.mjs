@@ -21,7 +21,12 @@
  *   required question fails the `completeCoverage` gate. Partial metrics are
  *   still reported for diagnosis but can never pass overall.
  * - Abstention contradicts assertion: `abstained:true` with any supplied
- *   assertions fails the `abstentionIntegrity` gate.
+ *   assertions fails the `abstentionIntegrity` gate, and so does answering
+ *   a `mustAbstain` question instead of abstaining — even with zero
+ *   assertions and even when no other gate fires. A failures entry without
+ *   a failing gate is a scorer bug, never a pass.
+ * - Required response fields are required: a response missing `abstained`
+ *   or `assertions` fails the `inputValidity` gate as malformed.
  * - Deletion, version, and linking checks are gates, not diagnostics.
  * - Duplicate, unknown, or malformed inputs fail the `inputValidity` gate.
  *
@@ -158,10 +163,14 @@ function main() {
       continue;
     }
     seenQuestionIds.add(r.questionId);
-    if ("abstained" in r && typeof r.abstained !== "boolean") {
+    if (!("abstained" in r)) {
+      inputErrors.push(`${where} (${r.questionId}): missing abstained field`);
+    } else if (typeof r.abstained !== "boolean") {
       inputErrors.push(`${where} (${r.questionId}): abstained must be boolean`);
     }
-    if ("assertions" in r && !Array.isArray(r.assertions)) {
+    if (!("assertions" in r)) {
+      inputErrors.push(`${where} (${r.questionId}): missing assertions field`);
+    } else if (!Array.isArray(r.assertions)) {
       inputErrors.push(`${where} (${r.questionId}): assertions must be an array`);
     }
     responseByQ.set(r.questionId, r);
@@ -295,6 +304,10 @@ function main() {
 
     if (q.mustAbstain) {
       if (!abstained || raw.length > 0) {
+        // Required-abstention violations always fail the abstentionIntegrity
+        // gate — even with zero assertions and even when no commercial or
+        // deletion gate fires. A silent non-answer is still an answer.
+        abstentionViolations += 1;
         failures.push({ questionId: q.questionId, reason: "mustAbstain question was answered instead of abstained" });
         if (q.commercialAuthority) {
           authorityFailures += 1;
