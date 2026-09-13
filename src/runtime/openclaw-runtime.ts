@@ -121,22 +121,25 @@ export class GatherOpenClawRuntime {
   }
 
   /**
-   * Ready-for-model gate for the live-model runner: reports whether an
-   * explicit supported model selection is configured. Absent model fails
-   * clearly (`MODEL_NOT_CONFIGURED`) while control-plane/demo use stays
-   * valid; invalid selections report their reason instead of throwing.
-   * Validation itself runs at config-write time and throws there.
+   * Configured-for-model gate for the live-model runner. Reports whether
+   * an explicit supported model selection is configured — and labels it
+   * exactly that: `configured`, with `verified` ALWAYS false. Configuration
+   * alone never proves OAuth or model readiness; actual verification lives
+   * in the separately managed live auth root, outside this lane. Absent
+   * model reports `MODEL_NOT_CONFIGURED` while control-plane/demo use
+   * stays valid; invalid selections report their reason instead of
+   * throwing. Validation itself runs at config-write time and throws there.
    */
-  modelStatus(): { ready: boolean; model?: string; reason?: string } {
+  modelStatus(): { configured: boolean; verified: false; model?: string; reason?: string } {
     const selection = this.options.model;
     if (selection === undefined) {
-      return { ready: false, reason: "MODEL_NOT_CONFIGURED: no explicit model selection was supplied; control-plane/demo use remains valid" };
+      return { configured: false, verified: false, reason: "MODEL_NOT_CONFIGURED: no explicit model selection was supplied; control-plane/demo use remains valid" };
     }
     try {
       const resolved = resolveModelConfig(selection);
-      return { ready: true, model: resolved.model };
+      return { configured: true, verified: false, model: resolved.model };
     } catch (error) {
-      return { ready: false, reason: error instanceof Error ? `${error.name}(${("code" in error && typeof error.code === "string") ? error.code : "invalid"}): ${error.message}` : String(error) };
+      return { configured: false, verified: false, reason: error instanceof Error ? `${error.name}(${("code" in error && typeof error.code === "string") ? error.code : "invalid"}): ${error.message}` : String(error) };
     }
   }
 
