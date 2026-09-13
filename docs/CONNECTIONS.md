@@ -84,7 +84,12 @@ database, no credential form, no assumed hardcoded account.
   endpoint called with the fresh access token — never from callback text.
   An account already bound to a different business is `CROSS_BUSINESS`.
 - **Scope coverage**: every required scope must be granted, else
-  `MISSING_SCOPE` and nothing connects.
+  `MISSING_SCOPE` and nothing connects. Google identity aliases are
+  normalized for this check only (`email` ≡
+  `https://www.googleapis.com/auth/userinfo.email`,
+  `profile` ≡ `https://www.googleapis.com/auth/userinfo.profile` in
+  either direction); Gmail/Drive/Calendar data scopes always compare
+  exactly, so a missing data scope can never hide behind an alias.
 - **Token supply**: `accessToken(connectionId)` refreshes near expiry under
   an in-process singleflight (concurrent callers share one exchange);
   `invalid_grant`/revocation marks the connection `revoked`.
