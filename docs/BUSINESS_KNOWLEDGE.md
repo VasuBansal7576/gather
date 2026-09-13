@@ -111,6 +111,18 @@ any rolled-back transaction, so the audit always survives the failure it
 describes; intake validation failures carry no command id and are not
 decision-logged by design.
 
+Command identity is re-verified inside the same transaction before any
+mutation: a shared commandId that landed between the fast-path replay check
+and the lock returns the recorded outcome for exact duplicates and rolls
+back with `command_conflict` for altered payloads — a conflicting audit row
+can never be hidden by the idempotent insert. Correction and exception
+fingerprints bind effective provenance (resolved sources, subject scope), so
+altered sources cannot replay as identical. Rejected decisions replay as
+their typed rejection (code and message stored at audit time), never as a
+successful result with absent rows. Reconfirming an already-confirmed
+candidate after a correction answers with the live fact/revision pair,
+never the stale confirmedFactId paired with a newer revision.
+
 ## Snapshot for offers
 
 `snapshotForOffers(businessId)` returns:

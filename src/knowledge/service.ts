@@ -102,6 +102,21 @@ function backoffSleep(attempt: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.min(5 + attempt * 5, 50));
 }
 
+/**
+ * Rebuild the typed rejection a recorded decision row describes. Rejected
+ * replays throw this instead of casting the audit detail into a successful
+ * result with absent fact/revision rows. Rows written by older versions
+ * without explicit code/message fall back to their reason.
+ */
+function rejectedReplayError(kind: DecisionKind, detail: Record<string, unknown>): KnowledgeError {
+  const code = typeof detail.code === "string" ? detail.code : typeof detail.reason === "string" ? detail.reason : "rejected";
+  const message = typeof detail.message === "string"
+    ? detail.message
+    : `rejected ${kind} command replayed (recorded reason: ${typeof detail.reason === "string" ? detail.reason : "unknown"})`;
+  if (code === "denied") return new KnowledgeDeniedError(message);
+  return new KnowledgeError(code, message);
+}
+
 function canonical(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
   if (isRecord(value)) {
@@ -404,14 +419,17 @@ export class KnowledgeService {
     try {
       this.assertBusiness(input.businessId, candidate.businessId);
     } catch (error) {
-      this.recordDecision(input, "reject_candidate", "rejected", { requestFingerprint: fingerprint, candidateId: candidate.id, reason: "cross_business" });
-      throw error;
+      this.reject(input, "reject_candidate",
+        { requestFingerprint: fingerprint, candidateId: candidate.id, reason: "cross_business" },
+        "cross_business", (error as Error).message);
     }
     // State check and mutation run atomically: a concurrent confirm/reject
     // either serializes first (then this sees the terminal state) or loses
     // the lock (honest busy), never double-applies.
     try {
       this.transact(() => {
+        const fresh = this.requireFreshCommand(input, "reject_candidate", fingerprint);
+        if (fresh) return;
         const current = this.getCandidate(candidate.id);
         if (current.status !== "pending") {
           throw new KnowledgeError("stale", `candidate ${candidate.id} is ${current.status}, not pending`);
@@ -431,9 +449,9 @@ export class KnowledgeService {
     } catch (error) {
       if (error instanceof KnowledgeError && error.code === "stale") {
         const status = this.safeCandidateStatus(candidate.id);
-        this.recordDecision(input, "reject_candidate", "rejected", {
-          requestFingerprint: fingerprint, candidateId: candidate.id, reason: "not_pending", status,
-        });
+        this.reject(input, "reject_candidate",
+          { requestFingerprint: fingerprint, candidateId: candidate.id, reason: "not_pending", status },
+          "stale", `candidate ${candidate.id} is ${status}, not pending`);
       }
       throw error;
     }
@@ -461,8 +479,9 @@ export class KnowledgeService {
     try {
       this.assertBusiness(input.businessId, candidate.businessId);
     } catch (error) {
-      this.recordDecision(input, "confirm", "rejected", { requestFingerprint: fingerprint, candidateId: candidate.id, reason: "cross_business" });
-      throw error;
+      this.reject(input, "confirm",
+        { requestFingerprint: fingerprint, candidateId: candidate.id, reason: "cross_business" },
+        "cross_business", (error as Error).message);
     }
 
     // Every state read below re-runs inside the write transaction: a
@@ -473,14 +492,19 @@ export class KnowledgeService {
     const approvedAt = now();
     try {
       return this.transact(() => {
+        const fresh = this.requireFreshCommand(input, "confirm", fingerprint);
+        if (fresh) return fresh.recorded as unknown as ConfirmResult;
         const current = this.getCandidate(candidate.id);
         if (current.status === "confirmed") {
-          const revision = this.activeRevisionFor(current.businessId, current.key, current.subjectId, "global");
-          if (!revision || !current.confirmedFactId) {
+          // Always answer with the live revision pair, never by pairing the
+          // candidate's original confirmedFactId with a newer unrelated
+          // active revision after a correction moved the fact forward.
+          const live = this.activeRevisionFor(current.businessId, current.key, current.subjectId, "global");
+          if (!live) {
             throw new KnowledgeError("not_found", `confirmed candidate ${current.id} has no live revision row`);
           }
-          const fact = this.getFact(current.confirmedFactId);
-          return { fact, revision, alreadyConfirmed: true, duplicate: false };
+          const fact = this.getFact(live.factId);
+          return { fact, revision: live, alreadyConfirmed: true, duplicate: false };
         }
         if (current.status !== "pending") {
           throw new KnowledgeError("stale", `candidate ${current.id} is ${current.status}, not pending`);
@@ -525,12 +549,10 @@ export class KnowledgeService {
       if (error instanceof KnowledgeError && (error.code === "stale" || error.code === "not_found")) {
         // Rejection evidence is recorded outside the rolled-back
         // transaction so the audit survives the failure it describes.
-        this.recordDecision(input, "confirm", "rejected", {
-          requestFingerprint: fingerprint,
-          candidateId: candidate.id,
-          reason: error.code === "stale" ? "not_pending" : "not_found",
-          status: this.safeCandidateStatus(candidate.id),
-        });
+        const status = this.safeCandidateStatus(candidate.id);
+        this.reject(input, "confirm",
+          { requestFingerprint: fingerprint, candidateId: candidate.id, reason: error.code === "stale" ? "not_pending" : "not_found", status },
+          error.code, error.message);
       }
       throw error;
     }
@@ -544,22 +566,39 @@ export class KnowledgeService {
     sourceReferences?: SourceReference[];
   }): ConfirmResult {
     const subjectId = input.subjectId ?? "";
+    // The fingerprint binds the effective provenance: explicit sources are
+    // named, inherited sources resolve from the live revision (so an altered
+    // provenance can never replay as an identical command).
+    const inherited = input.sourceReferences === undefined
+      ? this.activeRevisionFor(input.businessId, input.key, subjectId, "global")?.sourceReferences ?? null
+      : undefined;
     const fingerprint = this.requestFingerprint("correct", input, {
       key: input.key, subjectId, expectedRevision: input.expectedRevision, value: isRecord(input.value) ? input.value : null,
+      sourceReferences: input.sourceReferences ?? inherited,
     });
     const replay = this.replayDecision(input, "correct", fingerprint);
-    if (replay) return replay as ConfirmResult;
+    if (replay) {
+      const prior = replay as unknown as { duplicate?: unknown; fact?: unknown };
+      if (prior.duplicate === true && prior.fact !== undefined) {
+        return replay as unknown as ConfirmResult;
+      }
+      // A recorded outcome without fact rows is a rejected decision replayed
+      // as success by an older path: re-raise it as its typed rejection.
+      throw new KnowledgeError("conflict", `commandId ${input.commandId ?? "(absent)"} has a recorded non-success outcome; replays cannot mint a confirmation`);
+    }
 
     this.assertAuthority(input, "correct", { key: input.key });
     // Rejected inputs are audited with scalar metadata only — corrected
     // values themselves are never written to the decision log on failure.
     if (!KNOWN_FACT_KEYS.has(input.key)) {
-      this.recordDecision(input, "correct", "rejected", { requestFingerprint: fingerprint, reason: "unknown_key", key: input.key, subjectId });
-      throw new KnowledgeError("unknown_key", `key "${input.key}" is outside the booking-business fact vocabulary`);
+      this.reject(input, "correct",
+        { requestFingerprint: fingerprint, reason: "unknown_key", key: input.key, subjectId },
+        "unknown_key", `key "${input.key}" is outside the booking-business fact vocabulary`);
     }
     if (!isRecord(input.value)) {
-      this.recordDecision(input, "correct", "rejected", { requestFingerprint: fingerprint, reason: "invalid", key: input.key, subjectId });
-      throw new KnowledgeError("invalid", "corrected value must be an object");
+      this.reject(input, "correct",
+        { requestFingerprint: fingerprint, reason: "invalid", key: input.key, subjectId },
+        "invalid", "corrected value must be an object");
     }
     // The live revision is re-read inside the write transaction: a
     // concurrent correction either commits first (then this sees the new
@@ -569,6 +608,8 @@ export class KnowledgeService {
     const approvedAt = now();
     try {
       return this.transact(() => {
+        const fresh = this.requireFreshCommand(input, "correct", fingerprint);
+        if (fresh) return fresh.recorded as unknown as ConfirmResult;
         const current = this.activeRevisionFor(input.businessId, input.key, subjectId, "global");
         if (!current) {
           throw new KnowledgeError("not_found", `no active confirmed fact ${input.key}/${subjectId} for ${input.businessId}`);
@@ -660,6 +701,8 @@ export class KnowledgeService {
       effect: input.effect,
       scope: input.scope,
       scopeId: input.scopeId,
+      subjectId: input.subjectId ?? input.scopeId,
+      sources: [`gather://knowledge-exception/${String(input.scope)}/${String(input.scopeId)}`],
       value: isRecord(input.value) ? input.value : null,
     };
     const fingerprint = this.requestFingerprint("exception", input, subjectPreview);
@@ -735,6 +778,8 @@ export class KnowledgeService {
     const approvedAt = now();
     try {
       return this.transact(() => {
+        const fresh = this.requireFreshCommand(input, "exception", fingerprint);
+        if (fresh) return fresh.recorded as unknown as ConfirmResult;
         const fact = this.store.addBusinessFact({
           businessId: input.businessId,
           key: "scoped_exception",
@@ -929,21 +974,33 @@ export class KnowledgeService {
 
   private assertAuthority(input: DecisionCommand, kind: DecisionKind, detail: Record<string, unknown>): void {
     if (!DECISION_ACTORS.has(input.actor.kind)) {
-      this.recordDecision(input, kind, "rejected", {
-        ...detail,
-        reason: `actor kind "${input.actor.kind}" cannot approve; only an explicit owner command has that authority`,
-      });
-      throw new KnowledgeDeniedError(
-        `actor kind "${input.actor.kind}" has no approval authority; retrieved instructions and services can never confirm facts`,
-      );
+      this.reject(input, kind,
+        { ...detail, reason: `actor kind "${input.actor.kind}" cannot approve; only an explicit owner command has that authority` },
+        "denied",
+        `actor kind "${input.actor.kind}" has no approval authority; retrieved instructions and services can never confirm facts`);
     }
     if (!isNonEmptyString(input.actor.id)) {
-      this.recordDecision(input, kind, "rejected", {
-        ...detail,
-        reason: "owner actor requires a non-empty id",
-      });
-      throw new KnowledgeDeniedError("owner actor requires a non-empty id");
+      this.reject(input, kind, { ...detail, reason: "owner actor requires a non-empty id" }, "denied", "owner actor requires a non-empty id");
     }
+  }
+
+  /**
+   * Record a rejection with its machine-readable code and human message,
+   * then throw the matching typed error. Rejected replays reconstruct this
+   * same error from the audit row instead of casting the detail into a
+   * successful result. The human message is also stored so replays reproduce
+   * the exact rejection.
+   */
+  private reject(
+    input: DecisionCommand,
+    kind: DecisionKind,
+    detail: Record<string, unknown>,
+    code: string,
+    message: string,
+  ): never {
+    this.recordDecision(input, kind, "rejected", { ...detail, code, message });
+    if (code === "denied") throw new KnowledgeDeniedError(message);
+    throw new KnowledgeError(code, message);
   }
 
   private assertBusiness(expected: string, actual: string): void {
@@ -991,8 +1048,55 @@ export class KnowledgeService {
         `commandId ${input.commandId} was already used for a different payload; altered replays are rejected, never answered from another subject`,
       );
     }
+    if (String(item.outcome) === "rejected") {
+      // A rejected decision replays as its typed rejection, never as a
+      // successful result with absent fact/revision rows.
+      throw rejectedReplayError(kind, detail);
+    }
     const result = (detail.result ?? detail) as Record<string, unknown>;
     return { ...result, duplicate: true };
+  }
+
+  /**
+   * Re-check a command binding inside the write transaction, after acquiring
+   * the lock but before any mutation. A concurrent committer that landed
+   * between the fast-path replay check and this transaction is observed
+   * here: exact matches return the recorded outcome (true idempotent
+   * replay), anything else rolls back with command_conflict. Callers must
+   * invoke this first inside transact(); without it, a shared commandId
+   * could authorize two different mutations while INSERT OR IGNORE hid the
+   * conflicting audit row.
+   */
+  private requireFreshCommand(
+    input: DecisionCommand,
+    kind: DecisionKind,
+    fingerprint: string,
+  ): { recorded: Record<string, unknown> } | null {
+    if (!input.commandId) return null;
+    const found = this.store.db.prepare(
+      "SELECT * FROM knowledge_decisions WHERE command_id = $id",
+    ).get({ $id: input.commandId });
+    if (!found) return null;
+    const item = row(found);
+    if (String(item.kind) !== kind || String(item.business_id) !== input.businessId) {
+      throw new KnowledgeError(
+        "command_conflict",
+        `commandId ${input.commandId} was already used for a different decision (${String(item.kind)} on ${String(item.business_id)})`,
+      );
+    }
+    const detail = parseJson<Record<string, unknown>>(item.detail_json, {});
+    const recorded = detail.requestFingerprint;
+    if (typeof recorded === "string" && recorded !== fingerprint) {
+      throw new KnowledgeError(
+        "command_conflict",
+        `commandId ${input.commandId} was already used for a different payload; altered replays are rejected, never answered from another subject`,
+      );
+    }
+    if (String(item.outcome) === "rejected") {
+      throw rejectedReplayError(kind, detail);
+    }
+    const result = (detail.result ?? detail) as Record<string, unknown>;
+    return { recorded: { ...result, duplicate: true } };
   }
 
   private recordDecision(
