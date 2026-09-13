@@ -18,7 +18,10 @@ import { GatherStore } from "../src/server/sqlite-store.ts";
 import { emailOperationKey, holdOperationKey } from "../src/server/booking-service.ts";
 import { bindWaitingToProposal, drainDueWork } from "../src/server/operator-runtime/due-work.ts";
 import { operatorHealth } from "../src/server/operator-runtime/health.ts";
-import { MAX_INTAKE_ATTEMPTS, runIntakeSweep, type IntakeDeps, type ThreadReaderPort } from "../src/server/operator-runtime/intake.ts";
+import { MAX_INTAKE_ATTEMPTS, retryDeadLetteredItem, runIntakeSweep, type IntakeDeps, type ThreadReaderPort } from "../src/server/operator-runtime/intake.ts";
+import { recordVerifiedIdentityLink } from "../src/identity/service.ts";
+import { buildSourceKey } from "../src/identity/source-key.ts";
+import { ServiceError } from "../src/server/booking-service.ts";
 import { operatorMcpTools } from "../src/server/operator-runtime/mcp-tools.ts";
 import { OperatorIntakeStore } from "../src/server/operator-runtime/store.ts";
 import {
@@ -1135,5 +1138,149 @@ test("MCP tools are read-only and carry no approval surface", async () => {
     assert.equal(fx.store.listApprovals("nonexistent").length, 0);
   } finally {
     fx.cleanup();
+  }
+});
+
+function waitingToolCall(deps: IntakeDeps) {
+  const tools = operatorMcpTools(deps);
+  const waiting = tools.find((tool) => tool.name === "operator.waiting")!;
+  return waiting.call({ limit: 25 }, { toolName: "operator.waiting", execution: "live", simulated: false });
+}
+
+test("operator.waiting lists only the bound business's due work", async () => {
+  const fx = fixture();
+  try {
+    const foreignBusiness = fx.store.createBusiness({ name: "Foreign", timezone: "UTC" });
+    const foreignBooking = fx.store.createBooking({ businessId: foreignBusiness.id, eventName: "Foreign event", sourceReferences: [] });
+    const old = "2030-05-20T00:00:00.000Z";
+    fx.ledger.ingestEvent({ dedupeKey: "k-own", kind: "inquiry", bookingId: fx.bookingId, sourceId: "m-own", sourceKind: "email", observedAt: old });
+    fx.ledger.ingestEvent({ dedupeKey: "k-foreign", kind: "inquiry", bookingId: foreignBooking.id, sourceId: "m-foreign", sourceKind: "email", observedAt: old });
+    const deps = depsFor(fx, historyTransport([]));
+    const result = await waitingToolCall(deps) as { content: Array<{ text: string }> };
+    const seen = (JSON.parse(result.content[0]!.text) as Array<{ bookingId: string }>).map((item) => item.bookingId);
+    assert.ok(seen.includes(fx.bookingId), "own-business work is listed");
+    assert.ok(!seen.includes(foreignBooking.id), "foreign-business work is never surfaced to this binding");
+  } finally {
+    fx.cleanup();
+  }
+});
+
+function poisonDeps(fx: { store: GatherStore; ledger: import("../src/coordination/ledger.ts").CoordinationLedger; businessId: string }, transport: import("../src/connectors/google/transport.ts").GoogleHttpTransport): IntakeDeps {
+  const throwing = { readThread: async (): Promise<never> => { throw new Error("provider exploded"); } };
+  return depsFor(fx as Parameters<typeof depsFor>[0], transport, throwing);
+}
+
+function healthyThreads(messageId: string, threadId: string) {
+  return {
+    readThread: async (thread: string) => ({
+      threadId: thread,
+      subject: "Dinner",
+      messages: [{ id: messageId, threadId: thread, from: "guest@example.test", to: [], subject: "Dinner", body: "hi", receivedAt: NOW, sourceReferences: [] }],
+      sourceReferences: [],
+    }),
+  };
+}
+
+async function deadPoisonFixture(): Promise<{ fx: ReturnType<typeof fixture>; deps: IntakeDeps; cleanup: () => void }> {
+  const fx = fixture();
+  const deps = poisonDeps(fx, historyTransport([{ id: "m-poison", threadId: "t-poison" }]));
+  for (let index = 0; index < 6; index += 1) {
+    await runIntakeSweep(deps);
+  }
+  const intake = new OperatorIntakeStore(fx.store.db);
+  assert.deepEqual(intake.listDeadLettered(ACCOUNT).map((item) => item.messageId), ["m-poison"]);
+  return { fx, deps, cleanup: fx.cleanup };
+}
+
+test("owner retry re-arms a dead-lettered item without duplicating ingestion", async () => {
+  const { fx, deps, cleanup } = await deadPoisonFixture();
+  try {
+    // Owner fixes the cause out of band and links identity, then retries.
+    fx.store.upsertConnectedAccount({ id: ACCOUNT, businessId: fx.businessId, provider: "gmail", displayName: "t", status: "connected" });
+    recordVerifiedIdentityLink(fx.store, {
+      components: { provider: "gmail", accountId: ACCOUNT, businessId: fx.businessId, sourceKind: "email", externalId: "m-poison", threadId: "t-poison" },
+      bookingId: fx.bookingId,
+      receipt: { operationKey: "gather:demo:retry", mode: "demo" },
+      actor: "test-owner",
+    });
+    const intake = new OperatorIntakeStore(fx.store.db);
+    const cursorBefore = intake.getCursor(ACCOUNT);
+    const rearmed = retryDeadLetteredItem(deps, { messageId: "m-poison" });
+    assert.equal(rearmed.dead, false);
+    assert.equal(rearmed.attempts, MAX_INTAKE_ATTEMPTS, "attempt history is preserved, not reset");
+    assert.ok((rearmed.error ?? "").includes("provider exploded"), "error history is preserved");
+    assert.equal(rearmed.status, "failed");
+    assert.deepEqual(intake.getCursor(ACCOUNT), cursorBefore, "retry never touches the cursor");
+    const healthy = depsFor(fx, historyTransport([]), healthyThreads("m-poison", "t-poison"));
+    const sweep = await runIntakeSweep(healthy);
+    assert.equal(sweep.resumedDrained, 1);
+    assert.deepEqual(intake.listDeadLettered(ACCOUNT), []);
+    const events = fx.store.db.prepare("SELECT COUNT(*) AS n FROM coord_events WHERE booking_id = $b").get({ $b: fx.bookingId }) as { n: number };
+    assert.equal(events.n, 1, "exactly one ledger event: no duplicate ingestion");
+    // A live item is not retryable: the live retry flow is untouched.
+    assert.throws(() => retryDeadLetteredItem(deps, { messageId: "m-poison" }), (error: unknown) => error instanceof ServiceError && error.code === "INVALID_REQUEST");
+  } finally {
+    cleanup();
+  }
+});
+
+test("retry validates identity strictly and grants nothing", async () => {
+  const { fx, deps, cleanup } = await deadPoisonFixture();
+  try {
+    assert.throws(() => retryDeadLetteredItem(deps, { messageId: "m-unknown" }), (error: unknown) => error instanceof ServiceError && error.code === "NOT_FOUND");
+    const foreignAccount: IntakeDeps = { ...deps, accountId: "acct-other" };
+    assert.throws(() => retryDeadLetteredItem(foreignAccount, { messageId: "m-poison" }), (error: unknown) => error instanceof ServiceError && error.code === "NOT_FOUND");
+    // Attributed to another business: the source-key check refuses.
+    const otherBusiness = fx.store.createBusiness({ name: "Other", timezone: "UTC" });
+    const spoofed = buildSourceKey({ provider: "gmail", accountId: ACCOUNT, businessId: otherBusiness.id, sourceKind: "email", externalId: "m-poison", threadId: "t-poison" });
+    fx.store.db.prepare("UPDATE intake_items SET source_key = $key WHERE message_id = $message").run({ $key: spoofed, $message: "m-poison" });
+    assert.throws(() => retryDeadLetteredItem(deps, { messageId: "m-poison" }), (error: unknown) => error instanceof ServiceError && error.code === "INVALID_REQUEST");
+    // Attributed via booking to another business: the booking check refuses.
+    const foreignBooking = fx.store.createBooking({ businessId: otherBusiness.id, eventName: "Foreign", sourceReferences: [] });
+    fx.store.db.prepare("UPDATE intake_items SET source_key = NULL, booking_id = $booking WHERE message_id = $message").run({ $booking: foreignBooking.id, $message: "m-poison" });
+    assert.throws(() => retryDeadLetteredItem(deps, { messageId: "m-poison" }), (error: unknown) => error instanceof ServiceError && error.code === "INVALID_REQUEST");
+    // Never linked and no connected-account pin: refuse rather than guess.
+    fx.store.db.prepare("UPDATE intake_items SET source_key = NULL, booking_id = NULL WHERE message_id = $message").run({ $message: "m-poison" });
+    assert.throws(() => retryDeadLetteredItem(deps, { messageId: "m-poison" }), (error: unknown) => error instanceof ServiceError && error.code === "INVALID_REQUEST");
+    assert.deepEqual(new OperatorIntakeStore(fx.store.db).listDeadLettered(ACCOUNT).map((item) => item.messageId), ["m-poison"], "refusals leave the dead letter in place");
+  } finally {
+    cleanup();
+  }
+});
+
+test("retry survives restart and re-deads honestly on repeated failure", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "gather-op-"));
+  const path = join(dir, "gather.sqlite");
+  const store = new GatherStore(path);
+  const ledger = new CoordinationLedger(store.db, { clock: () => NOW });
+  const business = store.createBusiness({ name: "Fictional Hall", timezone: "UTC" });
+  const booking = store.createBooking({ businessId: business.id, eventName: "Fictional event", sourceReferences: [] });
+  const throwing = { readThread: async (): Promise<never> => { throw new Error("provider exploded"); } };
+  const shell = { dir, store, ledger, businessId: business.id, bookingId: booking.id, cleanup: () => {} };
+  const base = depsFor(shell, historyTransport([{ id: "m-poison", threadId: "t-poison" }]), throwing);
+  try {
+    for (let index = 0; index < 6; index += 1) {
+      await runIntakeSweep(base);
+    }
+    store.close();
+    // Restart on the same file with fresh connections.
+    const reopened = new GatherStore(path);
+    const ledger2 = new CoordinationLedger(reopened.db, { clock: () => NOW });
+    const deps2: IntakeDeps = { ...base, store: reopened, ledger: ledger2 };
+    // Owner pins the account to the business, then re-arms the dead item.
+    reopened.upsertConnectedAccount({ id: ACCOUNT, businessId: business.id, provider: "gmail", displayName: "t", status: "connected" });
+    const rearmed = retryDeadLetteredItem(deps2, { messageId: "m-poison" });
+    assert.equal(rearmed.dead, false);
+    assert.equal(rearmed.attempts, MAX_INTAKE_ATTEMPTS);
+    const sweep = await runIntakeSweep(deps2);
+    assert.equal(sweep.resumedFailed, 1, "the still-broken source fails its re-armed attempt");
+    const intake = new OperatorIntakeStore(reopened.db);
+    const dead = intake.listDeadLettered(ACCOUNT);
+    assert.deepEqual(dead.map((item) => item.messageId), ["m-poison"], "repeated failure dead-letters again immediately");
+    assert.equal(dead[0]!.attempts, MAX_INTAKE_ATTEMPTS + 1);
+    assert.ok(booking.id.length > 0);
+    reopened.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });
