@@ -51,10 +51,12 @@ function emailMatches(receipt: Record<string, unknown>, request: SendEmailReques
 export class DurableDemoCalendar implements CalendarAvailabilityReader, ProvisionalHoldWriter {
   private readonly store: GatherStore;
   private readonly demo: DemoCalendarConnector;
+  private readonly clockMs: () => number;
 
-  constructor(store: GatherStore, demo: DemoCalendarConnector) {
+  constructor(store: GatherStore, demo: DemoCalendarConnector, clockMs: () => number = Date.now) {
     this.store = store;
     this.demo = demo;
+    this.clockMs = clockMs;
   }
 
   checkAvailability(request: CheckAvailabilityRequest): Promise<ConnectorResult<CheckAvailabilityResponse>> {
@@ -82,7 +84,9 @@ export class DurableDemoCalendar implements CalendarAvailabilityReader, Provisio
     }
     // Durable conflict gate (C4): a fresh volatile world may admit a window
     // that SQLite already gave to another booking — refuse before any write.
-    const claim = this.store.claimHoldSlot(request.operationKey, request.calendarId, request.startAt, request.endAt);
+    // The injected clock keeps this consistent with the service availability
+    // pre-check in the same process and across restarts.
+    const claim = this.store.claimHoldSlot(request.operationKey, request.calendarId, request.startAt, request.endAt, { nowMs: this.clockMs() });
     if (!claim.ok) {
       return {
         status: "failed",
@@ -99,6 +103,9 @@ export class DurableDemoCalendar implements CalendarAvailabilityReader, Provisio
     }
     if (result.status === "succeeded") {
       this.store.saveProviderReceipt("hold", request.operationKey, result.data as unknown as Record<string, unknown>);
+      // The durable receipt now carries the evidence; the provisional intent
+      // is no longer needed and is released so history stays compact.
+      this.store.releaseHoldSlot(request.operationKey);
       return result;
     }
     if (result.status === "uncertain") {

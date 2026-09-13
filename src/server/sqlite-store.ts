@@ -717,13 +717,20 @@ export class GatherStore {
    * Atomically claim a hold window for one stable operation key (C4).
    *
    * Inside a single IMMEDIATE transaction this records the caller's intent
-   * and checks it against every other intent and durable receipt for the
-   * same calendar. Concurrent connections serialize on the write lock, so a
-   * fresh (restarted, memory-empty) adapter and a second booking action both
-   * observe the same durable conflict set — a different booking can never
-   * take an overlapping window on the same calendar. Own retries (same key)
-   * always pass. Stale intents (crashed before their provider call) expire
-   * and are purged, so they cannot block the calendar forever.
+   * and checks it against every other intent and unexpired durable receipt
+   * for the same calendar. Concurrent connections serialize on the write
+   * lock, so a fresh (restarted, memory-empty) adapter and a second booking
+   * action both observe the same durable conflict set — a different booking
+   * can never take an overlapping window on the same calendar. Own retries
+   * (same key) always pass.
+   *
+   * Pending intents are NEVER purged by lease or clock: an intent records a
+   * provider effect of unknown outcome, and expiring it could release a
+   * window whose hold actually exists. An intent leaves the conflict set
+   * only through evidence — a durable receipt for its key, an explicit
+   * release after a definitive provider failure, or reconciliation. Receipts
+   * whose hold has expired no longer deny the window, but the receipt rows
+   * themselves are preserved as history.
    */
   claimHoldSlot(
     operationKey: string,
@@ -741,32 +748,10 @@ export class GatherStore {
         VALUES ($key, $calendar, $start, $end, $expires, $timestamp) ON CONFLICT(operation_key) DO NOTHING`).run({
         $key: operationKey, $calendar: calendarId, $start: startAt, $end: endAt, $expires: expiresAt, $timestamp: timestamp,
       });
-      this.db.prepare("DELETE FROM provider_hold_intents WHERE expires_at <= $nowIso").run({ $nowIso: new Date(nowMs).toISOString() });
-      const startMs = Date.parse(startAt);
-      const endMs = Date.parse(endAt);
-      const intents = this.db.prepare("SELECT operation_key, start_at, end_at FROM provider_hold_intents WHERE calendar_id = $calendar").all({ $calendar: calendarId });
-      for (const item of intents) {
-        const candidate = row(item);
-        if (String(candidate.operation_key) === operationKey) continue;
-        if (Date.parse(String(candidate.start_at)) < endMs && Date.parse(String(candidate.end_at)) > startMs) {
-          this.db.exec("ROLLBACK");
-          return { ok: false, conflictingKey: String(candidate.operation_key) };
-        }
-      }
-      const receipts = this.db.prepare("SELECT operation_key, receipt_json, start_at, end_at FROM provider_receipts WHERE kind = 'hold' AND (calendar_id = $calendar OR calendar_id IS NULL)").all({ $calendar: calendarId });
-      for (const item of receipts) {
-        const candidate = row(item);
-        if (String(candidate.operation_key) === operationKey) continue;
-        const hold = ((parseJson(candidate.receipt_json, {}) as Record<string, unknown>).hold ?? {}) as Record<string, unknown>;
-        const receiptCalendar = typeof hold.calendarId === "string" ? hold.calendarId : undefined;
-        if (receiptCalendar !== undefined && receiptCalendar !== calendarId) continue;
-        const receiptStart = candidate.start_at ? String(candidate.start_at) : typeof hold.startAt === "string" ? hold.startAt : undefined;
-        const receiptEnd = candidate.end_at ? String(candidate.end_at) : typeof hold.endAt === "string" ? hold.endAt : undefined;
-        if (!receiptStart || !receiptEnd) continue;
-        if (Date.parse(receiptStart) < endMs && Date.parse(receiptEnd) > startMs) {
-          this.db.exec("ROLLBACK");
-          return { ok: false, conflictingKey: String(candidate.operation_key) };
-        }
+      const conflict = this.findOverlappingHold(calendarId, startAt, endAt, operationKey, nowMs);
+      if (conflict) {
+        this.db.exec("ROLLBACK");
+        return { ok: false, conflictingKey: conflict };
       }
       this.db.exec("COMMIT");
       return { ok: true };
@@ -778,6 +763,60 @@ export class GatherStore {
       }
       throw error;
     }
+  }
+
+  /**
+   * Read-only durable conflict check over the same conflict set that
+   * claimHoldSlot enforces, so availability and create paths agree. Returns
+   * the conflicting operation key, if any. Unknown pending intents always
+   * block (fail-closed until evidence); receipts block only while their
+   * hold is unexpired. The caller's own operation key is always excluded.
+   */
+  findHoldConflict(
+    calendarId: string,
+    startAt: string,
+    endAt: string,
+    opts: { excludeOperationKey?: string; nowMs?: number } = {},
+  ): string | undefined {
+    return this.findOverlappingHold(calendarId, startAt, endAt, opts.excludeOperationKey, opts.nowMs ?? Date.now());
+  }
+
+  private findOverlappingHold(
+    calendarId: string,
+    startAt: string,
+    endAt: string,
+    excludeOperationKey: string | undefined,
+    nowMs: number,
+  ): string | undefined {
+    const startMs = Date.parse(startAt);
+    const endMs = Date.parse(endAt);
+    const intents = this.db.prepare("SELECT operation_key, start_at, end_at FROM provider_hold_intents WHERE calendar_id = $calendar").all({ $calendar: calendarId });
+    for (const item of intents) {
+      const candidate = row(item);
+      if (excludeOperationKey !== undefined && String(candidate.operation_key) === excludeOperationKey) continue;
+      if (Date.parse(String(candidate.start_at)) < endMs && Date.parse(String(candidate.end_at)) > startMs) {
+        return String(candidate.operation_key);
+      }
+    }
+    const receipts = this.db.prepare("SELECT operation_key, receipt_json, start_at, end_at FROM provider_receipts WHERE kind = 'hold' AND (calendar_id = $calendar OR calendar_id IS NULL)").all({ $calendar: calendarId });
+    for (const item of receipts) {
+      const candidate = row(item);
+      if (excludeOperationKey !== undefined && String(candidate.operation_key) === excludeOperationKey) continue;
+      const hold = ((parseJson(candidate.receipt_json, {}) as Record<string, unknown>).hold ?? {}) as Record<string, unknown>;
+      const receiptCalendar = typeof hold.calendarId === "string" ? hold.calendarId : undefined;
+      if (receiptCalendar !== undefined && receiptCalendar !== calendarId) continue;
+      const receiptStart = candidate.start_at ? String(candidate.start_at) : typeof hold.startAt === "string" ? hold.startAt : undefined;
+      const receiptEnd = candidate.end_at ? String(candidate.end_at) : typeof hold.endAt === "string" ? hold.endAt : undefined;
+      if (!receiptStart || !receiptEnd) continue;
+      // An expired hold no longer denies its window; rows without a readable
+      // expiry stay fail-closed. History rows are never deleted here.
+      const expiryMs = typeof hold.expiresAt === "string" ? Date.parse(hold.expiresAt) : Number.NaN;
+      if (Number.isFinite(expiryMs) && expiryMs <= nowMs) continue;
+      if (Date.parse(receiptStart) < endMs && Date.parse(receiptEnd) > startMs) {
+        return String(candidate.operation_key);
+      }
+    }
+    return undefined;
   }
 
   /** Release a hold intent after a definitive provider failure (no effect). */

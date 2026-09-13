@@ -332,7 +332,7 @@ test("C4: restart cannot double-book the same calendar window", async () => {
     const actionB = secondStore.createProposedAction({ id: "a-c4-b", bookingId: bookingB.id, kind: "create_provisional_hold", payload: holdPayload(), sourceReferences: [] });
     const error = await assertServiceError(
       approveAndExecute(deps2, { bookingId: bookingB.id, proposedActionId: actionB.id, proposalVersion: 1, proposalFingerprint: actionB.proposalFingerprint }),
-      "EXECUTION_FAILED",
+      "SLOT_UNAVAILABLE",
     );
     assert.match(error.message, /already held/);
     assert.equal(demo2.store.listProvisionalHolds().length, 0);

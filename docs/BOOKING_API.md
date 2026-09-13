@@ -81,16 +81,28 @@ payment/confirmation step.
   `provider_receipts` overlap check inside one IMMEDIATE transaction) before
   the volatile adapter is touched, so a restarted process or a second booking
   action cannot double-book the same calendar window; definitive failures
-  release the claim.
+  release the claim. Pending intents are never purged by lease or clock: an
+  intent records a provider effect of unknown outcome and stays fail-closed
+  until evidence (a durable receipt, an explicit release after definitive
+  failure, or reconciliation). Receipts whose hold has expired no longer deny
+  their window — expiry is observed against the injected service clock — but
+  receipt rows are preserved as history. The availability read consults the
+  same durable conflict set (excluding the caller's own operation key), so
+  availability and create agree in-process and across restarts.
 - Failed steps reopen under the **same** idempotency key, so a real provider
   dedupes them.
 
 ## Ordering and state rules
 
 - The executable payload is validated **before** any approval row is stored:
-  invalid, past-window, or unsupported-kind proposals gain no approval and no
-  executions. Past event windows (`endAt` at or before the server clock) are
-  rejected outright.
+  invalid, past-window, malformed-recipient, or unsupported-kind proposals
+  gain no approval and no executions. Past event windows (`endAt` at or
+  before the server clock) are rejected outright, as are windows whose
+  `startAt` is at or before now (an event that already started cannot be
+  newly approved; `startAt == now` counts as begun). Every `emailTo` element
+  must be a non-empty address: malformed elements are rejected, never
+  silently filtered, so the approved recipient set is exactly the executed
+  one.
 - Only `kind: "create_provisional_hold"` is executable. Any other kind —
   including `custom` with a hold-shaped payload — is rejected with
   `INVALID_REQUEST` at the approve/retry boundary.
@@ -113,6 +125,14 @@ Typed `{ code, message, retryable, demo: true }`. Codes: `INVALID_REQUEST`
 
 `RECONCILE_PENDING` means reconciliation found no provider evidence yet: the
 execution stays `uncertain` and the caller may retry reconciliation later.
+It is explicitly not a failure verdict, and it never authorizes a new write.
+
+A demonstrated durable-window conflict (another booking durably holds the
+same calendar window) surfaces as actionable `SLOT_UNAVAILABLE` naming the
+conflicting record — both at the availability pre-check and, for create-time
+races, at the hold step. Other conflict kinds (e.g. an operation key rebound
+to a different payload) keep the `EXECUTION_FAILED` path and are never
+masked as availability.
 It is explicitly not a failure verdict, and it never authorizes a new write.
 
 ## Manual resolution limits

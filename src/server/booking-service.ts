@@ -122,9 +122,13 @@ export function resolveHoldParams(actionPayload: Record<string, unknown>, opts: 
     throw new ServiceError("INVALID_REQUEST", "Proposal payload must carry an explicit calendarId (it is part of the approved fingerprint)", false);
   }
   const nowMs = opts.nowMs ?? Date.now();
+  const startMs = Date.parse(startAt);
   const endMs = Date.parse(endAt);
   if (endMs <= nowMs) {
     throw new ServiceError("INVALID_REQUEST", "Proposal event window has already ended; past windows cannot be approved", false);
+  }
+  if (startMs <= nowMs) {
+    throw new ServiceError("INVALID_REQUEST", "Proposal event window has already started; past or current startAt values cannot be approved", false);
   }
   const expiryMs = expiresAt ? Date.parse(expiresAt) : Number.NaN;
   if (!expiresAt || !Number.isFinite(expiryMs)) {
@@ -134,8 +138,18 @@ export function resolveHoldParams(actionPayload: Record<string, unknown>, opts: 
     throw new ServiceError("INVALID_REQUEST", "Proposal payload expiresAt must be in the future (the hold has already expired)", false);
   }
   const rawTo = payload.emailTo;
-  const emailTo = (Array.isArray(rawTo) ? rawTo : []).filter((item): item is string => typeof item === "string" && item.length > 0);
-  if (emailTo.length === 0) throw new ServiceError("INVALID_REQUEST", "Proposal payload must carry an explicit non-empty emailTo array", false);
+  if (!Array.isArray(rawTo) || rawTo.length === 0) {
+    throw new ServiceError("INVALID_REQUEST", "Proposal payload must carry an explicit non-empty emailTo array", false);
+  }
+  // Every recipient must be reviewable exactly as executed: malformed
+  // elements are rejected rather than silently filtered, so the approved
+  // fingerprint covers precisely the executed recipient set.
+  const emailTo: string[] = rawTo.map((item, index) => {
+    if (typeof item !== "string" || item.trim().length === 0) {
+      throw new ServiceError("INVALID_REQUEST", `Proposal payload emailTo[${index}] must be a non-empty email address; malformed recipients are rejected, not filtered`, false);
+    }
+    return item;
+  });
   const emailSubject = str(payload.emailSubject);
   const emailBody = str(payload.emailBody);
   if (!emailSubject) throw new ServiceError("INVALID_REQUEST", "Proposal payload must carry an explicit emailSubject", false);
@@ -547,11 +561,18 @@ function requireLiveApproval(store: GatherStore, actionId: string): void {
  * The requested range must be FULLY covered by available slots: a single
  * partially overlapping open slot is not sufficient. Any overlapping
  * unavailable slot blocks the hold.
+ *
+ * After the provider read, the same durable conflict set that the create
+ * path enforces is consulted (excluding the caller's own operation key),
+ * so availability and create agree in the same process and across restarts:
+ * a window durably held by another booking refuses here with the same
+ * actionable SLOT_UNAVAILABLE instead of failing later at create time.
  */
 async function requireFreshAvailability(
   deps: BookingServiceDeps,
   bookingId: string,
   params: HoldParams,
+  ownOperationKey: string,
 ): Promise<void> {
   const { store, calendar } = deps;
   const availability = await calendar.checkAvailability({
@@ -587,6 +608,28 @@ async function requireFreshAvailability(
     store.updateBookingStatus(bookingId, "failed");
     throw new ServiceError("SLOT_UNAVAILABLE", "No available slot fully covers the requested range", false);
   }
+  const durableConflict = store.findHoldConflict(params.calendarId, params.startAt, params.endAt, {
+    excludeOperationKey: ownOperationKey,
+    nowMs: clockMs(deps),
+  });
+  if (durableConflict) {
+    store.updateBookingStatus(bookingId, "failed");
+    throw new ServiceError("SLOT_UNAVAILABLE", durableWindowMessage(durableConflict), false);
+  }
+}
+
+/**
+ * Actionable mapping for the demonstrated durable-window conflict only.
+ * Other conflict kinds (e.g. an operation key rebound to a different
+ * payload) keep their EXECUTION_FAILED path so they are never masked as
+ * availability.
+ */
+function isDurableWindowConflict(message: string | undefined): boolean {
+  return message !== undefined && message.includes("already held (durable record");
+}
+
+function durableWindowMessage(conflictingKey: string): string {
+  return `Demo calendar window is already held (durable record ${conflictingKey}); choose another window or reconcile the conflicting record`;
 }
 
 export async function approveAndExecute(deps: BookingServiceDeps, input: ApproveRequestDTO): Promise<ApproveResponseDTO> {
@@ -604,13 +647,16 @@ export async function approveAndExecute(deps: BookingServiceDeps, input: Approve
   // new write can occur, so a fresh availability read must not fail it.
   const ownHold = store.getExecutionByIdempotencyKey(holdOperationKey(action.id, action.proposalVersion));
   if (ownHold?.status !== "succeeded") {
-    await requireFreshAvailability(deps, booking.id, params);
+    await requireFreshAvailability(deps, booking.id, params, holdOperationKey(action.id, action.proposalVersion));
     assertLiveApprovalAfterWait(store, action.id, action.proposalVersion);
   }
 
   const holdExecution = await runHoldStep(deps, action.id, action.proposalVersion, params);
   if (holdExecution.status === "failed") {
     store.updateBookingStatus(booking.id, "failed");
+    if (isDurableWindowConflict(holdExecution.error)) {
+      throw new ServiceError("SLOT_UNAVAILABLE", holdExecution.error as string, false);
+    }
     throw new ServiceError("EXECUTION_FAILED", holdExecution.error ?? "Provisional hold failed", false);
   }
   // Hold exists (or its outcome is still uncertain): booking is provisional at best.
@@ -677,7 +723,7 @@ export async function retryFailedSteps(deps: BookingServiceDeps, proposedActionI
   // Fresh availability before any new hold write (skipped only when the hold
   // already succeeded and no write can occur).
   if (holdExisting?.status !== "succeeded") {
-    await requireFreshAvailability(deps, action.bookingId, params);
+    await requireFreshAvailability(deps, action.bookingId, params, holdKey);
   }
   // Re-run hold only when it has not already succeeded.
   const hold = holdExisting?.status === "succeeded" ? holdExisting : await runHoldStep(deps, action.id, action.proposalVersion, params);
@@ -687,6 +733,9 @@ export async function retryFailedSteps(deps: BookingServiceDeps, proposedActionI
   }
   if (hold.status !== "succeeded") {
     store.updateBookingStatus(action.bookingId, "failed");
+    if (isDurableWindowConflict(hold.error)) {
+      throw new ServiceError("SLOT_UNAVAILABLE", hold.error as string, false);
+    }
     throw new ServiceError("EXECUTION_FAILED", hold.error ?? "Hold retry did not succeed", false);
   }
   store.updateBookingStatus(action.bookingId, "provisional_hold");
