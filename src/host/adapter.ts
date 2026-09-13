@@ -78,7 +78,18 @@ function initialsOf(name: string): string {
 
 /** Latest proposal by numeric version — the one displayed and approvable. */
 function latestProposal(proposals: WorkspaceProposalDTO[]): WorkspaceProposalDTO | undefined {
-  return [...proposals].sort((left, right) => right.action.proposalVersion - left.action.proposalVersion)[0];
+  return [...proposals].sort((left, right) => {
+    if (right.action.proposalVersion !== left.action.proposalVersion) {
+      return right.action.proposalVersion - left.action.proposalVersion;
+    }
+    // Version ties (a changed persist creates a new row at version 1, never
+    // a bump): newest created wins so a repriced proposal displaces the
+    // stale one it supersedes instead of hiding behind it.
+    if (right.action.createdAt !== left.action.createdAt) {
+      return right.action.createdAt < left.action.createdAt ? -1 : 1;
+    }
+    return right.action.id < left.action.id ? -1 : 1;
+  })[0];
 }
 
 function stepOf(key: string): "hold" | "email" {
@@ -153,7 +164,7 @@ function isIso(value: unknown): value is string {
 }
 
 function isCents(value: unknown): value is number {
-  return typeof value === "number" && Number.isInteger(value) && value >= 0;
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
 function isNullableCents(value: unknown): value is number | null {
@@ -199,12 +210,14 @@ type ParsedOffer =
   | { kind: "valid"; offer: OfferCandidate };
 
 /**
- * Strict boundary validation of the immutable OfferCandidate persisted on
- * `action.payload.offer`. Any malformed field, non-finite amount, bad
- * currency, or internal contradiction marks the offer invalid — it can never
- * render as priced. When `payload.offerPreparationFingerprint` is present it
- * must bind exactly to the snapshot's own fingerprint: a mismatch means the
- * snapshot does not correspond to this proposal version.
+ * Strict boundary validation of the complete immutable OfferCandidate
+ * persisted on `action.payload.offer`. Any malformed field, non-finite or
+ * out-of-range amount, bad currency, empty required list, or internal
+ * contradiction marks the offer invalid — it can never render as priced.
+ * The snapshot fingerprint and `payload.offerPreparationFingerprint` are
+ * validated as separate non-empty hashes, never compared: binding the exact
+ * version is the canonical action.proposalFingerprint's job, enforced at
+ * approval, not the adapter's.
  */
 function parseOfferSnapshot(payload: Record<string, unknown>): ParsedOffer {
   const raw = payload.offer;
@@ -216,9 +229,9 @@ function parseOfferSnapshot(payload: Record<string, unknown>): ParsedOffer {
   if (raw.rank !== "primary" && raw.rank !== "alternative") return invalid("rank malformed");
   if (!isIso(raw.startAt) || !isIso(raw.endAt)) return invalid("window malformed");
   if (!isNonEmptyString(raw.spaceId) || !isNonEmptyString(raw.spaceName)) return invalid("space missing");
-  if (typeof raw.guestCount !== "number" || !Number.isInteger(raw.guestCount) || raw.guestCount < 0) return invalid("guestCount malformed");
+  if (typeof raw.guestCount !== "number" || !Number.isSafeInteger(raw.guestCount) || raw.guestCount < 0) return invalid("guestCount malformed");
   if (typeof raw.currency !== "string" || !/^[A-Z]{3}$/.test(raw.currency)) return invalid("currency malformed");
-  if (!Array.isArray(raw.lines)) return invalid("lines missing");
+  if (!Array.isArray(raw.lines) || raw.lines.length === 0) return invalid("lines missing or empty");
   const lines: OfferLine[] = [];
   for (const entry of raw.lines) {
     const line = parseOfferLine(entry);
@@ -236,16 +249,21 @@ function parseOfferSnapshot(payload: Record<string, unknown>): ParsedOffer {
   if (raw.profitabilityClaimed && (raw.unknownCostIds.length > 0 || raw.unknownPriceIds.length > 0)) {
     return invalid("profitability claimed with unknown costs or prices");
   }
-  if (!isStringArray(raw.consequences)) return invalid("consequences malformed");
-  if (!Array.isArray(raw.sources) || !raw.sources.every((ref) => isRecord(ref) && isNonEmptyString(ref.kind) && isNonEmptyString(ref.locator))) {
-    return invalid("sources malformed");
+  if (!isStringArray(raw.consequences) || raw.consequences.length === 0) return invalid("consequences malformed or empty");
+  if (!Array.isArray(raw.sources) || raw.sources.length === 0 || !raw.sources.every((ref) => isRecord(ref) && isNonEmptyString(ref.kind) && isNonEmptyString(ref.locator))) {
+    return invalid("sources malformed or empty");
   }
   if (!isNonEmptyString(raw.fingerprint)) return invalid("fingerprint missing");
   if (raw.supersedesFingerprint !== undefined && !isNonEmptyString(raw.supersedesFingerprint)) return invalid("supersedesFingerprint malformed");
   if (raw.note !== undefined && typeof raw.note !== "string") return invalid("note malformed");
+  // The snapshot fingerprint and the result-level preparation fingerprint
+  // are separate hashes validated independently below — never equated. The
+  // canonical action.proposalFingerprint already binds the entire payload,
+  // and approval binds that exact version, so no cross-digest comparison
+  // can add authority here.
   const preparationFingerprint = payload.offerPreparationFingerprint;
-  if (preparationFingerprint !== undefined && (!isNonEmptyString(preparationFingerprint) || preparationFingerprint !== raw.fingerprint)) {
-    return invalid("offer snapshot does not match its declared preparation fingerprint");
+  if (preparationFingerprint !== undefined && !isNonEmptyString(preparationFingerprint)) {
+    return invalid("preparation fingerprint malformed");
   }
   return { kind: "valid", offer: raw as unknown as OfferCandidate };
 }

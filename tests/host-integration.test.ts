@@ -465,7 +465,11 @@ test("malformed, contradictory, or mismatched offers never render as priced or a
     ["missing fingerprint", offerSnapshot({ fingerprint: undefined })],
     ["malformed line", offerSnapshot({ lines: [{ lineId: "l", label: "x" }] })],
     ["non-object offer", "not an offer"],
-    ["preparation fingerprint mismatch", offerSnapshot(), { offerPreparationFingerprint: "b".repeat(64) }],
+    ["malformed preparation fingerprint", offerSnapshot(), { offerPreparationFingerprint: "" }],
+    ["empty lines", offerSnapshot({ lines: [] })],
+    ["empty consequences", offerSnapshot({ consequences: [] })],
+    ["empty sources", offerSnapshot({ sources: [] })],
+    ["unsafe-integer total", offerSnapshot({ totalCents: Number.MAX_SAFE_INTEGER + 1 })],
   ];
   for (const [name, offer, extras] of cases) {
     const workspace = baseWorkspace();
@@ -477,6 +481,19 @@ test("malformed, contradictory, or mismatched offers never render as priced or a
     assert.equal(proposal.deposit, "Not priced", name);
     assert.equal(proposal.lines.length, 0, name);
   }
+});
+
+test("distinct snapshot and preparation fingerprints validate as separate hashes", () => {
+  // The candidate digest and the result-level preparation digest are
+  // different values by construction; the adapter validates each
+  // independently and never equates them. Binding the exact version stays
+  // with the canonical action fingerprint at approval.
+  const workspace = baseWorkspace();
+  workspace.bookings = [bookingWithOffer(offerSnapshot(), { offerPreparationFingerprint: "b".repeat(64) })] as unknown as ClientWorkspaceDTO["bookings"];
+  const proposal = adaptWorkspace(workspace).bookings[0].detail.proposal;
+  assert.equal(proposal.offerInvalid, undefined);
+  assert.equal(proposal.total, "$10,100.00");
+  assert.equal(proposal.offer?.preparationFingerprint, "b".repeat(64));
 });
 
 test("a legacy proposal without an offer keeps the honest Not priced state", () => {
