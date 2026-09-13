@@ -70,7 +70,11 @@ Full model execution and Gateway-mediated Gather tool invocation remain unverifi
 Google adapters passed independent review on `363bef7`, including scripted provider responses and a real loopback transport timeout.
 The combined suite on `72c82b7` passes 84 tests and type checking.
 These adapter component checks establish no live Google outcome; the adapters remain disconnected pending approved test-account assets.
-Offer and proactive-work modules require independent verification and integration before owner-facing acceptance.
+The business-aware offers module was integrated as `8bc9674` from `997c2cf` after independent review and correction of invented currency and missed suitable rooms.
+Astra reran all 41 offer-specific tests and type checking on the integrated module.
+The module preserves approved floors and margin rules, does not claim profit when costs are unknown, checks scoped availability and local-time alternatives, and binds deterministic offer fingerprints.
+It still requires host wiring to confirmed business facts, fresh availability, and exact owner approval before owner-facing acceptance.
+Proactive-work, business-knowledge, and delivery-readiness modules remain under independent review and integration.
 The next demonstrable owner journey is explicit demo initialization, exact proposal review and approval, individually persisted hold and email receipts, and restart recovery through the workspace.
 
 The full product requirements and build ownership are recorded in [PRD.md](PRD.md) and [ORCHESTRATION.md](ORCHESTRATION.md).
@@ -88,7 +92,7 @@ No credentials, personal OpenClaw configuration or data, provider actions, custo
 
 ## Workspace cleanup and dependency findings
 
-Nine completed review, failed-launch, and inherited milestone worktrees were removed after checking clean tracked state and active worker ownership.
+Ten completed review, failed-launch, runtime, and inherited milestone worktrees were removed after checking clean tracked state and active worker ownership.
 Original foundation, interface, connector-contract, and packaging commits remain preserved by local branch references; integrated review commits remain reachable on remote main.
 Active execution worktrees and unrelated work were preserved.
 
