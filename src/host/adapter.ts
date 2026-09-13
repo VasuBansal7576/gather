@@ -4,8 +4,10 @@ import type {
   BookingSummary,
   Connection,
   ConnectionProvider,
+  OfferView,
   ProposalSource,
 } from "../components/gather/types.ts";
+import type { OfferCandidate, OfferLine, PricingBasis } from "../offers/types.ts";
 import type {
   ApprovalDTO,
   BusinessDTO,
@@ -74,9 +76,32 @@ function initialsOf(name: string): string {
   return (first + second).toUpperCase();
 }
 
-/** Latest proposal by numeric version — the one displayed and approvable. */
-function latestProposal(proposals: WorkspaceProposalDTO[]): WorkspaceProposalDTO | undefined {
-  return [...proposals].sort((left, right) => right.action.proposalVersion - left.action.proposalVersion)[0];
+/**
+ * The booking's displayed proposal: the server's durable current pointer,
+ * selected by exact action id. This is the same pointer approve, retry,
+ * reconcile, and confirmation bind to — the adapter never re-derives
+ * "latest" from per-action versions, wall-clock timestamps, or UUID order,
+ * so it cannot disagree with the backend (e.g. showing an old v2 while the
+ * backend confirms a newer v1, or ordering equal timestamps by UUID).
+ *
+ * When the pointer is absent (pre-pointer payloads in tests/fixtures) the
+ * legacy version-then-createdAt ordering applies as backcompat; when the
+ * pointer names no listed proposal, nothing is displayed rather than a
+ * wrong proposal.
+ */
+function currentProposal(item: WorkspaceBookingDTO): WorkspaceProposalDTO | undefined {
+  if (item.currentProposedActionId !== undefined) {
+    return item.proposals.find((proposal) => proposal.action.id === item.currentProposedActionId);
+  }
+  return [...item.proposals].sort((left, right) => {
+    if (right.action.proposalVersion !== left.action.proposalVersion) {
+      return right.action.proposalVersion - left.action.proposalVersion;
+    }
+    if (right.action.createdAt !== left.action.createdAt) {
+      return right.action.createdAt < left.action.createdAt ? -1 : 1;
+    }
+    return right.action.id < left.action.id ? -1 : 1;
+  })[0];
 }
 
 function stepOf(key: string): "hold" | "email" {
@@ -99,6 +124,74 @@ const REQUIRED_STEPS_BY_ACTION_KIND: Record<string, ("hold" | "email")[]> = {
   create_provisional_hold: ["hold", "email"],
 };
 
+/**
+ * Display-side mirror of the server's live-proof rule: a succeeded receipt
+ * reads as a provider receipt only on positive proof (live mode, not
+ * simulated, non-empty non-fictional provenance). Missing proof, unknown or
+ * malformed envelopes fail closed to unverified — never simulated without
+ * positive simulation evidence; a fixture receipt is never upgraded to
+ * live at display.
+ */
+const LIVE_PROOF_SOURCE_KINDS = new Set(["connected_account", "document", "email", "calendar", "manual"]);
+
+function isLiveProof(proof: ExecutionDTO["proof"]): boolean {
+  if (proof === undefined) return false;
+  if (proof.mode !== "live" || proof.simulated !== false) return false;
+  if (proof.provenance.length === 0) return false;
+  // Positive validation matching the service rule: every ref must be a
+  // supported non-fixture kind with a non-empty locator — malformed or
+  // fictional entries never qualify as live evidence.
+  return proof.provenance.every(
+    (ref) => LIVE_PROOF_SOURCE_KINDS.has(ref.kind) && ref.locator.trim().length > 0 && ref.fictional !== true,
+  );
+}
+
+/**
+ * Positive simulated/fixture proof on a validated envelope: explicitly
+ * demo mode, explicitly simulated, or every provenance entry explicitly
+ * fictional. Anything else validated-but-not-live — empty provenance,
+ * unknown mode, mixed envelopes — is NOT simulation evidence and must read
+ * as unverified, never simulated.
+ */
+function isSimulatedProof(proof: ExecutionDTO["proof"]): boolean {
+  if (proof === undefined) return false;
+  if (proof.mode === "demo" || proof.simulated === true) return true;
+  if (proof.provenance.length === 0) return false;
+  return proof.provenance.every((ref) => ref.fictional === true);
+}
+
+/**
+ * Read the step proof from either execution shape: parsed client DTOs carry
+ * it as top-level `proof` (validated at the DTO boundary), while
+ * server-shape executions passed straight through carry it embedded in
+ * `result.proof`. Both are validated the same strict way; anything
+ * malformed yields undefined so display fails closed to unverified.
+ */
+function executionProof(execution: ExecutionDTO): ExecutionDTO["proof"] {
+  if (execution.proof !== undefined) return execution.proof;
+  const result = (execution as unknown as { result?: unknown }).result;
+  if (typeof result !== "object" || result === null) return undefined;
+  const proof = (result as { proof?: unknown }).proof;
+  if (typeof proof !== "object" || proof === null) return undefined;
+  const candidate = proof as { mode?: unknown; simulated?: unknown; provenance?: unknown };
+  if ((candidate.mode !== "demo" && candidate.mode !== "live") || typeof candidate.simulated !== "boolean") return undefined;
+  if (!Array.isArray(candidate.provenance)) return undefined;
+  const provenance: { kind: string; locator: string; label?: string; fictional?: boolean }[] = [];
+  for (const ref of candidate.provenance) {
+    if (typeof ref !== "object" || ref === null) return undefined;
+    const item = ref as { kind?: unknown; locator?: unknown; label?: unknown; fictional?: unknown };
+    if (typeof item.kind !== "string" || typeof item.locator !== "string") return undefined;
+    if (item.label !== undefined && typeof item.label !== "string") return undefined;
+    provenance.push({
+      kind: item.kind,
+      locator: item.locator,
+      ...(typeof item.label === "string" ? { label: item.label } : {}),
+      ...(item.fictional === true ? { fictional: true as const } : {}),
+    });
+  }
+  return { mode: candidate.mode, simulated: candidate.simulated, provenance };
+}
+
 function receiptOf(execution: ExecutionDTO, timezone: string | undefined): ActionReceipt {
   const step = stepOf(execution.idempotencyKey);
   const receipt: ActionReceipt = {
@@ -112,7 +205,16 @@ function receiptOf(execution: ExecutionDTO, timezone: string | undefined): Actio
     timestamp: formatTimestamp(execution.completedAt ?? execution.reconciledAt ?? execution.startedAt, timezone),
   };
   if (execution.error) receipt.detail = execution.error;
-  if (execution.status === "succeeded") receipt.detail = "Done — simulated provider receipt";
+  if (execution.status === "succeeded") {
+    const proof = executionProof(execution);
+    receipt.detail = proof === undefined
+      ? "Done — provider receipt unverified"
+      : isLiveProof(proof)
+        ? "Done — provider receipt recorded"
+        : isSimulatedProof(proof)
+          ? "Done — simulated provider receipt"
+          : "Done — provider receipt unverified";
+  }
   // Recovery is only ever offered for non-terminal states; pending and
   // succeeded never get a control.
   if (execution.status === "failed") receipt.recoveryLabel = "Retry failed steps";
@@ -129,8 +231,150 @@ function sourceKind(kind: string): ProposalSource["kind"] {
   return "unsupported";
 }
 
+// ---------- Authoritative offer snapshot (payload.offer) ----------
+
+const PRICING_BASES: readonly PricingBasis[] = ["per_event", "per_guest", "per_hour"];
+const PRICING_BASIS_LABEL: Record<PricingBasis, string> = {
+  per_event: "per event",
+  per_guest: "per guest",
+  per_hour: "per hour",
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function isIso(value: unknown): value is string {
+  return typeof value === "string" && Number.isFinite(Date.parse(value));
+}
+
+function isCents(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function isNullableCents(value: unknown): value is number | null {
+  return value === null || isCents(value);
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every(isNonEmptyString);
+}
+
+/** Display money in proper currency units; never amountCents glued to a code. */
+function formatMoney(amountCents: number, currency: string): string {
+  try {
+    return new Intl.NumberFormat("en-US", { style: "currency", currency }).format(amountCents / 100);
+  } catch {
+    return `${(amountCents / 100).toFixed(2)} ${currency}`;
+  }
+}
+
+function parseOfferLine(value: unknown): OfferLine | null {
+  if (!isRecord(value)) return null;
+  if (!isNonEmptyString(value.lineId) || !isNonEmptyString(value.label)) return null;
+  if (typeof value.pricingBasis !== "string" || !PRICING_BASES.includes(value.pricingBasis as PricingBasis)) return null;
+  if (typeof value.quantity !== "number" || !Number.isFinite(value.quantity) || value.quantity <= 0) return null;
+  if (!isNullableCents(value.unitCents) || !isNullableCents(value.lineTotalCents)) return null;
+  if (value.unknownUnit !== true && value.unknownUnit !== false) return null;
+  // Consistency: a known unit price can never carry the unknown marker.
+  if (value.unknownUnit && value.unitCents !== null) return null;
+  return {
+    lineId: value.lineId,
+    label: value.label,
+    pricingBasis: value.pricingBasis as PricingBasis,
+    quantity: value.quantity,
+    unitCents: value.unitCents,
+    lineTotalCents: value.lineTotalCents,
+    unknownUnit: value.unknownUnit,
+  };
+}
+
+type ParsedOffer =
+  | { kind: "absent" }
+  | { kind: "invalid"; reason: string }
+  | { kind: "valid"; offer: OfferCandidate };
+
+/**
+ * Strict boundary validation of the complete immutable OfferCandidate
+ * persisted on `action.payload.offer`. Any malformed field, non-finite or
+ * out-of-range amount, bad currency, empty required list, or internal
+ * contradiction marks the offer invalid — it can never render as priced.
+ * The snapshot fingerprint and `payload.offerPreparationFingerprint` are
+ * validated as separate non-empty hashes, never compared: binding the exact
+ * version is the canonical action.proposalFingerprint's job, enforced at
+ * approval, not the adapter's.
+ */
+function parseOfferSnapshot(payload: Record<string, unknown>): ParsedOffer {
+  const raw = payload.offer;
+  if (raw === undefined || raw === null) return { kind: "absent" };
+  const invalid = (reason: string): ParsedOffer => ({ kind: "invalid", reason });
+  if (!isRecord(raw)) return invalid("offer is not an object");
+  if (!isNonEmptyString(raw.offerId)) return invalid("offerId missing");
+  if (typeof raw.version !== "number" || !Number.isInteger(raw.version) || raw.version < 1) return invalid("version malformed");
+  if (raw.rank !== "primary" && raw.rank !== "alternative") return invalid("rank malformed");
+  if (!isIso(raw.startAt) || !isIso(raw.endAt)) return invalid("window malformed");
+  if (!isNonEmptyString(raw.spaceId) || !isNonEmptyString(raw.spaceName)) return invalid("space missing");
+  if (typeof raw.guestCount !== "number" || !Number.isSafeInteger(raw.guestCount) || raw.guestCount < 0) return invalid("guestCount malformed");
+  if (typeof raw.currency !== "string" || !/^[A-Z]{3}$/.test(raw.currency)) return invalid("currency malformed");
+  if (!Array.isArray(raw.lines) || raw.lines.length === 0) return invalid("lines missing or empty");
+  const lines: OfferLine[] = [];
+  for (const entry of raw.lines) {
+    const line = parseOfferLine(entry);
+    if (!line) return invalid("a priced line is malformed");
+    lines.push(line);
+  }
+  if (!isNullableCents(raw.totalCents) || !isNullableCents(raw.depositCents)) return invalid("amounts malformed");
+  if (raw.totalKnown !== true && raw.totalKnown !== false) return invalid("totalKnown missing");
+  // A claimed-known total can never be null, and a stored total can never
+  // carry the not-known flag.
+  if (raw.totalKnown !== (raw.totalCents !== null)) return invalid("total/totalKnown contradiction");
+  if (!isStringArray(raw.unknownCostIds) || !isStringArray(raw.unknownPriceIds)) return invalid("unknown id lists malformed");
+  if (raw.profitabilityClaimed !== true && raw.profitabilityClaimed !== false) return invalid("profitabilityClaimed missing");
+  // Unknown costs or prices can never carry a profitability claim.
+  if (raw.profitabilityClaimed && (raw.unknownCostIds.length > 0 || raw.unknownPriceIds.length > 0)) {
+    return invalid("profitability claimed with unknown costs or prices");
+  }
+  if (!isStringArray(raw.consequences) || raw.consequences.length === 0) return invalid("consequences malformed or empty");
+  if (!Array.isArray(raw.sources) || raw.sources.length === 0 || !raw.sources.every((ref) => isRecord(ref) && isNonEmptyString(ref.kind) && isNonEmptyString(ref.locator))) {
+    return invalid("sources malformed or empty");
+  }
+  if (!isNonEmptyString(raw.fingerprint)) return invalid("fingerprint missing");
+  if (raw.supersedesFingerprint !== undefined && !isNonEmptyString(raw.supersedesFingerprint)) return invalid("supersedesFingerprint malformed");
+  if (raw.note !== undefined && typeof raw.note !== "string") return invalid("note malformed");
+  // The snapshot fingerprint and the result-level preparation fingerprint
+  // are separate hashes validated independently below — never equated. The
+  // canonical action.proposalFingerprint already binds the entire payload,
+  // and approval binds that exact version, so no cross-digest comparison
+  // can add authority here.
+  const preparationFingerprint = payload.offerPreparationFingerprint;
+  if (preparationFingerprint !== undefined && !isNonEmptyString(preparationFingerprint)) {
+    return invalid("preparation fingerprint malformed");
+  }
+  return { kind: "valid", offer: raw as unknown as OfferCandidate };
+}
+
+function offerViewFor(offer: OfferCandidate, payload: Record<string, unknown>): OfferView {
+  return {
+    spaceName: offer.spaceName,
+    guestCount: offer.guestCount,
+    currency: offer.currency,
+    terms: offer.consequences,
+    unknownCosts: offer.unknownCostIds,
+    unknownPrices: offer.unknownPriceIds,
+    profitabilityClaimed: offer.profitabilityClaimed,
+    preparationFingerprint: isNonEmptyString(payload.offerPreparationFingerprint) ? payload.offerPreparationFingerprint : undefined,
+    note: offer.note,
+  };
+}
+
 function proposalFor(item: WorkspaceProposalDTO, timezone: string | undefined): BookingSummary["detail"]["proposal"] {
   const { action, consequences, consequencesError } = item;
+  const parsedOffer = parseOfferSnapshot(action.payload);
+  const offer = parsedOffer.kind === "valid" ? parsedOffer.offer : undefined;
   const consequenceSteps = consequences
     ? [
         `Recheck availability on ${consequences.calendarId} for ${formatDate(consequences.startAt, timezone)} ${formatTime(consequences.startAt, consequences.endAt, timezone)}`,
@@ -146,16 +390,32 @@ function proposalFor(item: WorkspaceProposalDTO, timezone: string | undefined): 
     versionLabel: `Version ${action.proposalVersion} · prepared ${formatTimestamp(action.createdAt, timezone)}`,
     fingerprint: action.proposalFingerprint,
     requiredSteps: REQUIRED_STEPS_BY_ACTION_KIND[action.kind] ?? [],
-    total: "Not priced",
-    deposit: "Not priced",
+    total: offer
+      ? offer.totalCents !== null
+        ? formatMoney(offer.totalCents, offer.currency)
+        : "Total unknown"
+      : "Not priced",
+    deposit: offer
+      ? offer.depositCents !== null
+        ? `Deposit ${formatMoney(offer.depositCents, offer.currency)}`
+        : "Deposit not specified"
+      : "Not priced",
     validUntil: consequences ? `Hold would expire ${formatTimestamp(consequences.expiresAt, timezone)}` : "Not specified",
+    offer: offer ? offerViewFor(offer, action.payload) : undefined,
+    offerInvalid: parsedOffer.kind === "invalid" || undefined,
     consequences: consequenceSteps,
-    lines: consequences
-      ? [
-          { label: "Provisional hold", detail: `${formatTime(consequences.startAt, consequences.endAt, timezone)} on ${consequences.calendarId}`, amount: "—" },
-          { label: "Offer email", detail: `to ${consequences.emailTo.join(", ")}`, amount: "—" },
-        ]
-      : [],
+    lines: offer
+      ? offer.lines.map((line) => ({
+          label: line.label,
+          detail: `${line.quantity} × ${line.unitCents !== null ? formatMoney(line.unitCents, offer.currency) : "unit price unknown"} ${PRICING_BASIS_LABEL[line.pricingBasis]}`,
+          amount: line.lineTotalCents !== null ? formatMoney(line.lineTotalCents, offer.currency) : "Unknown",
+        }))
+      : consequences
+        ? [
+            { label: "Provisional hold", detail: `${formatTime(consequences.startAt, consequences.endAt, timezone)} on ${consequences.calendarId}`, amount: "—" },
+            { label: "Offer email", detail: `to ${consequences.emailTo.join(", ")}`, amount: "—" },
+          ]
+        : [],
     sources: action.sourceReferences.map((source) => ({
       title: source.label ?? source.locator,
       detail: source.kind === "fixture" ? `${source.locator} (fixture source)` : source.locator,
@@ -238,7 +498,7 @@ function bookingFor(item: WorkspaceBookingDTO, index: number, business: Business
   const timezone = business?.timezone;
   const venue = business?.name ?? "Venue not specified";
   const mapped = statusFor(booking.status);
-  const proposal = latestProposal(item.proposals);
+  const proposal = currentProposal(item);
   const receipts = item.executions.map((execution) => receiptOf(execution, timezone));
   // A pending step on the CURRENT proposal version means an approval
   // execution is in flight — show waiting, never claim a completed hold.
@@ -327,7 +587,7 @@ function connectionFor(account: ConnectedAccountDTO): Connection {
 export interface AdaptedWorkspace {
   bookings: BookingSummary[];
   connections: Connection[];
-  dataMode: "demo" | "live";
+  dataMode: "demo" | "live" | "unknown";
   /** Fingerprints with a step execution still pending — approvals in flight. */
   pendingApprovals: string[];
   approvalIdentity: string;
@@ -337,7 +597,7 @@ export interface AdaptedWorkspace {
 export function adaptWorkspace(workspace: WorkspaceDTO): AdaptedWorkspace {
   const pendingApprovals = new Set<string>();
   for (const item of workspace.bookings) {
-    const proposal = latestProposal(item.proposals);
+    const proposal = currentProposal(item);
     if (!proposal) continue;
     // Scope pending to the exact displayed action + version: a pending
     // execution on an older version must not block the new proposal.
@@ -354,7 +614,14 @@ export function adaptWorkspace(workspace: WorkspaceDTO): AdaptedWorkspace {
       bookingFor(item, index, workspace.businesses.find((business) => business.id === item.booking.businessId) ?? workspace.businesses[0]),
     ),
     connections: workspace.connections.map(connectionFor),
-    dataMode: workspace.mode.kind === "demo" ? "demo" : "live",
+    // Three-state evidence marker, preserved exactly: only a positive live
+    // marker renders live, only positive fixture evidence renders demo —
+    // "unknown" (real records, unverified provider proof) stays unknown so
+    // real records are never labeled simulated nor upgraded to live.
+    dataMode:
+      workspace.mode.kind === "live" ? "live"
+        : workspace.mode.kind === "demo" ? "demo"
+          : "unknown",
     pendingApprovals: [...pendingApprovals],
     approvalIdentity: workspace.approvalIdentity,
     notice: workspace.notice,

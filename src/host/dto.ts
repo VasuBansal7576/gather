@@ -63,7 +63,7 @@ const BOOKING_STATUSES = [
 
 const EXECUTION_STATUSES = ["pending", "succeeded", "failed", "partial", "uncertain"] as const;
 
-const MODE_KINDS = ["demo", "live"] as const;
+const MODE_KINDS = ["demo", "live", "unknown"] as const;
 
 export interface SourceRefDTO {
   kind: string;
@@ -110,6 +110,12 @@ export interface ApprovalDTO {
   reason?: string;
 }
 
+export interface StepProofDTO {
+  mode: "demo" | "live";
+  simulated: boolean;
+  provenance: SourceRefDTO[];
+}
+
 export interface ExecutionDTO {
   id: string;
   proposedActionId: string;
@@ -120,6 +126,11 @@ export interface ExecutionDTO {
   startedAt: string;
   completedAt?: string;
   reconciledAt?: string;
+  /**
+   * Trusted connector proof preserved on the step result. Absent for legacy
+   * rows or unproven steps — the adapter fails those closed to simulated.
+   */
+  proof?: StepProofDTO;
 }
 
 export interface ProposalConsequencesDTO {
@@ -143,6 +154,8 @@ export interface WorkspaceBookingDTO {
   proposals: WorkspaceProposalDTO[];
   approvals: ApprovalDTO[];
   executions: ExecutionDTO[];
+  /** Durable current-proposal pointer from the server; absent only from pre-pointer payloads. */
+  currentProposedActionId?: string;
 }
 
 export interface ConnectedAccountDTO {
@@ -262,9 +275,25 @@ function parseApproval(value: unknown): ApprovalDTO {
   };
 }
 
+function parseStepProof(value: unknown): StepProofDTO | undefined {
+  // Strict proof read: anything malformed yields undefined so the adapter
+  // fails closed to simulated rather than rendering a live claim.
+  if (!isRecord(value)) return undefined;
+  const proof = value.proof;
+  if (!isRecord(proof)) return undefined;
+  const mode = proof.mode === "demo" || proof.mode === "live" ? proof.mode : undefined;
+  if (mode === undefined || typeof proof.simulated !== "boolean") return undefined;
+  if (!Array.isArray(proof.provenance)) return undefined;
+  return {
+    mode,
+    simulated: proof.simulated,
+    provenance: proof.provenance.map((item, index) => parseSourceRef(item, `execution.result.proof.provenance[${index}]`)),
+  };
+}
+
 function parseExecution(value: unknown): ExecutionDTO {
   const record = asRecordOf(value, "execution");
-  return {
+  const parsed: ExecutionDTO = {
     id: asString(req(record, "id"), "execution.id"),
     proposedActionId: asString(req(record, "proposedActionId"), "execution.proposedActionId"),
     proposalVersion: asNumber(req(record, "proposalVersion"), "execution.proposalVersion"),
@@ -275,16 +304,23 @@ function parseExecution(value: unknown): ExecutionDTO {
     completedAt: asOptString(record.completedAt, "execution.completedAt"),
     reconciledAt: asOptString(record.reconciledAt, "execution.reconciledAt"),
   };
+  const proof = parseStepProof(record.result);
+  if (proof !== undefined) parsed.proof = proof;
+  return parsed;
 }
 
 function parseWorkspaceBooking(value: unknown): WorkspaceBookingDTO {
   const record = asRecordOf(value, "bookings[]");
-  return {
+  const parsed: WorkspaceBookingDTO = {
     booking: parseBooking(req(record, "booking")),
     proposals: asArray(record.proposals ?? [], "proposals").map(parseProposal),
     approvals: asArray(record.approvals ?? [], "approvals").map(parseApproval),
     executions: asArray(record.executions ?? [], "executions").map(parseExecution),
   };
+  if (record.currentProposedActionId !== undefined) {
+    parsed.currentProposedActionId = asString(record.currentProposedActionId, "currentProposedActionId");
+  }
+  return parsed;
 }
 
 function parseConnection(value: unknown): ConnectedAccountDTO {
@@ -303,13 +339,14 @@ export function parseWorkspaceDTO(value: unknown): WorkspaceDTO {
   const mode = asRecordOf(req(record, "mode"), "workspace.mode");
   const kind = asEnum(req(mode, "kind"), "mode.kind", MODE_KINDS);
   const demo = record.demo === true;
-  // Correlated semantics: a "demo" mode must be flagged demo, and a live
-  // workspace may never claim the demo marker — anything else is corrupt.
+  // Correlated semantics: a "demo" mode must be flagged demo, and a live or
+  // unverified-evidence workspace may never claim the demo marker —
+  // anything else is corrupt.
   if (kind === "demo" && !demo) {
     throw new DtoValidationError('mode.kind is "demo" but workspace.demo is not true');
   }
-  if (kind === "live" && demo) {
-    throw new DtoValidationError('mode.kind is "live" but workspace.demo is true');
+  if (kind !== "demo" && demo) {
+    throw new DtoValidationError(`mode.kind is "${kind}" but workspace.demo is true`);
   }
   return {
     mode: { kind, label: asString(req(mode, "label"), "mode.label") },

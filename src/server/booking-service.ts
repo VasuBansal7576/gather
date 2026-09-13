@@ -1,12 +1,23 @@
 import { randomUUID } from "node:crypto";
-import { availabilityOperationKey, stableOperationKey } from "../connectors/contracts.ts";
+import {
+  availabilityOperationKey,
+  stableOperationKey,
+} from "../connectors/contracts.ts";
 import type {
   CalendarAvailabilityReader,
+  ConnectorMetadata,
   EmailSender,
   ProvisionalHoldWriter,
+  SourceReference,
 } from "../connectors/contracts.ts";
 import { GatherStore } from "./sqlite-store.ts";
 import type { StepReservation } from "./sqlite-store.ts";
+import {
+  DEMO_MARKER,
+  LIVE_MARKER,
+  UNKNOWN_MARKER,
+  type EvidenceModeMarker,
+} from "./dto.ts";
 
 export type { StepReservation };
 import type {
@@ -17,7 +28,6 @@ import type {
   StepReceiptDTO,
   WorkspaceDTO,
 } from "./dto.ts";
-import { DEMO_MARKER } from "./dto.ts";
 import type { ActionExecution, Booking } from "../domain/contracts.ts";
 
 export type ServiceErrorCode =
@@ -193,8 +203,124 @@ function stepOf(key: string): "hold" | "email" {
   return key.includes(":send:") ? "email" : "hold";
 }
 
+/**
+ * Trusted connector proof preserved on every completed step execution
+ * result. The proof carries the connector's own mode/simulated declaration
+ * plus the response provenance — it is read back (never re-derived) when
+ * rendering receipts, so a simulated fixture can never be displayed as a
+ * live provider effect.
+ */
+export interface StepProof {
+  mode: "demo" | "live";
+  simulated: boolean;
+  provenance: SourceReference[];
+}
+
+function proofOf(metadata: ConnectorMetadata, provenance: unknown): StepProof {
+  const refs = Array.isArray(provenance) ? provenance : [];
+  return {
+    mode: metadata.mode.mode,
+    simulated: metadata.simulated,
+    provenance: refs.map((ref) => ({ ...(ref as SourceReference) })),
+  };
+}
+
+/** Attach the connector's proof to a succeeded step result. */
+function provenResult(outcome: { metadata: ConnectorMetadata; data: { provenance?: unknown } }): Record<string, unknown> {
+  return { ...(outcome.data as Record<string, unknown>), proof: proofOf(outcome.metadata, outcome.data.provenance) };
+}
+
+/** Source kinds a live provider receipt may attest — fixture is never live proof. */
+const LIVE_PROOF_SOURCE_KINDS: ReadonlySet<string> = new Set([
+  "connected_account",
+  "document",
+  "email",
+  "calendar",
+  "manual",
+]);
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Positive structural check for one provenance ref: a supported non-fixture
+ * source kind plus a non-empty locator (and a string label when present).
+ * Anything else — null, strings, missing kind/locator, fictional flags — is
+ * not live evidence.
+ */
+function isValidLiveProvenanceRef(ref: unknown): boolean {
+  if (!isRecord(ref)) return false;
+  if (!LIVE_PROOF_SOURCE_KINDS.has(ref.kind as string)) return false;
+  if (typeof ref.locator !== "string" || ref.locator.trim().length === 0) return false;
+  if (ref.label !== undefined && typeof ref.label !== "string") return false;
+  if (ref.fictional === true) return false;
+  return true;
+}
+
+/**
+ * A receipt reads as live only on positive proof: live mode, explicitly not
+ * simulated, and a non-empty provenance list whose EVERY entry is a valid
+ * non-fixture source reference. Everything else — missing/malformed proof
+ * (legacy rows, unknown connectors), simulated results, empty provenance,
+ * or any fictional/malformed ref — fails closed to non-live. Fixture
+ * receipts are therefore never upgraded to live.
+ */
+export function isLiveStepProof(result: unknown): boolean {
+  if (!isRecord(result)) return false;
+  const proof = result.proof;
+  if (!isRecord(proof)) return false;
+  if (proof.mode !== "live" || proof.simulated !== false) return false;
+  if (!Array.isArray(proof.provenance) || proof.provenance.length === 0) return false;
+  return proof.provenance.every(isValidLiveProvenanceRef);
+}
+
+/**
+ * Positive simulated/fixture proof: the envelope explicitly says demo (or
+ * simulated), or every provenance entry is explicitly fictional. Anything
+ * else with a proof object — empty, unknown-mode, mixed, or malformed —
+ * is NOT simulation evidence and must read as unverified, never simulated.
+ */
+export function isSimulatedStepProof(result: unknown): boolean {
+  if (!isRecord(result)) return false;
+  const proof: unknown = result.proof;
+  if (!isRecord(proof)) return false;
+  if (proof.mode === "demo" || proof.simulated === true) return true;
+  if (!Array.isArray(proof.provenance) || proof.provenance.length === 0) return false;
+  return proof.provenance.every((ref) => isRecord(ref) && ref.fictional === true);
+}
+
+/** Honest per-receipt wording derived from the stored proof, never assumed. */
+export function stepReceiptDetail(execution: ActionExecution): string {
+  if (execution.status !== "succeeded") return execution.error ?? execution.status;
+  if (isLiveStepProof(execution.result)) return "Done — provider receipt recorded";
+  if (isSimulatedStepProof(execution.result)) return "Done — simulated provider receipt";
+  return "Done — provider receipt unverified";
+}
+
+/** A booking is a fixture only when every source reference is explicitly fictional. */
+function isFixtureBooking(booking: Booking): boolean {
+  const refs = booking.sourceReferences;
+  return refs.length > 0 && refs.every((ref) => ref.fictional === true);
+}
+
+/**
+ * Derive the response marker from actual evidence, never a hardcoded demo
+ * claim: fixture bookings are demo; real bookings are live only when every
+ * succeeded step carries positive live proof; any other real evidence —
+ * simulated, absent, or malformed proof — is honestly "unverified".
+ */
+function evidenceMarkerFor(booking: Booking, executions: ActionExecution[]): { demo: boolean; mode: EvidenceModeMarker } {
+  if (isFixtureBooking(booking)) return { demo: true, mode: DEMO_MARKER };
+  const succeeded = executions.filter((execution) => execution.status === "succeeded");
+  if (succeeded.length > 0 && succeeded.every((execution) => isLiveStepProof(execution.result))) {
+    return { demo: false, mode: LIVE_MARKER };
+  }
+  return { demo: false, mode: UNKNOWN_MARKER };
+}
+
 function toReceipt(execution: ActionExecution): StepReceiptDTO {
-  return { execution, step: stepOf(execution.idempotencyKey), demo: true as const };
+  return { execution, step: stepOf(execution.idempotencyKey), demo: !isLiveStepProof(execution.result) };
 }
 
 function availabilityKey(calendarId: string, startAt: string, endAt: string): string {
@@ -226,6 +352,7 @@ export function getWorkspace(store: GatherStore, deps?: Pick<BookingServiceDeps,
   const nowMs = deps?.now ? Date.parse(deps.now()) : Date.now();
   const bookings = store.listBookings().map((booking) => {
     const actions = store.listProposedActionsForBooking(booking.id);
+    const current = store.getCurrentProposalAction(booking.id);
     return {
       booking,
       proposals: actions.map((action) => {
@@ -238,16 +365,36 @@ export function getWorkspace(store: GatherStore, deps?: Pick<BookingServiceDeps,
       }),
       approvals: actions.flatMap((action) => store.listApprovals(action.id)),
       executions: actions.flatMap((action) => store.listActionExecutions(action.id)),
+      ...(current ? { currentProposedActionId: current.id } : {}),
     };
   });
+  // The workspace marker reflects what the payload actually contains: demo
+  // only when every booking is an explicit fixture; a workspace containing
+  // real bookings can never claim the fictional/simulated marker, and it
+  // claims live only when every succeeded step carries positive live proof.
+  const everyBookingFixture = bookings.every((item) => isFixtureBooking(item.booking));
+  const allExecutions = bookings.flatMap((item) => item.executions);
+  const workspaceMarker = everyBookingFixture
+    ? { demo: true as const, mode: DEMO_MARKER }
+    : {
+        demo: false as const,
+        mode: allExecutions.some((execution) => execution.status === "succeeded") &&
+          allExecutions.every((execution) => execution.status !== "succeeded" || isLiveStepProof(execution.result))
+          ? LIVE_MARKER
+          : UNKNOWN_MARKER,
+      };
   return {
-    mode: DEMO_MARKER,
-    demo: true,
+    mode: workspaceMarker.mode,
+    demo: workspaceMarker.demo,
     approvalIdentity: deps?.ownerId ?? process.env.GATHER_OWNER_ID ?? "local-owner",
     businesses,
     bookings,
     connections,
-    notice: "DEMO ONLY: all records and receipts are local fixtures/simulated integrations, not live provider state.",
+    notice: everyBookingFixture
+      ? "DEMO ONLY: all records and receipts are local fixtures/simulated integrations, not live provider state."
+      : workspaceMarker.mode === LIVE_MARKER
+        ? "Contains real bookings with provider receipts; holds are provisional, never confirmed bookings."
+        : "Contains real bookings; provider evidence is unverified unless a receipt shows live proof.",
   };
 }
 
@@ -269,7 +416,24 @@ function requireExactApproval(store: GatherStore, input: ApproveRequestDTO) {
       false,
     );
   }
+  requireCurrentBinding(store, action.id);
   return action;
+}
+
+/**
+ * Durable current-proposal gate: only the booking's single current proposal
+ * (explicit pointer, never version/timestamp/UUID ordering) can be
+ * approved, retried, or reconciled. A superseded action — even with a
+ * higher in-row version or a matching fingerprint — is stale by definition.
+ */
+function requireCurrentBinding(store: GatherStore, actionId: string): void {
+  if (!store.isCurrentProposalAction(actionId)) {
+    throw new ServiceError(
+      "STALE_PROPOSAL",
+      "This proposal is no longer current: a newer proposal superseded it — re-approve the displayed proposal",
+      false,
+    );
+  }
 }
 
 /**
@@ -305,6 +469,7 @@ function reserveStep(
 }
 
 function hasLiveApproval(store: GatherStore, actionId: string): boolean {
+  if (!store.isCurrentProposalAction(actionId)) return false;
   const action = store.getProposedAction(actionId);
   return store.listApprovals(actionId).some(
     (approval) =>
@@ -316,7 +481,7 @@ function hasLiveApproval(store: GatherStore, actionId: string): boolean {
 
 function isStale(store: GatherStore, actionId: string, version: number): boolean {
   const action = store.getProposedAction(actionId);
-  return action.proposalVersion !== version || !hasLiveApproval(store, actionId);
+  return action.proposalVersion !== version || !store.isCurrentProposalAction(actionId) || !hasLiveApproval(store, actionId);
 }
 
 /**
@@ -327,7 +492,7 @@ function isStale(store: GatherStore, actionId: string, version: number): boolean
  */
 function assertLiveApprovalAfterWait(store: GatherStore, actionId: string, version: number): void {
   const action = store.getProposedAction(actionId);
-  if (action.proposalVersion === version && hasLiveApproval(store, actionId)) return;
+  if (action.proposalVersion === version && store.isCurrentProposalAction(actionId) && hasLiveApproval(store, actionId)) return;
   try {
     store.updateBookingStatus(action.bookingId, "uncertain");
   } catch {
@@ -358,7 +523,7 @@ async function recoverReclaimedHold(
       "Recovered pending hold matched provider evidence on reconcile",
       { claimToken },
     );
-    const healed = store.reconcileActionExecution(pending.id, { status: "succeeded", result: { ...reconciled.data, demo: true } });
+    const healed = store.reconcileActionExecution(pending.id, { status: "succeeded", result: { ...provenResult(reconciled) } });
     assertLiveApprovalAfterWait(store, execution.proposedActionId, execution.proposalVersion);
     return healed;
   }
@@ -385,7 +550,7 @@ async function recoverReclaimedEmail(
       "Recovered pending email matched provider evidence on reconcile",
       { claimToken },
     );
-    const healed = store.reconcileActionExecution(pending.id, { status: "succeeded", result: { ...reconciled.data, demo: true } });
+    const healed = store.reconcileActionExecution(pending.id, { status: "succeeded", result: { ...provenResult(reconciled) } });
     assertLiveApprovalAfterWait(store, execution.proposedActionId, execution.proposalVersion);
     return healed;
   }
@@ -445,7 +610,7 @@ async function runHoldStep(deps: BookingServiceDeps, actionId: string, version: 
     return pending;
   }
   if (outcome.status === "succeeded") {
-    const done = store.completeActionExecution(execution.id, { status: "succeeded", result: { ...outcome.data, demo: true } }, claim);
+    const done = store.completeActionExecution(execution.id, { status: "succeeded", result: { ...provenResult(outcome) } }, claim);
     haltIfStale();
     return done;
   }
@@ -454,7 +619,7 @@ async function runHoldStep(deps: BookingServiceDeps, actionId: string, version: 
     const pending = store.markExecutionUncertain(execution.id, outcome.error.message, claim);
     const reconciled = await calendar.reconcileProvisionalHold({ operationKey: key });
     if (reconciled.status === "succeeded") {
-      const healed = store.reconcileActionExecution(pending.id, { status: "succeeded", result: { ...reconciled.data, demo: true } });
+      const healed = store.reconcileActionExecution(pending.id, { status: "succeeded", result: { ...provenResult(reconciled) } });
       haltIfStale();
       return healed;
     }
@@ -511,7 +676,7 @@ async function runEmailStep(deps: BookingServiceDeps, actionId: string, version:
     return pending;
   }
   if (outcome.status === "succeeded") {
-    const done = store.completeActionExecution(execution.id, { status: "succeeded", result: { ...outcome.data, demo: true } }, claim);
+    const done = store.completeActionExecution(execution.id, { status: "succeeded", result: { ...provenResult(outcome) } }, claim);
     haltIfStale();
     return done;
   }
@@ -519,7 +684,7 @@ async function runEmailStep(deps: BookingServiceDeps, actionId: string, version:
     const pending = store.markExecutionUncertain(execution.id, outcome.error.message, claim);
     const reconciled = await email.reconcileSentEmail({ operationKey: key });
     if (reconciled.status === "succeeded") {
-      const healed = store.reconcileActionExecution(pending.id, { status: "succeeded", result: { ...reconciled.data, demo: true } });
+      const healed = store.reconcileActionExecution(pending.id, { status: "succeeded", result: { ...provenResult(reconciled) } });
       haltIfStale();
       return healed;
     }
@@ -546,6 +711,7 @@ async function runEmailStep(deps: BookingServiceDeps, actionId: string, version:
  * exact-approval gate.
  */
 function requireLiveApproval(store: GatherStore, actionId: string): void {
+  requireCurrentBinding(store, actionId);
   const action = store.getProposedAction(actionId);
   if (!hasLiveApproval(store, actionId)) {
     throw new ServiceError(
@@ -664,8 +830,7 @@ export async function approveAndExecute(deps: BookingServiceDeps, input: Approve
   if (holdExecution.status === "uncertain") {
     const current = store.getBooking(booking.id);
     return {
-      demo: true,
-      mode: DEMO_MARKER,
+      ...evidenceMarkerFor(booking, [holdExecution]),
       approval,
       approvedBy,
       booking: current,
@@ -673,7 +838,7 @@ export async function approveAndExecute(deps: BookingServiceDeps, input: Approve
       email: null,
       availabilityFresh: true as const,
       confirmedBooking: false as const,
-      note: "DEMO ONLY: hold outcome is uncertain; reconcile before retrying. A hold is never a confirmed booking.",
+      note: "Hold outcome is uncertain; reconcile before retrying. A hold is never a confirmed booking.",
     };
   }
 
@@ -685,8 +850,7 @@ export async function approveAndExecute(deps: BookingServiceDeps, input: Approve
   }
   const current = store.getBooking(booking.id);
   return {
-    demo: true,
-    mode: DEMO_MARKER,
+    ...evidenceMarkerFor(booking, [holdExecution, emailExecution]),
     approval,
     approvedBy,
     booking: current,
@@ -696,8 +860,30 @@ export async function approveAndExecute(deps: BookingServiceDeps, input: Approve
     confirmedBooking: false as const,
     note: emailExecution.status === "uncertain"
       ? "DEMO ONLY: email outcome is uncertain; reconcile before retrying. A hold is never a confirmed booking."
-      : "DEMO ONLY: provisional hold is not a confirmed booking. Email receipt is simulated.",
+      : completionNote(holdExecution, emailExecution),
   };
+}
+
+/**
+ * Completion wording derived from the stored step proofs: steps with
+ * positive live proof are reported as provider receipts, steps with
+ * positive simulated/fixture proof as simulated, and anything else as
+ * unverified. Never blanket-claims simulated when a live-shaped connector
+ * actually served the step, never claims live without proof, and never
+ * labels malformed proof simulated without simulation evidence.
+ */
+function completionNote(hold: ActionExecution, email: ActionExecution): string {
+  const base = "Provisional hold is not a confirmed booking.";
+  const wording = (execution: ActionExecution): string =>
+    isLiveStepProof(execution.result)
+      ? "provider receipt"
+      : isSimulatedStepProof(execution.result)
+        ? "simulated receipt"
+        : "unverified receipt";
+  const liveHold = isLiveStepProof(hold.result);
+  const liveEmail = isLiveStepProof(email.result);
+  if (liveHold && liveEmail) return `${base} Provider receipts recorded for each step.`;
+  return `${base} Hold: ${wording(hold)}; email: ${wording(email)}.`;
 }
 
 /** Retry only failed steps; succeeded steps are never resent. */
@@ -745,13 +931,12 @@ export async function retryFailedSteps(deps: BookingServiceDeps, proposedActionI
     throw new ServiceError("RECONCILE_REQUIRED", email.error ?? "Email retry is uncertain; reconcile before retrying", false);
   }
   return {
-    demo: true,
-    mode: DEMO_MARKER,
+    ...evidenceMarkerFor(store.getBooking(action.bookingId), [hold, email]),
     booking: store.getBooking(action.bookingId),
     hold: toReceipt(hold),
     email: toReceipt(email),
     resentSucceededStep: false as const,
-    note: "DEMO ONLY: retry reused succeeded receipts; no successful provider step was resent.",
+    note: "Retry reused succeeded receipts; no successful provider step was resent.",
   };
 }
 
@@ -767,6 +952,11 @@ export async function reconcileExecution(deps: BookingServiceDeps, executionId: 
   if (current.status !== "uncertain" && current.status !== "partial") {
     throw new ServiceError("INVALID_REQUEST", "Only uncertain or partial executions require reconciliation", false);
   }
+  // Reconciliation binds to the current proposal too: an uncertain step on a
+  // superseded action (or one whose approval died with supersession) must
+  // not heal into history as if it were the displayed proposal's outcome.
+  // The owner re-approves the current proposal and its own steps run there.
+  requireLiveApproval(store, current.proposedActionId);
   const kind = stepOf(current.idempotencyKey);
   const outcome = kind === "hold"
     ? await calendar.reconcileProvisionalHold({ operationKey: current.idempotencyKey })
@@ -788,7 +978,12 @@ export async function reconcileExecution(deps: BookingServiceDeps, executionId: 
       true,
     );
   }
-  const execution = store.reconcileActionExecution(current.id, { status: "succeeded", result: { ...outcome.data, demo: true } });
+  // Post-await authority re-check: a proposal superseded while the provider
+  // call was in flight must not have its stale execution healed into
+  // history nor move the booking's status. Throws STALE/UNCERTAIN and marks
+  // the booking uncertain instead of mutating state.
+  assertLiveApprovalAfterWait(store, current.proposedActionId, current.proposalVersion);
+  const execution = store.reconcileActionExecution(current.id, { status: "succeeded", result: { ...provenResult(outcome) } });
   const action = store.getProposedAction(execution.proposedActionId);
   const booking = store.getBooking(action.bookingId);
   // After a hold reconciles to success the booking is provisional, never confirmed.
@@ -796,7 +991,16 @@ export async function reconcileExecution(deps: BookingServiceDeps, executionId: 
     store.updateBookingStatus(booking.id, "provisional_hold");
   }
   refreshBookingAggregate(store, booking.id);
-  return { demo: true, mode: DEMO_MARKER, execution, booking: store.getBooking(booking.id), note: "DEMO ONLY: reconciled against the simulated provider record." };
+  return {
+    ...evidenceMarkerFor(booking, [execution]),
+    execution,
+    booking: store.getBooking(booking.id),
+    note: isLiveStepProof(execution.result)
+      ? "Reconciled against the provider record."
+      : isSimulatedStepProof(execution.result)
+        ? "DEMO ONLY: reconciled against the simulated provider record."
+        : "Reconciled, but the stored receipt carries no provider proof; evidence is unverified.",
+  };
 }
 
 /**

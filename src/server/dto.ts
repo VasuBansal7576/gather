@@ -8,13 +8,31 @@ import type {
   SourceReference,
 } from "../domain/contracts.ts";
 
-/** Every workspace payload is explicitly demo-marked. Never render as live. */
+/** Payload marker for fixture/simulated evidence. Never render as live. */
 export interface DemoModeMarker {
   kind: "demo";
   label: "DEMO ONLY";
   fictional: true;
   simulated: true;
 }
+
+/** Payload marker for evidence carrying positive live provider proof. */
+export interface LiveModeMarker {
+  kind: "live";
+  label: "LIVE";
+  fictional: false;
+  simulated: false;
+}
+
+/** Payload marker for real records whose provider evidence is not positively proven. */
+export interface UnknownModeMarker {
+  kind: "unknown";
+  label: "EVIDENCE UNVERIFIED";
+  fictional: false;
+  simulated: false;
+}
+
+export type EvidenceModeMarker = DemoModeMarker | LiveModeMarker | UnknownModeMarker;
 
 export const DEMO_MARKER: DemoModeMarker = {
   kind: "demo",
@@ -23,16 +41,36 @@ export const DEMO_MARKER: DemoModeMarker = {
   simulated: true,
 };
 
+export const LIVE_MARKER: LiveModeMarker = {
+  kind: "live",
+  label: "LIVE",
+  fictional: false,
+  simulated: false,
+};
+
+export const UNKNOWN_MARKER: UnknownModeMarker = {
+  kind: "unknown",
+  label: "EVIDENCE UNVERIFIED",
+  fictional: false,
+  simulated: false,
+};
+
 export interface WorkspaceBookingDTO {
   booking: Booking;
   proposals: WorkspaceProposalDTO[];
   approvals: Approval[];
   executions: ActionExecution[];
+  /**
+   * Durable current-proposal pointer: id of the booking's single displayed /
+   * approvable / confirmable action. The adapter selects exactly this
+   * proposal and never re-derives "latest" from versions or timestamps.
+   */
+  currentProposedActionId?: string;
 }
 
 export interface WorkspaceDTO {
-  mode: DemoModeMarker;
-  demo: true;
+  mode: EvidenceModeMarker;
+  demo: boolean;
   /** Server-derived owner identity that approvals are recorded under. */
   approvalIdentity: string;
   businesses: Business[];
@@ -74,12 +112,18 @@ export interface WorkspaceProposalDTO {
 export interface StepReceiptDTO {
   execution: ActionExecution;
   step: "hold" | "email";
-  demo: true;
+  /**
+   * True unless the step's stored result carries positive live connector
+   * proof (live mode, not simulated, non-empty non-fictional provenance).
+   * Unknown, simulated, or fixture proofs fail closed to true — a fixture
+   * receipt is never upgraded to live.
+   */
+  demo: boolean;
 }
 
 export interface ApproveResponseDTO {
-  demo: true;
-  mode: DemoModeMarker;
+  demo: boolean;
+  mode: EvidenceModeMarker;
   approval: Approval;
   approvedBy: string;
   booking: Booking;
@@ -92,8 +136,8 @@ export interface ApproveResponseDTO {
 }
 
 export interface RetryResponseDTO {
-  demo: true;
-  mode: DemoModeMarker;
+  demo: boolean;
+  mode: EvidenceModeMarker;
   booking: Booking;
   hold: StepReceiptDTO;
   email: StepReceiptDTO | null;
@@ -102,8 +146,8 @@ export interface RetryResponseDTO {
 }
 
 export interface ReconcileResponseDTO {
-  demo: true;
-  mode: DemoModeMarker;
+  demo: boolean;
+  mode: EvidenceModeMarker;
   execution: ActionExecution;
   booking: Booking;
   note: string;
@@ -131,6 +175,8 @@ export interface ErrorDTO {
     | "RECONCILE_PENDING"
     | "CROSS_ORIGIN_DENIED"
     | "EXECUTION_FAILED"
+    | "DENIED"
+    | "BUSY"
     | "UNCERTAIN";
   message: string;
   retryable: boolean;

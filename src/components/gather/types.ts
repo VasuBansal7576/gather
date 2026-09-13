@@ -71,6 +71,29 @@ export interface BookingDetail {
   receipts?: ActionReceipt[];
 }
 
+/**
+ * The authoritative offer snapshot persisted on the proposal payload, shown
+ * only after strict boundary validation — never reconstructed from prose.
+ * Priced lines render exactly as prepared; anything unknown says so.
+ */
+export interface OfferView {
+  /** The space the offer selected, verbatim from the snapshot. */
+  spaceName: string;
+  guestCount: number;
+  currency: string;
+  /** Terms/consequences the prepared offer asserts, verbatim. */
+  terms: string[];
+  /** Ids of cost lines whose amount is unknown — a profit claim is never shown. */
+  unknownCosts: string[];
+  /** Ids of price lines whose unit price is unknown. */
+  unknownPrices: string[];
+  /** True only when the snapshot attests every price and cost is known. */
+  profitabilityClaimed: boolean;
+  /** The preparation fingerprint the snapshot was bound to, when the payload carries one. */
+  preparationFingerprint?: string;
+  note?: string;
+}
+
 export interface Proposal {
   /** Maps to the host's ProposedAction id. */
   id: string;
@@ -83,6 +106,18 @@ export interface Proposal {
   total: string;
   deposit: string;
   validUntil: string;
+  /**
+   * The validated offer snapshot when the payload carries a well-formed one.
+   * Absent for legacy proposals (which show "Not priced") and when the
+   * snapshot failed validation (which sets `offerInvalid` instead).
+   */
+  offer?: OfferView;
+  /**
+   * True when the payload carried an offer that failed boundary validation —
+   * a malformed offer can never present as priced, and meaningful review is
+   * impossible so the proposal is not approvable.
+   */
+  offerInvalid?: boolean;
   /**
    * Exact consequences the owner reviews before approving — each step the host
    * will attempt (recheck, provisional hold, offer send). Never claim an effect
@@ -207,9 +242,12 @@ export interface GatherWorkspaceProps {
    * Marks whether the data shown is simulated. Defaults to `'demo'` when the
    * local fixtures are in use and `'live'` when the host supplies both
    * bookings and connections — pass `'demo'` explicitly whenever custom data
-   * is still simulated so the label is never hidden.
+   * is still simulated so the label is never hidden. `'unknown'` preserves
+   * the server's unverified-evidence marker: real records whose provider
+   * proof is not established — rendered with its own honest banner, never
+   * collapsed into demo (falsely simulated) or live (unproven).
    */
-  dataMode?: 'demo' | 'live';
+  dataMode?: 'demo' | 'live' | 'unknown';
   /**
    * Proposal fingerprints with an approval request currently in flight.
    * Matching approve controls stay disabled so the same version cannot be
