@@ -28,9 +28,16 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
     // Proactive bindings live in a separate registry from operator deps:
     // only bindings whose accounts are actually wired are authoritative —
     // an unscoped listing must never leak entries for unwired accounts.
-    const bindings = accountId
+    // `watching` is true only for a running binding whose latest sweep
+    // succeeded: nothing here claims watching before real registration
+    // and a first successful sweep.
+    const bindings = (accountId
       ? [getProactiveBinding(deps.accountId)].filter((b) => b !== undefined)
-      : listProactiveBindingsForAccounts(listOperatorAccounts());
+      : listProactiveBindingsForAccounts(listOperatorAccounts())
+    ).map((binding) => ({
+      ...binding,
+      watching: binding.status === "running" && binding.lastOk === true,
+    }));
     return NextResponse.json({ demo: true, accountId: deps.accountId, bindings });
   } catch (error) {
     return unknownErrorResponse(error);

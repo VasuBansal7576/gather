@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { ConnectionError, getConnectionService } from "../../../../../src/server/connections/index.ts";
+import { refreshProactiveHost } from "../../../../../src/server/proactive/index.ts";
 import { ValidationError } from "../../../../../src/server/validation.ts";
 
 export const dynamic = "force-dynamic";
@@ -20,6 +21,10 @@ export async function GET(req: Request, ctx: { params: Promise<{ provider: strin
     const state = url.searchParams.get("state");
     if (!code || !state) throw new ValidationError("Callback requires code and state");
     const result = await getConnectionService().completeAuthorization({ code, state });
+    // A fresh connection may make an account eligible for durable inquiry
+    // capture: reconcile proactive registrations now (best-effort; the
+    // authorization result below is authoritative either way).
+    await refreshProactiveHost().catch(() => undefined);
     if (url.searchParams.get("format") === "json") return NextResponse.json(result);
     const target = new URL("/setup", url.origin);
     target.searchParams.set("businessId", result.businessId);

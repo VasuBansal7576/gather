@@ -3,6 +3,7 @@ import type { BookingServiceDeps } from "./booking-service.ts";
 import { demoFixtureSlots } from "./demo-fixtures.ts";
 import { DurableDemoCalendar, DurableDemoEmail } from "./durable-demo-connectors.ts";
 import { createProviderConnectors, type ProviderConnectors } from "./provider-runtime/index.ts";
+import { ensureProactiveHost, resetProactiveHostForTests } from "./proactive/index.ts";
 import { GatherStore } from "./sqlite-store.ts";
 
 /**
@@ -71,10 +72,27 @@ export function getRuntime(): ServerRuntime {
     now: () => new Date(clockMs()).toISOString(),
   };
   cached = { store, connectors, deps, providers };
+  // Lazy host entry: on first boot in this process, automatically register
+  // every eligible connected Gmail account for durable inquiry capture.
+  // Best-effort by design — a failed bootstrap never breaks boot — and a
+  // no-op for unconfigured, account-less, or demo-only setups (no external
+  // calls). Connection/setup lifecycle routes refresh explicitly afterwards.
+  try {
+    ensureProactiveHost({
+      store,
+      ownerId: ownerId(),
+      providers,
+      booking: deps,
+      connectionService: providers.connectionService,
+    });
+  } catch {
+    // Boot proceeds; the automation status route reports the truth.
+  }
   return cached;
 }
 
 /** Test-only escape hatch to reset the cached runtime between cases. */
 export function resetRuntimeForTests(): void {
   cached = null;
+  resetProactiveHostForTests();
 }
