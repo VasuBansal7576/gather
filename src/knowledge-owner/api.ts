@@ -4,12 +4,14 @@ import {
   parseFactsResponse,
   parseSetupBusinesses,
   parseSnapshotResponse,
+  parseWorkspaceBookings,
   type CandidatesResponse,
   type DecisionKind,
   type DecisionResponse,
   type FactsResponse,
   type KnowledgeBusiness,
   type SnapshotResponse,
+  type WorkspaceBooking,
 } from "./types.ts";
 
 /**
@@ -114,6 +116,8 @@ export interface KnowledgeOwnerApi {
   listCandidates(businessId: string, status?: string): Promise<CandidatesResponse>;
   getSnapshot(businessId: string): Promise<SnapshotResponse>;
   listFacts(businessId: string): Promise<FactsResponse>;
+  /** Owned-business bookings for meaningful scope selection (read-only). */
+  listWorkspaceBookings(): Promise<WorkspaceBooking[]>;
   confirmCandidate(businessId: string, candidateId: string, commandId: string): Promise<DecisionResponse>;
   rejectCandidate(businessId: string, candidateId: string, reason: string, commandId: string): Promise<DecisionResponse>;
   correctFact(businessId: string, input: CorrectInput): Promise<DecisionResponse>;
@@ -148,6 +152,9 @@ export function createKnowledgeOwnerApi(fetchImpl: KnowledgeFetch): KnowledgeOwn
         parseFactsResponse,
         "confirmed fact list",
       );
+    },
+    listWorkspaceBookings(): Promise<WorkspaceBooking[]> {
+      return request(fetchImpl, "/api/workspace", { method: "GET" }, parseWorkspaceBookings, "booking list");
     },
     confirmCandidate(businessId: string, candidateId: string, commandId: string): Promise<DecisionResponse> {
       return request(

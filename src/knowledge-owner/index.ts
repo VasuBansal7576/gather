@@ -15,6 +15,7 @@ export type {
   KnowledgeSourceReference,
   SnapshotResponse,
   WithheldFact,
+  WorkspaceBooking,
 } from "./types.ts";
 export {
   parseBusiness,
@@ -25,6 +26,7 @@ export {
   parseFactsResponse,
   parseSetupBusinesses,
   parseSnapshotResponse,
+  parseWorkspaceBookings,
 } from "./types.ts";
 export {
   createKnowledgeOwnerApi,
@@ -35,6 +37,7 @@ export {
   type KnowledgeOwnerApi,
 } from "./api.ts";
 export {
+  bookingsForBusiness,
   conflictingCandidates,
   countNeedsReview,
   describeConfirmEffect,
@@ -52,6 +55,7 @@ export {
   parseValueJson,
   policyFacts,
   scopedFacts,
+  scopeTargetLabel,
   sortCandidatesForReview,
   sourceKindLabel,
   subjectLabel,

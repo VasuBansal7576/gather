@@ -168,6 +168,21 @@ it — the boundary never claims cost completeness on its own.
 Every mutating call accepts an optional `commandId`; a repeat returns the
 recorded outcome (`duplicate: true`) with no additional effect.
 
+## Owner review forms (`/knowledge`)
+
+Confirmed facts are corrected through guided business-labelled inputs
+(`src/components/knowledge/factSchemas.ts`, mirroring the authoritative
+value schemas in `src/offers/prepare.ts`), never a raw JSON editor:
+price/cost minor-unit amounts with bounds-currency previews, explicit ISO
+currency, capacity and guest integers, effect selects, and offered flags.
+Identity fields are display-only, unrendered value fields are preserved
+untouched, and formats without guided inputs fail closed. Scoped exceptions
+choose an existing booking from the owned business's workspace identities
+(customer choice stays disabled — Gather keeps no customer directory, and
+none is invented); the exception detail is one focused question shaped to
+the scoped-exception value contract. Revision/command bindings are
+unchanged; account fact IDs arrive with the new account-aware service.
+
 ## Verification
 
 - `npx tsc --noEmit` — clean.

@@ -326,3 +326,38 @@ export function parseSetupBusinesses(value: unknown): KnowledgeBusiness[] | unde
   }
   return out;
 }
+
+/** Owned-business booking identity for meaningful scope selection (never a typed DB id). */
+export interface WorkspaceBooking {
+  id: string;
+  businessId: string;
+  eventName: string;
+  status: string;
+}
+
+function parseWorkspaceBooking(value: unknown): WorkspaceBooking | undefined {
+  if (!isRecord(value)) return undefined;
+  // GET /api/workspace nests rows as { booking: {...} }; accept a bare
+  // booking row too so the selector stays narrow either way.
+  const row = isRecord(value.booking) ? value.booking : value;
+  if (!isRecord(row)) return undefined;
+  const id = nonEmptyString(row.id);
+  const businessId = nonEmptyString(row.businessId);
+  const eventName = nonEmptyString(row.eventName);
+  const status = nonEmptyString(row.status);
+  if (!id || !businessId || !eventName || !status) return undefined;
+  return { id, businessId, eventName, status };
+}
+
+export function parseWorkspaceBookings(value: unknown): WorkspaceBooking[] | undefined {
+  if (!isRecord(value)) return undefined;
+  const raw = value.bookings;
+  if (!Array.isArray(raw)) return undefined;
+  const out: WorkspaceBooking[] = [];
+  for (const entry of raw) {
+    const parsed = parseWorkspaceBooking(entry);
+    if (!parsed) return undefined;
+    out.push(parsed);
+  }
+  return out;
+}
