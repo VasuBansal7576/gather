@@ -94,8 +94,19 @@ strand in requested+paused (verify refuses paused bookings while resume
 refuses requested ones): requesting while paused fails with retryable
 `BOOKING_PAUSED` (resume first, then request — due work stays suppressed
 throughout), and pausing a requested booking is refused (verify
-cancellation instead). Resume on a cancelled (or verified) booking is
+cancellation instead). The exclusion is enforced by atomic
+compare-and-set acquisition inside one transaction, so a concurrent
+pause/request pair cannot interleave a wedged row — the loser refuses
+explicitly. Resume on a cancelled (or verified) booking is
 refused — cancellation is terminal.
+
+Requested+paused rows that predate the exclusion (or lost a race under
+it) recover through an explicit owner `resume` command: only the paused
+flag clears — the ledger is untouched (its cancel control stays
+terminal), approvals stay invalidated, the status is unchanged, and new
+writes stay refused — after which `verifyCancellation` can finish the
+actual release. There is no automatic unpause and no business or
+model-action resume anywhere on this path.
 
 ## Narrow shared hooks (Astra note)
 

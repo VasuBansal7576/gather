@@ -16,6 +16,7 @@ import type {
   ReleaseProvisionalHoldResponse,
 } from "../src/connectors/hold-release.ts";
 import { CoordinationLedger } from "../src/coordination/ledger.ts";
+import { RevisionLifecycleStore } from "../src/server/booking-revisions/lifecycle-store.ts";
 import { KnowledgeService } from "../src/knowledge/index.ts";
 import {
   approveAndExecute,
@@ -692,14 +693,95 @@ test("pause is stale-gated, duplicate-safe, and terminal against cancellation", 
     } catch (error) {
       assert.ok(error instanceof ServiceError && error.code === "INVALID_REQUEST");
     }
-    try {
-      resumeBooking(w.deps, bindingOf(w, booking.id, "cmd-resume-dead"));
-      assert.fail("expected INVALID_REQUEST");
-    } catch (error) {
-      assert.ok(error instanceof ServiceError && error.code === "INVALID_REQUEST");
-    }
+    // Resume on a requested-but-unpaused booking is a harmless no-op state
+    // report (nothing is re-enabled); terminal refusal is reserved for
+    // verified/cancelled bookings.
+    const idle = resumeBooking(w.deps, bindingOf(w, booking.id, "cmd-resume-idle"));
+    assert.equal(idle.status, "resumed");
+    assert.equal(idle.paused, false);
   } finally {
     w.cleanup();
+  }
+});
+
+test("old requested-plus-paused rows recover through explicit resume, then verify", async () => {
+  const calls: string[] = [];
+  const w = world(scriptedRelease("succeeded", calls));
+  try {
+    const { booking, action } = seedSimpleBooking(w, "b-recover", "a-recover");
+    const identity = {
+      bookingId: booking.id, proposedActionId: action.id,
+      proposalVersion: action.proposalVersion, proposalFingerprint: action.proposalFingerprint,
+    };
+    const executed = await approveAndExecute(w.deps.booking, identity);
+    assert.equal(executed.hold.execution.status, "succeeded");
+    // Build the stranded row directly (reachable under the old code that
+    // allowed pause-after-request): terminal ledger cancel control,
+    // requested lifecycle, paused flag set.
+    const ledger = new CoordinationLedger(w.store.db);
+    ledger.applyOwnerControl({ dedupeKey: "cmd-old-req", kind: "cancel", bookingId: booking.id, attestedBy: OWNER });
+    const lifecycle = new RevisionLifecycleStore(w.store);
+    lifecycle.setCancelState(booking.id, "requested", "cmd-old-req");
+    w.store.invalidateApprovalsForBooking(booking.id);
+    lifecycle.setPaused(booking.id, true);
+    // Recovery is an explicit owner command: pause clears, and nothing else
+    // moves — no ledger call (control stays terminal), no approval revival,
+    // no status change, no writes re-enabled.
+    const eventsBefore = (w.store.db.prepare("SELECT COUNT(*) AS n FROM coord_events").get() as { n: number }).n;
+    const recovered = resumeBooking(w.deps, bindingOf(w, booking.id, "cmd-recover"));
+    assert.equal(recovered.status, "resumed");
+    assert.equal(recovered.paused, false);
+    assert.equal(new RevisionLifecycleStore(w.store).getLifecycle(booking.id).cancelState, "requested");
+    assert.equal((w.store.db.prepare("SELECT COUNT(*) AS n FROM coord_events").get() as { n: number }).n, eventsBefore);
+    const waiting = w.store.db.prepare("SELECT status FROM coord_waiting WHERE booking_id = $b").all({ $b: booking.id }) as Array<{ status: string }>;
+    assert.ok(waiting.every((row) => row.status === "invalidated"), "due work must stay stopped after recovery");
+    assert.deepEqual(w.store.listApprovals(action.id).filter((item) => item.status === "approved"), []);
+    assert.equal(w.store.getBooking(booking.id).status, "provisional_hold");
+    await assertServiceError(approveAndExecute(w.deps.booking, identity), "CANCELLATION_REQUESTED");
+    // The un-wedged booking now verifies for real through the port.
+    const verified = await verifyCancellation(w.deps, { binding: bindingOf(w, booking.id, "cmd-verify-recovered") });
+    assert.equal(verified.status, "verified");
+    assert.equal(verified.cancellationScope, "external_verified");
+    assert.ok(calls.some((call) => call.startsWith("release:")), "the actual release must have run");
+    assert.equal(w.store.getBooking(booking.id).status, "cancelled");
+  } finally {
+    w.cleanup();
+  }
+});
+
+test("competing pause and request commands never wedge a requested-plus-paused row", () => {
+  // Pause and request serialize on atomic acquisition: whichever commits
+  // first wins and the loser refuses explicitly. Alternating both orders
+  // across fresh bookings must never produce requested+paused.
+  for (let round = 0; round < 10; round += 1) {
+    const w = world();
+    try {
+      const { booking } = seedSimpleBooking(w, `b-race-${round}`, `a-race-${round}`);
+      const attempt = (kind: "pause" | "request", cmd: string): string => {
+        try {
+          if (kind === "pause") pauseBooking(w.deps, bindingOf(w, booking.id, cmd));
+          else requestCancellation(w.deps, bindingOf(w, booking.id, cmd));
+          return "ok";
+        } catch (error) {
+          assert.ok(error instanceof ServiceError, `expected ServiceError, got ${error}`);
+          return error.code;
+        }
+      };
+      if (round % 2 === 0) {
+        attempt("pause", `cmd-r${round}-p`);
+        attempt("request", `cmd-r${round}-c`);
+      } else {
+        attempt("request", `cmd-r${round}-c`);
+        attempt("pause", `cmd-r${round}-p`);
+      }
+      const state = new RevisionLifecycleStore(w.store).getLifecycle(booking.id);
+      assert.ok(
+        !(state.paused && state.cancelState !== "none"),
+        `round ${round}: wedged requested+paused row`,
+      );
+    } finally {
+      w.cleanup();
+    }
   }
 });
 
