@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { getRuntime } from "../../../../src/server/runtime.ts";
+import { refreshProactiveHost } from "../../../../src/server/proactive/index.ts";
 import { assertSameOrigin, readHeaders, ValidationError } from "../../../../src/server/validation.ts";
 import { connectionErrorResponse } from "../../connections/_helpers.ts";
 
@@ -46,6 +47,9 @@ export async function POST(req: Request): Promise<NextResponse> {
       }
       const business = store.createBusiness({ name, timezone });
       store.db.exec("COMMIT");
+      // A new business cannot be eligible yet (no connection), but refresh
+      // keeps the registry consistent for idempotent retries.
+      await refreshProactiveHost().catch(() => undefined);
       return NextResponse.json({ business: { id: business.id, name, timezone }, created: true, ownerId: deps.ownerId });
     } catch (error) {
       try {

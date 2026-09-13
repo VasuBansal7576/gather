@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { getConnectionService } from "../../../../../src/server/connections/index.ts";
+import { refreshProactiveHost } from "../../../../../src/server/proactive/index.ts";
 import { assertSameOrigin, parseId, readHeaders, ValidationError } from "../../../../../src/server/validation.ts";
 import { connectionErrorResponse } from "../../_helpers.ts";
 
@@ -14,6 +15,8 @@ export async function POST(req: Request, ctx: { params: Promise<{ provider: stri
     const accountId = parseId(body.accountId, "accountId");
     const businessId = parseId(body.businessId, "businessId");
     const result = await getConnectionService().disconnect({ accountId, businessId });
+    // Revocation/removal stops proactive waiting for that account at once.
+    await refreshProactiveHost().catch(() => undefined);
     return NextResponse.json(result);
   } catch (error) {
     return connectionErrorResponse(error);
