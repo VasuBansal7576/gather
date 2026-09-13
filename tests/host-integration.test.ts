@@ -370,3 +370,148 @@ test("a failed mutation still re-reads consistent workspace state", async () => 
   assert.equal(after.bookings[0].detail.receipts?.length ?? 0, 0);
   assert.equal(after.bookings[0].detail.proposal.fingerprint, clara.detail.proposal.fingerprint);
 });
+
+// ---------- Authoritative offer snapshot (payload.offer) ----------
+
+function offerSnapshot(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    offerId: "offer-1",
+    version: 1,
+    rank: "primary",
+    startAt: "2026-10-18T16:00:00.000Z",
+    endAt: "2026-10-18T20:00:00.000Z",
+    spaceId: "space-garden",
+    spaceName: "Fictional Garden Room",
+    guestCount: 80,
+    currency: "USD",
+    lines: [
+      { lineId: "line-venue", label: "Venue hire", pricingBasis: "per_event", quantity: 1, unitCents: 250000, lineTotalCents: 250000, unknownUnit: false },
+      { lineId: "line-dinner", label: "Plated dinner", pricingBasis: "per_guest", quantity: 80, unitCents: 9500, lineTotalCents: 760000, unknownUnit: false },
+    ],
+    totalCents: 1010000,
+    totalKnown: true,
+    depositCents: 252500,
+    unknownCostIds: [],
+    unknownPriceIds: [],
+    profitabilityClaimed: true,
+    consequences: ["50% deposit due on confirmation", "Final guest count due 7 days before the event"],
+    sources: [{ kind: "fixture", locator: "demo://offer" }],
+    fingerprint: "a".repeat(64),
+    ...overrides,
+  };
+}
+
+function bookingWithOffer(offer: unknown, extras: Record<string, unknown> = {}): Record<string, unknown> {
+  const booking = baseBooking();
+  const proposal = (booking as { proposals: { action: { payload: Record<string, unknown> } }[] }).proposals[0];
+  proposal.action.payload = { offer, ...extras };
+  return booking;
+}
+
+test("a valid offer snapshot renders exact priced lines, totals, space, and terms", () => {
+  const workspace = baseWorkspace();
+  workspace.bookings = [bookingWithOffer(offerSnapshot(), { offerPreparationFingerprint: "a".repeat(64) })] as unknown as ClientWorkspaceDTO["bookings"];
+  const proposal = adaptWorkspace(workspace).bookings[0].detail.proposal;
+  assert.equal(proposal.total, "$10,100.00");
+  assert.equal(proposal.deposit, "Deposit $2,525.00");
+  assert.equal(proposal.offerInvalid, undefined);
+  assert.equal(proposal.offer?.spaceName, "Fictional Garden Room");
+  assert.equal(proposal.offer?.guestCount, 80);
+  assert.equal(proposal.offer?.preparationFingerprint, "a".repeat(64));
+  assert.deepEqual(proposal.offer?.terms, ["50% deposit due on confirmation", "Final guest count due 7 days before the event"]);
+  assert.deepEqual(
+    proposal.lines.map((line) => [line.label, line.detail, line.amount]),
+    [
+      ["Venue hire", "1 × $2,500.00 per event", "$2,500.00"],
+      ["Plated dinner", "80 × $95.00 per guest", "$7,600.00"],
+    ],
+  );
+  // Approval still binds the action identity — never the offer snapshot.
+  assert.equal(proposal.id, "act-1");
+  assert.equal(proposal.version, 2);
+});
+
+test("unknown unit prices and unknown costs show honestly with no profit claim", () => {
+  const workspace = baseWorkspace();
+  workspace.bookings = [bookingWithOffer(offerSnapshot({
+    lines: [
+      { lineId: "line-venue", label: "Venue hire", pricingBasis: "per_event", quantity: 1, unitCents: 250000, lineTotalCents: 250000, unknownUnit: false },
+      { lineId: "line-dinner", label: "Plated dinner", pricingBasis: "per_guest", quantity: 80, unitCents: null, lineTotalCents: null, unknownUnit: true },
+    ],
+    totalCents: null,
+    totalKnown: false,
+    depositCents: null,
+    unknownCostIds: ["cost-staffing"],
+    unknownPriceIds: ["line-dinner"],
+    profitabilityClaimed: false,
+  }))] as unknown as ClientWorkspaceDTO["bookings"];
+  const proposal = adaptWorkspace(workspace).bookings[0].detail.proposal;
+  assert.equal(proposal.total, "Total unknown");
+  assert.equal(proposal.deposit, "Deposit not specified");
+  assert.equal(proposal.offer?.profitabilityClaimed, false);
+  assert.deepEqual(proposal.offer?.unknownCosts, ["cost-staffing"]);
+  assert.deepEqual(proposal.offer?.unknownPrices, ["line-dinner"]);
+  assert.equal(proposal.lines[1].detail.includes("unit price unknown"), true);
+  assert.equal(proposal.lines[1].amount, "Unknown");
+});
+
+test("malformed, contradictory, or mismatched offers never render as priced or approvable", () => {
+  const cases: Array<[string, unknown, Record<string, unknown>?]> = [
+    ["non-finite total", offerSnapshot({ totalCents: Number.NaN })],
+    ["non-integer cents", offerSnapshot({ totalCents: 100.5 })],
+    ["bad currency", offerSnapshot({ currency: "usd" })],
+    ["total/totalKnown contradiction", offerSnapshot({ totalCents: null })],
+    ["profit claim with unknowns", offerSnapshot({ unknownCostIds: ["c1"] })],
+    ["missing fingerprint", offerSnapshot({ fingerprint: undefined })],
+    ["malformed line", offerSnapshot({ lines: [{ lineId: "l", label: "x" }] })],
+    ["non-object offer", "not an offer"],
+    ["preparation fingerprint mismatch", offerSnapshot(), { offerPreparationFingerprint: "b".repeat(64) }],
+  ];
+  for (const [name, offer, extras] of cases) {
+    const workspace = baseWorkspace();
+    workspace.bookings = [bookingWithOffer(offer, extras)] as unknown as ClientWorkspaceDTO["bookings"];
+    const proposal = adaptWorkspace(workspace).bookings[0].detail.proposal;
+    assert.equal(proposal.offerInvalid, true, name);
+    assert.equal(proposal.offer, undefined, name);
+    assert.equal(proposal.total, "Not priced", name);
+    assert.equal(proposal.deposit, "Not priced", name);
+    assert.equal(proposal.lines.length, 0, name);
+  }
+});
+
+test("a legacy proposal without an offer keeps the honest Not priced state", () => {
+  const workspace = baseWorkspace();
+  workspace.bookings = [baseBooking()] as unknown as ClientWorkspaceDTO["bookings"];
+  const proposal = adaptWorkspace(workspace).bookings[0].detail.proposal;
+  assert.equal(proposal.total, "Not priced");
+  assert.equal(proposal.deposit, "Not priced");
+  assert.equal(proposal.offer, undefined);
+  assert.equal(proposal.offerInvalid, undefined);
+});
+
+test("an offer on an older proposal version never leaks onto the displayed latest", () => {
+  const workspace = baseWorkspace();
+  const booking = baseBooking();
+  const proposals = (booking as { proposals: { action: Record<string, unknown>; consequences: null }[] }).proposals;
+  proposals.push({
+    action: {
+      id: "act-2",
+      bookingId: "bk-1",
+      kind: "create_provisional_hold",
+      payload: {}, // v3 carries no offer — the v2 offer must not leak
+      proposalVersion: 3,
+      proposalFingerprint: "e".repeat(64),
+      sourceReferences: [],
+      status: "proposed",
+      createdAt: "2026-10-02T00:00:00.000Z",
+      updatedAt: "2026-10-02T00:00:00.000Z",
+    },
+    consequences: null,
+  });
+  proposals[0].action.payload = { offer: offerSnapshot() };
+  workspace.bookings = [booking] as unknown as ClientWorkspaceDTO["bookings"];
+  const proposal = adaptWorkspace(workspace).bookings[0].detail.proposal;
+  assert.equal(proposal.version, 3);
+  assert.equal(proposal.offer, undefined);
+  assert.equal(proposal.total, "Not priced");
+});
