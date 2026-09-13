@@ -1,10 +1,15 @@
 import { writeGatewayConfig, type GatherMcpServerRef } from "./config.ts";
-import { GatherGatewayConnection, type GatewayConnectionState } from "./client.ts";
+import {
+  GatherGatewayConnection,
+  type GatherGatewayClientOptions,
+  type GatewayConnectionState,
+} from "./client.ts";
 import { ensureLayoutDirectories, resolveGatherOpenClawLayout, type GatherOpenClawLayout } from "./layout.ts";
 import { GatherMcpBoundary, type GatherTool } from "./mcp.ts";
 import {
   ensureMcpToken,
   OpenClawGatewayProcess,
+  type GatewayProcessOptions,
   type GatewayProcessState,
   type OpenClawExecutable,
 } from "./process.ts";
@@ -41,9 +46,20 @@ export interface GatherOpenClawRuntimeOptions {
   log?: (line: string) => void;
 }
 
+/**
+ * Narrow injection seams for lifecycle tests — not a plugin framework. The
+ * defaults construct the real supervisor and client.
+ */
+export interface GatherRuntimeDeps {
+  processFactory?: (options: GatewayProcessOptions) => OpenClawGatewayProcess;
+  connectionFactory?: (options: GatherGatewayClientOptions) => GatherGatewayConnection;
+}
+
 export class GatherOpenClawRuntime {
   readonly layout: GatherOpenClawLayout;
   private readonly options: GatherOpenClawRuntimeOptions;
+  private readonly deps: GatherRuntimeDeps;
+  private startPromise: Promise<void> | null = null;
   private process: OpenClawGatewayProcess | null = null;
   private connection: GatherGatewayConnection | null = null;
   private mcpBoundary: GatherMcpBoundary | null = null;
@@ -51,8 +67,9 @@ export class GatherOpenClawRuntime {
   private mcpToken: string | null = null;
   private provisioned = false;
 
-  constructor(options: GatherOpenClawRuntimeOptions) {
+  constructor(options: GatherOpenClawRuntimeOptions, deps: GatherRuntimeDeps = {}) {
     this.options = options;
+    this.deps = deps;
     this.layout = resolveGatherOpenClawLayout({
       rootDir: options.rootDir,
       port: options.gatewayPort,
@@ -81,50 +98,106 @@ export class GatherOpenClawRuntime {
   }
 
   /**
-   * Starts the MCP boundary (if configured), rewrites config with its bound
-   * URL and auth header, spawns the gateway, and resolves after protocol
-   * hello-ok.
+   * Single-startup guard: concurrent start() calls share the one in-flight
+   * startup; calling start() on an already-running runtime rejects. A failed
+   * start rolls back only resources this invocation owned and keeps the
+   * process reference whenever the child's exit was not verifiably observed.
    */
   async start(): Promise<void> {
+    if (this.connection?.isReady) {
+      throw new Error("runtime already started");
+    }
+    if (this.startPromise) {
+      return this.startPromise;
+    }
+    this.startPromise = this.startInternal();
+    try {
+      await this.startPromise;
+    } finally {
+      this.startPromise = null;
+    }
+  }
+
+  private async startInternal(): Promise<void> {
     if (!this.provisioned) this.provision();
 
-    if (this.options.mcpTools && this.options.mcpTools.length > 0) {
-      this.mcpToken = ensureMcpToken(this.layout);
-      this.mcpBoundary = new GatherMcpBoundary({
-        tools: this.options.mcpTools,
-        authToken: this.mcpToken,
+    try {
+      if (this.options.mcpTools && this.options.mcpTools.length > 0) {
+        this.mcpToken = ensureMcpToken(this.layout);
+        this.mcpBoundary = new GatherMcpBoundary({
+          tools: this.options.mcpTools,
+          authToken: this.mcpToken,
+        });
+        const bound = await this.mcpBoundary.listen({
+          host: "127.0.0.1",
+          port: this.options.mcpPort ?? 0,
+        });
+        this.mcpRef = {
+          url: bound.url,
+          toolInclude: this.mcpBoundary.toolNames,
+        };
+        writeGatewayConfig(this.layout, { gatherMcp: this.mcpRef });
+      }
+
+      const factory = this.deps.processFactory ?? ((opts) => new OpenClawGatewayProcess(opts));
+      this.process = factory({
+        layout: this.layout,
+        executable: this.options.executable,
+        mcpToken: this.mcpToken ?? undefined,
+        log: this.options.log,
       });
-      const bound = await this.mcpBoundary.listen({
-        host: "127.0.0.1",
-        port: this.options.mcpPort ?? 0,
+      await this.process.start();
+
+      const connectFactory =
+        this.deps.connectionFactory ?? ((opts) => new GatherGatewayConnection(opts));
+      this.connection = connectFactory({
+        url: `ws://127.0.0.1:${this.layout.port}`,
+        token: this.process.gatewayToken,
+        onEvent: this.options.log
+          ? (event) => this.options.log!(`[event] ${JSON.stringify(event).slice(0, 500)}`)
+          : undefined,
       });
-      this.mcpRef = {
-        url: bound.url,
-        toolInclude: this.mcpBoundary.toolNames,
-      };
-      writeGatewayConfig(this.layout, { gatherMcp: this.mcpRef });
+      await this.connection.connect({ timeoutMs: this.options.connectTimeoutMs ?? 30000 });
+    } catch (error) {
+      await this.rollbackOwnedResources();
+      throw error;
     }
+  }
 
-    this.process = new OpenClawGatewayProcess({
-      layout: this.layout,
-      executable: this.options.executable,
-      mcpToken: this.mcpToken ?? undefined,
-      log: this.options.log,
-    });
-    await this.process.start();
-
-    this.connection = new GatherGatewayConnection({
-      url: `ws://127.0.0.1:${this.layout.port}`,
-      token: this.process.gatewayToken,
-      onEvent: this.options.log
-        ? (event) => this.options.log!(`[event] ${JSON.stringify(event).slice(0, 500)}`)
-        : undefined,
-    });
-    await this.connection.connect({ timeoutMs: this.options.connectTimeoutMs ?? 30000 });
+  /**
+   * Failed-start rollback: close the WS client if any, stop the child if
+   * spawned (keeping the reference when its exit was not observed), and tear
+   * down the MCP listener + rewrite config without the stale MCP ref.
+   */
+  private async rollbackOwnedResources(): Promise<void> {
+    if (this.connection) {
+      await this.connection.close().catch(() => {});
+      this.connection = null;
+    }
+    if (this.process) {
+      try {
+        await this.process.stop(this.options.stopTimeoutMs ?? 10000);
+        this.process = null;
+      } catch {
+        // Child exit uncertain — keep the reference so state() reports the
+        // true lifecycle and a later stop() can retry.
+      }
+    }
+    if (this.mcpBoundary) {
+      await this.mcpBoundary.close().catch(() => {});
+      this.mcpBoundary = null;
+      this.mcpRef = null;
+      this.mcpToken = null;
+      writeGatewayConfig(this.layout, {});
+    }
   }
 
   /** Closes the WS client, then stops the child process and MCP boundary. */
   async stop(): Promise<void> {
+    if (this.startPromise) {
+      // Let an in-flight startup settle before tearing down.
+      await this.startPromise.catch(() => {});
+    }
     if (this.connection) {
       await this.connection.close().catch(() => {});
       this.connection = null;

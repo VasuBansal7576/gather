@@ -75,6 +75,8 @@ let doctorDir = null;
 let gateway = null;
 let client = null;
 let cleanupEnabled = false;
+let stopPromise = null;
+let shutdownRecorded = false;
 
 function cleanup() {
   // Removes ONLY the directory this invocation created, and only after the
@@ -91,9 +93,44 @@ function cleanup() {
   rmSync(doctorDir, { recursive: true, force: true });
 }
 
+/**
+ * Coordinated shutdown shared by the normal path and signal handlers: close
+ * the client, stop the child, and only mark cleanup-safe once the child's
+ * exit was actually observed. Runs once; concurrent callers share the
+ * promise.
+ */
+function stopGateway() {
+  if (!stopPromise) {
+    stopPromise = (async () => {
+      if (client) {
+        await client.close().catch(() => {});
+        client = null;
+      }
+      if (!gateway) {
+        cleanupEnabled = true;
+        return;
+      }
+      const pid = gateway.pid;
+      await gateway.stop();
+      const observedStopped = gateway.currentState === "stopped" && (pid === null || !pidAlive(pid));
+      if (!observedStopped) throw new Error("child exit was not verifiably observed");
+      cleanupEnabled = true;
+      if (!shutdownRecorded) {
+        shutdownRecorded = true;
+        record("shutdown", true, `gateway child exit observed (state=${gateway.currentState})`);
+      }
+    })();
+  }
+  return stopPromise;
+}
+
 process.on("exit", cleanup);
-process.on("SIGINT", () => process.exit(130));
-process.on("SIGTERM", () => process.exit(143));
+process.on("SIGINT", () => {
+  void stopGateway().finally(() => process.exit(130));
+});
+process.on("SIGTERM", () => {
+  void stopGateway().finally(() => process.exit(143));
+});
 
 async function main() {
   const binary = resolveExplicitBinary();
@@ -197,12 +234,7 @@ async function main() {
     }
   } finally {
     try {
-      const pid = gateway.pid;
-      await gateway.stop();
-      const observedStopped = gateway.currentState === "stopped" && (pid === null || !pidAlive(pid));
-      if (!observedStopped) throw new Error("child exit was not verifiably observed");
-      record("shutdown", true, `gateway child exit observed (state=${gateway.currentState})`);
-      cleanupEnabled = true;
+      await stopGateway();
     } catch (error) {
       record("shutdown", false, String(error));
     }
