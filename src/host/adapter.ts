@@ -127,9 +127,10 @@ const REQUIRED_STEPS_BY_ACTION_KIND: Record<string, ("hold" | "email")[]> = {
 /**
  * Display-side mirror of the server's live-proof rule: a succeeded receipt
  * reads as a provider receipt only on positive proof (live mode, not
- * simulated, non-empty non-fictional provenance). Missing proof, simulated
- * results, and fixture refs fail closed to simulated — a fixture receipt is
- * never upgraded to live at display.
+ * simulated, non-empty non-fictional provenance). Missing proof, unknown or
+ * malformed envelopes fail closed to unverified — never simulated without
+ * positive simulation evidence; a fixture receipt is never upgraded to
+ * live at display.
  */
 const LIVE_PROOF_SOURCE_KINDS = new Set(["connected_account", "document", "email", "calendar", "manual"]);
 
@@ -146,11 +147,25 @@ function isLiveProof(proof: ExecutionDTO["proof"]): boolean {
 }
 
 /**
+ * Positive simulated/fixture proof on a validated envelope: explicitly
+ * demo mode, explicitly simulated, or every provenance entry explicitly
+ * fictional. Anything else validated-but-not-live — empty provenance,
+ * unknown mode, mixed envelopes — is NOT simulation evidence and must read
+ * as unverified, never simulated.
+ */
+function isSimulatedProof(proof: ExecutionDTO["proof"]): boolean {
+  if (proof === undefined) return false;
+  if (proof.mode === "demo" || proof.simulated === true) return true;
+  if (proof.provenance.length === 0) return false;
+  return proof.provenance.every((ref) => ref.fictional === true);
+}
+
+/**
  * Read the step proof from either execution shape: parsed client DTOs carry
  * it as top-level `proof` (validated at the DTO boundary), while
  * server-shape executions passed straight through carry it embedded in
  * `result.proof`. Both are validated the same strict way; anything
- * malformed yields undefined so display fails closed to simulated.
+ * malformed yields undefined so display fails closed to unverified.
  */
 function executionProof(execution: ExecutionDTO): ExecutionDTO["proof"] {
   if (execution.proof !== undefined) return execution.proof;
@@ -196,7 +211,9 @@ function receiptOf(execution: ExecutionDTO, timezone: string | undefined): Actio
       ? "Done — provider receipt unverified"
       : isLiveProof(proof)
         ? "Done — provider receipt recorded"
-        : "Done — simulated provider receipt";
+        : isSimulatedProof(proof)
+          ? "Done — simulated provider receipt"
+          : "Done — provider receipt unverified";
   }
   // Recovery is only ever offered for non-terminal states; pending and
   // succeeded never get a control.

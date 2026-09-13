@@ -275,16 +275,27 @@ export function isLiveStepProof(result: unknown): boolean {
   return proof.provenance.every(isValidLiveProvenanceRef);
 }
 
-/** True when the stored result carries a well-formed proof object at all. */
-function hasProof(result: unknown): boolean {
-  return isRecord(result) && isRecord(result.proof);
+/**
+ * Positive simulated/fixture proof: the envelope explicitly says demo (or
+ * simulated), or every provenance entry is explicitly fictional. Anything
+ * else with a proof object — empty, unknown-mode, mixed, or malformed —
+ * is NOT simulation evidence and must read as unverified, never simulated.
+ */
+export function isSimulatedStepProof(result: unknown): boolean {
+  if (!isRecord(result)) return false;
+  const proof: unknown = result.proof;
+  if (!isRecord(proof)) return false;
+  if (proof.mode === "demo" || proof.simulated === true) return true;
+  if (!Array.isArray(proof.provenance) || proof.provenance.length === 0) return false;
+  return proof.provenance.every((ref) => isRecord(ref) && ref.fictional === true);
 }
 
 /** Honest per-receipt wording derived from the stored proof, never assumed. */
 export function stepReceiptDetail(execution: ActionExecution): string {
   if (execution.status !== "succeeded") return execution.error ?? execution.status;
-  if (!hasProof(execution.result)) return "Done — provider receipt unverified";
-  return isLiveStepProof(execution.result) ? "Done — provider receipt recorded" : "Done — simulated provider receipt";
+  if (isLiveStepProof(execution.result)) return "Done — provider receipt recorded";
+  if (isSimulatedStepProof(execution.result)) return "Done — simulated provider receipt";
+  return "Done — provider receipt unverified";
 }
 
 /** A booking is a fixture only when every source reference is explicitly fictional. */
@@ -855,16 +866,18 @@ export async function approveAndExecute(deps: BookingServiceDeps, input: Approve
 
 /**
  * Completion wording derived from the stored step proofs: steps with
- * positive live proof are reported as provider receipts, all others as
- * simulated. Never blanket-claims simulated when a live-shaped connector
- * actually served the step, and never claims live without proof.
+ * positive live proof are reported as provider receipts, steps with
+ * positive simulated/fixture proof as simulated, and anything else as
+ * unverified. Never blanket-claims simulated when a live-shaped connector
+ * actually served the step, never claims live without proof, and never
+ * labels malformed proof simulated without simulation evidence.
  */
 function completionNote(hold: ActionExecution, email: ActionExecution): string {
   const base = "Provisional hold is not a confirmed booking.";
   const wording = (execution: ActionExecution): string =>
     isLiveStepProof(execution.result)
       ? "provider receipt"
-      : hasProof(execution.result)
+      : isSimulatedStepProof(execution.result)
         ? "simulated receipt"
         : "unverified receipt";
   const liveHold = isLiveStepProof(hold.result);
@@ -984,7 +997,7 @@ export async function reconcileExecution(deps: BookingServiceDeps, executionId: 
     booking: store.getBooking(booking.id),
     note: isLiveStepProof(execution.result)
       ? "Reconciled against the provider record."
-      : hasProof(execution.result)
+      : isSimulatedStepProof(execution.result)
         ? "DEMO ONLY: reconciled against the simulated provider record."
         : "Reconciled, but the stored receipt carries no provider proof; evidence is unverified.",
   };
