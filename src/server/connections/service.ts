@@ -40,6 +40,7 @@ type SqlRow = Record<string, unknown>;
 interface AuthSessionRow {
   id: string;
   businessId: string;
+  ownerId: string;
   provider: string;
   stateHash: string;
   verifierRef: string;
@@ -156,6 +157,7 @@ export class ConnectionService {
       CREATE TABLE IF NOT EXISTS connection_auth_sessions (
         id TEXT PRIMARY KEY,
         business_id TEXT NOT NULL,
+        owner_id TEXT NOT NULL DEFAULT 'local-owner',
         provider TEXT NOT NULL,
         state_hash TEXT NOT NULL UNIQUE,
         verifier_ref TEXT NOT NULL,
@@ -199,6 +201,13 @@ export class ConnectionService {
     }
     if (!cols.some((col) => col.name === "owner_id")) {
       this.db.exec("ALTER TABLE connection_accounts ADD COLUMN owner_id TEXT NOT NULL DEFAULT 'local-owner'");
+    }
+    // Legacy auth sessions predate owner binding: they gain owner_id as
+    // 'local-owner', so they resolve only under the configured local owner
+    // and are never adopted under an arbitrary new owner (fail closed).
+    const sessionCols = this.db.prepare("PRAGMA table_info(connection_auth_sessions)").all() as Array<{ name: string }>;
+    if (!sessionCols.some((col) => col.name === "owner_id")) {
+      this.db.exec("ALTER TABLE connection_auth_sessions ADD COLUMN owner_id TEXT NOT NULL DEFAULT 'local-owner'");
     }
   }
 
@@ -261,8 +270,8 @@ export class ConnectionService {
     const connected = connectionRows.filter((row) => row.status === "connected");
     const pending = this.db.prepare(
       `SELECT COUNT(*) AS n FROM connection_auth_sessions
-       WHERE business_id = $b AND provider = $p AND status = 'pending' AND expires_at_ms > $now`,
-    ).get({ $b: businessId, $p: provider, $now: this.nowMs() }) as SqlRow | undefined;
+       WHERE business_id = $b AND provider = $p AND owner_id = $o AND status = 'pending' AND expires_at_ms > $now`,
+    ).get({ $b: businessId, $p: provider, $o: this.ownerId, $now: this.nowMs() }) as SqlRow | undefined;
     let status: ConnectionStatus;
     if (connected.length > 0) status = "connected";
     else if (Number(pending?.n ?? 0) > 0) status = "authorization_pending";
@@ -293,7 +302,9 @@ export class ConnectionService {
   /** Business context for a callback redirect target; undefined for unknown states. */
   peekSessionBusinessId(state: string): string | undefined {
     if (typeof state !== "string" || state.length === 0) return undefined;
-    return this.sessionByState(state)?.businessId;
+    const session = this.sessionByState(state);
+    if (!session || session.ownerId !== this.ownerId) return undefined;
+    return session.businessId;
   }
 
   // ------------------------------------------------------------ oauth start
@@ -323,11 +334,12 @@ export class ConnectionService {
     this.secrets.set(verifierRef, codeVerifier);
     this.db.prepare(
       `INSERT INTO connection_auth_sessions
-        (id, business_id, provider, state_hash, verifier_ref, redirect_uri, scopes_json, display_name, status, expires_at_ms, created_at)
-       VALUES ($id, $b, $p, $sh, $vr, $ru, $sj, $dn, 'pending', $ex, $at)`,
+        (id, business_id, owner_id, provider, state_hash, verifier_ref, redirect_uri, scopes_json, display_name, status, expires_at_ms, created_at)
+       VALUES ($id, $b, $o, $p, $sh, $vr, $ru, $sj, $dn, 'pending', $ex, $at)`,
     ).run({
       $id: sessionId,
       $b: input.businessId,
+      $o: this.ownerId,
       $p: "google",
       $sh: sha256(state),
       $vr: verifierRef,
@@ -353,14 +365,18 @@ export class ConnectionService {
   // --------------------------------------------------------- oauth callback
 
   private sessionByState(state: string): AuthSessionRow | undefined {
-    const found = this.db.prepare("SELECT * FROM connection_auth_sessions WHERE state_hash = $sh").get({
+    const found = this.db.prepare(
+      "SELECT * FROM connection_auth_sessions WHERE state_hash = $sh AND owner_id = $o",
+    ).get({
       $sh: sha256(state),
+      $o: this.ownerId,
     });
     if (!found) return undefined;
     const row = found as SqlRow;
     return {
       id: String(row.id),
       businessId: String(row.business_id),
+      ownerId: row.owner_id ? String(row.owner_id) : "local-owner",
       provider: String(row.provider),
       stateHash: String(row.state_hash),
       verifierRef: String(row.verifier_ref),
@@ -371,6 +387,39 @@ export class ConnectionService {
       expiresAtMs: Number(row.expires_at_ms),
       createdAt: String(row.created_at),
     };
+  }
+
+  /**
+   * Consume a pending session and capture the binding fence in ONE write
+   * transaction: the consume, the expiry/owner/business re-check, and the
+   * business binding snapshot all commit together, so no disconnect can
+   * slip between the consume and the snapshot the during-exchange fence
+   * relies on.
+   */
+  private consumeSession(
+    session: AuthSessionRow,
+  ): Map<string, { revision: number; businessId: string; ownerId: string }> {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const consumed = this.db.prepare(
+        `UPDATE connection_auth_sessions SET status = 'consumed'
+         WHERE id = $id AND status = 'pending' AND expires_at_ms > $now
+           AND business_id = $b AND owner_id = $o`,
+      ).run({ $id: session.id, $now: this.nowMs(), $b: session.businessId, $o: session.ownerId });
+      if (Number(consumed.changes) !== 1) {
+        throw new ConnectionError("REPLAY", "Authorization session was already consumed by a concurrent callback");
+      }
+      const fence = this.snapshotBindings(session.businessId);
+      this.db.exec("COMMIT");
+      return fence;
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        // Already rolled back.
+      }
+      throw error;
+    }
   }
 
   /**
@@ -418,32 +467,13 @@ export class ConnectionService {
       );
     }
     // Single-use: consume under a write lock before any provider call, and
-    // re-check expiry inside the transaction — a session expiring between
-    // the read above and now must not complete.
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
-      const consumed = this.db.prepare(
-        "UPDATE connection_auth_sessions SET status = 'consumed' WHERE id = $id AND status = 'pending' AND expires_at_ms > $now",
-      ).run({ $id: session.id, $now: this.nowMs() });
-      if (Number(consumed.changes) !== 1) {
-        throw new ConnectionError("REPLAY", "Authorization session was already consumed by a concurrent callback");
-      }
-      this.db.exec("COMMIT");
-    } catch (error) {
-      try {
-        this.db.exec("ROLLBACK");
-      } catch {
-        // Already rolled back.
-      }
-      throw error;
-    }
-    // Binding fence captured BEFORE the provider exchange: the verified
-    // account identity only arrives after the exchange, so no single row
-    // can be fenced yet — instead every binding of this business is
-    // snapshotted. A disconnect, reconnect, or refresh landing mid-exchange
-    // changes a snapshotted row (or adds one), and the commit below rejects
-    // rather than resurrecting a stale binding with a usable token.
-    const fence = this.snapshotBindings(session.businessId);
+    // re-check expiry plus exact owner/business inside the transaction — a
+    // session expiring between the read above and now must not complete.
+    // The binding fence is captured in this SAME transaction: the write
+    // lock means no disconnect can land between the consume commit and the
+    // snapshot, so the during-exchange fence below starts from a sealed
+    // state instead of a moving one.
+    const fence = this.consumeSession(session);
     const codeVerifier = this.secrets.get(session.verifierRef);
     if (!codeVerifier) {
       this.failSession(session.id);
@@ -507,13 +537,18 @@ export class ConnectionService {
     // Staged publish: new secrets are written under fresh versioned refs and
     // only become the binding's refs when the DB commit succeeds — a failure
     // anywhere before commit leaves the prior valid binding and its secrets
-    // untouched, and superseded refs are deleted only after commit.
-    const staged = this.stageSecrets(token.accessToken, token.refreshToken, identity.accountKey);
-    const stagedAccessRef = staged.accessRef;
-    const stagedRefreshRef = staged.refreshRef;
+    // untouched, and superseded refs are deleted only after commit. Staging
+    // AND the BEGIN happen inside the cleanup boundary below: a busy BEGIN
+    // deletes only the newly staged refs and surfaces a typed, redacted
+    // error instead of leaking refs or raw store details.
+    let stagedAccessRef!: string;
+    let stagedRefreshRef!: string | undefined;
     const priorMeta = existing ? this.tokenMeta(existing.id) : undefined;
-    this.db.exec("BEGIN IMMEDIATE");
     try {
+      const staged = this.stageSecrets(token.accessToken, token.refreshToken, identity.accountKey);
+      stagedAccessRef = staged.accessRef;
+      stagedRefreshRef = staged.refreshRef;
+      this.db.exec("BEGIN IMMEDIATE");
       for (const [id, snap] of fence) {
         const current = this.connectionById(id);
         if (
@@ -600,9 +635,27 @@ export class ConnectionService {
       } catch {
         // Already rolled back.
       }
-      this.secrets.delete(stagedAccessRef);
-      if (stagedRefreshRef) this.secrets.delete(stagedRefreshRef);
-      throw error;
+      // Best-effort removal of ONLY the newly staged refs: the prior
+      // binding's secrets are never touched on this path.
+      if (stagedAccessRef) {
+        try {
+          this.secrets.delete(stagedAccessRef);
+        } catch {
+          // Cleanup is best-effort; the typed error below still carries the signal.
+        }
+      }
+      if (stagedRefreshRef) {
+        try {
+          this.secrets.delete(stagedRefreshRef);
+        } catch {
+          // Cleanup is best-effort; the typed error below still carries the signal.
+        }
+      }
+      if (error instanceof ConnectionError) throw error;
+      throw new ConnectionError(
+        "UNAVAILABLE",
+        "Connection store is busy; no credentials were persisted and no binding was changed",
+      );
     }
     // Compensating cleanup: only the now-superseded refs are removed, and
     // only after the new binding is durable.

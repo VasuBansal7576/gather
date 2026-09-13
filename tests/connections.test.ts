@@ -767,3 +767,87 @@ test("in-flight reauthorization callback cannot resurrect a disconnected binding
     fx.cleanup();
   }
 });
+
+test("pending sessions and callbacks are owner-bound: another owner sees and completes nothing", async () => {
+  const fx = fixture();
+  try {
+    const svc = service(fx);
+    const started = svc.startAuthorization({ businessId: fx.businessId, provider: "google" });
+    const state = stateOf(started.authorizationUrl);
+    const foreign = new ConnectionService({
+      store: fx.store, secrets: fx.secrets, transport: fx.transport,
+      googleApp: APP, ownerId: "someone-else", nowMs: () => fx.nowMs,
+    });
+    // No pending-activity leak: the foreign summary shows no pending state.
+    assert.equal(foreign.getConnections(fx.businessId).providers[0]?.status, "not_connected");
+    assert.deepEqual(foreign.getConnections(fx.businessId).providers[0]?.accounts, []);
+    // No callback-read leak: business context resolves only for the owner.
+    assert.equal(foreign.peekSessionBusinessId(state), undefined);
+    assert.equal(svc.peekSessionBusinessId(state), fx.businessId);
+    // A foreign completion attempt fails without consuming the session...
+    await assert.rejects(
+      foreign.completeAuthorization({ code: "c-foreign", state }),
+      (e: unknown) => e instanceof ConnectionError && e.code === "REPLAY",
+    );
+    // ...so the owner's own callback still completes normally afterwards.
+    await svc.completeAuthorization({ code: "c1", state });
+    assert.equal(svc.getConnections(fx.businessId).providers[0]?.status, "connected");
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test("a busy store during callback commit deletes only staged refs and stays typed", async () => {
+  const fx = fixture();
+  try {
+    const svc = service(fx);
+    const first = svc.startAuthorization({ businessId: fx.businessId, provider: "google" });
+    await svc.completeAuthorization({ code: "c1", state: stateOf(first.authorizationUrl) });
+    fx.transport.tokenResponse = {
+      accessToken: "access-fresh-secret", refreshToken: "refresh-fresh-secret",
+      expiresInSec: 3600, scope: APP.requiredScopes.join(" "),
+    };
+    const keysBefore = [...fx.secrets.keys()].sort();
+    // Fail exactly the commit-transaction BEGIN (the consume BEGIN passes).
+    const db = fx.store.db as unknown as { exec: (sql: string) => void };
+    const realExec = db.exec.bind(fx.store.db);
+    let begins = 0;
+    db.exec = (sql: string) => {
+      if (sql === "BEGIN IMMEDIATE" && ++begins === 2) throw new Error("SQLITE_BUSY: database is locked");
+      return realExec(sql);
+    };
+    try {
+      const second = svc.startAuthorization({ businessId: fx.businessId, provider: "google" });
+      await assert.rejects(
+        svc.completeAuthorization({ code: "c2", state: stateOf(second.authorizationUrl) }),
+        (e: unknown) => {
+          assert.ok(e instanceof ConnectionError, "raw store errors never surface");
+          assert.ok(!String((e as Error).message).includes("fresh-secret"), "secret material never surfaces");
+          assert.ok(!String((e as Error).message).includes("SQLITE_BUSY"), "raw store details never surface");
+          return true;
+        },
+      );
+    } finally {
+      db.exec = realExec;
+    }
+    // Only the newly staged refs are gone; the original binding and its
+    // secrets are untouched and still serve the original token.
+    assert.deepEqual([...fx.secrets.keys()].sort(), keysBefore, "no staged refs leak; original secrets intact");
+    assert.equal(svc.getConnections(fx.businessId).providers[0]?.status, "connected");
+    fx.transport.tokenResponse = {
+      accessToken: "access-ignored", expiresInSec: 3600, scope: APP.requiredScopes.join(" "),
+    };
+    fx.store.db.prepare("UPDATE connection_token_meta SET access_expires_at_ms = $t").run({ $t: fx.nowMs - 1000 });
+    assert.equal(
+      await svc.accessToken({
+        accountId: svc.getConnections(fx.businessId).providers[0]!.accounts[0]!.id,
+        businessId: fx.businessId,
+      }),
+      "access-refreshed",
+      "the original binding still refreshes with its original secret",
+    );
+    assert.equal(fx.transport.refreshCalls, 1);
+  } finally {
+    fx.cleanup();
+  }
+});
