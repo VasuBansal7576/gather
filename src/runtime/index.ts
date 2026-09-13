@@ -11,8 +11,11 @@ export {
   type GatherMcpServerRef,
 } from "./config.ts";
 export {
+  DOCTOR_REPAIR_TIMEOUT_MS,
   OpenClawGatewayProcess,
+  allocateLoopbackPort,
   buildGatewayChildEnv,
+  checkLoopbackPortOccupied,
   ensureGatewayToken,
   ensureMcpToken,
   tokenFilePath,
@@ -66,4 +69,5 @@ export {
   type GatherRuntimeDeps,
   type RuntimeProcessLike,
   type RuntimeConnectionLike,
+  type RuntimeMcpBoundaryLike,
 } from "./openclaw-runtime.ts";
