@@ -6,7 +6,7 @@ The local Gather application is runnable on Node 26 with the owner workspace, de
 The reviewed service was integrated as `ef5e7c9` from `b0058ba`.
 Reviewed Google Calendar and Gmail adapter boundaries were integrated as `72c82b7` from `363bef7`.
 The isolated OpenClaw adapter was integrated as `e81fab9` from `8bca2f2`.
-The owner workspace is still awaiting its verified API wiring and comparison with the owner-selected [Gather Linear UI](design/Gather-Linear-UI.png).
+The reviewed owner workspace and local API wiring were integrated as `dc07d55`, following comparison with the owner-selected [Gather Linear UI](design/Gather-Linear-UI.png).
 
 The demo connectors and fixture workspace remain explicitly simulated and are not live Gmail, Drive, Calendar, or OpenClaw integrations.
 
@@ -14,7 +14,8 @@ The demo connectors and fixture workspace remain explicitly simulated and are no
 
 This checklist has a fixed total of 17 gates.
 
-The local application and isolated adapter evidence satisfies 14/17 gates in this checklist.
+Thirteen gates currently remain accepted; the combined-test gate is reopened after a recurring isolated Gateway startup timeout.
+Fourteen gates had previously been accepted on the earlier combined milestone.
 This count describes the local application milestone only, not completion of the product requirements in [PRD.md](PRD.md).
 
 - [x] Next.js application scaffold is present and builds.
@@ -25,8 +26,8 @@ This count describes the local application milestone only, not completion of the
 - [x] Connector fixtures cover provenance, unavailable dates, idempotency, and timeout reconciliation.
 - [x] Local launcher and doctor scripts are present and do not install packages or touch external runtimes.
 - [x] `npm ci` completes without credentials or network provider setup.
-- [x] Storage, connector, approval, recovery, offers, and runtime checks pass in one combined 247-test run on `dae72d8`.
-  The earlier doctor timeout under concurrent load remains documented below.
+- [ ] Storage, connector, approval, recovery, offers, and runtime checks pass together on the current integration.
+  The earlier 247-test and 314-test runs passed, but `dc07d55` passed 330/331 with the isolated Gateway handshake timeout described below.
 - [x] `npm run typecheck` passes.
 - [x] `npm run build` passes.
 - [x] Doctor passes with Node 26.8.2, installed dependencies, supported scripts, and a project-local writable `.runtime` directory.
@@ -58,7 +59,7 @@ No live provider receipt or booking confirmation is established by these tests.
 
 ## Next integrated milestone
 
-The service is integrated; owner approval and recovery interactions remain under mounted browser review before API and UI integration.
+The service and reviewed owner approval interactions are integrated; setup, connection, runtime-intake, business-operator, and confirmation-service handoffs remain under review.
 The runtime adapter and business-aware offers module have passed component review and are integrated.
 Parallel workers are reviewing Google reads and confirmed knowledge, correcting durable identity and proactive work, and verifying delivery readiness and the owner workspace.
 Runtime worker evidence includes an actual isolated Gateway boot, protocol handshake, control-plane RPCs, and observed shutdown without model or Google calls.
@@ -109,10 +110,11 @@ No credentials, personal OpenClaw configuration or data, provider actions, custo
 
 ## Workspace cleanup and dependency findings
 
-Fourteen completed review, failed-launch, runtime, dependency-maintenance, knowledge, delivery-evaluator, and inherited milestone worktrees were removed after checking clean tracked state and active worker ownership.
+Fifteen completed review, failed-launch, runtime, dependency-maintenance, knowledge, delivery-evaluator, owner-workspace, and inherited milestone worktrees were removed after checking clean tracked state and active worker ownership.
 Original foundation, interface, connector-contract, and packaging commits remain preserved by local branch references; integrated review commits remain reachable on remote main.
 The completed knowledge commit is additionally preserved at `archive/gather-business-knowledge-640f57b`; its successor worker uses a separate business-operator worktree.
 The completed delivery evaluator is preserved at `archive/gather-delivery-readiness-e626000`; its successor uses a separate booking-delivery worktree.
+The completed owner workspace is preserved at `archive/gather-owner-host-fbafe11`; its worker now independently reviews the confirmation service.
 Active execution worktrees and unrelated work were preserved.
 
 Dependency remediation `64bb96e` was integrated as `1fbbb754` after compatibility review.
@@ -126,7 +128,23 @@ See [dependency evidence](DEPENDENCIES.md) for the exact scope and limitations.
 
 Chief identified, and Astra verified against the [Gmail history API](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.history/list), that incremental history requests do not support the `q` search parameter.
 The previous Google adapter review did not catch this unsupported parameter in delta and initial catch-up paths.
-Query-scoped incremental filtering acceptance is reopened and a separate worker is correcting it with supported membership checks and pagination regressions.
+The corrected intake boundary was integrated as `619ad4b` from `ef062eb` after Astra reran 66 focused Google tests and type checking.
+Only an unfiltered mailbox or a single supported system-label scope is accepted; arbitrary search queries are rejected before any HTTP request.
+Snapshot requests use exact `labelIds` and explicit spam/trash inclusion, while history and catch-up use `labelId`.
+This acceptance covers message-added intake, not a complete label-membership or deletion mirror, semantic relevance filtering, or live Google behavior.
+Review also found and corrected inherited object-property names escaping the scope allowlist.
 Knowledge vocabulary validation, attributable candidate storage, explicit owner confirmation, and source-change withholding are implemented.
 These controls do not establish semantic relevance classification, calibrated confidence, or measured precision and recall on noisy business data.
 No live Google or model extraction evaluation has been run.
+
+## Owner workspace integration and reopened startup reliability
+
+Astra reran 17 focused owner-state and host-contract tests and type checking on `fbafe11` before integration.
+The combined `dc07d55` run passed 330/331 tests; the production build passed separately.
+The sole failure was the actual isolated doctor not receiving Gateway `hello-ok` within 30 seconds, followed by verified child shutdown.
+The same timeout was observed on an earlier integration under concurrent load; its cause remains under investigation and a passing isolated retry would not erase the reliability gap.
+Astra exercised the exact integrated production build against a disposable database: empty workspace, explicit demo initialization, Today-to-booking navigation, approval, and separately persisted simulated hold and email receipts.
+Desktop 1586×992 and mobile 390×844 checks showed no horizontal overflow, with the mobile action control inside the viewport.
+Removing only the task-owned simulated email execution reproduced a crash between steps: the UI remained incomplete and reapproval recovered the missing step while preserving the original hold execution.
+The browser tab and task-owned server were closed after verification.
+These checks establish local simulated approval behavior, not live booking confirmation or complete proactive operation.
