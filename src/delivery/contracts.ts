@@ -346,9 +346,9 @@ export function assertValidEvaluateInput(value: unknown): asserts value is Evalu
   }
   value.policy.conditions.forEach(assertConditionConfig);
   if (!Array.isArray(value.evidence)) throw new Error("evidence must be an array");
-  for (const item of value.evidence) {
-    if (!isRecord(item)) throw new Error("every evidence item must be an object (untrusted shapes are rejected, not thrown, only when well-formed objects)");
-  }
+  // Individual items are not shape-checked here: non-object and malformed
+  // entries are rejected into rejectedEvidence by the evaluator rather than
+  // throwing the whole evaluation.
   if (value.rawSignals !== undefined) {
     if (!Array.isArray(value.rawSignals)) throw new Error("rawSignals must be an array when present");
     for (const signal of value.rawSignals) {
@@ -372,20 +372,29 @@ export function assertValidHandoffInput(value: unknown): asserts value is BuildH
  * Booking snapshot and accepted proposal must describe the same event
  * window: availability evaluates the proposal window while handoff and
  * lifecycle guards read the booking snapshot, so a mismatch is a binding
- * defect and evaluation is rejected, never averaged.
+ * defect and evaluation is rejected, never averaged. The comparison is
+ * per-field — a window field present on only one side (partial binding)
+ * or present with divergent values is rejected; only a fully absent or
+ * fully agreeing pair passes.
  */
 export function requireConsistentWindows(
   booking: { startAt?: string; endAt?: string },
   payload: Record<string, unknown>,
 ): void {
-  if (!isIso(booking.startAt) || !isIso(booking.endAt)) return;
-  const payloadStart: unknown = payload.startAt;
-  const payloadEnd: unknown = payload.endAt;
-  if (!isIso(payloadStart) || !isIso(payloadEnd)) return;
-  if (
-    new Date(Date.parse(booking.startAt)).toISOString() !== new Date(Date.parse(payloadStart)).toISOString() ||
-    new Date(Date.parse(booking.endAt)).toISOString() !== new Date(Date.parse(payloadEnd)).toISOString()
-  ) {
-    throw new Error("Binding mismatch: booking snapshot window differs from the accepted proposal window; reconcile before confirming");
+  for (const field of ["startAt", "endAt"] as const) {
+    const bookingValue = booking[field];
+    const payloadValue: unknown = payload[field];
+    const bookingHas = isIso(bookingValue);
+    const payloadHas = isIso(payloadValue);
+    if (bookingHas !== payloadHas) {
+      throw new Error(`Binding mismatch: ${field} is present on only one side of the booking/proposal window; reconcile before confirming`);
+    }
+    if (
+      bookingHas &&
+      payloadHas &&
+      new Date(Date.parse(bookingValue as string)).toISOString() !== new Date(Date.parse(payloadValue as string)).toISOString()
+    ) {
+      throw new Error("Binding mismatch: booking snapshot window differs from the accepted proposal window; reconcile before confirming");
+    }
   }
 }

@@ -104,7 +104,7 @@ export function buildHandoff(raw: unknown): OperationalHandoff {
       name: booking.eventName,
       ...(startAt ? { startAt } : {}),
       ...(endAt ? { endAt } : {}),
-      ...(typeof booking.guestCount === "number" ? { guestCount: booking.guestCount } : {}),
+      ...(typeof booking.guestCount === "number" && Number.isFinite(booking.guestCount) && booking.guestCount >= 0 ? { guestCount: booking.guestCount } : {}),
     },
     services,
     responsibilities,
