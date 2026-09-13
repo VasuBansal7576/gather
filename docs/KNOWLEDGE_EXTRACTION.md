@@ -146,3 +146,29 @@ facts; partial batches name every rejection.
    extraction quality (relevance, span choice, confidence choice) needs an
    owner-judged frozen suite; mapper bias is the known uncertainty until a
    production backend exists to measure.
+
+## OpenClaw task backend
+
+`src/knowledge/extraction/openclaw-backend.ts` implements
+`ExtractionBackend` over the existing isolated runtime task channel
+(`GatherRuntimeTasks`: `agent` / `agent.wait` / `chat.history`). Nothing is
+registered by default — the host constructs it with a validated
+`{businessId, accountId}` scope and the runtime's task channel.
+
+- One deterministic session per scope (`bookingSessionKey` over
+  `extraction:<businessId>:<accountId>`); the caller's persisted
+  idempotency key folds into a scope-bound gateway key via
+  `stableTaskIdempotencyKey`, so retries dedupe and no foreign scope's run
+  can be adopted.
+- The instruction pins the source digest, carries an in-text task marker
+  (`gather-extraction:<idempotencyKey>`), fences source text as untrusted
+  content, and grants the model no approval/spend/send authority.
+- `awaitExtraction` only accepts run ids this scope submitted, maps wait
+  statuses 1:1 (`timeout` stays wait-only, `error` covers cancellation),
+  and on `ok` reads the scoped history for the first assistant text after
+  the marker message — parsed strictly to `unknown` under a byte bound.
+  Channel failures throw `BackendUnavailableError` → `backend_unavailable`.
+
+Tests fake only the gateway channel with explicit simulated fixtures
+(`simulated: true`). No live model, provider, gateway, or credentials were
+contacted; a real OpenClaw run remains unverified.
