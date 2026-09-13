@@ -43,6 +43,7 @@ Keep personal OpenClaw untouched. Use separate runtime state, credentials and po
 
 The local application milestone is integrated and verified with the owner workspace, deterministic demo connectors, server-only SQLite persistence, and local doctor/launcher scripts.
 The isolated OpenClaw control-plane adapter, booking approval service, Google write adapter boundaries, and business-aware offer module have passed component review.
-Owner workspace integration, confirmed knowledge, durable intake and identity, guided app setup, and delivery readiness remain in progress.
+Confirmed knowledge, durable identity, incremental Google reads, and persistent waiting-work components have also passed review and combined regression checks.
+Owner workspace integration, knowledge-to-offer preparation, actual runtime intake, guided app setup, and delivery readiness remain in progress.
 Actual model execution and live provider verification remain separate acceptance gates.
 No live provider actions or external booking integration have been verified.
