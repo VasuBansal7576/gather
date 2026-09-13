@@ -275,7 +275,12 @@ Those integration checks used controlled providers and do not establish a live b
 Cold-listener and concurrent-start corrections were integrated at `af89d15` after independent reproduction checks, 12 focused integration tests, and type checking passed.
 The latest full 670-test and production-build pass remains the separate checkout at `0ebb118`; it does not cover every later change.
 
-Repeated macOS Keychain prompts currently block reliable live provider access.
-A consistent native read/write identity correction is under independent review, with repeated-access and refresh verification still pending.
+Repeated macOS Keychain prompts exposed a mismatch between the native writer and the command used to read credentials.
+The consistent native access and update-in-place correction was integrated at `5f4749f` after independent review, 26 connection tests, and type checking passed.
+The implementation worker verified a real isolated fictional Keychain entry through creation, three reads, update, three more reads, deletion, and a missing-entry check without prompts.
+The host worker then reported two successful existing-credential reads through Gather's application service in a separate process.
+That check did not force Google token expiry, disconnect an account, or prove token use through an HTTP request to the running host.
+Astra separately verified that the restarted host preserved all three connections and reported intake as unconfigured while background polling was disabled.
+A lifecycle-refresh correction for that temporary pause remains under review.
 There is no verified complete live inquiry-to-offer journey, confirmed booking, payment outcome, or operational handoff.
 The accepted local milestone count remains 14 of 17, and no whole-product completion percentage is established.
