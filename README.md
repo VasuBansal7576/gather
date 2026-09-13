@@ -9,8 +9,7 @@ Connect business apps, give the operator a goal, and review the decisions that n
 
 ## Demo video
 
-The narrated product walkthrough is being prepared for publication.
-The public video link will be added here after upload verification.
+[Watch the narrated Gather demo on YouTube](https://youtu.be/KsG9-CyNeLU) — under two minutes, with the creator's narration and actual application screens. The video distinguishes simulated actions and the target workflow from verified live capabilities.
 
 ## What the product does
 
@@ -50,7 +49,15 @@ See [local setup](docs/LOCAL_SETUP.md) for launcher and troubleshooting details.
 
 ## Connect real apps and a model
 
-Live mode requires additional owner configuration; running the demo command does not automatically authorize external accounts.
+**Live mode requires your own Google account authorization and a supported model login. Demo mode requires neither.**
+
+### Customer experience versus self-hosted developer setup
+
+The intended customer experience is **Connect Google → select your account → approve access**. Customers should not create Cloud projects, enable APIs, or manage OAuth client secrets. A Gather-operated OAuth application and connection service should handle that developer configuration and any required Google verification centrally.
+
+**That shared onboarding service is not included in this local prototype yet.** The instructions below are for developers self-hosting their own instance, not a finished customer signup flow. Cloning this repository does not provide access to the project's test OAuth client or anyone else's connected accounts. Never distribute a shared web-client secret in the repository or browser bundle.
+
+### Current self-hosted configuration
 
 1. Register a Google OAuth application, enable Gmail, Drive, and Calendar APIs, and designate the test user when using Testing mode.
 2. Configure `GATHER_GOOGLE_CLIENT_ID`, `GATHER_GOOGLE_CLIENT_SECRET`, and `GATHER_GOOGLE_REDIRECT_URI` securely in the server environment.
