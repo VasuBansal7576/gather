@@ -1,7 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
+import type { DatabaseSync } from "node:sqlite";
 import type { BusinessFact, SourceReference } from "../domain/contracts.ts";
 import type {
+  AgreementGroup,
+  BusinessConflict,
   CandidateConfidence,
+  ConflictRevision,
   ConfirmedFact,
   DecisionKind,
   FactScope,
@@ -11,6 +15,7 @@ import type {
   KnowledgeRevision,
   KnowledgeStorePort,
   OffersKnowledgeSnapshot,
+  WithheldFact,
 } from "./types.ts";
 
 /**
@@ -128,6 +133,13 @@ function canonical(value: unknown): string {
 export interface IntakeCandidateInput {
   businessId: string;
   key: string;
+  /**
+   * Stable account identity the observation belongs to, fixed by the host
+   * caller (never model-asserted). Canonical dedupe, supersede detection,
+   * and revision lineage are all scoped by it, so two accounts observing
+   * identical content mint separate rows instead of aliasing.
+   */
+  accountId?: string;
   /** Optional identity of the thing the fact describes (spaceId, lineId, ...). */
   subjectId?: string;
   value: Record<string, unknown>;
@@ -138,6 +150,13 @@ export interface IntakeCandidateInput {
   note?: string;
   /** Re-ingest dedupe: repeat calls with the same key return the same candidate. */
   intakeId?: string;
+  /**
+   * Hook executed inside the intake transaction after the candidate row
+   * and supersede updates, before commit. Lets a caller persist
+   * same-connection lineage atomically with intake: if the hook throws,
+   * the whole transaction rolls back and no candidate row survives.
+   */
+  atomically?: (db: DatabaseSync) => void;
 }
 
 export interface CandidateView extends KnowledgeCandidate {
@@ -161,6 +180,17 @@ export interface ConfirmResult {
   duplicate: boolean;
 }
 
+export interface ResolveConflictResult {
+  /** Owner-pinned winning revision id (exact revision, never a value match). */
+  winningRevisionId: string;
+  /** Exact active revision id set this resolution governs. */
+  consideredRevisionIds: string[];
+  /** Resolution row id (the commandId). */
+  resolutionId: string;
+  /** True when the same commandId was replayed. */
+  duplicate: boolean;
+}
+
 export class KnowledgeService {
   private readonly store: KnowledgeStorePort;
 
@@ -173,6 +203,7 @@ export class KnowledgeService {
       CREATE TABLE IF NOT EXISTS knowledge_candidates (
         id TEXT PRIMARY KEY,
         business_id TEXT NOT NULL,
+        account_id TEXT NOT NULL DEFAULT '',
         key TEXT NOT NULL,
         subject_id TEXT NOT NULL DEFAULT '',
         value_json TEXT NOT NULL,
@@ -192,6 +223,7 @@ export class KnowledgeService {
         id TEXT PRIMARY KEY,
         fact_id TEXT NOT NULL,
         business_id TEXT NOT NULL,
+        account_id TEXT NOT NULL DEFAULT '',
         key TEXT NOT NULL,
         subject_id TEXT NOT NULL DEFAULT '',
         revision INTEGER NOT NULL,
@@ -205,9 +237,6 @@ export class KnowledgeService {
         candidate_id TEXT,
         source_references_json TEXT NOT NULL
       );
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_active_revision
-        ON knowledge_revisions(business_id, key, subject_id, scope, COALESCE(scope_id, ''))
-        WHERE status = 'active';
       CREATE TABLE IF NOT EXISTS knowledge_decisions (
         command_id TEXT PRIMARY KEY,
         kind TEXT NOT NULL,
@@ -220,8 +249,53 @@ export class KnowledgeService {
       );
       CREATE INDEX IF NOT EXISTS idx_knowledge_decisions_business
         ON knowledge_decisions(business_id, created_at);
+      CREATE INDEX IF NOT EXISTS idx_knowledge_candidates_account
+        ON knowledge_candidates(business_id, account_id, key, subject_id, status);
+      CREATE TABLE IF NOT EXISTS knowledge_conflict_resolutions (
+        id TEXT PRIMARY KEY,
+        business_id TEXT NOT NULL,
+        key TEXT NOT NULL,
+        subject_id TEXT NOT NULL DEFAULT '',
+        scope TEXT NOT NULL,
+        scope_id TEXT,
+        winning_revision_id TEXT NOT NULL,
+        considered_revision_ids_json TEXT NOT NULL,
+        resolved_by TEXT NOT NULL,
+        resolved_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_knowledge_conflict_resolutions_group
+        ON knowledge_conflict_resolutions(business_id, key, subject_id, scope, COALESCE(scope_id, ''));
     `);
     });
+    // Migrate pre-account databases in place: add the columns, then replace
+    // the account-blind active-revision uniqueness with the account-scoped
+    // one (the old index would otherwise forbid two accounts holding the
+    // same key). Legacy rows read back as account ''.
+    this.ensureColumn("knowledge_candidates", "account_id", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("knowledge_revisions", "account_id", "TEXT NOT NULL DEFAULT ''");
+    this.store.db.exec("DROP INDEX IF EXISTS idx_knowledge_active_revision");
+    this.store.db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_active_revision_account
+        ON knowledge_revisions(business_id, account_id, key, subject_id, scope, COALESCE(scope_id, ''))
+        WHERE status = 'active'`);
+  }
+
+  /**
+   * The underlying database handle — the same connection intake
+   * transactions run on. Callers needing same-connection atomicity
+   * (e.g. lineage writes via `IntakeCandidateInput.atomically`) must use
+   * this handle; a different connection cannot join those transactions.
+   */
+  get database(): DatabaseSync {
+    return this.store.db;
+  }
+
+  private ensureColumn(table: string, column: string, type: string): void {
+    const info = this.store.db.prepare(`PRAGMA table_info(${table})`).all() as SqlRow[];
+    const names = new Set(info.map((entry) => String(row(entry).name)));
+    if (!names.has(column)) {
+      this.store.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+    }
   }
 
   /**
@@ -300,6 +374,10 @@ export class KnowledgeService {
       throw new KnowledgeError("invalid", "primary source reference needs a locator");
     }
     const subjectId = input.subjectId ?? "";
+    // Server-fixed account scope: the host caller pins which account the
+    // observation belongs to. Every identity check below includes it, so
+    // identical content from two accounts never aliases one row.
+    const accountId = input.accountId ?? "";
     // Canonical form (key-order insensitive) for both storage and every
     // comparison below: semantically identical values dedupe and never raise
     // spurious change flags.
@@ -314,17 +392,17 @@ export class KnowledgeService {
     let insertedId: string | undefined;
     let dedupedId: string | undefined;
     this.transact(() => {
-      // Idempotent re-ingest: same business+key+subject+locator+value. The
-      // source revision is deliberately NOT part of the identity: a revision
-      // bump with identical canonical content is a re-observation, and the
-      // stored revision advances to the newest observation.
+      // Idempotent re-ingest: same business+account+key+subject+locator+value.
+      // The source revision is deliberately NOT part of the identity: a
+      // revision bump with identical canonical content is a re-observation,
+      // and the stored revision advances to the newest observation.
       const existing = this.store.db.prepare(
-        `SELECT * FROM knowledge_candidates WHERE business_id = $businessId AND key = $key
-           AND subject_id = $subjectId AND source_locator = $locator
+        `SELECT * FROM knowledge_candidates WHERE business_id = $businessId AND account_id = $account
+           AND key = $key AND subject_id = $subjectId AND source_locator = $locator
            AND value_json = $value
            AND status IN ('pending', 'confirmed') ORDER BY ingested_at LIMIT 1`,
       ).get({
-        $businessId: business.id, $key: input.key, $subjectId: subjectId,
+        $businessId: business.id, $account: accountId, $key: input.key, $subjectId: subjectId,
         $locator: primary.locator, $value: valueJson,
       });
       if (existing) {
@@ -343,41 +421,45 @@ export class KnowledgeService {
       const ingestedAt = now();
       this.store.db.prepare(
         `INSERT INTO knowledge_candidates
-          (id, business_id, key, subject_id, value_json, confidence, source_references_json,
+          (id, business_id, account_id, key, subject_id, value_json, confidence, source_references_json,
            source_locator, source_revision, observed_at, ingested_at, status, note)
-         VALUES ($id, $businessId, $key, $subjectId, $value, $confidence, $refs,
+         VALUES ($id, $businessId, $account, $key, $subjectId, $value, $confidence, $refs,
            $locator, $revision, $observedAt, $ingestedAt, 'pending', $note)`,
       ).run({
-        $id: id, $businessId: business.id, $key: input.key, $subjectId: subjectId,
+        $id: id, $businessId: business.id, $account: accountId, $key: input.key, $subjectId: subjectId,
         $value: valueJson, $confidence: input.confidence, $refs: refsJson,
         $locator: primary.locator, $revision: input.sourceRevision ?? null,
         $observedAt: observedAt, $ingestedAt: ingestedAt, $note: input.note ?? null,
       });
-      // Changed source: prior pending candidates from the same locator for
-      // this key+subject carrying a DIFFERENT value are superseded, and
-      // confirmed revisions derived from that locator are flagged for review
-      // rather than silently updated. A revision bump with identical content
-      // is a re-observation, not a change.
+      // Changed source: prior pending candidates from the same account and
+      // locator for this key+subject carrying a DIFFERENT value are
+      // superseded, and confirmed revisions derived from that locator are
+      // flagged for review rather than silently updated. A revision bump
+      // with identical content is a re-observation, not a change.
       this.store.db.prepare(
         `UPDATE knowledge_candidates SET status = 'stale'
-           WHERE business_id = $businessId AND key = $key AND subject_id = $subjectId
+           WHERE business_id = $businessId AND account_id = $account AND key = $key AND subject_id = $subjectId
              AND source_locator = $locator AND status = 'pending' AND id != $id
              AND value_json != $value`,
       ).run({
-        $businessId: business.id, $key: input.key, $subjectId: subjectId,
+        $businessId: business.id, $account: accountId, $key: input.key, $subjectId: subjectId,
         $locator: primary.locator, $value: valueJson, $id: id,
       });
       this.store.db.prepare(
         `UPDATE knowledge_revisions SET review_state = 'review'
-           WHERE status = 'active' AND business_id = $businessId AND key = $key AND subject_id = $subjectId
+           WHERE status = 'active' AND business_id = $businessId AND account_id = $account AND key = $key AND subject_id = $subjectId
               AND candidate_id IN (
                 SELECT id FROM knowledge_candidates
-                  WHERE source_locator = $locator AND value_json != $value
+                  WHERE business_id = $businessId AND account_id = $account AND source_locator = $locator AND value_json != $value
               )`,
       ).run({
-        $businessId: business.id, $key: input.key, $subjectId: subjectId,
+        $businessId: business.id, $account: accountId, $key: input.key, $subjectId: subjectId,
         $locator: primary.locator, $value: valueJson,
       });
+      // Same-connection atomicity for caller lineage: runs inside this
+      // transaction, so a throwing hook rolls back the candidate row,
+      // the supersede updates, and any partial lineage write together.
+      if (input.atomically) input.atomically(this.store.db);
     });
     if (dedupedId !== undefined) return this.getCandidate(dedupedId);
     if (insertedId === undefined) throw new KnowledgeError("not_found", "candidate intake recorded nothing");
@@ -397,6 +479,10 @@ export class KnowledgeService {
     const candidates = rows.map((value) => this.readCandidate(row(value)));
     const pending = candidates.filter((candidate) => candidate.status === "pending");
     return candidates.map((candidate) => {
+      // Pending conflicts are business-wide: same key+subject with a
+      // different value conflicts across account lines too, so a second
+      // account's observation can never silently agree or override. Account
+      // lineage stays distinct; only the conflict link crosses accounts.
       const conflictsWith = candidate.status !== "pending" ? [] : pending
         .filter(
           (other) =>
@@ -499,7 +585,7 @@ export class KnowledgeService {
           // Always answer with the live revision pair, never by pairing the
           // candidate's original confirmedFactId with a newer unrelated
           // active revision after a correction moved the fact forward.
-          const live = this.activeRevisionFor(current.businessId, current.key, current.subjectId, "global");
+          const live = this.activeRevisionFor(current.businessId, current.accountId, current.key, current.subjectId, "global");
           if (!live) {
             throw new KnowledgeError("not_found", `confirmed candidate ${current.id} has no live revision row`);
           }
@@ -520,6 +606,7 @@ export class KnowledgeService {
         const revision = this.insertRevision({
           factId: fact.id,
           businessId: current.businessId,
+          accountId: current.accountId,
           key: current.key,
           subjectId: current.subjectId,
           value: current.value,
@@ -561,19 +648,24 @@ export class KnowledgeService {
   correctFact(input: DecisionCommand & {
     key: string;
     subjectId?: string;
+    /** Account scope of the revision line being corrected (default ''). */
+    accountId?: string;
     expectedRevision: number;
     value: Record<string, unknown>;
     sourceReferences?: SourceReference[];
   }): ConfirmResult {
     const subjectId = input.subjectId ?? "";
+    const accountId = input.accountId ?? "";
     // The fingerprint binds the effective provenance: explicit sources are
     // named, inherited sources resolve from the live revision (so an altered
-    // provenance can never replay as an identical command).
+    // provenance can never replay as an identical command). The account is
+    // part of the fingerprint so one commandId can never confirm two
+    // accounts' lines interchangeably.
     const inherited = input.sourceReferences === undefined
-      ? this.activeRevisionFor(input.businessId, input.key, subjectId, "global")?.sourceReferences ?? null
+      ? this.activeRevisionFor(input.businessId, accountId, input.key, subjectId, "global")?.sourceReferences ?? null
       : undefined;
     const fingerprint = this.requestFingerprint("correct", input, {
-      key: input.key, subjectId, expectedRevision: input.expectedRevision, value: isRecord(input.value) ? input.value : null,
+      key: input.key, subjectId, accountId, expectedRevision: input.expectedRevision, value: isRecord(input.value) ? input.value : null,
       sourceReferences: input.sourceReferences ?? inherited,
     });
     const replay = this.replayDecision(input, "correct", fingerprint);
@@ -610,7 +702,7 @@ export class KnowledgeService {
       return this.transact(() => {
         const fresh = this.requireFreshCommand(input, "correct", fingerprint);
         if (fresh) return fresh.recorded as unknown as ConfirmResult;
-        const current = this.activeRevisionFor(input.businessId, input.key, subjectId, "global");
+        const current = this.activeRevisionFor(input.businessId, accountId, input.key, subjectId, "global");
         if (!current) {
           throw new KnowledgeError("not_found", `no active confirmed fact ${input.key}/${subjectId} for ${input.businessId}`);
         }
@@ -640,6 +732,7 @@ export class KnowledgeService {
         const revision = this.insertRevision({
           factId: fact.id,
           businessId: input.businessId,
+          accountId,
           key: input.key,
           subjectId,
           revision: current.revision + 1,
@@ -663,16 +756,233 @@ export class KnowledgeService {
       if (error instanceof KnowledgeError && (error.code === "not_found" || error.code === "stale_version")) {
         // Rejection evidence is recorded outside the rolled-back
         // transaction so the audit survives the failure it describes.
-        const detail: Record<string, unknown> = { requestFingerprint: fingerprint, key: input.key, subjectId };
+        const detail: Record<string, unknown> = { requestFingerprint: fingerprint, key: input.key, subjectId, accountId };
         if (error.code === "not_found") {
           detail.reason = "not_found";
         } else {
-          const live = this.activeRevisionFor(input.businessId, input.key, subjectId, "global");
+          const live = this.activeRevisionFor(input.businessId, accountId, input.key, subjectId, "global");
           detail.reason = "stale_version";
           detail.expectedRevision = input.expectedRevision;
           detail.currentRevision = live?.revision;
         }
         this.recordDecision(input, "correct", "rejected", detail);
+      }
+      throw error;
+    }
+  }
+
+  // ---------- business-wide conflicts ----------
+
+  /**
+   * Business-wide conflict groups: active revisions for the same applicable
+   * fact (key + subject + scope) carrying different values on different
+   * account lines. Account lineage is never merged — rows stay distinct and
+   * only the comparison crosses accounts. Revisions under review (stale
+   * source) are listed for visibility but never trigger a conflict on their
+   * own; they are already withheld from consequential use.
+   */
+  listConflicts(businessId: string): BusinessConflict[] {
+    this.store.getBusiness(businessId); // throws if unknown
+    const rows = this.store.db.prepare(
+      `SELECT * FROM knowledge_revisions WHERE business_id = $b AND status = 'active'
+         ORDER BY key, subject_id, scope, COALESCE(scope_id, ''), approved_at, id`,
+    ).all({ $b: businessId });
+    const groups = new Map<string, KnowledgeRevision[]>();
+    for (const value of rows) {
+      const revision = this.readRevision(row(value));
+      const group = `${revision.key}	${revision.subjectId}	${revision.scope}	${revision.scopeId ?? ""}`;
+      const list = groups.get(group);
+      if (list) list.push(revision);
+      else groups.set(group, [revision]);
+    }
+    const conflicts: BusinessConflict[] = [];
+    for (const revisions of groups.values()) {
+      const usable = revisions.filter((revision) => revision.reviewState === "none");
+      const distinct = new Set(usable.map((revision) => canonical(revision.value)));
+      if (distinct.size < 2) continue;
+      const first = revisions[0]!;
+      const currentIds = revisions.map((revision) => revision.id).sort();
+      const governing = this.governingResolution(
+        businessId, first.key, first.subjectId, first.scope, first.scopeId, currentIds,
+      );
+      conflicts.push({
+        key: first.key,
+        subjectId: first.subjectId,
+        scope: first.scope,
+        ...(first.scopeId === undefined ? {} : { scopeId: first.scopeId }),
+        revisions: revisions.map((revision) => ({
+          revisionId: revision.id,
+          factId: revision.factId,
+          accountId: revision.accountId,
+          revision: revision.revision,
+          value: revision.value,
+          reviewState: revision.reviewState,
+          approvedBy: revision.approvedBy,
+          approvedAt: revision.approvedAt,
+        })),
+        status: governing ? "resolved" : "conflicted",
+        ...(governing ? { resolutionId: governing.id, winningRevisionId: governing.winningRevisionId } : {}),
+      });
+    }
+    return conflicts;
+  }
+
+  private governingResolution(
+    businessId: string,
+    key: string,
+    subjectId: string,
+    scope: FactScope,
+    scopeId: string | undefined,
+    currentIds: string[],
+  ): { id: string; winningRevisionId: string } | null {
+    const rows = this.store.db.prepare(
+      `SELECT * FROM knowledge_conflict_resolutions
+         WHERE business_id = $b AND key = $k AND subject_id = $s
+           AND scope = $scope AND COALESCE(scope_id, '') = $scopeId
+         ORDER BY rowid DESC`,
+    ).all({ $b: businessId, $k: key, $s: subjectId, $scope: scope, $scopeId: scopeId ?? "" });
+    const wanted = [...currentIds].sort().join(",");
+    for (const value of rows) {
+      const item = row(value);
+      const considered = parseJson<string[]>(item.considered_revision_ids_json, []);
+      if ([...considered].sort().join(",") !== wanted) continue;
+      const winner = String(item.winning_revision_id);
+      if (!currentIds.includes(winner)) continue;
+      return { id: String(item.id), winningRevisionId: winner };
+    }
+    return null;
+  }
+
+  /**
+   * Owner-only conflict resolution pinned to exact revisions: the winner is
+   * a revision id, never a value match, and the resolution governs exactly
+   * the commanded revision set — the exact ids the owner reviewed, carried
+   * on the command. The submitted set must equal the active applicable set
+   * atomically inside the write transaction: a new rival, a missing rival,
+   * a revision change, or a newly stale source since the owner's review
+   * rejects the command as stale instead of silently resolving an unseen
+   * conflict. Any later correction mints a new revision id, the set
+   * changes, and the conflict reopens — nothing silently carries forward.
+   * Losing lines keep their rows and lineage; they are withheld from offer
+   * preparation, never erased or merged. Resolution synthesizes nothing, so
+   * unknown costs can never gain a profit figure and scoped exceptions keep
+   * their commanded scope.
+   */
+  resolveConflict(
+    input: DecisionCommand & {
+      key: string;
+      subjectId?: string;
+      scope?: FactScope;
+      scopeId?: string;
+      winningRevisionId: string;
+      consideredRevisionIds: string[];
+    },
+  ): ResolveConflictResult {
+    const subjectId = input.subjectId ?? "";
+    const scope = input.scope ?? "global";
+    const scopeId = input.scopeId;
+    const commanded = Array.isArray(input.consideredRevisionIds)
+      ? [...input.consideredRevisionIds].sort()
+      : [];
+    const fingerprint = this.requestFingerprint("resolve_conflict", input, {
+      key: input.key, subjectId, scope, scopeId: scopeId ?? null, winningRevisionId: input.winningRevisionId,
+      consideredRevisionIds: commanded,
+    });
+    const replay = this.replayDecision(input, "resolve_conflict", fingerprint);
+    if (replay) {
+      return { ...(replay as ResolveConflictResult), duplicate: true };
+    }
+    this.assertAuthority(input, "resolve_conflict", { key: input.key, subjectId });
+    const rejectInvalid = (reason: string): never => {
+      this.recordDecision(input, "resolve_conflict", "rejected", {
+        requestFingerprint: fingerprint, reason, key: input.key, subjectId,
+      });
+      throw new KnowledgeError("invalid", reason);
+    };
+    if (!KNOWN_FACT_KEYS.has(input.key)) {
+      rejectInvalid(`key "${input.key}" is outside the booking-business fact vocabulary`);
+    }
+    if (!isNonEmptyString(input.winningRevisionId)) {
+      rejectInvalid("resolution requires an exact winningRevisionId; values are never matched");
+    }
+    if (
+      !Array.isArray(input.consideredRevisionIds) ||
+      input.consideredRevisionIds.length === 0 ||
+      !input.consideredRevisionIds.every(isNonEmptyString) ||
+      new Set(input.consideredRevisionIds).size !== input.consideredRevisionIds.length
+    ) {
+      rejectInvalid("resolution requires the exact non-empty unique consideredRevisionIds shown to the owner");
+    }
+    if (!commanded.includes(input.winningRevisionId)) {
+      rejectInvalid("winningRevisionId must be a member of the commanded consideredRevisionIds");
+    }
+    try {
+      return this.transact(() => {
+        const fresh = this.requireFreshCommand(input, "resolve_conflict", fingerprint);
+        if (fresh) return { ...(fresh.recorded as unknown as ResolveConflictResult), duplicate: true };
+        const group = this.store.db.prepare(
+          `SELECT * FROM knowledge_revisions WHERE business_id = $b AND key = $k AND subject_id = $s
+             AND scope = $scope AND COALESCE(scope_id, '') = $scopeId AND status = 'active'
+             ORDER BY approved_at, id`,
+        ).all({ $b: input.businessId, $k: input.key, $s: subjectId, $scope: scope, $scopeId: scopeId ?? "" })
+          .map((value) => this.readRevision(row(value)));
+        const active = group.map((revision) => revision.id).sort();
+        const winner = group.find((revision) => revision.id === input.winningRevisionId) ?? null;
+        if (!winner) {
+          throw new KnowledgeError("not_found", `winning revision ${input.winningRevisionId} is not an active revision of ${input.key}/${subjectId}`);
+        }
+        if (active.join(",") !== commanded.join(",")) {
+          throw new KnowledgeError(
+            "stale",
+            `conflict revision set changed since owner review for ${input.key}/${subjectId}: owner considered [${commanded.join(", ")}], active set is [${active.join(", ")}]; re-review before resolving`,
+          );
+        }
+        const staleSource = group.find((revision) => revision.reviewState !== "none") ?? null;
+        if (staleSource) {
+          throw new KnowledgeError(
+            "stale",
+            `revision ${staleSource.id} is under review (stale source) since owner review; reconfirm it before resolving ${input.key}/${subjectId}`,
+          );
+        }
+        const usable = group.filter((revision) => revision.reviewState === "none");
+        if (new Set(usable.map((revision) => canonical(revision.value))).size < 2) {
+          throw new KnowledgeError("invalid", `no cross-account value conflict to resolve for ${input.key}/${subjectId}`);
+        }
+        const considered = commanded;
+        const resolutionId = input.commandId ?? `kd_${createHash("sha256").update(canonical({ kind: "resolve_conflict", at: randomUUID() })).digest("hex").slice(0, 24)}`;
+        this.store.db.prepare(
+          `INSERT INTO knowledge_conflict_resolutions
+             (id, business_id, key, subject_id, scope, scope_id, winning_revision_id,
+              considered_revision_ids_json, resolved_by, resolved_at)
+           VALUES ($id, $b, $k, $s, $scope, $scopeId, $winner, $considered, $by, $at)`,
+        ).run({
+          $id: resolutionId, $b: input.businessId, $k: input.key, $s: subjectId,
+          $scope: scope, $scopeId: scopeId ?? null, $winner: winner.id,
+          $considered: JSON.stringify(considered), $by: input.actor.id, $at: now(),
+        });
+        const result: ResolveConflictResult = {
+          winningRevisionId: winner.id,
+          consideredRevisionIds: considered,
+          resolutionId,
+          duplicate: false,
+        };
+        this.recordDecision(input, "resolve_conflict", "applied", {
+          requestFingerprint: fingerprint,
+          key: input.key,
+          subjectId,
+          scope,
+          scopeId: scopeId ?? null,
+          winningRevisionId: winner.id,
+          consideredRevisionIds: considered,
+          result,
+        });
+        return result;
+      });
+    } catch (error) {
+      if (error instanceof KnowledgeError && (error.code === "not_found" || error.code === "invalid" || error.code === "stale")) {
+        this.recordDecision(input, "resolve_conflict", "rejected", {
+          requestFingerprint: fingerprint, reason: error.code, key: input.key, subjectId,
+        });
       }
       throw error;
     }
@@ -790,6 +1100,7 @@ export class KnowledgeService {
         const revision = this.insertRevision({
           factId: fact.id,
           businessId: input.businessId,
+          accountId: "",
           key: "scoped_exception",
           subjectId,
           value,
@@ -832,7 +1143,7 @@ export class KnowledgeService {
     return rows.map((value) => {
       const revision = this.readRevision(row(value));
       const fact = this.getFact(revision.factId);
-      return { ...fact, revision: revision.revision, subjectId: revision.subjectId, scope: revision.scope, scopeId: revision.scopeId, reviewState: revision.reviewState };
+      return { ...fact, revision: revision.revision, accountId: revision.accountId, subjectId: revision.subjectId, scope: revision.scope, scopeId: revision.scopeId, reviewState: revision.reviewState };
     });
   }
 
@@ -867,8 +1178,83 @@ export class KnowledgeService {
   snapshotForOffers(businessId: string): OffersKnowledgeSnapshot {
     const business = this.store.getBusiness(businessId);
     const confirmed = this.listFacts(businessId);
+    const withheld: WithheldFact[] = confirmed
+      .filter((fact) => fact.reviewState !== "none")
+      .map((fact) => ({
+        factId: fact.id,
+        key: fact.key,
+        subjectId: fact.subjectId,
+        reason: "source changed since owner confirmation; reconfirm via correctFact or by confirming the updated candidate",
+      }));
+    const reviewIds = new Set(withheld.map((fact) => fact.factId));
     const current = confirmed.filter((fact) => fact.reviewState === "none" && KNOWN_FACT_KEYS.has(fact.key));
-    const withheld = confirmed.filter((fact) => fact.reviewState !== "none");
+    // Business-wide conflicts: unresolved groups withhold every involved
+    // consequential fact until an owner resolution pins an exact winning
+    // revision; a resolved group contributes the winner only. Withholding
+    // is by fact id — losing account lines keep their rows and lineage.
+    const kept = new Set(current.map((fact) => fact.id));
+    for (const conflict of this.listConflicts(businessId)) {
+      if (conflict.status === "resolved" && conflict.winningRevisionId) {
+        const winner = conflict.revisions.find((revision) => revision.revisionId === conflict.winningRevisionId)!;
+        for (const revision of conflict.revisions) {
+          if (revision.factId === winner.factId || revision.reviewState !== "none") continue;
+          kept.delete(revision.factId);
+          withheld.push({
+            factId: revision.factId,
+            key: conflict.key,
+            subjectId: conflict.subjectId,
+            reason: `cross-account conflict resolved in favor of revision ${winner.revisionId} (account ${winner.accountId}); resolution ${conflict.resolutionId}`,
+          });
+        }
+      } else {
+        const rivals = conflict.revisions.filter((revision) => revision.reviewState === "none");
+        for (const revision of rivals) {
+          kept.delete(revision.factId);
+          withheld.push({
+            factId: revision.factId,
+            key: conflict.key,
+            subjectId: conflict.subjectId,
+            reason: `unresolved cross-account conflict across revisions ${rivals.map((other) => `${other.revisionId}(account ${other.accountId})`).join(", ")}; owner resolution required`,
+          });
+        }
+      }
+    }
+    // Agreement dedupes presentation only: identical values across account
+    // lines appear once, while every line's revision row (provenance) stays
+    // readable via listFacts/listConflicts.
+    const agreements: AgreementGroup[] = [];
+    const eligible = current.filter((fact) => kept.has(fact.id));
+    const scopeByFactId = new Map(eligible.map((fact) => [fact.id, fact.scope]));
+    const presentation: BusinessFact[] = [];
+    const byGroup = new Map<string, ConfirmedFact[]>();
+    for (const fact of eligible) {
+      const group = `${fact.key}	${fact.subjectId}	${fact.scope}	${fact.scopeId ?? ""}`;
+      const list = byGroup.get(group);
+      if (list) list.push(fact);
+      else byGroup.set(group, [fact]);
+    }
+    const strip = ({ revision: _r, accountId: _a, subjectId: _j, scope: _s, scopeId: _i, reviewState: _v, ...fact }: ConfirmedFact): BusinessFact => fact;
+    for (const group of byGroup.values()) {
+      const byValue = new Map<string, ConfirmedFact[]>();
+      for (const fact of group) {
+        const digest = canonical(fact.value);
+        const list = byValue.get(digest);
+        if (list) list.push(fact);
+        else byValue.set(digest, [fact]);
+      }
+      for (const same of byValue.values()) {
+        same.sort((left, right) => (left.id < right.id ? -1 : left.id > right.id ? 1 : 0));
+        presentation.push(strip(same[0]!));
+        if (same.length > 1) {
+          agreements.push({
+            key: same[0]!.key,
+            subjectId: same[0]!.subjectId,
+            keptFactId: same[0]!.id,
+            agreedFactIds: same.slice(1).map((fact) => fact.id),
+          });
+        }
+      }
+    }
     const businessFact: BusinessFact = {
       id: `gather:business:${business.id}`,
       businessId: business.id,
@@ -884,15 +1270,13 @@ export class KnowledgeService {
       businessId: business.id,
       timezone: business.timezone,
       generatedAt: now(),
-      facts: [businessFact, ...current.map(({ revision: _r, subjectId: _j, scope: _s, scopeId: _i, reviewState: _v, ...fact }) => fact)],
-      reviewFactIds: withheld.map((fact) => fact.id),
-      withheld: withheld.map((fact) => ({
-        factId: fact.id,
-        key: fact.key,
-        subjectId: fact.subjectId,
-        reason: "source changed since owner confirmation; reconfirm via correctFact or by confirming the updated candidate",
-      })),
-      scopedFactCount: current.filter((fact) => fact.scope !== "global").length,
+      facts: [businessFact, ...presentation],
+      // Compatibility: reviewFactIds names review-withheld facts only;
+      // conflict withholding is explicit in `withheld` with its own reasons.
+      reviewFactIds: [...reviewIds],
+      withheld,
+      scopedFactCount: presentation.filter((fact) => scopeByFactId.get(fact.id) !== "global").length,
+      agreements,
     };
   }
 
@@ -921,22 +1305,24 @@ export class KnowledgeService {
 
   private activeRevisionFor(
     businessId: string,
+    accountId: string,
     key: string,
     subjectId: string,
     scope: FactScope,
     scopeId?: string,
   ): KnowledgeRevision | null {
     const found = this.store.db.prepare(
-      `SELECT * FROM knowledge_revisions WHERE business_id = $b AND key = $k AND subject_id = $s
+      `SELECT * FROM knowledge_revisions WHERE business_id = $b AND account_id = $account AND key = $k AND subject_id = $s
          AND scope = $scope AND COALESCE(scope_id, '') = $scopeId AND status = 'active'
          ORDER BY revision DESC LIMIT 1`,
-    ).get({ $b: businessId, $k: key, $s: subjectId, $scope: scope, $scopeId: scopeId ?? "" });
+    ).get({ $b: businessId, $account: accountId, $k: key, $s: subjectId, $scope: scope, $scopeId: scopeId ?? "" });
     return found ? this.readRevision(row(found)) : null;
   }
 
   private insertRevision(input: {
     factId: string;
     businessId: string;
+    accountId: string;
     key: string;
     subjectId: string;
     revision?: number;
@@ -948,7 +1334,7 @@ export class KnowledgeService {
     candidateId?: string;
     sourceReferences: SourceReference[];
   }): KnowledgeRevision {
-    const prior = this.activeRevisionFor(input.businessId, input.key, input.subjectId, input.scope, input.scopeId);
+    const prior = this.activeRevisionFor(input.businessId, input.accountId, input.key, input.subjectId, input.scope, input.scopeId);
     const revision = input.revision ?? (prior ? prior.revision + 1 : 1);
     if (prior) {
       this.store.db.prepare("UPDATE knowledge_revisions SET status = 'superseded' WHERE id = $id").run({ $id: prior.id });
@@ -956,12 +1342,12 @@ export class KnowledgeService {
     const id = `kr_${randomUUID()}`;
     this.store.db.prepare(
       `INSERT INTO knowledge_revisions
-        (id, fact_id, business_id, key, subject_id, revision, value_json, scope, scope_id,
+        (id, fact_id, business_id, account_id, key, subject_id, revision, value_json, scope, scope_id,
          status, review_state, approved_by, approved_at, candidate_id, source_references_json)
-       VALUES ($id, $factId, $businessId, $key, $subjectId, $revision, $value, $scope, $scopeId,
+       VALUES ($id, $factId, $businessId, $account, $key, $subjectId, $revision, $value, $scope, $scopeId,
          'active', 'none', $approvedBy, $approvedAt, $candidateId, $refs)`,
     ).run({
-      $id: id, $factId: input.factId, $businessId: input.businessId, $key: input.key,
+      $id: id, $factId: input.factId, $businessId: input.businessId, $account: input.accountId, $key: input.key,
       $subjectId: input.subjectId, $revision: revision, $value: JSON.stringify(input.value),
       $scope: input.scope, $scopeId: input.scopeId ?? null, $approvedBy: input.approvedBy,
       $approvedAt: input.approvedAt, $candidateId: input.candidateId ?? null,
@@ -1121,6 +1507,7 @@ export class KnowledgeService {
     return {
       id: String(item.id),
       businessId: String(item.business_id),
+      accountId: item.account_id == null ? "" : String(item.account_id),
       key: String(item.key),
       subjectId: String(item.subject_id ?? ""),
       value: parseJson(item.value_json, {}),
@@ -1140,6 +1527,7 @@ export class KnowledgeService {
       id: String(item.id),
       factId: String(item.fact_id),
       businessId: String(item.business_id),
+      accountId: item.account_id == null ? "" : String(item.account_id),
       key: String(item.key),
       subjectId: String(item.subject_id ?? ""),
       revision: Number(item.revision),

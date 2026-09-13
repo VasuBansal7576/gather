@@ -6,11 +6,15 @@ export {
   type CandidateView,
   type DecisionCommand,
   type ConfirmResult,
+  type ResolveConflictResult,
 } from "./service.ts";
 export type {
   KnowledgeStorePort,
+  AgreementGroup,
+  BusinessConflict,
   CandidateConfidence,
   CandidateStatus,
+  ConflictRevision,
   FactScope,
   KnowledgeActor,
   KnowledgeActorKind,
