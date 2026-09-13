@@ -25,8 +25,8 @@ This count describes the local application milestone only, not completion of the
 - [x] Connector fixtures cover provenance, unavailable dates, idempotency, and timeout reconciliation.
 - [x] Local launcher and doctor scripts are present and do not install packages or touch external runtimes.
 - [x] `npm ci` completes without credentials or network provider setup.
-- [x] Storage, connector, approval, recovery, and runtime checks were exercised: the combined run passed 116/117, and the single failed doctor check passed a targeted retest with its threshold unchanged.
-  The timeout remains documented below; this is not a claim of a single green 117-test run.
+- [x] Storage, connector, approval, recovery, offers, and runtime checks pass in one combined 158-test run on `1fbbb754`.
+  The earlier doctor timeout under concurrent load remains documented below.
 - [x] `npm run typecheck` passes.
 - [x] `npm run build` passes.
 - [x] Doctor passes with Node 26.8.2, installed dependencies, supported scripts, and a project-local writable `.runtime` directory.
@@ -40,7 +40,7 @@ This count describes the local application milestone only, not completion of the
 
 Foundation commit `b9844b6` was integrated as `06798e9`, and packaging commit `bcd0a8d` was integrated as `aefd08a`.
 
-The current 55-test suite, type checking, and production build passed on integrated `ef5e7c9` on 14 September 2026 in the owner's timezone.
+The then-current 55-test suite, type checking, and production build passed on integrated `ef5e7c9` on 14 September 2026 in the owner's timezone.
 Chief also independently reran the 55-test suite on that commit.
 
 The incoming orchestrator independently verified that `main` and the remote `origin/main` both point to `f137a4401ae52fbc0ba36b104653d704caabd829` after the authorized handover.
@@ -96,6 +96,9 @@ Ten completed review, failed-launch, runtime, and inherited milestone worktrees 
 Original foundation, interface, connector-contract, and packaging commits remain preserved by local branch references; integrated review commits remain reachable on remote main.
 Active execution worktrees and unrelated work were preserved.
 
-The current dependency audit reports three vulnerable package entries: Next through PostCSS, PostCSS, and sharp.
-These are existing framework dependencies, not new OpenClaw dependencies.
-Their remediation is pending a scoped compatibility review; no forced major framework upgrade has been applied.
+Dependency remediation `64bb96e` was integrated as `1fbbb754` after compatibility review.
+PostCSS is pinned to 8.5.23 and sharp resolves to 0.35.4 within the existing framework dependency range.
+Astra independently ran a clean install, an audit with zero reported vulnerabilities, CSS and image-processing smoke checks, all 158 tests, type checking, and the production build successfully.
+The combined run included both actual isolated runtime checks; this later success does not erase the earlier observed doctor timeout under concurrent load.
+No major framework upgrade was applied.
+See [dependency evidence](DEPENDENCIES.md) for the exact scope and limitations.
