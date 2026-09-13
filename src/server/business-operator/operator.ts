@@ -493,19 +493,21 @@ function validatedOfferSnapshot(primary: OfferPreparationResult["offers"][number
   if (!Array.isArray(primary.lines) || primary.lines.length === 0) fail("at least one priced line is required");
   if (!nonEmptyString(primary.currency)) fail("currency is required");
   if (!nonEmptyString(primary.spaceId) || !nonEmptyString(primary.spaceName)) fail("space identity is required");
-  if (typeof primary.guestCount !== "number" || !Number.isInteger(primary.guestCount) || primary.guestCount < 0) {
-    fail("guestCount must be a non-negative integer");
+  if (typeof primary.guestCount !== "number" || !Number.isSafeInteger(primary.guestCount) || primary.guestCount < 0) {
+    fail("guestCount must be a non-negative safe integer");
   }
   if (!Array.isArray(primary.consequences) || primary.consequences.length === 0) fail("consequences are required");
   if (!Array.isArray(primary.unknownCostIds) || !Array.isArray(primary.unknownPriceIds)) {
     fail("unknown-cost honesty lists are required");
   }
-  if (primary.totalCents !== null && (typeof primary.totalCents !== "number" || !Number.isInteger(primary.totalCents) || primary.totalCents < 0)) {
-    fail("totalCents must be a non-negative integer or null");
+  if (primary.totalCents !== null && (typeof primary.totalCents !== "number" || !Number.isSafeInteger(primary.totalCents) || primary.totalCents < 0)) {
+    fail("totalCents must be a non-negative safe integer or null");
   }
-  if (primary.depositCents !== null && (typeof primary.depositCents !== "number" || !Number.isInteger(primary.depositCents) || primary.depositCents < 0)) {
-    fail("depositCents must be a non-negative integer or null");
+  if (primary.depositCents !== null && (typeof primary.depositCents !== "number" || !Number.isSafeInteger(primary.depositCents) || primary.depositCents < 0)) {
+    fail("depositCents must be a non-negative safe integer or null");
   }
+  if (!nonEmptyString(primary.fingerprint)) fail("primary fingerprint is required");
+  if (!Array.isArray(primary.sources) || primary.sources.length === 0) fail("at least one source reference is required");
   return {
     offerId: primary.offerId,
     version: primary.version,
@@ -524,6 +526,10 @@ function validatedOfferSnapshot(primary: OfferPreparationResult["offers"][number
     unknownPriceIds: [...primary.unknownPriceIds],
     profitabilityClaimed: primary.profitabilityClaimed,
     consequences: [...primary.consequences],
+    sources: structuredClone(primary.sources),
+    fingerprint: primary.fingerprint,
+    ...(primary.supersedesFingerprint === undefined ? {} : { supersedesFingerprint: primary.supersedesFingerprint }),
+    ...(primary.note === undefined ? {} : { note: primary.note }),
   };
 }
 
