@@ -17,6 +17,7 @@ export { GoogleCalendarConnector, googleEventIdFor, type GoogleCalendarOptions, 
 export { GoogleGmailConnector, gmailMessageIdFor, escapeGmailQuery, type GoogleGmailOptions, type SentExpectation, type SentExpectationResolver } from "./gmail.ts";
 export { GoogleDocumentRetriever, DEFAULT_DOCUMENT_BYTE_CAP, type GoogleDocumentsOptions } from "./documents.ts";
 export { GmailInboxPoller, encodeCursor, resolveHistoryLabelScope, resolvePollScope, type GmailInboxPollerOptions, type InboxChange, type InboxDelta, type PollScope, type PollInboxOptions } from "./incremental.ts";
+export { GoogleCalendarHoldReleaseConnector, type GoogleHoldReleaseOptions } from "./hold-release.ts";
 
 export interface GoogleConnectorSet {
   calendar: GoogleCalendarConnector;
