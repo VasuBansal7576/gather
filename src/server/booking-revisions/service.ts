@@ -369,28 +369,36 @@ export function requestCancellation(
   const outcome = runCommand(lifecycle, "cancellation_request", booking.id, binding.commandId,
     { kind: "cancellation_request", binding, note },
     () => {
-      const state = lifecycle.getLifecycle(booking.id);
-      if (state.cancelState !== "none") {
-        // A later command id on an already-requested booking is a
-        // read-only acknowledgement, never a duplicate invalidation.
-        const response: CancellationRequestResponse = {
-          commandId: binding.commandId, status: "already_requested", booking: store.getBooking(booking.id),
-          cancelState: state.cancelState, invalidatedApprovals: 0,
-          note: "Cancellation was already requested; no further authority was invalidated and due work stays stopped.",
-        };
-        return { status: "succeeded", response: response as unknown as Record<string, unknown> };
+      // Atomic acquisition first: refused when paused, acknowledged when a
+      // previous request stands. The losing side of a pause/request race
+      // refuses here instead of wedging a requested+paused row.
+      const acquired = lifecycle.acquireCancelRequest(booking.id, binding.commandId);
+      if (acquired === "refused-paused") {
+        throw new ServiceError("BOOKING_PAUSED", "Booking is paused by owner control; resume before requesting cancellation", true);
       }
-      // Authority dies at request time: lifecycle first, then approvals,
-      // then due work — each step idempotent so a crash between them replays
-      // safely under the same command id. The booking status is deliberately
-      // NOT set here: requested is local, verified is external.
-      lifecycle.setCancelState(booking.id, "requested", binding.commandId);
+      // Authority dies at request time: approvals, then due work — each
+      // step idempotent so a crash between them (or an "already" replay
+      // whose side effects never ran) completes safely under any command
+      // id. The booking status is deliberately NOT set here: requested is
+      // local, verified is external.
       const invalidated = store.invalidateApprovalsForBooking(booking.id);
       const ledgerResult = ledgerOf(deps).applyOwnerControl({
         dedupeKey: binding.commandId, kind: "cancel", bookingId: booking.id, attestedBy: deps.ownerId,
         ...(note === undefined ? {} : { note }),
       });
       void ledgerResult;
+      if (acquired === "already") {
+        // A later command id on an already-requested booking is a
+        // read-only acknowledgement once side effects are ensured above —
+        // never a duplicate invalidation.
+        const existing = lifecycle.getLifecycle(booking.id).cancelState;
+        const response: CancellationRequestResponse = {
+          commandId: binding.commandId, status: "already_requested", booking: store.getBooking(booking.id),
+          cancelState: existing === "none" ? "requested" : existing, invalidatedApprovals: 0,
+          note: "Cancellation was already requested; no further authority was invalidated and due work stays stopped.",
+        };
+        return { status: "succeeded", response: response as unknown as Record<string, unknown> };
+      }
       const response: CancellationRequestResponse = {
         commandId: binding.commandId, status: "request_received", booking: store.getBooking(booking.id),
         cancelState: "requested", invalidatedApprovals: invalidated,
@@ -620,14 +628,19 @@ export function pauseBooking(deps: RevisionsDeps, binding: RevisionBinding, note
   const outcome = runCommand(lifecycle, "pause", booking.id, binding.commandId,
     { kind: "pause", binding, note },
     () => {
-      // Ledger first (stops due work), then the local flag (blocks new
-      // writes): a crash between them replays safely under the same command
-      // id, and already-executed receipts are never rewritten.
+      // Atomic acquisition first: refused when cancellation was requested
+      // (the losing side of a pause/request race refuses here instead of
+      // wedging). Then the ledger stops due work; already-executed receipts
+      // are never rewritten. A crash between the flag and the ledger
+      // replays safely: the flag re-acquires idempotently and the ledger
+      // dedupes on the command id.
+      if (lifecycle.acquirePause(booking.id) === "refused-cancelled") {
+        throw new ServiceError("INVALID_REQUEST", "Booking cancellation is already requested; pausing a cancellation-terminal booking is refused — verify cancellation instead", false);
+      }
       ledgerOf(deps).applyOwnerControl({
         dedupeKey: binding.commandId, kind: "pause", bookingId: booking.id, attestedBy: deps.ownerId,
         ...(note === undefined ? {} : { note }),
       });
-      lifecycle.setPaused(booking.id, true);
       const response: PauseResponse = {
         commandId: binding.commandId, status: "paused", booking: store.getBooking(booking.id), paused: true,
         note: "Booking paused: due work stopped and new writes refused. Already-executed steps keep their exact receipts.",
@@ -641,8 +654,34 @@ export function resumeBooking(deps: RevisionsDeps, binding: RevisionBinding, not
   const { store } = deps;
   const lifecycle = new RevisionLifecycleStore(store);
   const { booking } = requireRevisionBinding(store, binding);
-  if (booking.status === "cancelled" || lifecycle.getLifecycle(booking.id).cancelState !== "none") {
+  const state = lifecycle.getLifecycle(booking.id);
+  if (booking.status === "cancelled" || state.cancelState === "verified") {
     throw new ServiceError("INVALID_REQUEST", "Booking cancellation is terminal; resume is refused", false);
+  }
+  if (state.cancelState === "requested") {
+    // Explicit owner recovery for requested+paused rows (old stranded rows
+    // or a pause/request race loser): clear the pause flag ONLY. The ledger
+    // is untouched (its cancel control stays terminal, so due work stays
+    // suppressed), approvals stay invalidated, the booking status is
+    // unchanged, and new writes stay refused via the requested state — this
+    // resumes nothing except the ability to verify cancellation next. There
+    // is no automatic business or model-action resume anywhere on this path.
+    const outcome = runCommand(lifecycle, "resume", booking.id, binding.commandId,
+      { kind: "resume", binding, note },
+      () => {
+        const cleared = lifecycle.clearPauseForCancelRecovery(booking.id);
+        if (cleared === "refused") {
+          throw new ServiceError("INVALID_REQUEST", "Booking is not in a recoverable requested state", false);
+        }
+        const response: PauseResponse = {
+          commandId: binding.commandId, status: "resumed", booking: store.getBooking(booking.id), paused: false,
+          note: cleared === "cleared"
+            ? "Pause cleared on a cancellation-requested booking: due work stays stopped, authority stays invalidated, and new writes stay refused — verify cancellation next to finish the actual release."
+            : "Booking was already unpaused with cancellation still requested: due work stays stopped — verify cancellation next.",
+        };
+        return { status: "succeeded", response: response as unknown as Record<string, unknown> };
+      });
+    return outcome as unknown as PauseResponse;
   }
   const outcome = runCommand(lifecycle, "resume", booking.id, binding.commandId,
     { kind: "resume", binding, note },
