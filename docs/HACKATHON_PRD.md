@@ -133,3 +133,98 @@ Not required for this release: subscription billing, comprehensive employee/mult
 | Submission | Runnable instructions, demo and event-specific technology/reuse requirements verified |
 
 Maintain separate Planned, Implemented, Locally tested and Live verified statuses. A build, screenshot, test count or worker report alone is not product completion. This PRD introduces requirements; Composio migration and hosted onboarding must not be reported complete until those gates pass.
+
+## 11. Hackathon-specific requirements and submission configurations
+
+Research snapshot: September 14, 2026. These are candidate submissions, not completed eligibility determinations. Recheck linked primary rules before entry. All deadlines below are IST unless explicitly stated. AWS Agents for Humans is excluded by project-owner decision.
+
+### AI Builders Hackathon
+
+- Deadline: September 16, 2026, 08:30 IST (September 15, 23:00 EDT).
+- Mandatory theme: AI, agentic AI or intelligent systems. No mandatory vendor identified in published rules.
+- Gather configuration: shared booking engine, OpenClaw, Composio connections and self-fixing journey; no extra sponsor adapter needed.
+- Required materials: public source repository, project description, demo video (3–5 minutes recommended), documentation and team details.
+- Eligibility gate: submitted work must have been created during the event window beginning August 21. Audit actual development history; a recent push does not establish eligibility. Existing-project reuse is not explicitly authorized.
+- Source: https://ai-builders-hackathon-2026.devpost.com/rules
+
+### NextStep Hacks
+
+- Deadline: September 21, 2026, 02:30 IST (September 20, 17:00 EDT).
+- No mandatory vendor identified. Use the same core Gather configuration.
+- Participants must be ages 13–24 as of August 21, 2026; teams up to five. Candidate age eligibility remains to be confirmed.
+- Product must be built within the specified event time frame. Existing-project permission and full build-window applicability remain unresolved.
+- Required materials include a Devpost project page and 3–5 minute demonstration video.
+- Source: https://nextstep2026.devpost.com/rules
+
+### OpenServ SERV Edition 01
+
+- Deadline: September 28, 2026, 05:30 IST (00:00 UTC).
+- Mandatory: meaningful SERV Reasoning usage and enabled organization data collection.
+- Gather configuration: a separately selected SERV Reasoning adapter used for a real booking task; preserve Gather's approval/execution boundary and OpenClaw runtime. Do not add an unused sponsor call.
+- Use fictional test-business data for the demonstration. Verify processing terms and account isolation before connecting real customer information.
+- Required outcome: new, working and demoable agent/workflow/product. Existing-project reuse is not explicit and remains an eligibility blocker to resolve.
+- Awards are SERV tokens and USDC, not an equivalent advertised cash total. No application fee stated; initial API credit is limited and usage budgets require verification.
+- Source: https://www.openserv.ai/hackathon
+
+### AssemblyAI Voice Agent Hackathon
+
+- Event runs September 1–30, 2026; exact final cutoff/timezone remains unresolved.
+- Mandatory: AssemblyAI usage in a voice-agent project.
+- Gather configuration: voice inquiry intake connected to the same qualification, evidence, approval and booking engine. Show actual voice processing and downstream booking work, not a text-only demonstration.
+- Existing-project permission and detailed final submission checklist must be verified before committing to entry. Worldwide online participation is advertised.
+- Source: https://lablab.ai/ai-hackathons/assemblyai-voice-agent-hackathon
+
+### ForgeHacks Online
+
+- Event: October 3–10, 2026. Rules state October 10 at 12:00 PM EST; confirm whether this means fixed EST or local Eastern daylight time before converting the deadline.
+- Current students worldwide, teams of 1–4, minimum age/consent requirements apply. Confirm participant eligibility.
+- No mandatory vendor identified; use Gather's shared engine with meaningful new work during this window.
+- Projects must be substantially created during the event. The rules conditionally permit pre-existing projects when additions during the event are clearly stated; this is not permission for an unchanged resubmission.
+- Make code viewable to judges, list all team members and retain a baseline/change log. Verify the final submission form's required materials.
+- Source: https://forgehacks-2026.devpost.com/rules
+
+### Amazon Build, Ship, Shape
+
+- Deadline: October 24, 2026, 00:30 IST (October 23, 12:00 PDT).
+- Selected candidate primary track: Alexa+. Build a working Agent Skill, a self-hosted MCP server implementing spec 2025-11-25 or a subsequently accepted version over Streamable HTTP, OR a simulated Alexa+ experience using the entrant's own AI/agentic tools. The simulation alternative does not require a specific framework, SDK or MCP interface.
+- Gather configuration: owner-facing agent interaction that operates the existing booking engine. Show meaningful cross-service actions and persistent context; generic AWS usage alone is not a primary-track submission.
+- Existing projects require significant updates during the submission period beginning August 31. Describe and demonstrate those updates.
+- Required materials include public licensed source, a working demonstration, track selection and product feedback describing actual technology usage. Recheck exact demo limits and repository conditions before submission.
+- AWS Builder and Open Source mini challenges are optional additions, not substitutes for a primary track; do not add unrelated infrastructure solely for an optional award.
+- Source: https://amazonappdev2026.devpost.com/rules
+
+### Nebius × NVIDIA Global AI Hackathon
+
+- Deadline: October 30, 2026, 22:30 IST (10:00 PDT).
+- Mandatory: run on Nebius Token Factory or Nebius AI Cloud and use an NVIDIA open-source model. Candidate track: Best Apps and Agents, using Nemotron on Nebius as specified by the track.
+- Gather configuration: genuine booking reasoning through the Nebius model adapter. A qualifying Token Factory inference call can satisfy the runtime route; deploying the whole website on Nebius is not universally required.
+- Existing projects require significant updates during the submission window beginning August 26, explained in the submission.
+- Required: public open-source-licensed repository containing all necessary source/assets/run instructions, working demo or test build, project description, technology feedback and a public demonstration video under three minutes. A private essential dependency must not prevent the submitted project from meeting these requirements.
+- City-specific awards require attendance; do not assume remote participation qualifies for those awards. Overall eligibility has separate terms.
+- Source: https://nebiusglobalaihackathon.devpost.com/rules
+
+### Waycode Founding 100 — builder challenge
+
+- Event: October 22–November 6, 2026; deadline November 6, 23:59 IST.
+- Solo online challenge for students and independent builders in India.
+- Existing projects explicitly welcome, with meaningful development and inspectable proof during the challenge.
+- No universal sponsor technology requirement identified. A sponsor-specific award such as Best Use of Render requires the relevant technology for that award only.
+- Gather configuration: shared product, with a documented baseline and challenge-period improvements. Provide inspectable demo/repository/build-log evidence as required by final instructions.
+- Published rewards include credits/subscriptions/certificates, not an established cash-prize pool.
+- Source: https://www.waycode.in/founding-100
+
+### Anna AI OS — adjacent programme, not a hackathon
+
+- Founding Builder qualification window ends November 30, 2026; exact final cutoff must be checked.
+- Existing agents/SaaS can be adapted, but must become a complete functional native Anna Marketplace app with UI/backend. Linking the external Gather website is insufficient.
+- Qualification requires approval/publication and at least 200 qualified monthly active users in an eligible month, alongside maintenance and programme rules. Grants are conditional, not guaranteed winnings.
+- This is an optional port/distribution investigation, not mandatory architecture for the shared hackathon build. Verify platform/runtime compatibility, terms and payment eligibility before adoption.
+- Source: https://forum.anna.partners/t/turn-your-ai-agents-apps-into-recurring-monthly-grants-join-the-anna-ai-os-founding-builder-program-up-to-80k-month-pool/205
+
+### Cross-event release rules
+
+- Maintain one reusable codebase with independently configurable Composio, model, voice and interface adapters. Do not require all sponsors in every deployment or run.
+- Record each event's baseline commit, new work, configuration, external execution evidence and submission materials. Disclose reused components honestly.
+- Nebius and Amazon require multiple entries within their respective event to be unique and substantially different. Renaming or reskinning is not sufficient. Across events, verify each event's prior-work and prior-submission rules independently.
+- Private strategy and the private PRD remain unpublished. Public source obligations still apply to the actual submitted application.
+- OpenServ/AssemblyAI reuse, student/age constraints, and ambiguous deadlines remain unresolved gates, not implied eligibility. Registration, submission and paid usage are separate actions from implementing this PRD.
