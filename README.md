@@ -106,7 +106,6 @@ See [progress and acceptance gates](docs/PROGRESS.md) for detailed evidence and 
 
 ## Product documentation
 
-- [Product requirements](docs/PRD.md)
 - [Business knowledge](docs/BUSINESS_KNOWLEDGE.md)
 - [Booking API](docs/BOOKING_API.md)
 - [Proactive work](docs/PROACTIVE_WORK.md)

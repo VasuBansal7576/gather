@@ -16,3 +16,6 @@ secrets/
 *.sqlite3
 *.db
 *.log
+
+# Product strategy is maintained privately, outside this repository.
+/docs/PRD.md

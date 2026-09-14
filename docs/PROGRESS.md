@@ -17,7 +17,7 @@ This checklist has a fixed total of 17 gates.
 Fourteen gates are accepted on the combined 450-test run and production build at `f3b7894`.
 The preceding setup integration at `8b35a2d` passed its production build but only 380 of 381 combined tests; that failed run remains recorded below.
 The recurring isolated Gateway startup timeout remains an open reliability issue despite the passing rerun.
-This count describes the local application milestone only, not completion of the product requirements in [PRD.md](PRD.md).
+This count describes the local application milestone only, not completion of the product requirements in the privately maintained product requirements.
 
 - [x] Next.js application scaffold is present and builds.
 - [x] Owner workspace renders Today, Bookings, and Connections views.
@@ -96,7 +96,7 @@ These are component acceptances; knowledge-to-offer host integration, delivery r
 The isolated-runtime intake integration now has verified dependency artifacts; live provider and model execution remain separate blocked gates.
 The next demonstrable owner journey is explicit demo initialization, exact proposal review and approval, individually persisted hold and email receipts, and restart recovery through the workspace.
 
-The full product requirements and build ownership are recorded in [PRD.md](PRD.md) and [ORCHESTRATION.md](ORCHESTRATION.md).
+The full product requirements and build ownership are recorded in the privately maintained product requirements and [ORCHESTRATION.md](ORCHESTRATION.md).
 The owner approved the full scope and clarified proactive monitoring, pricing and margin boundaries with honest treatment of unknown costs, and a seamless product experience that does not expose infrastructure configuration.
 The PRD now contains an explicit section 13 for the operations handoff.
 

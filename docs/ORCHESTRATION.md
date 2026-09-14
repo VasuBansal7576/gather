@@ -66,4 +66,4 @@ Each child Dispatch needs an accepted outcome and an explicit reuse, retention, 
 Keep [PROGRESS.md](PROGRESS.md) current with bounded commitments and acceptance evidence.
 Send Chief the active nested run, worker ownership, dependency map, concrete blockers, and verified results through Orca.
 Push coherent reviewed and tested milestones as they become ready.
-A local simulation milestone is progress toward [PRD.md](PRD.md), and does not prove live product readiness.
+A local simulation milestone is progress toward the privately maintained product requirements, and does not prove live product readiness.
