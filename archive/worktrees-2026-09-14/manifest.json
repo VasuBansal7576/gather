@@ -1,0 +1,376 @@
+{
+  "purpose": "Preserve original branch histories before deleting local worktrees. These histories are not integrated application changes.",
+  "base_commit": "748a5bacddb6179c08bf5f8f43b1de81316658cd",
+  "archive_branch": "archive/worktrees-2026-09-14",
+  "original_commits_outside_main": 128,
+  "branches": [
+    {
+      "name": "VasuBansal7576/gather-booking-identity",
+      "commit": "f60f8f8656296b7693917fdf7293ee7a866d55bb"
+    },
+    {
+      "name": "VasuBansal7576/gather-booking-revisions",
+      "commit": "fb04beb88aa83d930db78b63b18162ae107d657b"
+    },
+    {
+      "name": "VasuBansal7576/gather-booking-service",
+      "commit": "16ca877bc23701ed49e9826b6e74887b41755019"
+    },
+    {
+      "name": "VasuBansal7576/gather-business-offers",
+      "commit": "997c2cf84f8a00c1734e6b31c1bdc39c4362344a"
+    },
+    {
+      "name": "VasuBansal7576/gather-business-operator",
+      "commit": "d015d27c0890df6b6700b2f460e0b54293b04f01"
+    },
+    {
+      "name": "VasuBansal7576/gather-commercial-integration",
+      "commit": "40c6909cc6e0ef259885dbc3f9168f42747c7a64"
+    },
+    {
+      "name": "VasuBansal7576/gather-commercial-ui",
+      "commit": "c7bbe5cc585a181dec8fd35f25627cbf29992a3d"
+    },
+    {
+      "name": "VasuBansal7576/gather-connector-contracts",
+      "commit": "8ec92f64bbc5e5d620e27e04a4b42ec51cceeb24"
+    },
+    {
+      "name": "VasuBansal7576/gather-delivery-owner",
+      "commit": "d47b05b0143f0873ce801cbaa022cb2d12c90263"
+    },
+    {
+      "name": "VasuBansal7576/gather-extraction-backend",
+      "commit": "62c5316fe483b433f141099ad1b647750ffe135e"
+    },
+    {
+      "name": "VasuBansal7576/gather-foundation",
+      "commit": "b9844b67d8e97c158c862581b5356ab1f116500d"
+    },
+    {
+      "name": "VasuBansal7576/gather-google-filtering",
+      "commit": "ef062ebe866a602ac73bf0dd1e2c240ff0fc1fc0"
+    },
+    {
+      "name": "VasuBansal7576/gather-hold-release",
+      "commit": "0ce19c41ce4f51740f7f6f8c130ed297e8bdc835"
+    },
+    {
+      "name": "VasuBansal7576/gather-interface",
+      "commit": "ce572779b67275e75b036d9638cee14c5f7621b9"
+    },
+    {
+      "name": "VasuBansal7576/gather-knowledge-conflicts",
+      "commit": "c3593e4df21729204bc592afd9a88f36a85d33ce"
+    },
+    {
+      "name": "VasuBansal7576/gather-knowledge-evaluation",
+      "commit": "f31df046807ffc966790e46eab02fcab2577cee2"
+    },
+    {
+      "name": "VasuBansal7576/gather-knowledge-extraction",
+      "commit": "0cf8411838bd193afe3f80f89b3e413cefafb2bf"
+    },
+    {
+      "name": "VasuBansal7576/gather-knowledge-forms",
+      "commit": "bf8de83acf1ba31fa86b9dec2d04eba46a1419c7"
+    },
+    {
+      "name": "VasuBansal7576/gather-knowledge-integration",
+      "commit": "fe867b7573b26c04e47a878ac217e1ccb360bfaa"
+    },
+    {
+      "name": "VasuBansal7576/gather-knowledge-owner",
+      "commit": "04c183e129540d1ad1a0fcaad62aa8373c19e265"
+    },
+    {
+      "name": "VasuBansal7576/gather-live-execution",
+      "commit": "9940888010174d937e39720820e11de12025ef29"
+    },
+    {
+      "name": "VasuBansal7576/gather-live-model",
+      "commit": "ed7c68cabd7a52afd4aa5aa32159e857855ec46c"
+    },
+    {
+      "name": "VasuBansal7576/gather-local-packaging",
+      "commit": "bcd0a8d7886cc68ceda4fd7b76633e3652cb0ed2"
+    },
+    {
+      "name": "VasuBansal7576/gather-model-config",
+      "commit": "cde4775411dc2fc1fe2a3d0c29fc8aa75e6cc96a"
+    },
+    {
+      "name": "VasuBansal7576/gather-owner-interactions",
+      "commit": "dde4e04158918d95ae63f602f82931c0f0868a9e"
+    },
+    {
+      "name": "VasuBansal7576/gather-proactive-bootstrap",
+      "commit": "0c9c3d34e77228c13225c876441fb7073928c331"
+    },
+    {
+      "name": "VasuBansal7576/gather-proactive-host",
+      "commit": "2871c28e40bc9717ef8fe8d389a7e9ddcba828b6"
+    },
+    {
+      "name": "VasuBansal7576/gather-proactive-repair",
+      "commit": "42aed17231932dc13a0c01b7768d0ebd9f7405a9"
+    },
+    {
+      "name": "VasuBansal7576/gather-proactive-work",
+      "commit": "7f21c7e0ce5b645e01032e9f94e0b239851e5163"
+    },
+    {
+      "name": "VasuBansal7576/gather-proposal-authority",
+      "commit": "9bddff788400233f1f7c2bc94723341e1608c1ae"
+    },
+    {
+      "name": "VasuBansal7576/gather-real-booking-turn",
+      "commit": "b5f869219aa76181a3ad5b699f886178f37d5535"
+    },
+    {
+      "name": "VasuBansal7576/gather-runtime-intake",
+      "commit": "f8341b218fe042b68e1622f9ea402efb1b18d8e4"
+    },
+    {
+      "name": "VasuBansal7576/gather-runtime-startup",
+      "commit": "3bd3e03740d6c2fe81f026b949d8e7984fdbdd82"
+    },
+    {
+      "name": "VasuBansal7576/gather-setup-integration",
+      "commit": "9d65478665dc9c35edfb517957a5889368cfaf82"
+    },
+    {
+      "name": "VasuBansal7576/gather-setup-ui",
+      "commit": "57e2518977a4e6c29d3cc6f803a33aeb4f31c380"
+    },
+    {
+      "name": "VasuBansal7576/gramma",
+      "commit": "25476b6660bf867e8356c8f46e573dff3992caef"
+    },
+    {
+      "name": "archive/gather-booking-delivery-f7662de",
+      "commit": "f7662de0bb6be2a0fda40e2a933353aa8ea324c6"
+    },
+    {
+      "name": "archive/gather-business-knowledge-640f57b",
+      "commit": "640f57b293b38bf8b7cb510a645241ef06583ee1"
+    },
+    {
+      "name": "archive/gather-business-operator-d015d27",
+      "commit": "d015d27c0890df6b6700b2f460e0b54293b04f01"
+    },
+    {
+      "name": "archive/gather-commercial-ui-c7bbe5c",
+      "commit": "c7bbe5cc585a181dec8fd35f25627cbf29992a3d"
+    },
+    {
+      "name": "archive/gather-connections-db6815f",
+      "commit": "db6815ff5bf95955aa2573603b86fe15c1c13c5c"
+    },
+    {
+      "name": "archive/gather-data-recovery-03cafd4",
+      "commit": "03cafd4cfa4159382f4d89aad1e9215f2d2e807b"
+    },
+    {
+      "name": "archive/gather-delivery-readiness-e626000",
+      "commit": "e6260006ad2be6ccdd9ac056348ad4df1f5aa146"
+    },
+    {
+      "name": "archive/gather-drive-range-d945242",
+      "commit": "d9452428a3c22f3e069c97529aa08b7fb3e20e19"
+    },
+    {
+      "name": "archive/gather-extraction-backend-62c5316",
+      "commit": "62c5316fe483b433f141099ad1b647750ffe135e"
+    },
+    {
+      "name": "archive/gather-google-scope-fix-e6c3017",
+      "commit": "e6c30173997c8e767986bacae332d5a0d6f85f9a"
+    },
+    {
+      "name": "archive/gather-integration-build-0ebb118",
+      "commit": "0ebb1188d7bd9724796e748ce4dddbf6e2abc2ad"
+    },
+    {
+      "name": "archive/gather-keychain-identity-2fac093",
+      "commit": "2fac093cc4e763d1b1c5366a1cf3fd80844b1835"
+    },
+    {
+      "name": "archive/gather-knowledge-concurrency-2b41417",
+      "commit": "2b41417ec6e4b8c5164605e3be6d0bdd5fb69350"
+    },
+    {
+      "name": "archive/gather-knowledge-conflicts-c3593e4",
+      "commit": "c3593e4df21729204bc592afd9a88f36a85d33ce"
+    },
+    {
+      "name": "archive/gather-live-empty-state-dc162d5",
+      "commit": "dc162d5aa760a3f66712b0a2ddbfcbc7396d03a0"
+    },
+    {
+      "name": "archive/gather-live-proposal-contract-86962f7",
+      "commit": "86962f7561e499d39cadd49ab02a79530c2b0193"
+    },
+    {
+      "name": "archive/gather-owner-host-fbafe11",
+      "commit": "fbafe1149fe6f17e60e141ee375574c9c5298304"
+    },
+    {
+      "name": "archive/gather-proactive-bootstrap-0c9c3d3",
+      "commit": "0c9c3d34e77228c13225c876441fb7073928c331"
+    },
+    {
+      "name": "archive/gather-proactive-disable-b17154a",
+      "commit": "b17154a0e085beeacbf2c29ca26b11e3ce0ee421"
+    },
+    {
+      "name": "archive/gather-proactive-repair-42aed17",
+      "commit": "42aed17231932dc13a0c01b7768d0ebd9f7405a9"
+    },
+    {
+      "name": "archive/gather-provider-runtime-85027c8",
+      "commit": "85027c84ca4b868eabe15f53a60efee60b35f6a8"
+    },
+    {
+      "name": "archive/gather-setup-integration-9d65478",
+      "commit": "9d65478665dc9c35edfb517957a5889368cfaf82"
+    },
+    {
+      "name": "archive/gather-setup-ui-57e2518",
+      "commit": "57e2518977a4e6c29d3cc6f803a33aeb4f31c380"
+    },
+    {
+      "name": "main",
+      "commit": "748a5bacddb6179c08bf5f8f43b1de81316658cd"
+    }
+  ],
+  "worktrees": [
+    {
+      "path": "/Users/vasu/orca/workspaces/gather/gather-booking-identity",
+      "branch": "refs/heads/VasuBansal7576/gather-booking-identity",
+      "commit": "f60f8f8656296b7693917fdf7293ee7a866d55bb"
+    },
+    {
+      "path": "/Users/vasu/orca/workspaces/gather/gather-booking-revisions",
+      "branch": "refs/heads/VasuBansal7576/gather-booking-revisions",
+      "commit": "fb04beb88aa83d930db78b63b18162ae107d657b"
+    },
+    {
+      "path": "/Users/vasu/orca/workspaces/gather/gather-booking-service",
+      "branch": "refs/heads/VasuBansal7576/gather-booking-service",
+      "commit": "16ca877bc23701ed49e9826b6e74887b41755019"
+    },
+    {
+      "path": "/Users/vasu/orca/workspaces/gather/gather-business-offers",
+      "branch": "refs/heads/VasuBansal7576/gather-business-offers",
+      "commit": "997c2cf84f8a00c1734e6b31c1bdc39c4362344a"
+    },
+    {
+      "path": "/Users/vasu/orca/workspaces/gather/gather-commercial-integration",
+      "branch": "refs/heads/VasuBansal7576/gather-commercial-integration",
+      "commit": "40c6909cc6e0ef259885dbc3f9168f42747c7a64"
+    },
+    {
+      "path": "/Users/vasu/orca/workspaces/gather/gather-delivery-owner",
+      "branch": "refs/heads/VasuBansal7576/gather-delivery-owner",
+      "commit": "d47b05b0143f0873ce801cbaa022cb2d12c90263"
+    },
+    {
+      "path": "/Users/vasu/orca/workspaces/gather/gather-google-filtering",
+      "branch": "refs/heads/VasuBansal7576/gather-google-filtering",
+      "commit": "ef062ebe866a602ac73bf0dd1e2c240ff0fc1fc0"
+    },
+    {
+      "path": "/Users/vasu/orca/workspaces/gather/gather-hold-release",
+      "branch": "refs/heads/VasuBansal7576/gather-hold-release",
+      "commit": "0ce19c41ce4f51740f7f6f8c130ed297e8bdc835"
+    },
+    {
+      "path": "/Users/vasu/orca/workspaces/gather/gather-knowledge-evaluation",
+      "branch": "refs/heads/VasuBansal7576/gather-knowledge-evaluation",
+      "commit": "f31df046807ffc966790e46eab02fcab2577cee2"
+    },
+    {
+      "path": "/Users/vasu/orca/workspaces/gather/gather-knowledge-extraction",
+      "branch": "refs/heads/VasuBansal7576/gather-knowledge-extraction",
+      "commit": "0cf8411838bd193afe3f80f89b3e413cefafb2bf"
+    },
+    {
+      "path": "/Users/vasu/orca/workspaces/gather/gather-knowledge-forms",
+      "branch": "refs/heads/VasuBansal7576/gather-knowledge-forms",
+      "commit": "bf8de83acf1ba31fa86b9dec2d04eba46a1419c7"
+    },
+    {
+      "path": "/Users/vasu/orca/workspaces/gather/gather-knowledge-integration",
+      "branch": "refs/heads/VasuBansal7576/gather-knowledge-integration",
+      "commit": "fe867b7573b26c04e47a878ac217e1ccb360bfaa"
+    },
+    {
+      "path": "/Users/vasu/orca/workspaces/gather/gather-knowledge-owner",
+      "branch": "refs/heads/VasuBansal7576/gather-knowledge-owner",
+      "commit": "04c183e129540d1ad1a0fcaad62aa8373c19e265"
+    },
+    {
+      "path": "/Users/vasu/orca/workspaces/gather/gather-live-execution",
+      "branch": "refs/heads/VasuBansal7576/gather-live-execution",
+      "commit": "9940888010174d937e39720820e11de12025ef29"
+    },
+    {
+      "path": "/Users/vasu/orca/workspaces/gather/gather-live-model",
+      "branch": "refs/heads/VasuBansal7576/gather-live-model",
+      "commit": "ed7c68cabd7a52afd4aa5aa32159e857855ec46c"
+    },
+    {
+      "path": "/Users/vasu/orca/workspaces/gather/gather-model-config",
+      "branch": "refs/heads/VasuBansal7576/gather-model-config",
+      "commit": "cde4775411dc2fc1fe2a3d0c29fc8aa75e6cc96a"
+    },
+    {
+      "path": "/Users/vasu/orca/workspaces/gather/gather-owner-interactions",
+      "branch": "refs/heads/VasuBansal7576/gather-owner-interactions",
+      "commit": "dde4e04158918d95ae63f602f82931c0f0868a9e"
+    },
+    {
+      "path": "/Users/vasu/orca/workspaces/gather/gather-proactive-host",
+      "branch": "refs/heads/VasuBansal7576/gather-proactive-host",
+      "commit": "2871c28e40bc9717ef8fe8d389a7e9ddcba828b6"
+    },
+    {
+      "path": "/Users/vasu/orca/workspaces/gather/gather-proactive-work",
+      "branch": "refs/heads/VasuBansal7576/gather-proactive-work",
+      "commit": "7f21c7e0ce5b645e01032e9f94e0b239851e5163"
+    },
+    {
+      "path": "/Users/vasu/orca/workspaces/gather/gather-proposal-authority",
+      "branch": "refs/heads/VasuBansal7576/gather-proposal-authority",
+      "commit": "9bddff788400233f1f7c2bc94723341e1608c1ae"
+    },
+    {
+      "path": "/Users/vasu/orca/workspaces/gather/gather-real-booking-turn",
+      "branch": "refs/heads/VasuBansal7576/gather-real-booking-turn",
+      "commit": "b5f869219aa76181a3ad5b699f886178f37d5535"
+    },
+    {
+      "path": "/Users/vasu/orca/workspaces/gather/gather-runtime-intake",
+      "branch": "refs/heads/VasuBansal7576/gather-runtime-intake",
+      "commit": "f8341b218fe042b68e1622f9ea402efb1b18d8e4"
+    },
+    {
+      "path": "/Users/vasu/orca/workspaces/gather/gather-runtime-startup",
+      "branch": "refs/heads/VasuBansal7576/gather-runtime-startup",
+      "commit": "3bd3e03740d6c2fe81f026b949d8e7984fdbdd82"
+    },
+    {
+      "path": "/Users/vasu/orca/workspaces/gather/gramma",
+      "branch": "refs/heads/VasuBansal7576/gramma",
+      "commit": "25476b6660bf867e8356c8f46e573dff3992caef"
+    }
+  ],
+  "local_config": {
+    "original_worktree": "gather-owner-interactions",
+    "original_path": ".devin/config.local.json",
+    "archived_path": "archive/worktrees-2026-09-14/gather-owner-interactions/config.local.json",
+    "sha256": "18634fed64a084cea2c31809ed5d61c887e0f8ebf916bf3402c66de3446853f3"
+  }
+}
