@@ -106,6 +106,7 @@ See [progress and acceptance gates](docs/PROGRESS.md) for detailed evidence and 
 
 ## Product documentation
 
+- [Public hackathon requirements](docs/HACKATHON_PRD.md) — target scope; Composio onboarding is not yet implemented.
 - [Business knowledge](docs/BUSINESS_KNOWLEDGE.md)
 - [Booking API](docs/BOOKING_API.md)
 - [Proactive work](docs/PROACTIVE_WORK.md)
