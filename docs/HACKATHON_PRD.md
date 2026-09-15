@@ -1,7 +1,7 @@
 # Gather — Public Hackathon PRD
 
 Status: requirements, not a claim of implementation or live verification.
-Updated: 2026-09-14.
+Updated: 2026-09-15.
 
 ## 1. Product and audience
 
@@ -22,6 +22,8 @@ This document defines the public hackathon release. It does not publish the priv
 7. See verified external results, pending conditions and the current handoff.
 
 No customer or judge should need a terminal, Google Cloud project, OAuth client ID, client secret, Composio account, model-provider account or workflow configuration to use the hosted experience. Infrastructure and model configuration belong to the operator.
+
+Gather provisions a dedicated, hosted OpenClaw instance for each business in the background. The owner uses Gather's interface, connects applications and confirms operating policy; they do not install or maintain OpenClaw. Show honest provisioning, readiness and failure states rather than exposing infrastructure setup. See section 8 for isolation and lifecycle responsibilities.
 
 ## 3. Seamless connections — Composio selected
 
@@ -108,6 +110,36 @@ Product-specific layer: customer/problem, selected integrations, policies, appro
 
 Optional sponsor adapters must be explicit, disabled unless configured, and genuinely exercised in the relevant submission. Do not silently switch providers or send data to every sponsor. One codebase can support different submission configurations; each must satisfy its own event rules and disclose reused versus newly built work.
 
+### 8.1 Managed per-business OpenClaw instances
+
+OpenClaw is the selected runtime. Each business receives a separate complete runtime instance with isolated workspace, memory, runtime state and access to only that business's connected accounts. Separate sessions or agent names inside one shared trust boundary are not sufficient customer isolation. This does not require a physical server per business.
+
+- The instance belongs to the business context, not to each individual employee. Any supported additional user must be authorized through Gather; comprehensive employee administration remains outside this release.
+- Gather authenticates the owner and derives the business-to-instance mapping server-side. Neither model arguments nor client-supplied instance identifiers grant access.
+- Shared software does not mean shared business knowledge, approval records or credentials. Provider operations remain behind controlled Gather tools and the server-side Composio connection boundary.
+- Gather manages provisioning, readiness, routing, runtime health and recovery. Repeated onboarding or provisioning attempts must not attach the owner to another business or silently create conflicting active instances.
+- Customers interact through Gather, not a fleet administrator interface. Business agents cannot administer other instances or the operator's personal OpenClaw.
+- Dedicated hosting is not customer-operated infrastructure or a claim that Gather's trusted hosting administrators cannot access hosted state. Do not imply either in product copy.
+
+### 8.2 Runtime updates and failure recovery
+
+Gather owns runtime updates; customer instances must not independently follow upstream releases or modify their runtime installation. Pin the runtime and compatible client/plugin versions. Upstream availability is a candidate for a Gather release, not automatic authorization to deploy it to every business.
+
+- Test a candidate against the required booking, approval, connector and recovery journeys before promotion. Preserve business state and connections through tested migrations.
+- Before an upgrade, pause new affected work and settle or durably account for in-flight actions. Keep a verified consistent backup and its matching known-good runtime/configuration.
+- Verify useful behavior after activation, not merely process startup. Stop a rollout when verification fails; avoid exposing every business to an unverified candidate at once.
+- An external supervisor, outside the affected business agent, owns startup failure detection and runtime restoration. Agent-led operational repair in section 6 remains separate from platform recovery.
+- Downgrading software does not undo incompatible data migrations. Restore only a compatible runtime/state combination or leave affected work visibly blocked for the operator.
+- Restoring local state does not reverse Gmail or Calendar effects. Reconcile external outcomes and recheck current authority before resuming; never replay writes blindly.
+
+For the hackathon, a pinned deployment and a documented, tested basic restart/recovery path are required. Automated fleet-wide rollout infrastructure and a full production disaster-recovery programme remain outside the release; a supervised manual upgrade procedure can satisfy the update policy.
+
+### 8.3 Design before implementation
+
+The PRD remains the source of truth. Before assigning implementation phases, specify the machinery that connects OpenClaw's general capabilities to Gather's requirements: business evidence and policy lifecycle, focused questioning and readiness, inquiry identity, qualification calculations, versioned approvals, controlled external actions, durable booking progression, bounded repair and owner-visible state.
+
+For each subsystem, define inputs, authoritative stored state, model responsibilities, deterministic enforcement, triggers, failure/recovery behavior and observable acceptance scenarios. Reuse supported OpenClaw capabilities where adequate; a skill instruction, memory entry or successful tool call alone does not establish business correctness. Mark unresolved design choices explicitly rather than leaving implementation agents to invent them. The earlier delivery outline is not an approved implementation specification.
+
 ## 9. Completion and honest scope
 
 A hold is not a confirmed booking; a draft is not a sent email; a payment link is not a payment. Confirm only when every configured business condition has authoritative evidence. If payment or resource commitments are required but unverified, label the outcome provisional and show what remains.
@@ -121,6 +153,8 @@ Not required for this release: subscription billing, comprehensive employee/mult
 | Gate | Required proof |
 |---|---|
 | Hosted access | Judge reaches a usable workspace without local installation or developer-console steps |
+| Managed runtime | Business is mapped to its own ready instance; repeated provisioning remains correctly scoped; customers need no runtime administration |
+| Runtime lifecycle | Pinned version recorded; basic restart/recovery verified without duplicated actions; upgrade/compatible-state restoration procedure documented |
 | Composio connections | Real consent, correct account attachment, sufficient permissions and working Gmail/Drive/Calendar operations |
 | Understanding | Attributable facts, remembered owner corrections and correct handling of conflicting evidence |
 | Booking journey | Actual model invocation and verified inquiry-to-offer-to-provisional-hold execution |
