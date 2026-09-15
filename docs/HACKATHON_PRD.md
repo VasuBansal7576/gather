@@ -57,6 +57,17 @@ Qualify inquiry date/time, guest count, services and other consequential require
 
 Customer messages and retrieved documents cannot grant authority or override owner policy. No unrestricted negotiation: commercial flexibility must be explicitly owner-authorized and enforced outside the model.
 
+### 4.1 Progressive ingestion and knowledge lifecycle
+
+Do not require a full-account import before Gather becomes useful. Prioritize current commercial documents and active inquiry threads, expand related evidence and older history in the background or on demand, and show incomplete coverage honestly. Select initial search windows and limits through representative tests rather than inventing a universal cutoff.
+
+- Narrow candidates through supported provider searches and metadata before expensive model processing; include relevant sent replies and thread context. Test excluded-record samples so faster ingestion does not simply conceal missed evidence.
+- Persist stable provider/source identity, business scope, source version, observation time, import cursor and extraction provenance. Fetching a record does not automatically make it durable policy or memory.
+- Reuse clean provider text/structured exports. Cache unchanged content and parser output by source/content and parser version; use bounded concurrency and incremental updates/deletions where supported.
+- Model-extracted facts remain attributable candidates until their authority and applicability are established. Keep current policy, historical commitments and scoped exceptions distinct. Propagate owner corrections to pending work without rewriting accepted commitments.
+- Preserve canonical evidence and authoritative structured business records independently of derived summaries, graphs or vector indexes. A missing/unavailable index is not proof that no policy exists.
+- Readiness is action-specific: enough information to qualify is not necessarily enough to price or send. Critical conditions such as availability require a fresh check before consequential execution.
+
 ## 5. Offers, authority and execution
 
 Keep a stable booking identity across inquiry, conversation, offer and calendar records. Ambiguous matches require resolution.
@@ -70,6 +81,8 @@ Demonstrated journey: read a real test inquiry in Gmail, retrieve business evide
 Track replies, follow-ups and expiring holds durably. Process replies before follow-ups. Permit owner pause and takeover. Recheck current authority after restart.
 
 ## 6. Self-fixing OpenClaw — included
+
+Detailed repair design is deferred until the core knowledge, authority and booking behavior is specified. This sequencing decision does not remove the requirements or acceptance gate below.
 
 Gather must use its isolated OpenClaw runtime to detect, diagnose and repair recoverable technical blockers within explicit authority, verify recovery, and resume affected booking work. A fixed retry loop alone is not the complete self-fixing demonstration.
 
@@ -140,6 +153,52 @@ The PRD remains the source of truth. Before assigning implementation phases, spe
 
 For each subsystem, define inputs, authoritative stored state, model responsibilities, deterministic enforcement, triggers, failure/recovery behavior and observable acceptance scenarios. Reuse supported OpenClaw capabilities where adequate; a skill instruction, memory entry or successful tool call alone does not establish business correctness. Mark unresolved design choices explicitly rather than leaving implementation agents to invent them. The earlier delivery outline is not an approved implementation specification.
 
+### 8.4 Minimal maintainable stack — agreed direction
+
+Optimize for an easy owner experience and a small maintainable system, not the number of integrations. Customers install no knowledge backend, parser, database or evaluation tool and need no associated infrastructure accounts. Gather operates the selected components.
+
+| Responsibility | Selected direction | Adoption boundary |
+|---|---|---|
+| Agent runtime and conversational continuity | OpenClaw with native recall | Do not replace its memory automatically or introduce competing auto-capture systems |
+| Application connections | Composio, as in section 3 | Its open-source SDK does not establish that the managed OAuth/execution backend is self-hostable |
+| Authoritative business, evidence, booking, approval and action records | PostgreSQL is the preferred hosted target | Validate deployment topology, isolation, backups and migration before implementation; do not migrate working storage merely to add an extension |
+| Curated derived knowledge | Evaluate bundled OpenClaw memory-wiki first, only if useful | Not a bulk mailbox/PDF ingestion engine or automatic semantic policy-conflict resolver; current authority must not depend solely on delayed compilation |
+| Additional semantic evidence retrieval | pgvector only for a demonstrated retrieval gap | Reuse PostgreSQL if selected; do not duplicate native conversational recall without a distinct need |
+| Difficult documents, scans and tables | Docling only where clean provider exports are insufficient | Bounded parsing worker with selected dependencies, attributable output and cached unchanged documents; not a heavy parser inside every agent |
+| Additional durable application jobs | pg-boss only if PostgreSQL is selected and existing runtime primitives leave a gap | One booking controller owns progression; do not run competing follow-up/retry schedules or add a second queue alongside it |
+| Development/regression evaluation | promptfoo, outside the customer runtime | Deterministic assertions and selective calibrated LLM rubrics; no mandatory judge call after every production action |
+
+Do not include Supermemory, HydraDB or Graphify as default customer knowledge infrastructure. Supermemory remains a conditional evaluation candidate after verifying the actual engine source/build, deployment and behavior; its OpenClaw plugin changes memory/prompt behavior and is not merely a search tool. HydraDB is deferred until a concrete graph-storage need justifies its operational cost. Graphify-Labs/graphify is omitted from the customer knowledge stack. Graphiti is a conditional temporal/relationship retrieval challenger, not an additional default service. Do not combine overlapping brains merely because they are open source.
+
+Optional components must demonstrate a concrete user benefit against the baseline using the same evidence and model settings. Record dependencies, licenses, source/build availability, update burden, latency, model usage and failure behavior; an SDK license, a published binary or repository activity alone does not prove complete platform source availability or runtime suitability. These choices are requirements/design direction, not claims of installed or tested integrations.
+
+Integration contracts:
+
+- Use supported OpenClaw Gateway protocols and extension points. Do not patch its core or read/write private runtime tables and transcript files to implement Gather features.
+- Expose narrow Gather-controlled tools for evidence search, current policy, booking state, offer proposals and approved actions. Derive business scope server-side; return bounded evidence, versions, applicability and uncertainty.
+- Keep one authoritative policy record, one action ledger and one progression owner. Derived knowledge must not mint approval, override current policy or independently schedule commercial work.
+- Retain provider reconciliation even with a durable queue: retryable job delivery does not guarantee exactly-once Gmail/Calendar effects.
+
+References: [OpenClaw embedding](https://docs.openclaw.ai/gateway/embedding), [memory wiki](https://docs.openclaw.ai/plugins/memory-wiki), [PostgreSQL](https://www.postgresql.org/), [pgvector](https://github.com/pgvector/pgvector), [Docling](https://github.com/docling-project/docling), [pg-boss](https://github.com/timgit/pg-boss), [promptfoo](https://github.com/promptfoo/promptfoo).
+
+### 8.5 Remaining design decisions
+
+The questions below remain open; they are not reasons to reopen the settled runtime choice or install all candidate libraries. Resolve them through worked booking scenarios before deriving implementation phases.
+
+| Area | Decision still needed |
+|---|---|
+| Initial business template | Which venue, private-dining or catering scenario anchors the first complete journey, and which fields/resources/calculations differ across the supported audiences? This does not silently exclude the other audiences. |
+| Source scope and retention | What import defaults, owner exclusions, history expansion and retention/deletion behavior apply? How do disconnection and revoked access affect stored evidence and derived knowledge? |
+| Policy authority | Which facts can become usable from authoritative documents, which need owner confirmation, and how are conflicts, effective dates and customer/booking exceptions resolved? |
+| Questions and readiness | What is the minimum knowledge for each action, when should Gather interrupt versus batch questions, and how does it proceed while an answer is missing? |
+| Operating authority | Which actions require one-time approval versus explicit standing authority; what material changes, limits, expiry and revocation rules apply? |
+| Booking lifecycle | Exact matching/ambiguity rules, qualification calculations, hold duration, follow-up cadence, negotiation limits, pause/takeover/resume behavior and evidence required for confirmation/handoff. |
+| Owner experience | Exact first-run understanding review, approval presentation and notification defaults; distinguish consequential alerts from routine background progress. |
+| Engineering validation | Verify selected Composio operations, data topology/migration, runtime/tool contracts, event ordering, action reconciliation, optional-library need, budgets and measured readiness targets. These are engineering responsibilities, not customer setup choices. |
+| Later repair design | Supported repair contracts and supervisor controls remain to be specified after the above core behavior, within section 6. |
+
+Separate product decisions from business-specific policies collected from each owner and from technical choices resolved through evidence. The product owner should not have to pick chunk sizes, database indexes or retry algorithms to make progress.
+
 ## 9. Completion and honest scope
 
 A hold is not a confirmed booking; a draft is not a sent email; a payment link is not a payment. Confirm only when every configured business condition has authoritative evidence. If payment or resource commitments are required but unverified, label the outcome provisional and show what remains.
@@ -157,6 +216,9 @@ Not required for this release: subscription billing, comprehensive employee/mult
 | Runtime lifecycle | Pinned version recorded; basic restart/recovery verified without duplicated actions; upgrade/compatible-state restoration procedure documented |
 | Composio connections | Real consent, correct account attachment, sufficient permissions and working Gmail/Drive/Calendar operations |
 | Understanding | Attributable facts, remembered owner corrections and correct handling of conflicting evidence |
+| Progressive ingestion | First useful work before full import; interrupted import resumes; changed/deleted evidence and excluded-record sampling are checked without false completeness claims |
+| Knowledge lifecycle | Scoped exception and owner correction apply to the right pending work; accepted commitments stay unchanged; unavailable or stale derived context cannot silently authorize an action |
+| Evaluation | Human-reviewed scenarios; deterministic authority/arithmetic/isolation checks and calibrated semantic rubrics where useful; judge output never substitutes for provider evidence |
 | Booking journey | Actual model invocation and verified inquiry-to-offer-to-provisional-hold execution |
 | Exact authority | Stale/changed approvals and cross-booking authorization rejected |
 | Recovery | Duplicate delivery, partial success, uncertain outcome and restart scenarios preserve correct state |
