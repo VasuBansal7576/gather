@@ -1,7 +1,7 @@
 # Gather — Public Hackathon PRD
 
 Status: requirements, not a claim of implementation or live verification.
-Updated: 2026-09-15.
+Updated: 2026-09-16.
 
 ## 1. Product and audience
 
@@ -49,6 +49,8 @@ Reference: [Composio authentication](https://docs.composio.dev/docs/authenticati
 
 ## 4. Business understanding and qualification
 
+Use OpenClaw native recall with its bundled memory-wiki as the first-choice business-understanding layer. Remember services, packages, policies, owner preferences and customer-specific arrangements with supporting sources; do not build a parallel knowledge engine upfront. This is the selected direction, subject to the native-knowledge acceptance gate in section 10, not a claim of a verified integration.
+
 Retrieve attributable packages, prices, capacities, availability and commercial policies from connected sources. Distinguish current policy, historical agreements, booking-specific exceptions, customer claims and uncertainty.
 
 Ask focused questions alongside ingestion rather than waiting for every record to import. Do not ask for information already provided. Persist owner answers with scope, source and applicable version. New policies must not silently rewrite existing commitments.
@@ -59,13 +61,13 @@ Customer messages and retrieved documents cannot grant authority or override own
 
 ### 4.1 Progressive ingestion and knowledge lifecycle
 
-Do not require a full-account import before Gather becomes useful. Prioritize current commercial documents and active inquiry threads, expand related evidence and older history in the background or on demand, and show incomplete coverage honestly. Select initial search windows and limits through representative tests rather than inventing a universal cutoff.
+Importing the full authorized business history is permitted when practical; storing that history does not require sending it all to the model on every turn. Do not require a full-account import before Gather becomes useful. Prioritize current commercial documents and active inquiry threads, expand related evidence and older history in the background or on demand, and show incomplete coverage honestly. Select initial search windows and limits through representative tests rather than inventing a universal cutoff.
 
 - Narrow candidates through supported provider searches and metadata before expensive model processing; include relevant sent replies and thread context. Test excluded-record samples so faster ingestion does not simply conceal missed evidence.
 - Persist stable provider/source identity, business scope, source version, observation time, import cursor and extraction provenance. Fetching a record does not automatically make it durable policy or memory.
 - Reuse clean provider text/structured exports. Cache unchanged content and parser output by source/content and parser version; use bounded concurrency and incremental updates/deletions where supported.
 - Model-extracted facts remain attributable candidates until their authority and applicability are established. Keep current policy, historical commitments and scoped exceptions distinct. Propagate owner corrections to pending work without rewriting accepted commitments.
-- Preserve canonical evidence and authoritative structured business records independently of derived summaries, graphs or vector indexes. A missing/unavailable index is not proof that no policy exists.
+- Preserve source evidence and version/scope metadata through supported native knowledge interfaces. Memory-wiki may maintain business policies; a second policy database or parallel retrieval pipeline is not required by default. Persist the exact terms and policy versions relied on by offers/approvals in transactional records. A missing/unavailable index is not proof that no policy exists.
 - Readiness is action-specific: enough information to qualify is not necessarily enough to price or send. Critical conditions such as availability require a fresh check before consequential execution.
 
 ## 5. Offers, authority and execution
@@ -161,14 +163,14 @@ Optimize for an easy owner experience and a small maintainable system, not the n
 |---|---|---|
 | Agent runtime and conversational continuity | OpenClaw with native recall | Do not replace its memory automatically or introduce competing auto-capture systems |
 | Application connections | Composio, as in section 3 | Its open-source SDK does not establish that the managed OAuth/execution backend is self-hostable |
-| Authoritative business, evidence, booking, approval and action records | PostgreSQL is the preferred hosted target | Validate deployment topology, isolation, backups and migration before implementation; do not migrate working storage merely to add an extension |
-| Curated derived knowledge | Evaluate bundled OpenClaw memory-wiki first, only if useful | Not a bulk mailbox/PDF ingestion engine or automatic semantic policy-conflict resolver; current authority must not depend solely on delayed compilation |
-| Additional semantic evidence retrieval | pgvector only for a demonstrated retrieval gap | Reuse PostgreSQL if selected; do not duplicate native conversational recall without a distinct need |
+| Transactional booking, offer, approval, pending-action and verified-result records | Gather PostgreSQL database | Validate deployment topology, isolation, backups and migration; do not duplicate the native knowledge layer or migrate storage merely to add an extension |
+| Business understanding and source-backed policies | OpenClaw native recall + bundled memory-wiki, first choice | Prove changed prices, scoped exceptions, deleted evidence and restart recall before committing the knowledge implementation; do not treat stale compiled context as current authority |
+| Additional semantic evidence retrieval | No separate pgvector/pgContext pipeline initially | Add only for a measured gap that native recall/wiki cannot adequately address; demonstrate benefit before adoption |
 | Difficult documents, scans and tables | Docling only where clean provider exports are insufficient | Bounded parsing worker with selected dependencies, attributable output and cached unchanged documents; not a heavy parser inside every agent |
 | Additional durable application jobs | pg-boss only if PostgreSQL is selected and existing runtime primitives leave a gap | One booking controller owns progression; do not run competing follow-up/retry schedules or add a second queue alongside it |
 | Development/regression evaluation | promptfoo, outside the customer runtime | Deterministic assertions and selective calibrated LLM rubrics; no mandatory judge call after every production action |
 
-Do not include Supermemory, HydraDB or Graphify as default customer knowledge infrastructure. Supermemory remains a conditional evaluation candidate after verifying the actual engine source/build, deployment and behavior; its OpenClaw plugin changes memory/prompt behavior and is not merely a search tool. HydraDB is deferred until a concrete graph-storage need justifies its operational cost. Graphify-Labs/graphify is omitted from the customer knowledge stack. Graphiti is a conditional temporal/relationship retrieval challenger, not an additional default service. Do not combine overlapping brains merely because they are open source.
+Leave pgvector, Polygres (pgContext/pgGraph), Supermemory, HydraDB, Graphify and Graphiti out of the initial knowledge stack. Do not run competing brains. Reconsider an additional component only after a demonstrated native-knowledge limitation and a comparison showing concrete user benefit. This decision supersedes earlier recommendations to start with a separate PostgreSQL/vector knowledge pipeline; PostgreSQL remains the transaction store.
 
 Optional components must demonstrate a concrete user benefit against the baseline using the same evidence and model settings. Record dependencies, licenses, source/build availability, update burden, latency, model usage and failure behavior; an SDK license, a published binary or repository activity alone does not prove complete platform source availability or runtime suitability. These choices are requirements/design direction, not claims of installed or tested integrations.
 
@@ -176,7 +178,9 @@ Integration contracts:
 
 - Use supported OpenClaw Gateway protocols and extension points. Do not patch its core or read/write private runtime tables and transcript files to implement Gather features.
 - Expose narrow Gather-controlled tools for evidence search, current policy, booking state, offer proposals and approved actions. Derive business scope server-side; return bounded evidence, versions, applicability and uncertainty.
-- Keep one authoritative policy record, one action ledger and one progression owner. Derived knowledge must not mint approval, override current policy or independently schedule commercial work.
+- Maintain one current, source-backed policy representation in the native knowledge layer, one transactional action ledger and one progression owner. Do not mirror all policies into a second knowledge system. Freeze the applicable terms in versioned offers/approvals and detect consequential policy changes before execution; knowledge alone cannot grant approval.
+- Keep the integration thin: retrieve and normalize connected content, feed it through supported native knowledge tools, propagate corrections/deletions, and enforce approved actions. Verify changes reach retrieval and compiled context before relying on them; stale or incomplete propagation must remain visible.
+- OpenClaw remembers how the business works; Gather transaction records establish what was approved and what actually happened. A remembered claim of sending is not a provider receipt.
 - Retain provider reconciliation even with a durable queue: retryable job delivery does not guarantee exactly-once Gmail/Calendar effects.
 
 References: [OpenClaw embedding](https://docs.openclaw.ai/gateway/embedding), [memory wiki](https://docs.openclaw.ai/plugins/memory-wiki), [PostgreSQL](https://www.postgresql.org/), [pgvector](https://github.com/pgvector/pgvector), [Docling](https://github.com/docling-project/docling), [pg-boss](https://github.com/timgit/pg-boss), [promptfoo](https://github.com/promptfoo/promptfoo).
@@ -217,6 +221,7 @@ Not required for this release: subscription billing, comprehensive employee/mult
 | Composio connections | Real consent, correct account attachment, sufficient permissions and working Gmail/Drive/Calendar operations |
 | Understanding | Attributable facts, remembered owner corrections and correct handling of conflicting evidence |
 | Progressive ingestion | First useful work before full import; interrupted import resumes; changed/deleted evidence and excluded-record sampling are checked without false completeness claims |
+| Native knowledge selection | Test OpenClaw recall + memory-wiki on changed prices, customer-only exceptions, deleted sources and restart recall; preserve provenance and business isolation. If inadequate, document the specific failure before adding a separate knowledge component |
 | Knowledge lifecycle | Scoped exception and owner correction apply to the right pending work; accepted commitments stay unchanged; unavailable or stale derived context cannot silently authorize an action |
 | Evaluation | Human-reviewed scenarios; deterministic authority/arithmetic/isolation checks and calibrated semantic rubrics where useful; judge output never substitutes for provider evidence |
 | Booking journey | Actual model invocation and verified inquiry-to-offer-to-provisional-hold execution |
