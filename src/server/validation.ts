@@ -60,14 +60,18 @@ export function assertSameOrigin(headers: { origin?: string | null; referer?: st
   const referer = headers.referer ?? undefined;
   const host = (headers.host ?? "").toLowerCase();
   const candidate = origin ?? referer;
-  if (!candidate) return;
+  if (candidate === undefined) return;
+  if (!host || !candidate) throw new CrossOriginError("Missing Host or empty Origin was rejected");
   let parsed: URL;
   try {
     parsed = new URL(candidate);
   } catch {
     throw new CrossOriginError("Unparseable Origin was rejected");
   }
-  if (host && parsed.host.toLowerCase() !== host) {
+  if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password) {
+    throw new CrossOriginError("Invalid browser Origin was rejected");
+  }
+  if (parsed.host.toLowerCase() !== host) {
     throw new CrossOriginError(`Cross-origin mutation denied (origin ${parsed.host} != host ${host})`);
   }
 }

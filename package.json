@@ -28,7 +28,7 @@
     "postcss": "8.5.23"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=26"
   },
   "license": "MIT"
 }

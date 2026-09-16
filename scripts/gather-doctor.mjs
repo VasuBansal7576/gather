@@ -20,7 +20,7 @@ function usage() {
 Check the local Gather app prerequisites without changing the project.
 
 Checks:
-  Node.js 26 or newer (the foundation uses node:sqlite)
+  Node.js 26 or newer (the supported development baseline)
   package.json and the supported npm commands
   installed package dependencies
   an existing, writable project-local .runtime directory
@@ -85,9 +85,9 @@ function checkNode() {
   const version = process.versions.node;
   const major = Number.parseInt(version.split(".", 1)[0], 10);
   if (Number.isInteger(major) && major >= MIN_NODE_MAJOR) {
-    return check("pass", "Node.js", `Node.js ${version} is compatible (requires ${MIN_NODE_MAJOR}+ for node:sqlite).`);
+    return check("pass", "Node.js", `Node.js ${version} meets the supported baseline (${MIN_NODE_MAJOR}+).`);
   }
-  return check("fail", "Node.js", `Node.js ${version} is unsupported; Gather requires Node.js ${MIN_NODE_MAJOR}+ because the foundation uses node:sqlite.`);
+  return check("fail", "Node.js", `Node.js ${version} is unsupported; Gather's supported development baseline is Node.js ${MIN_NODE_MAJOR}+. See .node-version.`);
 }
 
 function checkDependencies(cwd, packageJson) {

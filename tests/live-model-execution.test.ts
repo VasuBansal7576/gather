@@ -33,14 +33,13 @@ import { GatherStore } from "../src/server/sqlite-store.ts";
 /**
  * Scripted MCP execution regression: a real MCP client drives the four
  * registered Gather tools over loopback HTTP against scripted fictional
- * provider transports. Facts come only from /tmp/gather-live-test-seed
- * (explicitly FICTIONAL, reused never regenerated). No live model runs
+ * provider transports. Facts come from versioned fixtures beside this test
+ * (explicitly FICTIONAL). No live model runs
  * (scripted planner stands in), no approval, no send, no live reads.
  */
 
-const SEED_DIR = "/tmp/gather-live-test-seed";
-const INQUIRY_TEXT = readFileSync(join(SEED_DIR, "inquiry.txt"), "utf8");
-const POLICY_TEXT = readFileSync(join(SEED_DIR, "venue-policy.md"), "utf8");
+const INQUIRY_TEXT = readFileSync(new URL("./fixtures/live-model/inquiry.txt", import.meta.url), "utf8");
+const POLICY_TEXT = readFileSync(new URL("./fixtures/live-model/venue-policy.md", import.meta.url), "utf8");
 
 const APP: GoogleProviderApp = {
   clientId: "gather-test-client",

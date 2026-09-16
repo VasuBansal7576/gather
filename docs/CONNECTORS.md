@@ -71,8 +71,7 @@ This result is not a confirmed booking and does not imply payment.
 
 ## Requirements for real adapters
 
-Live adapters remain unverified in this repository.
-The following are capability requirements, not claims that an available tool, SDK, or OpenClaw interface exists.
+Google adapters exist under `src/connectors/google/` and are wired through the [provider runtime](PROVIDER_RUNTIME.md). Their scripted regression tests are not live provider evidence. The following describe the provider-neutral contract.
 
 ### Email provider requirements
 
@@ -102,16 +101,13 @@ The following are capability requirements, not claims that an available tool, SD
 - Recheck availability immediately before a consequential hold and distinguish conflicts from authorization, quota, and transport failures.
 - Preserve the calendar source locator and the provider's observed timestamp.
 
-## What is intentionally absent
+## Simulator versus live adapters
 
-There are no live provider clients, network sends, OAuth configuration, credential reads, environment lookups, or external runtime dependencies in this package.
-No provider tool names or OpenClaw capabilities are asserted here because they have not been verified.
-Production wiring must be implemented only after the supported interface, account identity, test account, and reconciliation behavior are verified by the coordinator.
+`demo.ts` is deliberately simulated and performs no external provider calls. The repository also contains Google clients, OAuth configuration and scoped provider dispatch; see [Google adapters](GOOGLE_CONNECTORS.md) and [connections](CONNECTIONS.md). Never infer live connectivity or outcomes from the simulator.
 
 ## Node-compatible checks
 
-This repository currently has no package manifest or test runner configuration.
-On Node 22 or newer with built-in TypeScript stripping, run:
+`npm test` includes these tests. For the connector subset on the supported Node.js 26+ baseline, run:
 
 ```sh
 node --experimental-strip-types --test src/connectors/demo.test.ts

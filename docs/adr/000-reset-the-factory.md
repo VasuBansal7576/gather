@@ -1,6 +1,6 @@
 # ADR-000: Reset the factory
 
-Status: shipped (see the commit that adds this file)
+Status: historical repository reset (6f3582f); workflow rules superseded by current AGENTS.md
 Depends on: none
 PRD: 8.4 (design before implementation), 10 (Submission gate)
 
@@ -14,7 +14,7 @@ Remove hand-maintained status ledgers and personal identifiers from the reposito
 - Deleted stale remote branches; rewrote history so the former private PRD is not present in any commit.
 - Added `AGENTS.md`, `.agents/skills/{isolate,build,prove,ship,coordinate}/SKILL.md`, `docs/adr/000-template.md`, `.evidence/` to `.gitignore`.
 
-## Rules that now hold
+## Historical rules (not current instructions)
 - No status documents. Progress is merged PRs and ADR statuses.
 - No personal identifiers in tracked files.
-- Every change after this commit arrives through an ADR and a PR with an evidence table.
+- The reset required one ADR and an evidence table per change. Current AGENTS.md distinguishes maintenance from authorized feature work; the execution index now specifies ADRs 001–016 without lifting the implementation pause.

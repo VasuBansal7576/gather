@@ -1,17 +1,36 @@
-# Gather: how agents work here
+# Working on Gather
 
-Every task is one ADR from `docs/adr/`. Read your ADR, then run the four steps in order using the skills in `.agents/skills/`:
-`isolate` (fresh worktree from origin/main) -> `build` (service-layer code, only files your ADR owns) -> `prove` (before/after evidence at the user-visible level) -> `ship` (PR with the evidence, loop with review until clean).
-`coordinate` is for the integrator only.
+## Current scope
 
-Non-obvious facts about this repo:
+This public repository is the **hackathon build**, governed by `docs/HACKATHON_PRD.md` and its hackathon ADRs. Preserve its local-first distribution, prepared-business path and event-specific requirements. The private SaaS is a different product scope; do not import its hosted-delivery, billing or operational requirements here. A difference between the two is not a defect.
 
-- Requirements live in `docs/HACKATHON_PRD.md`. Read only the sections your ADR cites. Do not invent scope beyond the ADR.
-- `src/runtime/` is the only code that knows about OpenClaw. Never read or write the developer's personal `~/.openclaw`; the isolated runtime lives under `.runtime/`.
-- The prepared business (demo mode) uses simulated connectors. Anything simulated must stay labeled as simulated in the UI and in test names.
-- Authority, price floors, recipient limits and scope gates are enforced in server code, never in prompts. If your change would make a prompt the only enforcement, stop.
-- A passing test, a tool call returning, or a model saying it sent something is not evidence of an external outcome. Evidence is a receipt, a screenshot, or a transcript.
-- Golden path: `tests/golden-path.test.ts` (ADR-002) must stay green on every PR once it exists.
-- Commands: `npm ci`, `npm test`, `npm run typecheck`, `npm run build`, `node scripts/gather-doctor.mjs`. Node 22+.
-- Never commit secrets, runtime state, `.runtime/`, `*.sqlite`, customer data, or personal account identifiers. Operator-specific values come from env (`GATHER_*`).
-- No status ledgers. Progress is the PR and its evidence, not a markdown file.
+Feature implementation is paused at the owner's request. The active task is repository recovery: understand the product, correct misleading documentation and conflicting PRD/ADR instructions, repair existing application defects, and repair build/test/CI reproducibility. Application code is in scope for evidenced repairs; do not execute the unbuilt PRD/ADR backlog, remove existing modules, migrate data, or invent a new product direction.
+
+Read [README.md](README.md) and [docs/README.md](docs/README.md) first. The [PRD](docs/HACKATHON_PRD.md) describes intended behavior, not current capabilities. ADRs 001–016 are specified hackathon work orders with future acceptance evidence; the [execution index](docs/adr/README.md) and [shared contracts](docs/adr/CONTRACTS.md) define their scope and dependencies. Their presence is not implementation authorization. Only an explicit owner instruction resumes feature work.
+
+## Workflow
+
+- Chief owns pre-execution reconciliation and amendments. Follow the completed public execution index, contract definitions, coverage and dependency waves; do not re-decompose the PRD in Orca or ask workers to infer missing product scope. Return evidenced contract contradictions to Chief.
+- Orca is the intended execution orchestrator after that plan is ready and the owner explicitly resumes implementation. It coordinates the configured workers and handoffs; it does not have authority to invent requirements, import private SaaS scope or resolve product contradictions silently. An unresolved planning dependency returns to Chief before dispatch.
+
+- Inspect Git state and use an isolated worktree; continue the existing clean PR worktree for follow-up repairs, or create a fresh one from `origin/main` for a new task. Never overwrite another worker's files or runtime state.
+- Use the repository's `isolate`, `build`, `prove`, and `ship` skills in `.agents/skills/`. Maintenance can use a bounded PR scope; feature work requires an accepted ADR. User instructions take precedence over either.
+- No delegation or parallel workers unless requested. An ADR marked ready is not a dispatch instruction.
+- Keep changes reviewable. Record before/after evidence and unresolved findings in the PR, not a new progress ledger. Do not mark planned work implemented or a PR merged without evidence.
+- Open PRs ready for review, never draft. Do not merge or deploy unless explicitly authorized. If a reviewer is unavailable, report that fact; do not claim review approval or wait indefinitely for an unconfigured service.
+
+## Boundaries
+
+- Never read or write the developer's personal `~/.openclaw` for Gather work. Any Gather runtime must use its own root and isolated environment. `src/runtime/` owns the Gateway/process boundary; existing server/knowledge modules consume it.
+- Preserve deterministic server-side authority, recipient, scope, pricing, and approval checks. Prompts and memory never replace enforcement. Missing checks are defects/design gaps, not permission to claim the intended boundary already exists.
+- Preserve explicitly simulated labels on fixtures, UI states, and receipts. A test pass, model statement, or successful tool return is not evidence of a real external outcome.
+- Do not use live credentials or contact Google/model providers during default checks. Real runtime tests require an explicit `GATHER_TEST_OPENCLAW_BIN`; never discover and boot the developer's installation implicitly.
+- Never commit credentials, databases, `.runtime/`, customer data, or personal account identifiers. Tests must own their temporary state and keep fictional input fixtures in Git, not depend on a shared `/tmp` file.
+- Do not change existing database paths or delete data as a documentation fix. Supply `GATHER_DATABASE_PATH` explicitly for local inspection.
+- Preserve unrelated settings; no speculative dependency/framework swaps or removal of existing modules.
+
+## Validation
+
+Node.js 26+; use `.node-version` for the checked baseline. Run `npm ci`, `npm test`, `npm run typecheck`, and `npm run build`. The doctor also needs an existing `.runtime/` directory. `npm run lint` currently aliases typechecking.
+
+Keep skips visible. The full product golden-path test does not exist yet; do not claim it passed. Add focused regression/integration tests for existing behavior repaired during cleanup; this does not authorize building the missing product journey. Once separately implemented, it must remain green. UI changes need rendered evidence; docs/config-only changes do not need invented screenshots.

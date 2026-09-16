@@ -12,7 +12,7 @@ The root component includes three responsive views:
 
 Loading, empty, and blocked states are first-class UI states.
 The local fixtures in `demo-data.ts` are visibly labeled `Demo data` in the workspace.
-They must be replaced with the host application's contracts before production use.
+The root route uses `GatherHostWorkspace` to supply persisted API records; component-local fixtures are only a standalone UI fallback.
 
 ## Integration
 
@@ -131,4 +131,4 @@ The styling is scoped under `.gather-app-shell` so the host application can moun
 
 ## Local checks
 
-`src/components/gather/state.ts` holds the pure selection, pending-approval, and recovery-routing helpers; `src/components/gather/state.test.ts` covers them and runs with `node --experimental-strip-types --test src/components/gather/state.test.ts` until the shared test script picks it up.
+`src/components/gather/state.ts` holds the pure selection, pending-approval, and recovery-routing helpers. `src/components/gather/state.test.ts` covers them and is included by `npm test`. These helper tests do not replace rendered interaction checks.

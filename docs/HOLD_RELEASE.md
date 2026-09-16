@@ -1,11 +1,8 @@
-# Calendar hold release (G11 cancellation/revisions)
+# Calendar hold release
 
-Bounded verified release port for provisional calendar holds. Consumed by
-the K cancellation service through the separately exported optional port
-`CalendarHoldReleaseConnector` — deliberately NOT merged into
-`CalendarConnector`, so existing lanes keep compiling unchanged.
+Bounded release/reconciliation port for provisional calendar holds. `CalendarHoldReleaseConnector` is exported separately from `CalendarConnector`; the adapter contract alone does not establish a complete cancellation workflow.
 
-## Contract (for the K cancellation service)
+## Contract
 
 - Types: `src/connectors/hold-release.ts`
   - `ReleaseProvisionalHoldRequest`: `operationKey` (this release action's

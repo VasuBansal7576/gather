@@ -1,29 +1,24 @@
 ---
 name: prove
-description: Capture before/after evidence at the user-visible level for an ADR: screenshots, HTTP transcripts, test output, receipts. Use after build, before ship.
+description: Verify the actual changed Gather behavior and report honest evidence.
 ---
 
 # Prove
 
-A worker saying "it works" is not evidence. Tests alone are not evidence of user-visible behavior. Produce artifacts a reviewer can inspect without running anything.
+Keep local evidence under ignored `.evidence/`; put inspectable summaries, command output or CI links in the PR. An ignored local path alone is not a public evidence link.
 
-## Required artifacts (put them in `.evidence/adr-<NNN>/`, attach to the PR, never commit them)
+1. Show the before/after for the actual change: source excerpts or command output for docs/config, failing/passing reproductions for defects, rendered interaction for UI.
+2. Run `npm test`, `npm run typecheck` and `npm run build`; state the revision and any skips/failures. Run the golden path only once it exists; until then say it is absent.
+3. For authorized feature work, account for every ADR acceptance item. Missing evidence stays missing; never alter criteria to manufacture a pass.
+4. Label simulated, scripted and real provider evidence separately. Tool returns and model prose do not establish external effects.
+5. For UI changes, capture desktop/mobile rendered evidence. For persistence changes, restart against the same isolated database. Neither requirement applies automatically to documentation-only work.
 
-1. **Before**: what the app did on `origin/main` for the scenario your ADR changes. A screenshot, an HTTP transcript (`curl -i`), or a failing test run. If the feature did not exist, a screenshot showing its absence.
-2. **After**: the same scenario on your branch. Same viewport, same route, same inputs.
-3. **The ADR's Acceptance list, item by item**, each with the artifact that proves it. Missing items are listed as missing, not omitted.
-4. **Suite**: `npm test`, `npm run typecheck`, `npm run build` output from your worktree, plus `tests/golden-path.test.ts` passing if it exists.
+For an isolated app inspection, set the database on the **server process**, not merely on the preceding build:
 
-## How to capture
+```sh
+mkdir -p .runtime
+npm run build
+GATHER_DATABASE_PATH=.runtime/review.sqlite npm start -- --hostname 127.0.0.1 --port <free-port>
+```
 
-- Start the app on a fresh database: `GATHER_DATABASE_PATH=.runtime/adr-<NNN>.sqlite npm run build && npm run start -- --hostname 127.0.0.1 --port <free port>`.
-- Screenshots at 1440x900 and 390x844 for any UI change. Show the full route, including labels such as "simulated".
-- HTTP transcripts must show request and response including status codes; redact nothing except tokens.
-- For anything involving the model or a provider, state plainly whether the artifact came from a simulated connector, a scripted transport, or a real external call. Never blur that line.
-- Restart the server once and re-check anything that claims persistence.
-
-## Not allowed
-
-- Editing acceptance criteria to match what you built.
-- Claiming an external outcome (email sent, hold created) from a tool return value. Only a re-read receipt counts.
-- Screenshots of code or terminals as proof of UI behavior.
+Do not reuse an existing developer database or stop an unrelated server. Do not include credentials or personal/customer content in evidence.

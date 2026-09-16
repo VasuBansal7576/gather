@@ -1,4 +1,4 @@
-# Owner setup UI (PRD G01/G18)
+# Owner setup UI
 
 Guided setup: a real owner chooses or creates a venue (name + timezone),
 connects Google apps against actual connection state, then enters the
@@ -6,15 +6,14 @@ workspace — or explicitly tries the demo. No workflows, agents, databases,
 mappings, or OAuth technical forms are exposed; the provider list is driven
 by the server (no app cap).
 
-Ownership: `app/setup/**`, `src/setup/**`, `tests/setup*.test.ts`, this
-document. Host globals, layout, workspace UI, and shared CSS are untouched.
+Existing implementation: `app/setup/`, `src/setup/`, and `tests/setup*.test.ts`. This is the venue-form setup, not the proposed two-card prepared-business onboarding.
 
 ## Route and states
 
 `/setup` (client component, scoped `app/setup/setup.css` under
 `.setup-shell`, inheriting host `globals.css`):
 
-1. **Your venue** — existing businesses from `GET /api/workspace` as
+1. **Your venue** — existing businesses from `GET /api/setup` (workspace fallback only if the setup route is absent) as
    single-tap choices; create form (name + timezone with datalist)
    `POST /api/setup/business`. Loading, empty, error/retry throughout.
 2. **Your apps** — `GET /api/connections?businessId` drives one card per
@@ -36,10 +35,9 @@ superseded business selections or retries. Callback query is read once for
 the controlled `connected`/`connectionError` hint only; authoritative state
 always comes from a refetch. Keyboard: native buttons/inputs/labels,
 `aria-live` status region, `aria-current` steps, visible `:focus-visible`
-ring. Layouts: single column under 720px (390 verified), centered 880px
-panel at desktop (1586 verified).
+ring. Layouts: single column under 720px and centered 880px panel at desktop; verify rendered behavior for each UI change rather than relying on historical screenshot claims.
 
-## API contract used (connections service owns the server; shapes verified read-only against its edba5dd routes)
+## API contract
 
 - `GET /api/setup` → `{ownerId, businesses:[{id,name,timezone}], providers:[{provider:'google',status:'available'|'unavailable',unavailableReason?}]}` — venue list plus readiness. Only when this route itself is absent does the UI fall back to the workspace aggregation for the same business rows.
 - `POST /api/setup/business {name, timezone}` → `{business:{id,name,timezone}, created, ownerId}` — IANA-validated, idempotent on same name+timezone, owner server-derived, no seed data.
@@ -54,6 +52,4 @@ panel at desktop (1586 verified).
 injected fixture fetch only — they assert validators, stale guards, and
 error mapping, never real provider outcomes. The app itself calls the real
 local service and renders the honest unavailable state when APIs are
-absent. Rendered browser checks (desktop 1586 + mobile 390 screenshots)
-are captured per run; full API integration follows the separate gate after
-the connections service is accepted.
+absent. Rendered browser checks belong to individual UI changes; this guide does not claim current screenshot or live-provider acceptance.

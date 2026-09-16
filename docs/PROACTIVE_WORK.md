@@ -1,8 +1,6 @@
 # Proactive waiting-work ledger
 
-Files owned: `src/coordination/**`,
-`tests/coordination*.test.ts`, this document. Shared domain, server,
-SQLite store, API, UI, and packaging files are untouched.
+Durable ledger in `src/coordination/`, covered by `tests/coordination*.test.ts`. Its consumers include the [operator runtime](OPERATOR_RUNTIME.md) and [proactive bootstrap](PROACTIVE_BOOTSTRAP.md). This is a module reference, not an active file-ownership assignment.
 
 ## What it is
 
@@ -180,6 +178,9 @@ UTC for storage and compared as epoch millis, so caller clock shapes
 
 ## Verified (module scope only)
 
+The following describes module coverage, not a current run receipt. Test counts and live outcomes must come from the exact revision's CI or explicit verification.
+
+
 `tests/coordination.ledger.test.ts` — 28 tests against real temporary
 SQLite files: restart survival across close/reopen (including persisted
 control state), duplicate collapse, scoped per-booking dedupe keys, legacy
@@ -200,16 +201,11 @@ about external duplication.
 
 ## Wiring that remains (not claimed)
 
-1. OpenClaw watch loop calling `ingestEvent` for new/changed provider
-   state, with stable `dedupeKey` and `sourceId` derivation per connector,
-   namespaced per booking. `sourceKind` and payloads are untrusted labels.
+1. The existing Gather host scheduler and intake service call `ingestEvent` for captured Gmail state. There is no need to assume an additional OpenClaw watch loop. `sourceKind` and payloads remain untrusted labels.
 2. Owner-experience control callbacks into `applyOwnerControl` with the
    persisted owner identity, and verifier callbacks into
    `recordVerifiedReceipt` — never provider text.
-3. Host drain loop calling `listDueWork` / `claimDueWork`, then routing
-   claimed items to guarded Gather services (availability recheck, offer
-   drafting, approval-gated sends, deposit-receipt verification) using
-   stable operation keys with reconciliation of uncertain outcomes.
+3. `src/server/operator-runtime/due-work.ts` already lists/claims due work and reconciles guarded execution outcomes. It does not authorize automatic offer drafting or follow-up sends. See its reference before adding another progression loop.
 4. Guarded-service callbacks into `resolveWaiting` after acting; services
    must recheck pause/cancel/revision/reply immediately before any external
    effect, since in-flight ledger rows never block a send by themselves.

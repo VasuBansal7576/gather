@@ -1,28 +1,28 @@
 ---
 name: build
-description: Implement one ADR with readable service-layer code, tests that assert observable behavior, and no scope beyond the ADR. Use after isolate.
+description: Make the authorized Gather change without expanding product scope.
 ---
 
 # Build
 
-Read the ADR fully. Read only the PRD sections it cites. Then:
+Read `AGENTS.md` first. Feature work is paused unless explicitly resumed by the owner. A documentation, CI or test-harness cleanup is not permission to implement the ADR backlog.
 
-## Structure
+## Maintenance
 
-- Route handlers (`app/api/**`) parse, validate with zod at the boundary, call one service, and map the result to a DTO. No business logic in routes.
-- Services (`src/server/**`, `src/<domain>/**`) own the why and when. They are pure TypeScript with explicit types at their public surface and are testable without HTTP.
-- Stores own SQL. A service never writes SQL inline.
-- Anything that must hold regardless of what the model says (price floor, recipient allowlist, scope gate, approval binding) is a plain function with unit tests, called from the service before any provider or runtime call.
-- `unknown` plus narrowing at boundaries; no `any`; no helpers that exist only to hide a cast.
-- Comments explain contracts and non-obvious constraints, not what the code obviously does. Do not delete existing comments.
+- Correct claims against source. Separate intended behavior, existing code, tests and live evidence.
+- Repair reproduced defects in existing application behavior as well as build/test reproducibility. Add focused regression evidence; preserve intended contracts and never weaken assertions. Do not implement missing product capabilities under the label of repair.
+- Preserve existing contracts, data and unrelated settings. Do not delete modules because their names overlap.
+- Use fictional versioned fixtures, not local account data or shared `/tmp` inputs.
+- Repository-owned skill files can be corrected as ordinary source when requested; do not change installed/global skills.
 
-## Behavior
+## Authorized feature work (only after the pause is lifted)
 
-- Extend `tests/golden-path.test.ts` if your ADR adds a step to the journey. Never weaken an existing assertion to make a change pass.
-- Simulated connectors and fixtures stay labeled `simulated` in names, DTOs and UI copy.
-- New operator-specific values are read from `GATHER_*` env with an undeliverable or disabled default, never a real account or address.
-- Keep the change to the files the ADR **Owns**. Note anything you wanted to change elsewhere in the PR under "Follow-ups".
+- Read the accepted ADR and the PRD sections it cites. Stay inside the reviewed scope.
+- Routes parse and validate inputs, call services and map responses. Services own business behavior; stores own SQL.
+- Use `unknown` and narrowing at boundaries. Do not weaken deterministic authority, price, scope or recipient checks.
+- Preserve comments explaining contracts, simulation labels, and operator-specific `GATHER_*` configuration.
+- Extend the golden path if it exists and the behavior changes; never invent a passing golden-path claim.
 
-## Before moving to prove
+## Before proving
 
-`npm run typecheck && npm test && npm run build` all pass in your worktree.
+Run `npm run typecheck`, `npm test` and `npm run build`. Report failures and skips accurately. New product behavior needs user-visible evidence; docs/config changes need source and command evidence, not screenshots of unchanged UI.

@@ -3,8 +3,7 @@
 Contract-level live adapters under `src/connectors/google/`. Every exchange
 is currently exercised only against scripted transports in
 `tests/google-calendar.test.ts` and `tests/google-gmail.test.ts` (labeled
-SIMULATED). **No live account verification has been performed; the live gate
-is BLOCKED** until onboarding provides approved account assets. These
+SIMULATED). These tests do not verify a live account. A live run needs separately authorized, configured account assets and independent outcome evidence. These
 adapters are never registered as connected by default — `createGoogleConnectors`
 only composes them; no runtime wiring references them.
 

@@ -1,6 +1,8 @@
 # Business knowledge boundary
 
-`src/knowledge/` implements the source-linked business understanding lane:
+This documents the existing SQLite-backed module, not the PRD's proposed native OpenClaw recall/wiki integration. The native integration remains unimplemented; the ownership and adoption gate are clarified in ADR-005. See the [repository guide](README.md#design-conflicts-to-resolve-before-implementation).
+
+`src/knowledge/` implements the source-linked business understanding boundary:
 extracted content from connected documents/messages arrives as **untrusted
 candidates** (`probable` or `uncertain`), and only an **explicit owner
 command** can mint the verified `BusinessFact` rows the rest of Gather (and
@@ -169,6 +171,9 @@ Every mutating call accepts an optional `commandId`; a repeat returns the
 recorded outcome (`duplicate: true`) with no additional effect.
 
 ## Verification
+
+The following describes module coverage, not a current run receipt. Test counts and live outcomes must come from the exact revision's CI or explicit verification.
+
 
 - `npx tsc --noEmit` — clean.
 - `node --experimental-strip-types --test tests/knowledge.test.ts` — 12

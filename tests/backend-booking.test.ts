@@ -431,3 +431,86 @@ test("cross-origin mutations are denied while same-origin and non-browser calls 
   assert.doesNotThrow(() => assertSameOrigin({ host: "localhost:3000", origin: "http://localhost:3000" }));
   assert.throws(() => assertSameOrigin({ host: "localhost:3000", origin: "https://evil.example" }), /Cross-origin/);
 });
+
+for (const operation of ["approve", "retry"] as const) {
+  test(`cleanup regression: ${operation} replay preserves confirmed booking and receipts`, async () => {
+    const s = setup();
+    try {
+      const { action, booking } = seedBooking(s, { booking: "b-confirmed", action: "a-confirmed" });
+      const first = await approveAndExecute(s.deps, approveInput(s, action.id, booking.id));
+      // Model the authoritative delivery transition that follows successful execution.
+      s.store.updateBookingStatus(booking.id, "confirmed");
+      const replay = operation === "approve"
+        ? await approveAndExecute(s.deps, approveInput(s, action.id, booking.id))
+        : await retryFailedSteps(s.deps, action.id);
+      assert.equal(replay.booking.status, "confirmed", "execution replay must not undo delivery confirmation");
+      assert.equal(replay.hold.execution.id, first.hold.execution.id);
+      assert.equal(replay.email?.execution.id, first.email?.execution.id);
+      assert.equal(s.connectors.store.listProvisionalHolds().length, 1);
+    } finally { s.cleanup(); }
+  });
+}
+
+test("cleanup regression: cancelled booking cannot be approved or retried", async () => {
+  const s = setup();
+  try {
+    const { action, booking } = seedBooking(s, { booking: "b-cancelled", action: "a-cancelled" });
+    s.store.approveProposedAction(action.id, "test-owner");
+    s.store.updateBookingStatus(booking.id, "cancelled");
+    await assertServiceError(approveAndExecute(s.deps, approveInput(s, action.id, booking.id)), "CONFLICT");
+    await assertServiceError(retryFailedSteps(s.deps, action.id), "CONFLICT");
+    assert.equal(s.store.getBooking(booking.id).status, "cancelled");
+    assert.equal(s.store.listActionExecutions(action.id).length, 0);
+  } finally { s.cleanup(); }
+});
+
+test("cleanup regression: cancellation during availability read prevents hold and email", async () => {
+  const s = setup();
+  try {
+    const { action, booking } = seedBooking(s, { booking: "b-cancel-await", action: "a-cancel-await" });
+    const calendar = s.deps.calendar;
+    s.deps.calendar = {
+      ...calendar,
+      checkAvailability: async (request) => {
+        const result = await calendar.checkAvailability(request);
+        s.store.updateBookingStatus(booking.id, "cancelled");
+        return result;
+      },
+      createProvisionalHold: (request) => calendar.createProvisionalHold(request),
+      reconcileProvisionalHold: (request) => calendar.reconcileProvisionalHold(request),
+    };
+    await assertServiceError(approveAndExecute(s.deps, approveInput(s, action.id, booking.id)), "CONFLICT");
+    assert.equal(s.store.getBooking(booking.id).status, "cancelled");
+    assert.equal(s.store.listActionExecutions(action.id).length, 0);
+  } finally { s.cleanup(); }
+});
+
+test("cleanup regression: browser origin checks fail closed without a valid host or origin", () => {
+  for (const headers of [
+    { origin: "https://other.example.test" },
+    { host: "localhost:3000", origin: "" },
+    { host: "localhost:3000", origin: "ftp://localhost:3000" },
+    { host: "localhost:3000", origin: "http://user:pass@localhost:3000" },
+  ]) assert.throws(() => assertSameOrigin(headers), /Origin|origin/);
+});
+
+test("cleanup regression: cancellation during hold preserves its receipt but stops the email", async () => {
+  const s = setup();
+  try {
+    const { action, booking } = seedBooking(s, { booking: "b-cancel-hold", action: "a-cancel-hold" });
+    const calendar = s.deps.calendar;
+    s.deps.calendar = {
+      checkAvailability: (request) => calendar.checkAvailability(request),
+      reconcileProvisionalHold: (request) => calendar.reconcileProvisionalHold(request),
+      createProvisionalHold: async (request) => {
+        const result = await calendar.createProvisionalHold(request);
+        s.store.updateBookingStatus(booking.id, "cancelled");
+        return result;
+      },
+    };
+    await assertServiceError(approveAndExecute(s.deps, approveInput(s, action.id, booking.id)), "CONFLICT");
+    assert.equal(s.store.getBooking(booking.id).status, "cancelled");
+    assert.equal(s.store.getExecutionByIdempotencyKey(holdOperationKey(action.id, 1))?.status, "succeeded");
+    assert.equal(s.store.getExecutionByIdempotencyKey(emailOperationKey(action.id, 1)), undefined);
+  } finally { s.cleanup(); }
+});

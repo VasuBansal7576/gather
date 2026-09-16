@@ -1,9 +1,6 @@
 # Booking Delivery: Guarded Confirmation and Operational Handoff
 
-Status: implemented module, fixture-verified. The wired runtime uses the
-demo calendar adapter, so real-venue confirmation is **unavailable** — a
-simulated provider can never mint live provenance, and `liveReady`
-requires every cited source reference to be non-fictional.
+Existing module with fixture-based regression coverage. The runtime uses `getRuntime().deps.calendar`, which dispatches to simulated or configured Google adapters. A simulated provider can never mint live provenance, and `liveReady` requires every cited source reference to be non-fictional. This module alone does not establish a complete live confirmation journey.
 
 ## What this adds
 
@@ -139,9 +136,7 @@ Fixture proof vs real receipt verification is carried by
 `SourceReference.fictional` end to end: the availability verifier
 inherits the provider adapter's declared `simulated` flag, and
 `liveReady` requires zero fictional refs among cited evidence.
-The default runtime wires the demo calendar adapter, so its
-attestations are fictional and `confirm` will report `blocked` — the
-guarded path is exercised in tests with injected live-marked fakes.
+Fixture bookings dispatch to the demo calendar adapter, so their attestations are fictional and cannot prove live confirmation. The guarded path is exercised in tests with injected live-marked fakes; a fake marked live is still not external provider evidence.
 
 An expired in-progress confirm command is reclaimable only once: the
 reclaim is a conditional update on `updated_at`, and a caller whose
@@ -150,6 +145,9 @@ re-classified against the winner's row — `conflict`, `in_progress`, or
 `replay` — never `owned`.
 
 ## Verified
+
+The following describes module coverage, not a current run receipt. Test counts and live outcomes must come from the exact revision's CI or explicit verification.
+
 
 - `tests/booking-delivery.test.ts` — 22 tests: live confirm +
   persisted decision, canonical replay, key conflict and in-progress

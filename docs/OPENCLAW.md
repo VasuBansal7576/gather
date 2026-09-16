@@ -13,6 +13,9 @@ read or written.
 
 ## Verified package interface
 
+The following describes module coverage, not a current run receipt. Test counts and live outcomes must come from the exact revision's CI or explicit verification.
+
+
 | Package | Pinned | Evidence |
 | --- | --- | --- |
 | `openclaw` (runtime binary) | host-installed `2026.9.4`, resolved as an explicit absolute path and verified via `--version` (`OpenClaw x.y.z` banner required) | `npm view openclaw bin` → `openclaw.mjs` entry; `resolveInstalledPackageEntry()` mirrors the embedding doc's `import.meta.resolve("openclaw")` + sibling `openclaw.mjs` pattern |
@@ -248,43 +251,19 @@ missing/unknown session ids get `404` per the MCP spec.
   OpenClaw's tool approval is a separate mechanism that confers no Gather
   booking authority.
 
-## Verification
+## Verification boundary
 
-- `npm run typecheck` — clean.
-- `npm test` — all pass. `tests/runtime.test.ts` (42 tests) covers
-  isolation, config materialization, env allowlist rejection, executable
-  validation, loopback port probes (free/held/released; invalid ports
-  rejected; wildcard-bound occupants detected; two allocations do not
-  collide), bounded tracked repair (deadline kills a hung `doctor --fix`;
-  `stop()` reaches the in-flight repair child), collision-proof session keys,
-  mock-transport protocol
-  (connect/hello-ok, malformed responses, wait-status mapping), spawn-error
-  and observed-exit shutdown semantics, facade lifecycle (failed-start MCP
-  rollback with same-port rebind proving release, failed MCP close keeps
-  ownership until an observed close, connect-failure cleanup,
-  single-flight concurrent/repeated start, blocked retry after uncertain
-  child exit, running-child-with-dropped-WS guard, start-during-stop
-  ordering; MCP ports are ephemeral or per-run allocated, never fixed),
-  real loopback MCP (auth/Host/Origin, two-session reconnect, simulated
-  labeling), and four real-boot doctor tests (sentinel preservation on an
-  auto-allocated port; SIGTERM mid-run on an explicit per-run port still
-  observing child exit and cleaning only its own directory; occupied port
-  failing at preflight with the foreign listener untouched and sentinel
-  preserved; bare `--port` failing preflight).
-- `node scripts/openclaw-doctor.mjs` — actual isolated boot on host
-  `openclaw@2026.9.4` (explicit `--openclaw-bin`, e.g.
-  `/opt/homebrew/bin/openclaw`): unique `.runtime/openclaw-doctor-*` root
-  → `port` record (dynamic allocation or explicit+preflight) → verified
-  `--version` → `child spawned` (liveness past the 1.5 s window, NOT
-  readiness) → `protocol-ready (hello-ok)` (protocol 4, 424 methods,
-  unchanged 30 s deadline) → `status`, `sessions.list`, `config.get`
-  (proves `tools.profile=messaging` + `mcp.servers=[gather]` accepted) →
-  observed SIGTERM exit → removes only the directory it created.
-  Demonstrated: two simultaneous isolated boots on distinct dynamic ports
-  (both full PASS, exit 0), plus a busy-port run failing clear at
-  preflight (exit 1, occupant untouched). Contract tests use a mock
-  transport; the doctor and the three end-to-end tests are real-process
-  proofs. No model/provider invocation occurs.
+`npm test` includes runtime contract, isolation, model configuration, cancellation and loopback MCP tests using controlled fixtures/transports. It does not require an installed OpenClaw binary and does not call a model or Google.
+
+Four doctor/process tests are opt-in through `GATHER_TEST_OPENCLAW_BIN`, an absolute path to an existing binary. Default tests and CI report them as skipped. An invalid explicit path fails; the suite does not discover a host installation automatically.
+
+```sh
+GATHER_TEST_OPENCLAW_BIN=/absolute/path/to/openclaw npm test
+```
+
+Those tests exercise isolated boot/sentinel preservation, shutdown during startup, occupied-port refusal and invalid-port input. They allocate their own temporary project state and ports. The separate `scripts/openclaw-doctor.mjs` accepts `--openclaw-bin` for an explicit control-plane probe; neither that probe nor a successful handshake establishes model execution or provider outcomes.
+
+Use the exact revision's test output and explicit live receipts for verification. Historical boot observations and module test counts are not current acceptance evidence.
 
 ## Known limitations
 
@@ -296,14 +275,14 @@ missing/unknown session ids get `404` per the MCP spec.
 3. Inbound customer replies must be injected by Gather via `agent` RPC —
    channels are intentionally disabled (`OPENCLAW_SKIP_CHANNELS=1`).
 4. `agent` runs require a configured model provider; the doctor verifies
-   control-plane only. No live model or Google API call has been made.
+   control-plane only; it supplies no model or Google outcome evidence.
 5. Startup reliability is bounded, not proven: dynamic per-run ports remove
    the fixed-port collision weakness and the busy-port preflight fails
    fast, but a "free" probe never guarantees the gateway bind succeeds —
    the bind is authoritative. No root cause is claimed for earlier
    load-related boot failures; fixed ports and 1.5 s liveness-as-boot were
    weaknesses, not established causes.
-5. The gateway tool policy constrains *which tools exist*; MCP tool calls
+6. The gateway tool policy constrains *which tools exist*; MCP tool calls
    still flow through OpenClaw's tool-policy layer, which is advisory for
    Gather business authority — the Gather-side approval/action store remains
    the authority boundary.
