@@ -59,19 +59,26 @@ const pingTool = defineGatherTool({
   }),
 });
 
+const PROFILE_ID = process.env.GATHER_MODEL_PROFILE_ID;
+const PROFILE_EMAIL = process.env.GATHER_MODEL_EMAIL;
+if (!PROFILE_ID || !PROFILE_EMAIL) {
+  console.error("GATHER_MODEL_PROFILE_ID and GATHER_MODEL_EMAIL are required (OpenClaw OAuth auth profile)");
+  process.exit(2);
+}
+
 async function main() {
   const gatewayPort = Number(arg("--gateway-port", "0")) || (await freeLoopbackPort());
   const runtime = new GatherOpenClawRuntime({
     rootDir: LIVE_ROOT,
     gatewayPort,
-    executable: { command: "/opt/homebrew/bin/openclaw" },
+    executable: { command: process.env.GATHER_OPENCLAW_BIN ?? "/opt/homebrew/bin/openclaw" },
     model: {
       model: "openai/gpt-5.6-luna",
       auth: {
-        profileId: "openai:bansalv8198@gmail.com",
+        profileId: PROFILE_ID,
         provider: "openai",
         mode: "oauth",
-        email: "bansalv8198@gmail.com",
+        email: PROFILE_EMAIL,
       },
     },
     mcpTools: [pingTool],
@@ -142,7 +149,7 @@ async function main() {
     }
     const receipt = {
       model: "openai/gpt-5.6-luna",
-      profileId: "openai:bansalv8198@gmail.com",
+      profileId: PROFILE_ID,
       gatewayPort,
       runId,
       sessionKey: submitted.sessionKey,

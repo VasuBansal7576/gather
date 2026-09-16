@@ -1,6 +1,6 @@
 # Proactive waiting-work ledger
 
-Owner: coordination worker. Files owned: `src/coordination/**`,
+Files owned: `src/coordination/**`,
 `tests/coordination*.test.ts`, this document. Shared domain, server,
 SQLite store, API, UI, and packaging files are untouched.
 

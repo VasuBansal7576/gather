@@ -39,7 +39,12 @@ import { LiveModelError } from "./types.ts";
  * the same boundary through a real MCP client over loopback HTTP.
  */
 
-export const CONTROLLED_TEST_RECIPIENT = "work.vasu.ai@gmail.com";
+/**
+ * The only address live sends may target during development. Operators set
+ * GATHER_TEST_RECIPIENT; the default is undeliverable by design.
+ */
+export const CONTROLLED_TEST_RECIPIENT =
+  process.env.GATHER_TEST_RECIPIENT ?? "gather-test-recipient@example.invalid";
 
 export interface ExecutionPlannerCall {
   tool: string;

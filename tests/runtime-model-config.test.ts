@@ -26,7 +26,7 @@ import {
 } from "../src/runtime/index.ts";
 
 const MODEL = "openai/gpt-5.6-luna";
-const PROFILE = "openai:bansalv8198@gmail.com";
+const PROFILE = "openai:owner@example.invalid";
 
 function selection(overrides: Record<string, unknown> = {}): GatherModelSelection {
   return {

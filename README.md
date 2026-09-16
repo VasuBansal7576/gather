@@ -1,31 +1,38 @@
 # Gather
 
-### Your event-booking operator. Your tools. Your authority.
+### Your event-booking operator. Your tools. Your machine.
 
 Gather helps independent venues, private-dining restaurants, and caterers move from scattered inquiries to organized bookings.
 Connect business apps, give the operator a goal, and review the decisions that need you.
 
 **Gmail brings the conversation. Drive supplies packages and policies. Calendar provides availability. Gather connects the work.**
 
+Gather is local-first: everything runs on your machine and your business data stays with you.
+A hosted service is a later offering.
+
 ## Demo video
 
-The previous narrated overview has been withdrawn: it did not demonstrate the application executing a complete workflow. A replacement screen recording will be linked only after the actual workflow and its results are verified.
+A narrated recording of the actual workflow will be linked here once the current build is verified.
+The previous overview was withdrawn because it did not show a complete run.
 
 ## What the product does
 
 - Brings inquiries, business information, offers, approvals, and action results into one owner workspace.
+- Acts only on event bookings; everything else is visibly declined with a reason.
 - Uses an isolated OpenClaw runtime to let a model call controlled Gather tools.
 - Prepares offers using customer requirements, venue policies, and availability.
 - Binds approval to the exact proposal, rather than granting unlimited permission.
 - Records calendar and email actions separately, so partial completion is visible.
 - Persists booking progress and supports recovery instead of blindly repeating writes.
+- Detects operational failures and repairs recoverable ones from a fixed catalog, with a visible repair thread.
 
 The intended journey is **inquiry → evidence → feasible offer → owner approval → reservation and communication → verified booking conditions → team handoff**.
 A provisional hold is not a paid or confirmed booking.
 
-## Run locally
+## Run it
 
-Use **Node.js 26+** for the documented, tested setup and npm.
+Use **Node.js 22+** and npm.
+The verified route today is a clone:
 
 ```sh
 git clone https://github.com/VasuBansal7576/gather.git
@@ -39,34 +46,29 @@ GATHER_DATABASE_PATH=.runtime/owner-demo.sqlite npm run start -- --hostname 127.
 
 Open **http://127.0.0.1:3000/setup**, select **Try demo**, and enter the owner workspace.
 Keep the server running; the database remains in `.runtime` across restarts.
-Choose a different port if 3000 is already occupied.
+All state lives under `.runtime/`; nothing outside the working directory is created.
 
-**Demo mode requires no Google credentials or model subscription.**
-Its application logic and persistence are real; its venue records and external effects are explicitly simulated.
+A one-command install (`npx github:VasuBansal7576/gather`) and a "prepared business" first-run screen are the current build target (see `docs/adr/001-local-first-product-shell.md`); the steps above are what works today.
 
-For development, use `npm run dev` after installing dependencies.
-See [local setup](docs/LOCAL_SETUP.md) for launcher and troubleshooting details.
+**The prepared business needs no Google credentials and no model subscription.**
+Its application logic and persistence are real; its venue records and external effects are explicitly simulated and labeled as such.
 
-## Connect real apps and a model
+## Connect your own apps and a model
 
-**Live mode requires your own Google account authorization and a supported model login. Demo mode requires neither.**
+**Live mode requires your own Google account authorization and a supported model login. The prepared business requires neither.**
 
-### Customer experience versus self-hosted developer setup
+Live mode is the current development focus; the prepared business is the supported evaluation path today.
+When live mode ships, it will:
 
-The intended customer experience is **Connect Google → select your account → approve access**. Customers should not create Cloud projects, enable APIs, or manage OAuth client secrets. A Gather-operated OAuth application and connection service should handle that developer configuration and any required Google verification centrally.
+- Install the pinned OpenClaw runtime under `.runtime/` on first use (never touching `~/.openclaw`).
+- Sign into a model through OpenClaw's own subscription login or a key you provide.
+- Connect Gmail, Drive, and Calendar through a Gather OAuth client using the loopback flow, with `drive.file` plus a document picker instead of full Drive access.
+- Send only to the inquiry sender (plus an optional configured test recipient).
 
-**That shared onboarding service is not included in this local prototype yet.** The instructions below are for developers self-hosting their own instance, not a finished customer signup flow. Cloning this repository does not provide access to the project's test OAuth client or anyone else's connected accounts. Never distribute a shared web-client secret in the repository or browser bundle.
-
-### Current self-hosted configuration
-
-1. Register a Google OAuth application, enable Gmail, Drive, and Calendar APIs, and designate the test user when using Testing mode.
-2. Configure `GATHER_GOOGLE_CLIENT_ID`, `GATHER_GOOGLE_CLIENT_SECRET`, and `GATHER_GOOGLE_REDIRECT_URI` securely in the server environment.
-3. Register the exact callback, normally `http://localhost:3000/api/connections/google/callback`, and use the matching browser hostname for the connection flow.
-4. Use Gather's **Connect Google** flow and approve the requested permissions.
-5. Configure a separate OpenClaw runtime with a supported, authorized model login and designate the business sources used by its tools.
+Today, developers can exercise the live boundary with `GATHER_MODEL_PROFILE_ID`, `GATHER_MODEL_EMAIL`, `GATHER_TEST_RECIPIENT`, and `GATHER_OPENCLAW_BIN` environment variables; see the guides below.
 
 Never put OAuth secrets, tokens, runtime state, or customer data in Git.
-The macOS connection adapter uses Keychain; other deployment environments require an appropriate secret-store integration.
+The macOS connection adapter uses Keychain; other environments use the file-backed adapter under `.runtime/secrets/`.
 
 Detailed guides: [Google connections](docs/CONNECTIONS.md) · [Google adapters](docs/GOOGLE_CONNECTORS.md) · [OpenClaw integration](docs/OPENCLAW.md) · [Model configuration](docs/MODEL_CONFIG.md) · [Model-driven execution](docs/LIVE_MODEL_RUN.md).
 
@@ -74,17 +76,16 @@ Detailed guides: [Google connections](docs/CONNECTIONS.md) · [Google adapters](
 
 ```text
 Owner workspace
-      │
+      |
 Gather backend: booking state, authority, approvals, receipts
-      │
-Isolated OpenClaw runtime ↔ controlled Gather tools
-                                  │
+      |
+Isolated OpenClaw runtime <-> controlled Gather tools
+                                  |
                       Gmail · Drive · Calendar
 ```
 
 **Gather** owns the business rules and customer experience.
 **OpenClaw** supplies the agent runtime; this repository does not rebuild it.
-**Orca** coordinates development and is not required by customers.
 Connected applications remain authoritative for their external records.
 
 ## Reliability and honest boundaries
@@ -98,15 +99,15 @@ npm run build
 ```
 
 Automated tests include simulated providers and are not, on their own, proof of live external outcomes.
-Owner-authorized development runs have separately verified Google account connection and Luna model/tool execution.
-A complete live inquiry-to-confirmed-booking outcome is not claimed here until its external receipts and UI journey are verified.
-The current local prototype is not a production multi-tenant hosted service.
-
-See [progress and acceptance gates](docs/PROGRESS.md) for detailed evidence and outstanding work.
+Owner-authorized development runs have separately verified Google account connection and model/tool execution.
+A complete live inquiry-to-confirmed-booking outcome is not claimed until its external receipts and UI journey are verified.
+This is a local-first single-business application, not a multi-tenant hosted service.
 
 ## Product documentation
 
-- [Public hackathon requirements](docs/HACKATHON_PRD.md) — target scope; Composio onboarding is not yet implemented.
+- [Public hackathon requirements](docs/HACKATHON_PRD.md) — target scope for the Amazon, AssemblyAI, and Nebius/NVIDIA events.
+- [Architecture decision records](docs/adr/) — the units of work for this build.
+- [Agent workflow](AGENTS.md) — how every change is isolated, built, proven, and shipped.
 - [Business knowledge](docs/BUSINESS_KNOWLEDGE.md)
 - [Booking API](docs/BOOKING_API.md)
 - [Proactive work](docs/PROACTIVE_WORK.md)

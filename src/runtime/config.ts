@@ -50,8 +50,8 @@ export interface GatherGatewayConfigOptions {
 /**
  * Owner-authorized models, exact `provider/model` refs. Only these refs
  * are ever emitted into a gateway config — anything else fails closed.
- * Today: gpt-5.6-luna via the owner OAuth subscription ONLY (verified
- * actual provider `openai`, profile `openai:bansalv8198@gmail.com`).
+ * Today: gpt-5.6-luna via the owner OAuth subscription ONLY (provider
+ * `openai`; the auth profile id is supplied by the operator, never hardcoded).
  */
 export const GATHER_SUPPORTED_MODELS: readonly string[] = Object.freeze([
   "openai/gpt-5.6-luna",

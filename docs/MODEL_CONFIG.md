@@ -12,7 +12,7 @@ Exactly one owner-authorized ref, enforced in code
 (`GATHER_SUPPORTED_MODELS` in `src/runtime/config.ts`):
 
 - `openai/gpt-5.6-luna` via the owner OAuth subscription ONLY
-  (verified actual: provider `openai`, profile `openai:bansalv8198@gmail.com`).
+  (provider `openai`; profile id supplied by the operator).
 - No alternate model, no `fallbacks` chain, no API-key fallback.
 
 ## Exact API (for the live-model runner)
@@ -29,7 +29,7 @@ const runtime = new GatherOpenClawRuntime({
   model: {
     model: "openai/gpt-5.6-luna",
     auth: {
-      profileId: "openai:bansalv8198@gmail.com", // metadata only, never a secret
+      profileId: "openai:owner@example.invalid", // metadata only, never a secret
       provider: "openai",              // must equal the model ref provider
       mode: "oauth",                         // literal: api_key is unrepresentable
       email: "owner@example.test",           // fictional example: caller email is

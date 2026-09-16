@@ -30,7 +30,7 @@ the runner carries an explicit `GatherModelSelection` through
 - `tools.ts` — policy enforcement reused by the handlers (exact
   arithmetic, capacity, same-run attested free slot; violations reject
   pre-write). Proposal payloads name the controlled test recipient
-  (`work.vasu.ai@gmail.com`) server-side and stay `pending_approval`.
+  (`GATHER_TEST_RECIPIENT`) server-side and stay `pending_approval`.
 - `app/api/live-model/run/route.ts` — owner same-origin entry with
   typed codes; `scripts/gather-live-model.mjs` — run command below.
 
@@ -64,18 +64,3 @@ node --experimental-strip-types scripts/gather-live-model.mjs \
 `manifest.json` (`prepared locally; not uploaded or sent`). Scripted
 transports serve exactly these contents; the journey derives the exact
 GBP 600 total from them.
-
-## Remaining before any live outcome (no overall completion claimed)
-
-1. **Astra start handoff + consent**: no live Google/model requests
-   until then (`GATHER_LIVE_CONSENT` + `allowLive` gate). Model
-   selection consumed exactly from N (verified actual
-   `openai/gpt-5.6-luna`, `openai:bansalv8198@gmail.com`); OAuth root
-   at `main/.runtime/openclaw-live` left untouched pending handoff.
-2. **I — authorized Codex OAuth** under `main/.runtime/openclaw-live`
-   and the exact Luna auth profile (root/config untouched meanwhile);
-   model-driven (non-scripted) tool calling wires up with that path.
-3. **Dependencies**: provider 85027c8 accepted; scheduler bbc
-   residual, runtime 497 spawn, and proposal 4402 fixes still pending
-   elsewhere — this module uses only preserved public contracts, and
-   the runtime here is constructed, never spawned.

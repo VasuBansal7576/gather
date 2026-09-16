@@ -1,7 +1,6 @@
 {
-  "name": "gather-foundation",
+  "name": "gather",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
   "scripts": {
     "dev": "next dev",
@@ -30,5 +29,6 @@
   },
   "engines": {
     "node": ">=22"
-  }
+  },
+  "license": "MIT"
 }

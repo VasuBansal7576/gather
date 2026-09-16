@@ -19,3 +19,4 @@ secrets/
 
 # Product strategy is maintained privately, outside this repository.
 /docs/PRD.md
+.evidence/

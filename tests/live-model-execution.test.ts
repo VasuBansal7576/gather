@@ -66,7 +66,7 @@ const CALENDAR_ID = "gather-test-calendar";
 const BODY_B64URL = Buffer.from(INQUIRY_TEXT, "utf-8").toString("base64url");
 const SLOT = { startAt: "2026-09-18T18:00:00+01:00", endAt: "2026-09-18T20:00:00+01:00" };
 
-const MODEL = { model: "openai/gpt-5.6-luna", auth: { provider: "openai", mode: "oauth" as const, profileId: "openai:bansalv8198@gmail.com" } };
+const MODEL = { model: "openai/gpt-5.6-luna", auth: { provider: "openai", mode: "oauth" as const, profileId: "openai:owner@example.invalid" } };
 
 class ScriptedOAuth implements OAuthTransport {
   async exchangeCode(): Promise<OAuthTokenResponse> {

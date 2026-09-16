@@ -1,6 +1,6 @@
 # Delivery readiness (G12) and operational handoff (G13)
 
-Owner: delivery worker. Files owned: `src/delivery/**`,
+Files owned: `src/delivery/**`,
 `tests/delivery*.test.ts`, this document. Shared domain, server, store,
 connector, API, UI, and packaging files are untouched.
 

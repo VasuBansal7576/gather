@@ -21,8 +21,8 @@
  *     [--root <runtimeRoot>] [--gateway-port <port>] [--db <sqlitePath>] \
  *     [--idempotency-key <key>] [--wait-ms 300000]
  *
- * Model is pinned to the verified subscription profile (openai/gpt-5.6-luna
- * via openai:bansalv8198@gmail.com — OAuth, never an API key). Exit codes:
+ * Model is pinned to openai/gpt-5.6-luna via the OAuth subscription profile
+ * named in GATHER_MODEL_PROFILE_ID (never an API key). Exit codes:
  * 0 proposal prepared, 2 usage, 3 refused (not authorized or model
  * unconfigured), 4 tool/policy failure.
  */
@@ -49,9 +49,14 @@ async function freeLoopbackPort() {
   return port;
 }
 
+const PROFILE_ID = process.env.GATHER_MODEL_PROFILE_ID;
+if (!PROFILE_ID) {
+  console.error("GATHER_MODEL_PROFILE_ID is required (the OpenClaw OAuth auth profile id, e.g. openai:<account>)");
+  process.exit(2);
+}
 const MODEL = {
   model: "openai/gpt-5.6-luna",
-  auth: { provider: "openai", mode: "oauth", profileId: "openai:bansalv8198@gmail.com" },
+  auth: { provider: "openai", mode: "oauth", profileId: PROFILE_ID },
 };
 
 async function main() {
