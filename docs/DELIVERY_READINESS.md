@@ -1,8 +1,6 @@
-# Delivery readiness (G12) and operational handoff (G13)
+# Delivery readiness and operational handoff
 
-Files owned: `src/delivery/**`,
-`tests/delivery*.test.ts`, this document. Shared domain, server, store,
-connector, API, UI, and packaging files are untouched.
+Pure evaluation layer in `src/delivery/`, covered by `tests/delivery*.test.ts`. The [booking-delivery service](BOOKING_DELIVERY.md) supplies persistence and API integration; this is not a separate release or an active ownership assignment.
 
 ## What it is
 
@@ -96,6 +94,9 @@ or services are fabricated. Provenance travels with the handoff.
 
 ## Verified (module scope only)
 
+The following describes module coverage, not a current run receipt. Test counts and live outcomes must come from the exact revision's CI or explicit verification.
+
+
 - `tests/delivery.readiness.test.ts` — 17 tests (pure core).
 - `tests/delivery.handoff.test.ts` — 5 tests.
 - `tests/delivery.verifiers.test.ts` — 6 tests (host boundary: exact
@@ -107,14 +108,11 @@ or services are fabricated. Provenance travels with the handoff.
   rejection, order-independent redelivery freshness, expired-hold veto,
   partial window binding, expiry supersession, non-object evidence
   rejection, fingerprint diagnostics and NaN guest count).
-- Full suite: 94 tests pass; `npm run typecheck` clean (see commit).
-  These are module tests with injected fakes; they do not establish live
-  provider integration acceptance and do not prove live confirmation.
+These are module tests with injected fakes; use current CI for results and counts. They do not establish live provider integration acceptance or prove live confirmation.
 
 ## Integration left (not claimed)
 
-1. Guarded confirmation service calling `evaluateReadiness` with live
-   resolver outputs and enforcing `liveReady` before marking confirmed.
+1. `src/server/booking-delivery/` already calls `evaluateReadiness` and guards confirmation with `liveReady`. End-to-end evidence from actual provider resolvers remains a separate acceptance requirement.
 2. Resolver adapters producing typed outputs (deposit ledger receipts,
    calendar attestations, resource registry commitments, acceptance
    records, persisted owner waivers) from verified provider state.

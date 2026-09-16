@@ -1,13 +1,11 @@
-# Booking identity (PRD G04)
+# Booking identity
 
 Cross-app identity resolver: connects inquiry, conversation, proposal,
 calendar hold, deposit, and resource records to the same booking, and
 requires explicit owner resolution instead of silently merging different
 customers or events.
 
-Ownership: `src/identity/**`, `tests/identity*.test.ts`, and this document.
-Existing `src/domain/**` and `src/server/**` contracts are read-only to this
-module; it calls `GatherStore` but never modifies shared files.
+Implementation: `src/identity/` and `tests/identity*.test.ts`. The resolver consumes the shared GatherStore contracts; this module guide does not assign exclusive file ownership.
 
 ## Model
 
@@ -127,16 +125,14 @@ on every binding path — including `propose` on an already-linked key.
 
 ## Host wiring gaps (for later ingestion/UI integration)
 
-1. No ingestion hook calls `proposeBookingIdentity` yet — Gmail/calendar
-   readers, deposit/resource writers, and proposal creation do not emit
-   identity components or receipts.
+1. Gmail intake calls `proposeBookingIdentity` in `src/server/operator-runtime/intake.ts`. This is not complete correlation across Calendar, deposits and resources; those paths need separately verified integration.
 2. `actor` must be the host's server-derived owner principal (same rule as
    approvals) — never a request field or message-claimed identity.
 3. The UI has no "ambiguous match" surface: `needs_decision` candidates and
    the audit trail are API-ready but unrendered.
 4. `findCandidates` matches only same-business bookings on weak
    contact/date/name overlap; richer deposit/resource correlation needs the
-   ingestion hook (gap 1) first.
+   corresponding source integration first.
 5. Concurrent writers on separate connections serialize via SQLite + unique
    key; lock-contention errors are mapped to `CONFLICT`, so callers should
    surface "another writer bound it first" and re-propose rather than retry

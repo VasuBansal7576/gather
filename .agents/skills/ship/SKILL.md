@@ -1,35 +1,15 @@
 ---
 name: ship
-description: Open a PR for an ADR with the evidence embedded, then loop with automated review until there are zero unresolved comments. Use after prove.
+description: Publish a ready-for-review Gather PR with validation and known limitations.
 ---
 
 # Ship
 
-1. Commit on your `adr-<NNN>-*` branch. Message: what changed and why, one paragraph. No co-author trailers.
-2. Push and open the PR against `main` with `gh pr create`. Body template:
+1. Review the diff for scope, secrets, generated files and accidental product changes. Commit only the authorized change on its isolated branch. No co-author trailers.
+2. Push and open a **ready-for-review**, never draft, PR. Describe the problem, fix and actual validation concisely. Link the ADR for authorized feature work; maintenance may cite its bounded scope instead.
+3. Include inspectable before/after evidence and exact test/build results. Distinguish passed, failed, skipped, not run and not implemented. Never paste a template claiming the golden path passed when it does not exist.
+4. Check actual CI and available review comments on the exact head. Fix relevant failures and address comments without weakening tests. Do not assume Greptile or another reviewer is configured; absent review is unreviewed, not approval and not an indefinite wait.
+5. Do not merge or deploy without explicit authorization. Report the PR link, CI state and remaining blockers. Do not mark an ADR shipped before a verified merge.
+6. Retain the worktree while the PR is open. Remove it after merge only if clean and no longer needed; never discard someone else's work.
 
-```
-## ADR
-docs/adr/NNN-slug.md
-
-## What changed
-<3 to 6 bullets>
-
-## Evidence
-| Acceptance item | Artifact |
-|---|---|
-| ... | <inline image or link to .evidence/adr-NNN/...> |
-
-Before/after: <images>
-Suite: npm test <n> passed, typecheck ok, build ok, golden path ok
-Simulated vs real: <state which artifacts are simulated, scripted, or real>
-
-## Follow-ups
-<things noticed but outside this ADR's Owns list>
-```
-
-3. Wait for review (Greptile or the reviewer agent). For each comment: fix it or reply with the reason it is wrong, citing the ADR. Push again. Repeat until the reviewer reports no unresolved comments and the PR body's evidence table has no missing rows.
-4. Do not merge. The integrator merges (see `coordinate`). Do not mark the ADR `shipped`; the integrator does.
-5. After merge, remove your worktree: `git worktree remove ../gather-adr-<NNN>`.
-
-A PR without the evidence table is returned unread.
+Suggested PR shape: Problem / Changes / Validation / Remaining limitations. Feature PRs additionally map the accepted ADR's evidence requirements. No progress ledger is needed.

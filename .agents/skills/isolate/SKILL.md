@@ -1,17 +1,15 @@
 ---
 name: isolate
-description: Start every ADR in a fresh git worktree branched from origin/main so parallel agents never collide. Use before touching any file.
+description: Inspect state and use a fresh worktree before changing Gather files.
 ---
 
 # Isolate
 
-Never build on `main` or inside another agent's worktree.
+1. Read `AGENTS.md`, the requested scope, and relevant documentation. A paused ADR is not an implementation instruction.
+2. Inspect `git status`, branches and worktrees; fetch `origin/main`.
+3. Create a fresh worktree/branch from `origin/main`. Never edit another worker's checkout or overwrite uncommitted work.
+4. Run `npm ci`, `npm test` and `npm run typecheck` before changes. Record failures and real skips in the PR. Do not infer clean-checkout reproducibility from untracked local files.
+5. For maintenance, use the bounded scope in the request/PR. For authorized feature work, use the accepted ADR's owned files. Explain any necessary scope change before editing unrelated files.
+6. Create a fresh `.runtime/` in this worktree and pass `GATHER_DATABASE_PATH` explicitly to every app invocation. Never use another checkout's database or personal OpenClaw state.
 
-1. `git fetch origin main`
-2. `git worktree add ../gather-adr-<NNN> -b adr-<NNN>-<slug> origin/main`
-3. `cd ../gather-adr-<NNN> && npm ci`
-4. Run `npm test` and `npm run typecheck` once before changing anything. Record the result in your PR as the "before" state for the suite.
-5. Work only inside this worktree and only in the files your ADR lists under **Owns**. If you need a file outside that list, stop and write the reason in the PR; do not edit it.
-6. Use a fresh `.runtime/` and a fresh SQLite path (`GATHER_DATABASE_PATH=.runtime/adr-<NNN>.sqlite`) so you never touch another worktree's state or the developer's live database.
-
-Done when: the worktree exists, `npm test` baseline is recorded, and no edits have been made yet.
+Done when the worktree and baseline are established. No parallel workers unless explicitly requested.

@@ -1,4 +1,4 @@
-# Proactive host automation (`src/server/operator-runtime/automation.ts`, DEMO ONLY)
+# Proactive host automation (`src/server/operator-runtime/automation.ts`)
 
 Host-owned proactive lifecycle for operator sweeps: register, refresh, and
 remove per-account bindings, each owning exactly one bounded local timer.
@@ -52,7 +52,7 @@ re-register after the owner reconnects. Restart state comes from existing
 SQLite (cursors, checkpoints, batches, waiting rows); bindings themselves
 are re-registered by the host on boot.
 
-## Production registration hook (for D bootstrap integration)
+## Host registration hook
 
 `startProactiveAccount({ runtime, intervalMs?, maxConsecutiveErrors?, clock? })`
 is the exported hook. D supplies the requested connector/dependency shape —

@@ -1,10 +1,12 @@
 # ADR-001: Local-first product shell
 
-Status: ready
+Status: paused proposal — requires design reconciliation and explicit authorization before implementation
 Depends on: ADR-000
 PRD: 2, 2.1, 2.2, 7, 7.1, 10 (Local run gate, UX gate, Submission gate)
 
-## Decision
+> The task list below is retained for design review, not execution. See [repository design conflicts](../README.md#design-conflicts-to-resolve-before-implementation). No feature work is authorized during cleanup.
+
+## Proposed decision
 Gather is distributed as a local-first app started with one command. `npx github:VasuBansal7576/gather` (and `npm start` from a clone) boots the prepared business with Node only: no keys, no OpenClaw install, no network provider. The first screen offers "Try the prepared business" and "Connect your own" (the latter gated by ADR-006). All judge-testable behavior in this build runs in the prepared business with visibly simulated connectors.
 
 ## Owns

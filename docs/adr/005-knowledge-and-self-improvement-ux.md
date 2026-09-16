@@ -1,10 +1,12 @@
 # ADR-005: Knowledge rules and self-improvement UX
 
-Status: ready
+Status: paused proposal — requires design reconciliation and explicit authorization before implementation
 Depends on: ADR-002, ADR-003
 PRD: 4.2, 4.3, 5, 10 (Understanding, Knowledge lifecycle, Evaluation gates)
 
-## Decision
+> The task list below is retained for design review, not execution. See [repository design conflicts](../README.md#design-conflicts-to-resolve-before-implementation). No feature work is authorized during cleanup.
+
+## Proposed decision
 Business knowledge is typed, sourced, scoped and versioned, and the owner can add or correct it in plain language with visible scope and citation. Every correction becomes a regression case; Gather re-scores itself on that business's own past inquiries and shows the trend. This is the honest form of "self-improving": measured, per business, without code changes.
 
 ## Owns

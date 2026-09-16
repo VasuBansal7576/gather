@@ -1,94 +1,72 @@
-# Local setup
+# Local development and inspection
 
-Gather's local packaging launches the owner application and its explicit simulated demo.
-An isolated OpenClaw control-plane adapter exists; model execution and real external app connections remain unverified.
-These commands therefore do not constitute a complete one-command Gather product launch.
+This runs the existing prototype with simulated fixtures, not the proposed one-command product. Use Node.js 26+ and npm; `.node-version` pins the development/CI baseline. Gather uses built-in SQLite and TypeScript stripping, but the version policy is the tested project baseline—not a claim that SQLite first appeared in Node 26.
 
-## Prerequisites
+## Fresh checkout
 
-- Node.js 26 or newer.
-- npm, as provided by the Node.js installation.
-- The Gather foundation scaffold, including `package.json` and its application files.
-
-The foundation uses Node's built-in `node:sqlite` API, so older Node versions are not supported.
-The application scaffold and launcher are integrated on `main`.
-
-## First-time local setup
-
-Run these commands from the repository root:
+From the repository root:
 
 ```sh
-mkdir -p .runtime
 npm ci
+mkdir -p .runtime
 node scripts/gather-doctor.mjs
+npm run build
+GATHER_DATABASE_PATH=.runtime/owner-demo.sqlite npm start -- --hostname 127.0.0.1 --port 3000
 ```
 
-`gather-doctor.mjs` only reads and checks the project.
-It never creates `.runtime`, installs dependencies, downloads files, changes ports, or starts a process.
-Create `.runtime` explicitly as shown above, and run `npm ci` explicitly when `node_modules` is absent.
-The `.runtime` directory is project-local and ignored by Git.
+Open `/setup`, choose **Try demo**, then **Enter workspace**. The initializer creates two fictional bookings with proposals. It does not exercise model extraction or a complete real booking journey. All provider effects on this path are simulated.
 
-## Supported local commands
+Keep the server bound to loopback. The local owner identity and same-origin checks are not hosted authentication.
 
-The doctor expects the foundation package to expose these scripts:
+## Commands
 
 | Command | Purpose |
 | --- | --- |
-| `npm run dev` | Run the Gather owner application in development mode. |
-| `npm run build` | Build the Gather application. |
-| `npm run lint` | Run the foundation's lint or type-check command. |
-| `npm run typecheck` | Run the foundation's explicit type-check command. |
-| `npm test` | Run the local test suite. |
-| `npm run start` | Run a previously built application. |
+| `npm run dev -- --hostname 127.0.0.1` | Next.js development server; use an explicit database path as below. |
+| `npm run build` | Production compilation. |
+| `npm start -- --hostname 127.0.0.1` | Serve an existing build; does not install or build it. |
+| `npm run typecheck` | TypeScript check. |
+| `npm run lint` | Compatibility alias for typecheck; no separate linter is configured. |
+| `npm test` | Local regression suite, with optional OpenClaw process checks skipped unless requested. |
+| `node scripts/gather-doctor.mjs --json` | Read-only prerequisites check. |
+| `node scripts/gather-start.mjs --dry-run` | Check prerequisites and describe the legacy development launcher without starting it. |
 
-The packaging launcher uses only `npm run dev`.
-It does not start, configure, copy, or inspect any OpenClaw installation.
-
-## Check and launch
-
-Show command help inline:
+For development:
 
 ```sh
-node scripts/gather-doctor.mjs --help
-node scripts/gather-start.mjs --help
+GATHER_DATABASE_PATH=.runtime/development.sqlite npm run dev -- --hostname 127.0.0.1 --port 3000
 ```
 
-Run a machine-readable preflight check:
+The legacy `gather-start.mjs` helper invokes `npm run dev`, inherits `PORT`, and does not implement the proposed packaged CLI. Prefer the explicit loopback commands above. No `bin` entry or working `npx github:` installer is shipped.
+
+## State and credentials
+
+- The commands above explicitly place SQLite in `.runtime/`; the unchanged application default is `data/gather.sqlite`.
+- Existing databases are not moved or reset. Use a new database filename to inspect fresh fictional fixtures without affecting prior work.
+- The doctor requires `.runtime/` to exist and never creates it, installs dependencies or starts a runtime.
+- The simulated path needs no provider credentials or OpenClaw binary. Do not configure live accounts for routine checks.
+- Live Google secrets use macOS Keychain by default; the proposed cross-platform file-backed adapter is not implemented. See [connections](CONNECTIONS.md).
+
+## Optional OpenClaw process checks
+
+`npm test` does not discover or boot a personal OpenClaw installation. Four doctor/process tests use Node's explicit skip reporting by default. To deliberately exercise them against an existing absolute-path binary:
 
 ```sh
-node scripts/gather-doctor.mjs --json
+GATHER_TEST_OPENCLAW_BIN=/absolute/path/to/openclaw npm test
 ```
 
-Run a local dry check without starting the app:
+An invalid explicit path fails rather than skipping. These checks create isolated temporary state, use per-run loopback ports, and exercise process/control-plane behavior, not model or Google calls. They do not log into or reuse personal `~/.openclaw` state. The supported runtime interface is described in [OPENCLAW.md](OPENCLAW.md).
 
-```sh
-node scripts/gather-start.mjs --dry-run
-```
+## CI and evidence
 
-Launch the Gather owner application after all checks pass:
+[CI](../.github/workflows/ci.yml) installs the lockfile, runs the doctor, typechecks, tests and builds on Linux and macOS using `.node-version`. It has read-only repository permissions, no provider secrets, and does not install OpenClaw or deploy the app. Optional process-test skips remain visible; there is no golden-path test yet.
 
-```sh
-node scripts/gather-start.mjs
-```
-
-`gather-start.mjs` fails clearly when the scaffold is absent or prerequisites are incomplete.
-It never runs `npm install`, downloads dependencies, or launches a separate runtime.
-It inherits `PORT` unchanged when it is set, for example:
-
-```sh
-PORT=4310 node scripts/gather-start.mjs
-```
-
-It does not kill, reassign, or probe for another process using that port.
+For a PR, report the exact commands, failures/skips and the boundary exercised. A build or simulated receipt is not a live booking result. See the [README](../README.md#inspect-the-prototype-locally) for the inspection scope.
 
 ## Troubleshooting
 
-- If `package.json` is missing, integrate or check out the Gather foundation scaffold before running the launcher.
-- If dependencies are missing, run `npm ci` explicitly and rerun the doctor.
-- If `.runtime` is missing, create it with `mkdir -p .runtime` and rerun the doctor.
-- If Node.js is too old, install or select Node.js 26 or newer, then rerun the doctor.
-- If a supported npm script is missing, restore the foundation package scripts before launching.
-
-The owner demo does not require OpenClaw or provider credentials.
-The separate isolated OpenClaw doctor has shown an intermittent Gateway handshake timeout; a passing control-plane check does not establish model execution.
-See the [README demonstration](../README.md#run-the-local-demo) for the production build launch and the exact simulated boundary.
+- Missing dependencies: run `npm ci` from the checkout.
+- Missing `.runtime/`: create it explicitly before the doctor.
+- Unsupported Node: select `.node-version`, then reinstall dependencies.
+- Port occupied: choose another local port; do not stop an unrelated process.
+- Existing fixture state: choose a new `GATHER_DATABASE_PATH`; no automated reset/migration is provided by this cleanup.

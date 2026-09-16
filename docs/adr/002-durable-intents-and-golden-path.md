@@ -1,10 +1,12 @@
 # ADR-002: Durable intents and the golden path
 
-Status: ready
+Status: paused proposal — requires design reconciliation and explicit authorization before implementation
 Depends on: ADR-000
 PRD: 5, 6.1, 9, 10 (Booking journey, Exact authority, Recovery gates)
 
-## Decision
+> The task list below is retained for design review, not execution. See [repository design conflicts](../README.md#design-conflicts-to-resolve-before-implementation). No feature work is authorized during cleanup.
+
+## Proposed decision
 Every consequential user action is persisted as an intent before any work starts, progresses through an explicit state machine, and the UI renders progress from that record. One end-to-end test (`tests/golden-path.test.ts`) exercises the prepared business from inquiry to offer to approval to hold and email receipts, through a price change that invalidates approval, and through a process restart that resumes without duplicating any receipt. Every later PR must keep it green.
 
 ## Owns

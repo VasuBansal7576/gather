@@ -1,10 +1,12 @@
 # ADR-004: Self-healing system
 
-Status: ready
+Status: paused proposal — requires design reconciliation and explicit authorization before implementation
 Depends on: ADR-002
 PRD: 6 (all subsections), 10 (Self-healing gate, Recovery gate)
 
-## Decision
+> The task list below is retained for design review, not execution. See [repository design conflicts](../README.md#design-conflicts-to-resolve-before-implementation). No feature work is authorized during cleanup.
+
+## Proposed decision
 Failures are detected automatically from failed intents, runtime health probes and dead-lettered work, recorded as incidents, and repaired by a Gather-owned repair agent choosing only from a fixed catalog of actions, each verified before the original intent resumes. The owner sees a plain-language repair thread or an honest blocked state. A labeled fault-injection panel on the prepared business drives the same path so judges can break things and watch them heal.
 
 ## Owns

@@ -1,10 +1,12 @@
 # ADR-006: Live mode on the user's own accounts
 
-Status: ready
+Status: paused proposal — requires design reconciliation and explicit authorization before implementation
 Depends on: ADR-001, ADR-002, ADR-003, ADR-004
 PRD: 3, 5, 8.1, 8.3, 10 (Connections, Booking journey, Managed runtime, Budgets gates)
 
-## Decision
+> The task list below is retained for design review, not execution. See [repository design conflicts](../README.md#design-conflicts-to-resolve-before-implementation). No feature work is authorized during cleanup.
+
+## Proposed decision
 "Connect your own apps" becomes real, locally: OpenClaw is installed lazily under `.runtime/openclaw/`, the user signs into a model through OpenClaw's own subscription login or pastes a key, connects Gmail, Drive and Calendar through Gather's OAuth client using the loopback flow, and runs the same inquiry -> offer -> approval -> hold -> email journey on their real accounts with independent receipts. Everything runs on the user's machine; Gather the operator pays nothing and holds no user data. Composio is the fallback if the direct Google path proves unusable for unverified apps.
 
 ## Owns

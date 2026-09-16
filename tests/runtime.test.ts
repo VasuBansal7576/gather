@@ -4,7 +4,7 @@ import { request as httpRequest } from "node:http";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { PassThrough } from "node:stream";
 import assert from "node:assert/strict";
 import test from "node:test";
@@ -76,23 +76,16 @@ async function closeServer(server: Server): Promise<void> {
 }
 
 /**
- * Explicit absolute binary for real-boot tests. The task host provides
- * /opt/homebrew/bin/openclaw; `which` is only a fallback because PATH can
- * differ per launcher. Never declare "not installed" from PATH alone.
+ * Real-boot checks are opt-in, not dependent on an incidental host install.
+ * Default tests run without OpenClaw. An explicitly configured but invalid
+ * binary is a failure, never a successful-looking skip.
  */
 function resolveTestBinary(): string | null {
-  const explicit = "/opt/homebrew/bin/openclaw";
-  try {
-    if (existsSync(explicit)) return explicit;
-  } catch {
-    // fall through to which
-  }
-  try {
-    const found = execFileSync("which", ["openclaw"], { encoding: "utf8" }).trim();
-    return found || null;
-  } catch {
-    return null;
-  }
+  const explicit = process.env.GATHER_TEST_OPENCLAW_BIN?.trim();
+  if (!explicit) return null;
+  assert.ok(isAbsolute(explicit), "GATHER_TEST_OPENCLAW_BIN must be an absolute path");
+  assert.ok(existsSync(explicit), "GATHER_TEST_OPENCLAW_BIN does not exist");
+  return explicit;
 }
 
 // Placeholder URL for mock-transport tests: the fake transport never dials,
@@ -1382,10 +1375,10 @@ function doctorLeftovers(projectDir: string): string[] {
 test(
   "doctor: real isolated boot preserves pre-existing .runtime state (sentinel)",
   { timeout: 90000 },
-  async () => {
+  async (t) => {
     const binary = resolveTestBinary();
     if (!binary) {
-      console.log("SKIP: no openclaw binary (explicit /opt/homebrew/bin/openclaw or PATH); doctor boot not run");
+      t.skip("Set GATHER_TEST_OPENCLAW_BIN to opt into real isolated OpenClaw process checks");
       return;
     }
 
@@ -1427,10 +1420,10 @@ test(
 test(
   "doctor: SIGTERM mid-run still observes child exit and preserves sentinel",
   { timeout: 90000 },
-  async () => {
+  async (t) => {
     const binary = resolveTestBinary();
     if (!binary) {
-      console.log("SKIP: no openclaw binary (explicit /opt/homebrew/bin/openclaw or PATH); doctor signal run not run");
+      t.skip("Set GATHER_TEST_OPENCLAW_BIN to opt into real isolated OpenClaw process checks");
       return;
     }
 
@@ -1497,10 +1490,10 @@ test(
 test(
   "doctor: occupied port fails at preflight without touching the foreign listener",
   { timeout: 90000 },
-  async () => {
+  async (t) => {
     const binary = resolveTestBinary();
     if (!binary) {
-      console.log("SKIP: no openclaw binary (explicit /opt/homebrew/bin/openclaw or PATH); busy-port run not run");
+      t.skip("Set GATHER_TEST_OPENCLAW_BIN to opt into real isolated OpenClaw process checks");
       return;
     }
 
@@ -1555,10 +1548,10 @@ test(
 test(
   "doctor: bare --port flag fails preflight instead of silently allocating",
   { timeout: 90000 },
-  async () => {
+  async (t) => {
     const binary = resolveTestBinary();
     if (!binary) {
-      console.log("SKIP: no openclaw binary (explicit /opt/homebrew/bin/openclaw or PATH); bare-port run not run");
+      t.skip("Set GATHER_TEST_OPENCLAW_BIN to opt into real isolated OpenClaw process checks");
       return;
     }
     const projectDir = mkdtempSync(join(tmpdir(), "gather-doctor-bareport-"));

@@ -1,14 +1,10 @@
 # Explicit model configuration (DEMO/LIVE config surface, no credentials)
 
-Owner-authorized model wiring for the isolated gateway. Code and scripted
-tests only: no actual provider calls, logins, or credentials anywhere on
-this surface. The live auth root (`main/.runtime/openclaw-live`) is never
-touched — OAuth login and provider/model verification happen there,
-outside this lane.
+Existing model-selection wiring for the isolated gateway. This surface validates metadata; it does not log in, create credentials or prove provider readiness. OAuth credentials belong to an explicitly selected Gather-owned runtime root, never another checkout or personal OpenClaw state. Broader model/API-key onboarding in the PRD is not implemented.
 
 ## Authorized model
 
-Exactly one owner-authorized ref, enforced in code
+Exactly one model ref is currently allowlisted in code
 (`GATHER_SUPPORTED_MODELS` in `src/runtime/config.ts`):
 
 - `openai/gpt-5.6-luna` via the owner OAuth subscription ONLY

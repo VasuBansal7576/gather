@@ -1,7 +1,7 @@
 # Proactive host bootstrap (`src/server/proactive/`)
 
-Production registration of durable inquiry capture (proactive waiting).
-This is the D-side assembly the automation docs designate: the shared
+Host registration of durable inquiry capture (proactive waiting).
+This assembly uses the shared
 scheduler (`operator-runtime/automation.ts`), provider composition
 (`provider-runtime`), connection service, SQLite store, and ledger are
 used as-is — this module only decides *which* accounts sweep and keeps

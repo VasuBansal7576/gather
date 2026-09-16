@@ -1,6 +1,6 @@
 # Gather: Public Hackathon PRD
 
-Status: requirements, not a claim of implementation or live verification.
+Status: requirements under reconciliation, not a claim of implementation or live verification. Feature implementation is paused by the owner; this document and the ADRs are not execution authorization. See [repository design conflicts](README.md#design-conflicts-to-resolve-before-implementation).
 Updated: 2026-09-16.
 
 ## 1. Product and audience
@@ -11,7 +11,7 @@ It coordinates inquiries across the business's existing applications and shows t
 Promise: **Connect your tools. Gather handles booking coordination. Approve the decisions that matter.**
 
 Gather is local-first.
-One command installs and starts it on the owner's own machine; the business's email, documents, calendar and booking records never leave that machine.
+The target is one-command installation on the owner's machine, with local application state. Connected Google services and a configured remote model receive the data necessary for live operations; local-first does not mean offline or that source content never leaves the machine.
 A hosted multi-tenant service is a later offering, not part of this release.
 
 This document defines the public hackathon release: one build, configured per event.
@@ -189,7 +189,7 @@ Before execution, refresh critical conditions.
 Persist each action's intent, authorization, external identifier, result and verification.
 A successful tool response alone does not establish completion.
 
-Demonstrated journey: read a real test inquiry in Gmail, retrieve business evidence from Drive, check Calendar, prepare an offer with the model, obtain approval, create a provisional hold and send the authorized offer.
+Required demonstration journey (not yet established by this document): read a real test inquiry in Gmail, retrieve business evidence from Drive, check Calendar, prepare an offer with the model, obtain approval, create a provisional hold and send the authorized offer.
 Verify each external outcome independently.
 
 Track replies, follow-ups and expiring holds durably.
@@ -347,7 +347,7 @@ For this release a pinned deployment and a documented, tested restart/recovery p
 
 The PRD remains the source of truth.
 Implementation proceeds through the ADRs in `docs/adr/`; each ADR cites its PRD sections, owns explicit files, forbids explicit files and defines its own acceptance evidence.
-Workers receive one ADR, not this document.
+Any future authorized implementation must read its accepted ADR alongside the relevant PRD sections and existing interfaces. An ADR cannot override the product requirements or resolve an open design choice by assumption.
 
 For each subsystem, define inputs, authoritative stored state, model responsibilities, deterministic enforcement, triggers, failure/recovery behavior and observable acceptance scenarios.
 Reuse supported OpenClaw capabilities where adequate; a skill instruction, memory entry or successful tool call alone does not establish business correctness.
@@ -361,7 +361,7 @@ The owner installs nothing but the one command and needs no infrastructure accou
 | Responsibility | Selected direction | Adoption boundary |
 |---|---|---|
 | Agent runtime and conversational continuity | OpenClaw with native recall, under `.runtime/` | Do not replace its memory automatically or introduce competing auto-capture systems |
-| Application connections | Gather Google OAuth client via loopback; Composio fallback behind a flag | Direct-Google adapters stay the developer fallback; Composio is adopted only if the unverified-client path fails its verification |
+| Application connections | Proposed Gather Google OAuth client via loopback; Composio fallback subject to verification | Existing direct-Google adapters are developer-configured; product onboarding and any hosted fallback need feasibility, data-flow and cost decisions before implementation |
 | Transactional booking, offer, approval, pending-action and verified-result records | SQLite under `.runtime/` | Keep storage behind one server-side layer so a later move to PostgreSQL is contained |
 | Business understanding and source-backed policies | OpenClaw native recall + bundled memory-wiki, first choice | Prove changed prices, scoped exceptions, deleted evidence and restart recall before committing; do not treat stale compiled context as current authority |
 | Additional semantic evidence retrieval | No separate pgvector/pgContext pipeline initially | Add only for a measured gap that native recall/wiki cannot adequately address |
@@ -444,7 +444,7 @@ These exclusions do not waive authorization, durable storage or correctness for 
 | UX | Rendered and interactive checks of the demonstration script, mobile layout and error/reconnection states |
 | Submission | Public open-source license present; runnable instructions; demonstration video of the actual journey; event-specific technology/reuse requirements verified |
 
-Maintain separate Planned, Implemented, Locally tested and Live verified statuses.
+Distinguish planned requirements, implemented code, local test evidence and live verification in each PR. Do not create a second progress ledger or infer completion from ADR status.
 A build, screenshot, test count or worker report alone is not product completion.
 
 ## 11. Hackathon-specific requirements and submission configurations

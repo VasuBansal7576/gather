@@ -1,12 +1,6 @@
 # Live-model booking-proposal execution (wired, gated)
 
-The model drives the journey by CALLING four registered Gather MCP
-tools — reads and proposal assembly happen inside tool handlers
-against server-side designated sources, never in a hardcoded pipeline
-(the ed7c68c pipeline was replaced; its history stays in git for G's
-review). N's exact model-config commit is consumed (cherry-picked):
-the runner carries an explicit `GatherModelSelection` through
-`modelStatus()`/`requireModelSelection()` with no fallback model.
+The existing developer runner exposes four scoped Gather tools to a model through the isolated OpenClaw runtime. It reads designated inquiry/policy/calendar sources and persists a pending proposal. It does not provide completed customer onboarding, approve the proposal, send an offer, or prove a confirmed booking.
 
 ## What is wired (`src/server/live-model/`)
 
@@ -45,22 +39,27 @@ Scripted MCP regression (no live requests of any kind):
 node --experimental-strip-types --test tests/live-model-execution.test.ts
 ```
 
-Live attempt (refuses honestly until consent, designation, and the
-authorized model path land):
+## Developer-only live invocation
 
-```
+Do not run this during default checks. It requires a separately authorized test account, configured Google connection and calendar binding, a Gather-owned runtime root with OAuth credentials, and an explicit model profile. The supported model is currently `openai/gpt-5.6-luna`; `--model` and `--auth-profile` are not CLI options.
+
+After those prerequisites have been established outside this cleanup:
+
+```sh
+GATHER_LIVE_CONSENT=1 \
+GATHER_MODEL_PROFILE_ID='<configured-profile-id>' \
+GATHER_TEST_RECIPIENT='<authorized-test-recipient>' \
+GATHER_DATABASE_PATH='.runtime/live-test.sqlite' \
 node --experimental-strip-types scripts/gather-live-model.mjs \
-  --business <businessId> --thread <threadId> \
-  --file <driveFileId> --calendar <calendarId> \
-  --model openai-codex/gpt-5.6-luna --auth-profile <profileId> \
-  [--allow-live] [--idempotency-key <key>]
+  --business '<business-id>' --thread '<thread-id>' \
+  --file '<drive-file-id>' --calendar '<calendar-id>' \
+  --root '.runtime/isolated-live-runtime' --allow-live
 ```
 
-## Test facts (explicitly FICTIONAL, reused — never regenerated)
+Do not copy personal runtime credentials or assume a fresh root has a model login. The runner's gate refusing a run is not proof that all onboarding prerequisites have been tested. A returned proposal still requires exact approval and independent provider verification before external outcomes can be claimed.
 
-`/tmp/gather-live-test-seed/`: `inquiry.txt` (12 guests,
-2026-09-18 18:00–20:00 Europe/London, vegetarian x2, budget GBP 650),
-`venue-policy.md` (GBP 50/person, 20 seated, GATHER TEST rules),
-`manifest.json` (`prepared locally; not uploaded or sent`). Scripted
-transports serve exactly these contents; the journey derives the exact
-GBP 600 total from them.
+## Scripted fixtures
+
+`tests/fixtures/live-model/` contains versioned, fictional `inquiry.txt` and `venue-policy.md`: 12 guests, 18 September 2026 from 18:00–20:00 Europe/London, two vegetarian meals, GBP 650 budget, GBP 50/person and 20-seat capacity. The scripted planner requests 12 guests and the handler computes GBP 600. This tests the controlled tool/handler path, not free-text understanding by a real model.
+
+The suite does not depend on shared `/tmp` input files or local account content. Temporary databases and server state are created per test and cleaned up by that test.

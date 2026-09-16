@@ -1,4 +1,4 @@
-# Connections (PRD G01/G18)
+# Connections
 
 The owner chooses which apps to connect — never workflows, databases,
 agents, or technical mappings. There is no arbitrary connection cap, and a
@@ -6,10 +6,7 @@ real Google integration is distinct from the demo fixtures: it requires a
 configured provider app and reports an explicit `unavailable` status when
 one is missing rather than fabricating a connected state.
 
-Ownership: `src/server/connections/**`, `app/api/connections/**`,
-`tests/connections*.test.ts`, this document. Shared `src/server/**` files
-are read-only to this module; the route-facing wiring is the factory
-contract below.
+Implementation: `src/server/connections/`, `app/api/connections/` and `tests/connections*.test.ts`. File ownership is determined by the active change scope, not this historical module guide.
 
 ## Model
 
@@ -55,8 +52,7 @@ contract below.
   deleted after commit, and a reauthorization that omits a new refresh
   token preserves the previously granted one.
 
-All state lives in the injected GatherStore SQLite database. No second
-database, no credential form, no assumed hardcoded account.
+Connection metadata lives in the injected GatherStore SQLite database; secret material lives in the injected secret store, not SQLite.
 
 ## Trust boundary
 
@@ -116,14 +112,14 @@ database, no credential form, no assumed hardcoded account.
   `EXCHANGE_FAILED`, `MISSING_SCOPE`; `providerError` carries structural
   OAuth codes and `retryable` flags transient failures.
 
-## Host wiring (documented handoff — shared runtime.ts unchanged)
+## Current host wiring
 
 Routes call `getConnectionService()` in `src/server/connections/index.ts`:
 it borrows `getRuntime().store`, reads provider app metadata from
 `GATHER_GOOGLE_CLIENT_ID` / `GATHER_GOOGLE_CLIENT_SECRET` /
 `GATHER_GOOGLE_REDIRECT_URI` / `GATHER_GOOGLE_SCOPES`, injects
 `FetchOAuthTransport`, and defaults secrets to `KeychainSecretStore`
-or `EnvSecretStore` when `GATHER_SECRETS=env`. A different host injects
+or `EnvSecretStore` when `GATHER_SECRETS=env`. There is no automatic file-backed fallback on other operating systems; the prepared fixture path does not need one. A different host injects
 its own `SecretStore`/`OAuthTransport` via `createConnectionService`
 instead. Internal diagnostics: `GATHER_*` variable names and the
 `security`/`swift` binaries are host-operations detail — the owner-facing
@@ -135,8 +131,7 @@ installation".
 it created. Writes go through a native SecItem boundary (`swift -e`
 helper) with the secret on stdin — never argv — because
 `security add-generic-password -w` would expose it to `ps`. Reads and
-deletes use `security` (argv carries only the service name and account
-key). The command runner is injectable (`KeychainRunner`), which is how
+deletes use the same Swift/Security-framework boundary so Keychain access identity remains consistent (argv carries service/account metadata, never secret values). The command runner is injectable (`KeychainRunner`), which is how
 tests assert the argv hygiene without ever touching a real keychain.
 
 ## Routes
@@ -163,10 +158,6 @@ tests assert the argv hygiene without ever touching a real keychain.
 Error bodies everywhere are `{ code, message, retryable }` with codes from
 `ConnectionError` plus `CROSS_ORIGIN_DENIED`/`INVALID_REQUEST`.
 
-## Explicitly out of scope
+## Verification boundary
 
-No live OAuth was performed for this task — transport is scripted in
-tests. `KeychainSecretStore` was verified only as a scoped adapter over a
-fake store interface; real `security`-CLI and provider calls are deferred
-to live acceptance. No generic credential UI; the owner never sees a
-client id/secret/token field.
+The automated connection tests use scripted OAuth transports and an injected Keychain runner. They do not establish a working Google consent journey or real Keychain access. Live onboarding remains developer-configured; a Gather-operated OAuth client and cross-platform secret store are proposed work, not supplied by these routes. Default scopes in `config.ts` currently include full Calendar and Drive read access, not the PRD's proposed `calendar.events`/`drive.file` picker flow.

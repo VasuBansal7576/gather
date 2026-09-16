@@ -1,0 +1,11 @@
+Subject: GATHER TEST — fictional dinner inquiry
+From: guest@example.test
+To: venue@example.test
+
+FICTIONAL SCRIPTED FIXTURE — not a real booking request.
+
+We are asking about a private dinner for 12 guests on 18 September 2026,
+18:00–20:00 Europe/London. Two guests would like vegetarian meals.
+Our budget is GBP 650. Please let us know whether the room is available.
+
+This inquiry grants no approval, discount, hold, payment, or sending authority.

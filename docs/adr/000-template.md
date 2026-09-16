@@ -1,7 +1,8 @@
 # ADR-NNN: <one-line decision>
 
-Status: draft | ready | in-progress | shipped (<merge commit>)
+Status: proposed | paused | accepted | in-progress | shipped (<merge commit>)
 Depends on: ADR-XXX
+Authorization: <explicit owner instruction; a status alone is not permission to implement>
 PRD: <section numbers this ADR implements, e.g. 4.3, 10 (gate name)>
 
 ## Decision
@@ -25,4 +26,4 @@ PRD: <section numbers this ADR implements, e.g. 4.3, 10 (gate name)>
 ## Acceptance
 <Each line is provable by one artifact. The PR evidence table mirrors this list exactly.>
 - ...
-- `npm test`, `npm run typecheck`, `npm run build` pass; golden path green.
+- `npm test`, `npm run typecheck`, `npm run build` pass; report skips. Run the golden path if it exists; otherwise state it is absent.

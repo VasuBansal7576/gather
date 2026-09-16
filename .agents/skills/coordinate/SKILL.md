@@ -1,37 +1,26 @@
 ---
 name: coordinate
-description: Integrator role. Write ADRs from the PRD, dispatch one worker per ADR in Orca, review evidence against the ADR's acceptance list, merge in dependency order, keep the golden path green. Use only as the integrator.
+description: Reconcile Gather design and supervise explicitly authorized implementation work.
 ---
 
 # Coordinate
 
-One integrator owns `main` and the end-to-end journey. Workers own ADRs.
+Read `AGENTS.md`. Feature implementation is currently paused. Do not dispatch paused ADRs, infer delegation from their presence, or resume implementation during repository cleanup.
 
-## Writing an ADR
+## Before a feature ADR is accepted
 
-Copy `docs/adr/000-template.md`. An ADR is ready when a worker can finish it without asking a question: Decision, PRD sections, Owns, Must not touch, Do, Don't, Out of scope, Acceptance (each item provable by an artifact). Set `Status: ready`. Number contiguously.
+- Reconcile it with the PRD, actual interfaces and related ADRs.
+- Identify the authoritative state/progression owner, failure behavior, scope, non-goals and observable acceptance evidence.
+- Mark unresolved choices as unresolved; do not convert them into invented implementation instructions.
+- Include all required file ownership and dependencies. Check overlaps and avoid concurrent writers.
+- An ADR is ready only after its design and scope are accepted; ready does not itself authorize execution.
 
-## Dispatching
+## Explicitly authorized coordination
 
-- One worker per ADR, in Orca, each in its own worktree (the worker runs `isolate`).
-- Prompt the worker with: the ADR path, "follow AGENTS.md and the skills", nothing else. Do not paste the PRD.
-- Respect `Depends on`. Do not dispatch an ADR whose dependency is not merged.
-- Never two workers on ADRs with overlapping **Owns**.
+Use workers only when the owner requests delegation. Give each the approved scope and relevant design context, not only an isolated task list. Respect dependency order and overlapping ownership. Delegation does not remove coordinator responsibility to inspect the diff and actual evidence.
 
-## Reviewing a PR
+## Review and landing
 
-Reject without reading code if the evidence table is missing or has missing rows. Otherwise check, in order:
+Review source, scope, evidence, CI and remaining gaps. Require real provider receipts for external claims. Run the golden path if it exists; otherwise record its absence, not a fictitious pass. Maintenance does not need feature screenshots or a complete ADR implementation.
 
-1. Every Acceptance item has an artifact that actually shows it.
-2. Simulated vs real is stated and matches the artifacts.
-3. Files changed are within **Owns**. Anything else is either justified in the PR or rejected.
-4. `tests/golden-path.test.ts` passes on the branch merged with current `main` (run it yourself).
-5. No new prompt-only enforcement; no personal identifiers; nothing under `.runtime/` committed.
-
-## Merging
-
-Squash-merge in dependency order. After each merge: run the golden path on `main`, set the ADR `Status: shipped` with the merge commit, delete the branch. If the golden path breaks, revert immediately, then investigate.
-
-## Boundaries
-
-Do not fix a worker's PR yourself; return it with the failing item. Do not widen an ADR mid-flight; write a new one. Do not keep a status ledger; the ADR statuses and merged PRs are the record.
+Merge only when explicitly authorized and required checks pass on the current head. Verify GitHub's merged state before marking work shipped. Do not automatically revert unrelated work, delete active worktrees or widen scope. Keep unresolved work and concrete blockers visible in the PR; no duplicate status ledger.

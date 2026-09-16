@@ -1,10 +1,12 @@
 # ADR-003: Scope and authority boundary
 
-Status: ready
+Status: paused proposal — requires design reconciliation and explicit authorization before implementation
 Depends on: ADR-001, ADR-002
 PRD: 4, 4.1, 4.4, 10 (Exact authority, External-content boundary, Scope boundary)
 
-## Decision
+> The task list below is retained for design review, not execution. See [repository design conflicts](../README.md#design-conflicts-to-resolve-before-implementation). No feature work is authorized during cleanup.
+
+## Proposed decision
 Gather acts only on event bookings, and that is enforced by code, not prompts. A booking exists only when deterministic extraction yields an event date or range and at least one of guest count or event type. The agent's tool surface contains only booking-scoped tools. Price floors, concession limits and recipient constraints are enforced server-side before any provider call. Everything Gather declines is visible with a reason, so a judge can type arbitrary emails into the prepared inbox and watch the boundary hold.
 
 ## Owns
