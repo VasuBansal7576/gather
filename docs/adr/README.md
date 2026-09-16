@@ -1,4 +1,4 @@
-# Public execution index and Orca handoff
+# Public execution index
 
 Chief prepared this plan for the **public hackathon build**. It is a static coverage/dependency contract, not another progress ledger. ADR-000 is historical, `000-template.md` is a template, and ADRs 001–016 are specified work orders. Six earlier proposals have been reconciled and ten missing scopes added; this is not a claim to have recovered a historical fifteen-ADR plan.
 
@@ -134,48 +134,5 @@ Every PRD section is mapped below. The final column names the acceptance IDs in 
 Orca can implement against the specified ports and scripted tests after authorization. It cannot fabricate proof of a configured Google client/Picker, supported model login, native knowledge capability, or sponsor call. Relevant ADRs define the experiment and exact blocked outcome. Chief owns resolving a failed capability check or obtaining operator configuration within authority; the worker reports concrete evidence instead of selecting another architecture.
 
 No direct-to-Composio fallback, new paid service, public server, personal runtime access or scope expansion happens automatically. An absent key is a live-proof blocker, not a reason to ask the user to redesign the product or to fake a receipt. Default tests remain entirely local.
-
-## Paste into Orca when starting execution
-
-This prompt is for the owner's later execution instruction, not an instruction executed by this planning commit:
-
-```text
-Execute the public Gather hackathon plan in docs/adr/README.md.
-This instruction authorizes implementation of the specified ADRs, not
-private SaaS work, purchases, deployment, submission or merging into main.
-
-Use the public repository revision containing this plan. The planning PR
-may still be unmerged: verify the selected remote branch/SHA and create a
-dedicated integration branch from that revision, not stale main. Do not
-overwrite an existing checkout or another worker's changes.
-
-Read AGENTS.md, docs/HACKATHON_PRD.md, docs/adr/CONTRACTS.md, this index
-and the repository isolate/build/prove/ship/coordinate skills.
-Do not re-decompose the PRD or ask workers to invent product requirements.
-
-Use Orca's version-matched orchestration guide and the configured Muse
-Spark 1.3, SWE 2 and Luna workers. Verify their actual configured IDs;
-do not silently substitute models. Use the specified dependency waves,
-one scoped task/worktree per worker and exclusive ownership of shared
-paths. Dispatch only after dependency contracts and evidence are verified.
-
-Each task must include its ADR, cited PRD/contracts, exact files, acceptance
-IDs and expected evidence. Handle worker questions and completion events;
-do not treat queued messages or a live terminal as task completion.
-
-Review changes and evidence; integrate reviewed worker commits into the
-dedicated integration branch and verify combined behaviour before the next
-wave. Keep protected/main merges for separate authorization. If integration
-fails, return a bounded repair task to its owner, not another broad rewrite.
-
-Chief owns product/contract contradictions and failed capability decisions.
-Return those with evidence; continue independent authorized work when safe.
-Preserve simulation labels and explicit live-proof blockers.
-
-Commit, push the correct public task/integration branches and verify local
-and remote SHAs match. Open PRs ready for review, never draft. Do not merge
-main, deploy or submit. Finish with each ADR's evidence/outcome and all
-section-10 and selected event gates accounted for, including blockers.
-```
 
 For base-only or a single-event build, the owner can select that profile explicitly; do not silently omit other target events from an all-events request. ADR-016 can check base evidence early, but its all-events completion remains blocked until all listed dependencies and qualifying event proofs are available.

@@ -20,7 +20,7 @@ Chief owns this entire preparation stage. Orca is reserved for execution of the 
 
 ## Explicitly authorized coordination
 
-Use the execution index's dependency waves and paste-ready handoff. Preserve ADR numbering and contracts; do not ask Orca to re-decompose the PRD. Select the remote revision containing this plan, not an older main checkout. Track dependency completion through reviewed integrated code and acceptance evidence, not agent prose or branch existence. Common files require exclusive write ownership even across nominally independent tasks.
+Use the execution index's dependency waves and the owner's explicit execution instruction. Preserve ADR numbering and contracts; do not ask Orca to re-decompose the PRD. Select the remote revision containing this plan, not an older main checkout. Track dependency completion through reviewed integrated code and acceptance evidence, not agent prose or branch existence. Common files require exclusive write ownership even across nominally independent tasks.
 
 Use workers only when the owner requests delegation. Give each the approved scope and relevant design context, not only an isolated task list. Respect dependency order and overlapping ownership. Delegation does not remove coordinator responsibility to inspect the diff and actual evidence.
 

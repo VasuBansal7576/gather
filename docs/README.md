@@ -40,7 +40,7 @@ The plan resolves the previously conflicting incomplete-inquiry gate, honest emp
 
 Existing code remains the partial prototype mapped above. Engineering proof still belongs to the named tasks: native recall/wiki capability and migration (008), isolated pinned runtime/model budgets (009), configured Google client/Picker (012), full live composition (006), and real sponsor use plus release evidence (013–016). No client credential, consent bypass, model capability or paid service is assumed. A failed capability gate returns concrete evidence to Chief; workers do not choose another product architecture.
 
-Orca receives the index's execution prompt after the owner resumes implementation. It does not receive an instruction to redesign the PRD, discover missing requirements or silently import private SaaS decisions. The current planning pass changes no application behavior.
+Orca follows the execution index after the owner explicitly resumes implementation. It does not receive an instruction to redesign the PRD, discover missing requirements or silently import private SaaS decisions. The current planning pass changes no application behavior.
 
 ## Reading technical guides
 
