@@ -1,6 +1,6 @@
 # Local development and inspection
 
-This runs the existing prototype with simulated fixtures, not the future managed customer service. Use Node.js 26+ and npm; `.node-version` pins the development/CI baseline. Gather uses built-in SQLite and TypeScript stripping, but the version policy is the tested project baseline—not a claim that SQLite first appeared in Node 26.
+This runs the existing prototype with simulated fixtures, not the proposed one-command product. Use Node.js 26+ and npm; `.node-version` pins the development/CI baseline. Gather uses built-in SQLite and TypeScript stripping, but the version policy is the tested project baseline—not a claim that SQLite first appeared in Node 26.
 
 ## Fresh checkout
 

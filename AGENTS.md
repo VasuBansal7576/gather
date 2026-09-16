@@ -2,9 +2,11 @@
 
 ## Current scope
 
+This public repository is the **hackathon build**, governed by `docs/HACKATHON_PRD.md` and its hackathon ADRs. Preserve its local-first distribution, prepared-business path and event-specific requirements. The private SaaS is a different product scope; do not import its hosted-delivery, billing or operational requirements here. A difference between the two is not a defect.
+
 Feature implementation is paused at the owner's request. The active task is repository recovery: understand the product, correct misleading documentation and conflicting PRD/ADR instructions, repair existing application defects, and repair build/test/CI reproducibility. Application code is in scope for evidenced repairs; do not execute the unbuilt PRD/ADR backlog, remove existing modules, migrate data, or invent a new product direction.
 
-Read [README.md](README.md) and [docs/README.md](docs/README.md) first. The [PRD](docs/HACKATHON_PRD.md) describes intended behavior, not current capabilities. ADRs 001–006 record reconciled design boundaries and future acceptance evidence; they are not approved implementation tasks. Only an explicit owner instruction resumes feature work.
+Read [README.md](README.md) and [docs/README.md](docs/README.md) first. The [PRD](docs/HACKATHON_PRD.md) describes intended behavior, not current capabilities. ADRs 001–006 are hackathon proposals with future acceptance evidence; they are not approved implementation tasks. Only an explicit owner instruction resumes feature work.
 
 ## Workflow
 

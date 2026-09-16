@@ -1,28 +1,51 @@
-# ADR-006: Authorized live connections in the managed service
+# ADR-006: Live mode on the user's own accounts
 
-Status: reconciled design contract — feature implementation remains paused. Existing defect repairs are authorized.
+Status: paused proposal — requires design reconciliation and explicit authorization before implementation
+Depends on: ADR-001, ADR-002, ADR-003, ADR-004
+PRD: 3, 5, 8.1, 8.3, 10 (Connections, Booking journey, Managed runtime, Budgets gates)
 
-PRD: 2–3, 8.1–8.3, 10. Related: ADR-001–005.
+> The task list below is retained for design review, not execution. See [repository design conflicts](../README.md#design-conflicts-to-resolve-before-implementation). No feature work is authorized during cleanup.
 
-## Reconciled decision
+## Proposed decision
+"Connect your own apps" becomes real, locally: OpenClaw is installed lazily under `.runtime/openclaw/`, the user signs into a model through OpenClaw's own subscription login or pastes a key, connects Gmail, Drive and Calendar through Gather's OAuth client using the loopback flow, and runs the same inquiry -> offer -> approval -> hold -> email journey on their real accounts with independent receipts. The application/runtime run on the user's machine; model access is supplied by the local user. Local storage does not imply zero operating cost or no external processing; Google/model calls and any optional broker have explicit data flows and costs. Composio is the fallback if the direct Google path proves unusable for unverified apps.
 
-Live customers connect authorized business tools to Gather's managed runtime. They do not install OpenClaw, register a Google Cloud project or supply personal subscription OAuth for pooled hosting. The former desktop/loopback installer plan and zero-operator-cost promise are superseded. Current developer integration remains separate from finished hosted onboarding.
+## Owns
+- `src/runtime/**` (lazy install, model login flow, budget bounds)
+- `src/server/connections/**`, `src/connectors/google/**` (loopback OAuth, `drive.file` + picker, token storage under `.runtime/secrets/` with 0600; replace the macOS-only Keychain adapter with a file-backed adapter behind the existing interface)
+- `app/setup/**` "Connect your own" path, `app/api/connections/**`, `app/api/live-model/**`
+- New `src/server/budget.ts`
+- `docs/CONNECTIONS.md`, `docs/GOOGLE_CONNECTORS.md`, `docs/OPENCLAW.md`, `docs/MODEL_CONFIG.md`, `docs/LIVE_MODEL_RUN.md` (update to match)
+- `tests/live-*.test.ts`, `tests/connections*.test.ts`, `tests/budget.test.ts`
 
-## Connection and execution contracts
+## Must not touch
+- `~/.openclaw`, `~/.config`, or any path outside the repo and `.runtime/`
+- Intent, incident, knowledge and gate modules beyond calling them
 
-- Use a Gather-operated web OAuth callback with state/PKCE validation, verified account identity, exact business binding and protected server-side tokens. Hosted session/tenant authentication must exist before public exposure.
-- Determine Google scope, permitted-use and verification/assessment requirements for the actual data flow. Do not instruct production users to bypass unverified warnings or treat a connector broker as an automatic exemption.
-- Validate selected-document access and least-privilege scopes end to end before narrowing current configured scopes. There is no shipped Picker merely because the PRD names one.
-- Handle consent denial, callback replay/expiry, token refresh/revocation, partial import, connection ambiguity and account changes explicitly. Authentication is not proof of complete sync.
-- Use supported model access with per-business usage attribution, cancellation and tool/token/time limits. No silent provider fallback, pooled personal subscription credentials or unlimited/zero-cost claim.
-- Exact approved recipients and message content remain enforced. A developer test-recipient allowlist is an additional restriction, not permission to reroute mail.
-- Keep secrets behind the existing interface; the current macOS Keychain adapter does not establish hosted storage. No tokens in logs, browser errors, analytics, fixtures or Git.
-- Provider uncertainty follows ADR-002; operational failure follows ADR-004. A tool return is not independent verification of a live effect.
+## Do
+- Lazy install: on first "Connect your own", `npm install --prefix .runtime/openclaw openclaw@<pinned>` with progress shown; verify `--version`; never a global install. Reuse `src/runtime/process.ts` isolation env exactly as documented in `docs/OPENCLAW.md`.
+- Model: present OpenClaw's supported subscription login (OAuth) as the default with the exact profile id stored in `.runtime/openclaw/`; "paste an API key" as the alternative. Persist `GATHER_MODEL_PROFILE_ID` equivalent in the runtime config, never in git. Copy states plainly that a subscription login is for personal use on this machine.
+- Google: register one OAuth client (desktop/loopback type) operated by Gather; the client id ships in the app, no client secret is required for the loopback flow. Scopes: `gmail.readonly`, `gmail.send`, `calendar.events`, `drive.file`. Use the Google Picker for the owner to select the policy and price documents. Show the "unverified app" step honestly in the UI with a screenshot of what Google will display and the "Advanced -> continue" instruction.
+- Verify on a fresh Google account whether restricted scopes complete on the unverified client. If they do not, implement the Composio Connect Link path behind `GATHER_CONNECTOR=composio` with a tiny broker endpoint (the operator's Composio key never ships in the app) and state in the UI that mail transits Composio during sync. Broker deployment and spending need separate authorization; a broker does not automatically waive provider requirements.
+- Budget: per-run max tool calls (15) and wall-clock (5 min) via the existing `agent.wait` timeout; per-day runs per business (default 50); all configurable. Exceeding shows a plain message; nothing silent.
+- Route real provider failures into ADR-004's detector unchanged; `request_reconnect` must surface as a button in Connections.
+- Recipient for real sends is the inquiry sender only (ADR-003 tool contract). Keep `GATHER_TEST_RECIPIENT` as an optional additional restriction for the developer, never permission to add an unapproved recipient.
+- Live journey on the developer's own test account, recorded: real inquiry email -> offer citing the Drive document -> approval -> Calendar hold receipt re-read from Calendar -> Gmail send receipt re-read from Gmail -> owner-visible receipts.
 
-## Existing interfaces / future scope
+## Don't
+- Don't hardcode any account, profile id, or address.
+- Don't default to full `drive.readonly`; `drive.file` plus picker.
+- Don't store tokens in the SQLite database or in git-tracked paths.
+- Don't let a subscription login serve anyone but the local user; no hosted use.
+- Don't fake a receipt from a tool return; re-read the provider.
+- Don't remove the prepared business path or make it depend on any of this.
 
-`src/runtime/`, `server/connections/`, `connectors/google/`, `provider-runtime/`, `live-model/` and connection routes are existing integration boundaries. Repair malformed responses, credential leaks, state/claim defects and other reproduced failures without implementing hosted authentication/provisioning, new connector brokers or new model onboarding.
+## Out of scope
+Hosted multi-tenant deployment. Sponsor model adapters (one ADR per event, next). Voice intake (event ADR).
 
-## Required future evidence
-
-An authorized isolated account journey: consent, progressive source intake, actual model execution, grounded proposal, exact approval, Calendar/Gmail effects independently re-read, and explicit reconnect/budget-failure behavior. Scripted transports prove boundary behavior only. Preserve fixture inspection without live credentials. Do not start paid or live-provider runs as part of default repository checks.
+## Acceptance
+- Screen recording: fresh clone -> `npx github:...` -> Connect your own -> OpenClaw installs under `.runtime/` (directory listing, `~/.openclaw` untouched by mtime) -> model login -> Google consent -> workspace shows three connected accounts.
+- Live journey recording with the four receipts, each re-read from the provider (Calendar event id fetched back, Gmail message id fetched back).
+- Decision record on the unverified-client test: works, or Composio fallback implemented with its own consent screenshot.
+- Budget test: 16th tool call in a run is refused with the message; screenshot.
+- Expired-token scenario: reconnect button appears via the incident path; screenshot.
+- `npm test`, `npm run typecheck`, `npm run build` pass; golden path green.
