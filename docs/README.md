@@ -36,6 +36,8 @@ The similarly named modules above are not automatically duplicates. For example,
 
 The original ADR task lists remain available for review, but [ADRs 001–006](adr/) are **paused proposals**, not an implementation queue.
 
+Chief owns the remaining PRD/ADR reconciliation, complete requirement coverage, dependency contracts and safe execution order. Orca will execute the prepared plan using the configured workers; it is not being assigned the missing design work. Until that preparation is complete, do not describe these proposals as ready for Orca or ask its workers to fill product gaps. The next planning pass must close the unassigned release requirements listed below and reconcile the existing ADR dependency/ownership conflicts before any execution handoff.
+
 The public local-first product and its hackathon task lists are restored; the private hosted SaaS must not override them. The following corrections stay within hackathon scope:
 
 1. **Distribution/state:** keep the one-command local target; require Node 26 and inventory runtime/store owners before any path migration. Existing records are not moved by this cleanup.

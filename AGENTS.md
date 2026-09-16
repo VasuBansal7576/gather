@@ -10,6 +10,9 @@ Read [README.md](README.md) and [docs/README.md](docs/README.md) first. The [PRD
 
 ## Workflow
 
+- Chief owns pre-execution reconciliation: the public PRD, complete ADR coverage, interface contracts, dependency order, conflicting file ownership and acceptance evidence. Do not hand that unfinished planning to Orca or ask implementation workers to infer product scope.
+- Orca is the intended execution orchestrator after that plan is ready and the owner explicitly resumes implementation. It coordinates the configured workers and handoffs; it does not have authority to invent requirements, import private SaaS scope or resolve product contradictions silently. An unresolved planning dependency returns to Chief before dispatch.
+
 - Inspect Git state and use an isolated worktree; continue the existing clean PR worktree for follow-up repairs, or create a fresh one from `origin/main` for a new task. Never overwrite another worker's files or runtime state.
 - Use the repository's `isolate`, `build`, `prove`, and `ship` skills in `.agents/skills/`. Maintenance can use a bounded PR scope; feature work requires an accepted ADR. User instructions take precedence over either.
 - No delegation or parallel workers unless requested. An ADR marked ready is not a dispatch instruction.

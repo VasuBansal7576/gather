@@ -147,6 +147,7 @@ These rules are enforced in code, not prompt text.
 3. Empty is honest.
    No facts produces "No business information found yet"; an offer that needs a price the memory does not have asks the owner rather than inventing one.
    No inquiries produces "Scanned N emails. No event inquiries found."
+   State the scanned scope and completion/coverage. An in-progress import says "No event inquiries found yet; scanning continues"; failed access says the scan could not complete, never that no leads exist. Relevant inquiries without business facts remain visible with the missing-information question. Never populate connected live accounts with prepared-business fixtures to conceal an empty result.
 4. Scope never widens by itself.
    A customer or booking exception stays scoped; repeated behavior, customer claims and documents cannot promote it to policy.
    Only an owner rule can, and it is versioned.
@@ -166,14 +167,13 @@ These rules are enforced in code, not prompt text.
 
 Gather acts on event bookings and declines everything else, enforced by capability, not by instructions.
 
-- **Deterministic gate.** A booking exists only when extraction yields a resolvable event date or range and at least one of a guest count or an event type.
-  The model may extract candidate fields; the gate is code and decides.
+- **Domain gate and qualification are separate.** Classify messages as eligible event inquiries, clearly unrelated, or uncertain/requires review, with evidence and reasons. A legitimate inquiry missing a date, guest count or event type remains eligible; missing fields trigger qualification, not automatic rejection. Extraction/classification may use the model, but server-side validation and authority checks decide which actions can execute. Ambiguous messages cannot trigger external writes merely because the model called them bookings.
 - **Booking-scoped tools.** The agent's tool surface takes a booking, proposal or server-derived business identity.
   There is no tool to read arbitrary mail, search arbitrary Drive, or send to arbitrary recipients, so there is nothing callable outside the domain.
 - **Visible refusal.** Messages that fail the gate appear in a "Not an event inquiry" list with the reason.
   An empty scan reports that no event inquiries were found.
   Out-of-domain owner requests receive a one-line refusal.
-- **Judge-testable.** The prepared business includes a composer where anyone can type an email (an invoice, a newsletter, an injection attempt, or a real inquiry) and watch it classified live: non-events are declined with reasons, injection attempts invoke no tool, and a valid inquiry becomes a booking.
+- **Judge-testable.** The prepared business includes a composer where anyone can type an email (an invoice, a newsletter, an injection attempt, or a real inquiry) and watch it classified: unrelated requests cannot trigger business actions, while legitimate inquiries remain eligible even with missing fields or embedded malicious instructions. Injected claims never grant authority; safe qualification may continue. Show prepared/model simulation honestly.
 
 ## 5. Offers, authority and execution
 
@@ -292,6 +292,7 @@ The submission video and a judge running the prepared business follow this seque
 5. The judge triggers a fault mid-action from the fault panel; the repair thread appears; the action completes with no duplicate hold. A second fault ends in an honest blocked state.
 6. A claim of an owner-approved discount is rejected as authority with its reason; the floor holds while legitimate inquiry qualification may continue.
 7. Owner tells Gather a new rule in plain language; the next affected inquiry respects it and cites it; the trend chart moves after the correction.
+8. A separately selectable empty/non-event fixture shows the scanned count/scope and "No event inquiries found" without generated leads or invented business facts. Separate partial-import and failed-connection fixtures demonstrate that neither is misreported as a completed empty scan.
 
 The live-mode recording (developer's own test account) adds: Google consent, a real Gmail inquiry, and hold and email receipts re-read from Calendar and Gmail.
 
@@ -347,6 +348,7 @@ For this release a pinned deployment and a documented, tested restart/recovery p
 
 The PRD remains the source of truth.
 Implementation proceeds through the ADRs in `docs/adr/`; each ADR cites its PRD sections, owns explicit files, forbids explicit files and defines its own acceptance evidence.
+Chief owns completion and reconciliation of that plan before execution: requirement-to-ADR coverage, contracts, dependency ordering, ownership conflicts and acceptance scenarios. Orca is the execution orchestrator for the resulting ready work orders, not the owner of unfinished product design. Workers must return contradictions to Chief rather than inventing requirements. The six existing feature proposals are not a complete execution-ready release plan.
 Any future authorized implementation must read its accepted ADR alongside the relevant PRD sections and existing interfaces. An ADR cannot override the product requirements or resolve an open design choice by assumption.
 
 For each subsystem, define inputs, authoritative stored state, model responsibilities, deterministic enforcement, triggers, failure/recovery behavior and observable acceptance scenarios.

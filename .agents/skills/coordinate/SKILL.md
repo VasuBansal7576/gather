@@ -9,7 +9,10 @@ Read `AGENTS.md`. Feature implementation is currently paused. Do not dispatch pa
 
 ## Before a feature ADR is accepted
 
+Chief owns this entire preparation stage. Orca is reserved for execution of the reconciled plan, not PRD decomposition or product decision-making. Do not send Orca a request to distribute incomplete requirements among implementation workers.
+
 - Reconcile it with the PRD, actual interfaces and related ADRs.
+- Account for every public PRD requirement in an ADR coverage map, including honest empty scans, partial/failed import, judge-testable prepared mode and separately evidenced live effects. Reference guides are not substitute work orders.
 - Identify the authoritative state/progression owner, failure behavior, scope, non-goals and observable acceptance evidence.
 - Mark unresolved choices as unresolved; do not convert them into invented implementation instructions.
 - Include all required file ownership and dependencies. Check overlaps and avoid concurrent writers.
@@ -18,6 +21,8 @@ Read `AGENTS.md`. Feature implementation is currently paused. Do not dispatch pa
 ## Explicitly authorized coordination
 
 Use workers only when the owner requests delegation. Give each the approved scope and relevant design context, not only an isolated task list. Respect dependency order and overlapping ownership. Delegation does not remove coordinator responsibility to inspect the diff and actual evidence.
+
+When Orca execution is authorized, use Orca's version-matched orchestration workflow and the configured workers. Do not substitute another orchestration mechanism. Its coordinator may resolve routine implementation details within accepted contracts, but unresolved product decisions or missing dependency contracts return to Chief before the affected work is dispatched. No planning status authorizes a merge or deployment.
 
 ## Review and landing
 
