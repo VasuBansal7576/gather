@@ -105,9 +105,9 @@ This is a local-first single-business application, not a multi-tenant hosted ser
 
 ## Product documentation
 
-- [Public hackathon requirements](docs/HACKATHON_PRD.md) — target scope for the Amazon, AssemblyAI, and Nebius/NVIDIA events.
-- [Architecture decision records](docs/adr/) — the units of work for this build.
-- [Agent workflow](AGENTS.md) — how every change is isolated, built, proven, and shipped.
+- [Public hackathon requirements](docs/HACKATHON_PRD.md): target scope for the Amazon, AssemblyAI, and Nebius/NVIDIA events.
+- [Architecture decision records](docs/adr/): the units of work for this build.
+- [Agent workflow](AGENTS.md): how every change is isolated, built, proven, and shipped.
 - [Business knowledge](docs/BUSINESS_KNOWLEDGE.md)
 - [Booking API](docs/BOOKING_API.md)
 - [Proactive work](docs/PROACTIVE_WORK.md)
