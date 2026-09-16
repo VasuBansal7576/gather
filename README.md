@@ -17,9 +17,9 @@ The fixture path starts with two pre-created bookings and proposals. It does **n
 
 ## What is not ready
 
-The one-command installer, prepared-inbox composer and reset flow, event-only intake gate, durable user-intent runner, automatic incident/repair experience, native-memory integration, and finished live onboarding are proposed work—not shipped capabilities. The end-to-end golden-path test is also not present.
+Managed hosted onboarding, the prepared-inbox composer and reset flow, event-only intake gate, durable user-intent runner, automatic incident/repair experience, native-memory integration, and finished live onboarding are proposed work—not shipped capabilities. The end-to-end golden-path test is also not present.
 
-The [product requirements](docs/HACKATHON_PRD.md) describe the intended product. The [repository guide](docs/README.md) maps the existing code and unresolved design conflicts. ADRs are proposals unless explicitly accepted; they are not permission to start implementation.
+The [product requirements](docs/HACKATHON_PRD.md) describe the intended product. The [repository guide](docs/README.md) maps the existing code, reconciled design boundaries and release coverage. ADRs are proposals unless explicitly accepted; they are not permission to start implementation.
 
 ## Inspect the prototype locally
 
@@ -55,7 +55,7 @@ A green build or test suite does not establish live Google outcomes, model quali
 
 ## Data and live integrations
 
-Local-first is the intended distribution model, not a claim that live data never leaves the machine. Connected Google services and a configured remote model necessarily receive the data needed for their operations.
+The intended customer experience is managed hosting with an isolated OpenClaw instance per business, not customer installation. The current local prototype is a developer inspection path, not a hosted-ready deployment. Connected Google services and a configured remote model necessarily receive the data needed for their operations.
 
 Live integration remains developer-configured. The current Google secret adapter uses macOS Keychain; there is no shipped cross-platform file-backed Google credential store. The current model configuration accepts one explicit OAuth model selection, not arbitrary subscriptions or API keys. See [connections](docs/CONNECTIONS.md), [model configuration](docs/MODEL_CONFIG.md), and [live execution](docs/LIVE_MODEL_RUN.md) for the actual boundaries.
 

@@ -10,7 +10,7 @@ Read `AGENTS.md` first. Feature work is paused unless explicitly resumed by the 
 ## Maintenance
 
 - Correct claims against source. Separate intended behavior, existing code, tests and live evidence.
-- Repair build/test reproducibility without changing application behavior or weakening assertions.
+- Repair reproduced defects in existing application behavior as well as build/test reproducibility. Add focused regression evidence; preserve intended contracts and never weaken assertions. Do not implement missing product capabilities under the label of repair.
 - Preserve existing contracts, data and unrelated settings. Do not delete modules because their names overlap.
 - Use fictional versioned fixtures, not local account data or shared `/tmp` inputs.
 - Repository-owned skill files can be corrected as ordinary source when requested; do not change installed/global skills.

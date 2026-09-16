@@ -1,50 +1,27 @@
-# ADR-001: Local-first product shell
+# ADR-001: Managed customer delivery and local inspection
 
-Status: paused proposal — requires design reconciliation and explicit authorization before implementation
-Depends on: ADR-000
-PRD: 2, 2.1, 2.2, 7, 7.1, 10 (Local run gate, UX gate, Submission gate)
+Status: reconciled design contract — feature implementation remains paused. Existing defect repairs are authorized.
 
-> The task list below is retained for design review, not execution. See [repository design conflicts](../README.md#design-conflicts-to-resolve-before-implementation). No feature work is authorized during cleanup.
+PRD: 1–3, 7, 8.1–8.3, 10.
 
-## Proposed decision
-Gather is distributed as a local-first app started with one command. `npx github:VasuBansal7576/gather` (and `npm start` from a clone) boots the prepared business with Node only: no keys, no OpenClaw install, no network provider. The first screen offers "Try the prepared business" and "Connect your own" (the latter gated by ADR-006). All judge-testable behavior in this build runs in the prepared business with visibly simulated connectors.
+## Reconciled decision
 
-## Owns
-- `package.json` (`bin`, `scripts.start`, `files`), `scripts/gather-start.mjs`, `scripts/gather-doctor.mjs`, new `scripts/gather-cli.mjs`
-- `app/setup/**`, `app/page.tsx`, `app/layout.tsx`, `app/globals.css`
-- `src/setup/**`
-- `src/server/demo-fixtures.ts` (seed content only; keep exported IDs stable)
-- `README.md`
-- `tests/setup*.test.ts`, `tests/cli*.test.ts`
+Customers use a managed web workspace. Gather hosts a dedicated isolated OpenClaw instance per business, owns pinned updates and operates an external supervisor. This supersedes the former customer-installed/local-first proposal; the historical filename is retained for existing links. No `npx github:` installer or second local customer product is required.
 
-## Must not touch
-- `src/runtime/**`, `src/server/connections/**`, `src/server/live-model/**`, `src/connectors/google/**`
-- `~/.openclaw` or any path outside the repo and its `.runtime/`
+The current Next.js/SQLite checkout is a developer inspection path, not a hosted-ready deployment. Preserve its documented clone/install/build/start workflow and loopback binding. `local-owner` is not hosted authentication. Do not publish the prototype as a SaaS before authenticated tenant scope and runtime isolation are proved.
 
-## Do
-- Add `"bin": { "gather": "scripts/gather-cli.mjs" }`. The CLI: verify Node >= 22, create `.runtime/`, run the doctor, `next build` if `.next/` is missing, start on `127.0.0.1` with a free port, print the URL, open the browser (`open`/`xdg-open`/`start`, ignore failure). Flags: `--port`, `--no-open`, `--reset` (deletes only `.runtime/prepared-business.sqlite`).
-- Default database path when unset: `.runtime/prepared-business.sqlite`. Never default to a path outside the repo.
-- Make the first-run screen two cards: "Try the prepared business" (one click, seeds fixtures, enters the workspace) and "Connect your own apps" (explains it needs a model login and Google consent; button disabled with that copy until ADR-006 ships). Remove the timezone/business-name form from the first run; the prepared business supplies its own.
-- Every prepared-business screen shows a persistent, non-dismissable "Prepared business, simulated connectors" badge. Keep the existing `fictional: true` source labels.
-- Extend the prepared business seed with: one venue policy document, one package/price list, one calendar with two existing holds, six inbox messages (three event inquiries, three non-events: an invoice, a newsletter, a vendor pitch). Non-events are needed by ADR-003.
-- Add a "Reset prepared business" action in the workspace header that reseeds from scratch and confirms before doing so.
-- Rewrite `README.md` top to: one-paragraph promise, "Watch (video link placeholder)", "Run: `npx github:VasuBansal7576/gather`", "What is simulated", "Connect your own (coming in ADR-006)". Keep the developer section below.
-- Tests: CLI argument parsing, doctor runs, default DB path, seed idempotency, first-run render at 1440x900 and 390x844 with the badge present.
+## State and fixture boundaries
 
-## Don't
-- Don't install or spawn OpenClaw in this path. Demo mode is deterministic and stays that way.
-- Don't publish to npm; `npx github:` is the distribution.
-- Don't ask for a model key, Google client id, or any env var on first run.
-- Don't touch the existing `/api/demo/init` contract; call it.
-- Don't write a new status document. The README states what is simulated; nothing else.
+- Preserve `data/gather.sqlite` as the existing default. Tests/inspection explicitly choose isolated paths. Any later migration must inventory all stores/runtime consumers, back up, migrate and verify existing records; changing one default is not a migration.
+- Keep fixtures visibly simulated and opt-in. Current seeds contain two bookings with pre-created proposals, not a demonstrated intake-to-offer journey.
+- A future fixture reset operates only on fixture-owned state after confirmation, never a shared database deletion or another business's records.
+- Fixture inspection needs neither model credentials nor OpenClaw. Real runtime/model recovery belongs to the separate opt-in harness in ADR-004.
+- Keep private strategy, hosting vendors and commercial plans outside public docs.
 
-## Out of scope
-Live Google and model login (ADR-006). Classification of the seeded non-event emails (ADR-003). Durable intents behind the buttons (ADR-002).
+## Existing interfaces / future scope
 
-## Acceptance
-- Fresh clone, `npx github:VasuBansal7576/gather` on a machine with only Node: browser opens, prepared business visible within the doctor's reported time. Terminal transcript attached.
-- Screenshot of first-run screen at 1440x900 and 390x844 showing both cards and the disabled "Connect your own" copy.
-- Screenshot of the workspace with the simulated badge and the six seeded inbox messages.
-- Reset action reseeds; screenshot before and after with different booking timestamps.
-- `--reset` deletes only the prepared-business database (directory listing before/after).
-- `npm test`, `npm run typecheck`, `npm run build` pass.
+`app/setup/`, `src/setup/`, `src/server/runtime.ts`, `src/server/sqlite-store.ts`, `src/server/demo-fixtures.ts`, the launcher/doctor and README describe the current path. Hosted authentication/provisioning and richer prepared-business UX are unbuilt features, not instructions to implement now. Any later implementation plan must include every actual state-path owner rather than forbid runtime/store changes while moving their data.
+
+## Required future evidence
+
+Documented inspection from a fresh checkout; explicit simulation labels; no personal runtime access; fixture reset isolation if implemented. For hosted delivery: authenticated business scope on all routes, isolated runtime/credential/file access, lifecycle recovery and owner onboarding without local installation. Existing prototype tests alone cannot pass the hosted gate.

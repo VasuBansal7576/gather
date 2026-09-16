@@ -1,6 +1,6 @@
 # Gather: Public Hackathon PRD
 
-Status: requirements under reconciliation, not a claim of implementation or live verification. Feature implementation is paused by the owner; this document and the ADRs are not execution authorization. See [repository design conflicts](README.md#design-conflicts-to-resolve-before-implementation).
+Status: reconciled product direction; future requirements, not a claim of implementation or live verification. Feature implementation is paused by the owner; this document and the ADRs are not execution authorization. See [repository design conflicts](README.md#design-conflicts-to-resolve-before-implementation).
 Updated: 2026-09-16.
 
 ## 1. Product and audience
@@ -10,58 +10,49 @@ It coordinates inquiries across the business's existing applications and shows t
 
 Promise: **Connect your tools. Gather handles booking coordination. Approve the decisions that matter.**
 
-Gather is local-first.
-The target is one-command installation on the owner's machine, with local application state. Connected Google services and a configured remote model receive the data necessary for live operations; local-first does not mean offline or that source content never leaves the machine.
-A hosted multi-tenant service is a later offering, not part of this release.
+Gather is a managed service: the owner uses the web workspace and does not install OpenClaw or maintain a server. Gather manages a dedicated isolated OpenClaw instance per business, tested/pinned updates and external-supervisor recovery. A dedicated instance does not necessarily mean a dedicated VM.
+The current repository runs locally for developer inspection; it does not yet provide hosted authentication or provisioning. Public demonstration scope does not override the customer delivery model. Vendor, commercial and private operating plans are outside this document.
 
 This document defines the public hackathon release: one build, configured per event.
 It does not publish the private product strategy or roadmap.
 
 ## 2. Complete user journey
 
-1. Run one command (`npx github:VasuBansal7576/gather`) on a machine with Node; Gather builds if needed, starts on a local port and opens the browser.
-2. Choose **Try the prepared business** (zero keys, zero accounts) or **Connect your own** (a model login and Google consent on your own accounts).
-3. See what Gather understands about the business while import progresses.
-4. Answer only consequential unanswered questions; confirm policies and operating authority.
+1. Open the Gather workspace; the target customer path is managed sign-in and business onboarding.
+2. Connect authorized business tools, or inspect a clearly labeled fictional prepared business without real credentials.
+3. See what Gather understands while import progresses.
+4. Answer consequential unanswered questions; confirm policies and operating authority.
 5. Receive a grounded, evidence-cited offer for an inquiry.
 6. Approve the exact proposed actions where required.
 7. See verified external results, pending conditions and the current handoff.
-8. When something breaks underneath, see Gather notice, repair and resume the work on its own, or say plainly that it could not.
+8. See recovery and useful continuation, or an honest blocked state, when something fails.
 
-No terminal steps beyond the one command, no Google Cloud project, no OAuth client, no Composio account and no workflow configuration are required of the person evaluating or using the prepared business.
-Model login and Google consent are required only for the live path in section 2.2.
+### 2.1 Developer inspection versus customer delivery
 
-### 2.1 Local-first distribution
+- The existing local inspection commands are in the root README; they require Node.js 26+, dependencies and a production build. There is no packaged `npx github:` installer.
+- Preserve the existing default `data/gather.sqlite`; inspection may explicitly set `GATHER_DATABASE_PATH` under `.runtime/`. No implicit path migration or reset of existing databases.
+- Local development must never read or alter the developer's personal OpenClaw state.
+- Hosted sign-in, provisioning and tenant isolation require their own implementation evidence before deployment. `local-owner` is not customer authentication.
 
-- Distribution is `npx github:VasuBansal7576/gather` running the packaged CLI, and `npm ci && npm start` from a clone for developers.
-- The CLI checks the Node version, creates `.runtime/` inside the working directory, runs the doctor, builds the app if needed, starts on `127.0.0.1` with a free port and opens the browser.
-- All state lives under `.runtime/` (SQLite database, secrets, OpenClaw installation when live mode is used, repair artifacts).
-- Nothing outside the working directory is created or modified; the developer's personal `~/.openclaw` is never touched.
-- The prepared-business path installs no runtime and asks for no credentials.
+### 2.2 Prepared business and live operation
 
-### 2.2 Prepared business and live mode
-
-- **Try the prepared business** opens a fictional venue with seeded inquiries, documents and calendar.
-  Its connectors are explicitly simulated and labeled as such on every screen where they appear.
-- **Connect your own** installs the pinned OpenClaw runtime under `.runtime/` on first use, asks the user to sign into a supported model (OpenClaw's own subscription login or a user-provided API key) and then connects Gmail, Drive and Calendar through Gather's OAuth client (section 3).
-  It performs real reads and writes on the user's own accounts.
-- Live sends are restricted to the inquiry sender plus an optional operator-configured test recipient; there is no free-recipient send tool.
-- A reset action restores the prepared business to its seed at any time.
+- The prepared business is explicitly fictional, with simulated connectors labeled wherever effects or receipts appear. It currently has two bookings with pre-created proposals; a richer intake/offer journey is future work.
+- Fixture inspection requires no model credentials or OpenClaw process. It cannot prove actual runtime restart, model diagnosis or provider recovery.
+- Live operation uses the host-managed isolated runtime and authorized Google accounts. Model access is configured by the operator under supported provider terms; no pooled personal subscription credentials.
+- Sending is limited to the exact approved booking recipient and content. A developer test-recipient restriction narrows this boundary; it never grants permission to add recipients.
+- Any future fixture reset must be explicitly confirmed and limited to fictional state; it must not erase real businesses or source records.
 
 ## 3. Connections
 
 Initial required applications are Gmail, Google Drive and Google Calendar.
 Keep real multi-application execution in live mode; do not replace connectors with screenshots or simulated effects.
 
-Primary path: a Gather-operated Google OAuth client using the desktop/loopback flow, direct to Google, with no third party in the data path.
-The client identifier ships in the application; the loopback flow needs no shipped client secret.
+Target path: a Gather-operated web OAuth flow with server-side callback/state/PKCE handling, business ownership checks and protected credentials. The current localhost callback and macOS Keychain setup are developer plumbing, not completed hosted onboarding.
 
-- Use the narrowest scopes that support the journey: `gmail.readonly`, `gmail.send`, `calendar.events` and `drive.file` with the Google Picker for the owner to select menu, package and policy documents, instead of full Drive read access.
-- While the OAuth client is unverified, Google shows a "Google hasn't verified this app" screen; the connection UI states this plainly with the "Advanced, continue" instruction, and the unverified-client completion of the required scopes is verified on a fresh account before this path is declared usable.
-- If restricted scopes cannot complete on the unverified client, the fallback is a Composio Connect Link path behind a connector flag, served through a minimal operator-hosted broker so the Composio key never ships in the application.
-  That path discloses in the UI that mail transits Composio during synchronization even though storage remains local.
-- Keep credentials and connection operations server-side in the local process; tokens are stored under `.runtime/secrets/` with owner-only permissions, behind the existing secret-store interface.
-- Derive business scope server-side from the local store, not from model arguments or untrusted callback parameters.
+- Validate the minimum scopes against actual read/write operations and selected-document access; a Picker and `drive.file` flow must work end to end before narrowing existing configured scopes. Do not silently break current integrations.
+- Determine Google verification and assessment applicability for the actual scopes/data flow before onboarding businesses. An unverified-app bypass or connector broker is not a production consent strategy.
+- Keep tokens server-side behind the secret-store interface. No token in model arguments, browser responses, analytics or Git. Hosted secret storage and lifecycle require explicit design and verification.
+- Derive business scope from authenticated server context, not model arguments or untrusted callback parameters. Local inspection remains loopback-only until hosted authentication exists.
 - Validate connection ownership and callback completion before attaching accounts.
 - Expose only authorized tools through Gather's controlled execution boundary.
   Provider access must not bypass booking approvals.
@@ -138,15 +129,15 @@ Select initial search windows and limits through representative tests rather tha
 Business memory is information, not authority.
 These rules are enforced in code, not prompt text.
 
-1. Typed facts only.
-   Memory accepts only facts with a domain type: package, price, capacity, space, policy, customer arrangement, owner rule, booking.
-   The typed write path is the only writer; the agent cannot free-write into memory.
+1. Controlled commercial assertions.
+   Assertions used to price or authorize work carry a domain type: package, price, capacity, space, policy, customer arrangement, owner rule or booking.
+   Validate these at Gather-controlled ingestion/action boundaries while using supported native recall/wiki interfaces. Native notes are not a second authority store; free text cannot directly authorize a booking action.
 2. No source, no fact.
    Every fact carries source, observation time, scope (business, customer or booking), version and effective period.
    Fetched or generated text without provenance never becomes memory.
 3. Empty is honest.
    No facts produces "No business information found yet"; an offer that needs a price the memory does not have asks the owner rather than inventing one.
-   No inquiries produces "Scanned N emails. No event inquiries found."
+   Only completed classification over a stated coverage window can produce "Scanned N emails. No event inquiries found." Incomplete ingestion or unavailable retrieval must say so.
 4. Scope never widens by itself.
    A customer or booking exception stays scoped; repeated behavior, customer claims and documents cannot promote it to policy.
    Only an owner rule can, and it is versioned.
@@ -214,8 +205,8 @@ Examples: recovering interrupted synchronization, restarting a failed isolated w
 
 ### 6.1 Durable intents
 
-Every consequential user action (prepare offer, approve, send, connect, reset, inject a fault) is stored as a durable intent before any work starts and the interface reports progress from that record.
-A failure mid-way is a state on the intent, not a lost request.
+Consequential asynchronous work must be durably recorded before dispatch and report progress from persisted records. Reuse existing approval/execution claims, waiting-work records and connection sessions; do not introduce a competing runner. ADR-002 defines ownership and crash-reconciliation boundaries for any future orchestration layer.
+A failure mid-way is retained work, not a lost request. An external success without a persisted receipt remains uncertain; receipt absence never authorizes blind replay.
 After repair, the same intent resumes from its last verified step; completed receipts are never redone.
 
 ### 6.2 Incident detection
@@ -247,8 +238,8 @@ The default interface shows only "Gather recovered from X" with a link to the th
 
 ### 6.5 Fault injection for demonstration
 
-Provide a clearly labeled fault-injection panel on the prepared business: stop the runtime instance, expire access, corrupt a sync cursor, force a provider error on the next Calendar or Gmail call, fail the email step after the hold, and one unrepairable fault that must end in an honest blocked state.
-Injected faults flow through the same detection, repair and resume path as real failures and are marked as injected in the incident record.
+For a future recovery demonstration, use a clearly labeled isolated fault-injection harness: stop the runtime instance, expire access, corrupt a sync cursor, force a provider error on the next Calendar or Gmail call, fail the email step after the hold, and one unrepairable fault that must end in an honest blocked state.
+Injected faults flow through the same detection, repair and resume path as real failures and are marked as injected in the incident record. Fixture faults prove simulated behavior only. Actual runtime-stop/diagnosis proof requires a separate opt-in runtime harness; the credential-free fixture path cannot claim it.
 
 Autonomous self-improvement is excluded from this release: no unsupervised strategy optimization or production code changes intended to improve future performance.
 Remembering authorized business corrections remains included, and corrections feed the measured self-improvement trend in section 7.
@@ -256,7 +247,7 @@ Remembering authorized business corrections remains included, and corrections fe
 ### 6.6 Non-negotiable repair rules
 
 1. Repairs come from the catalog only; anything else is denied.
-2. A repair never touches prices, approvals, accepted records, credential scope, Gather's own running source, or any installation outside `.runtime/`.
+2. A repair never touches prices, approvals, accepted records, credential scope, Gather's own running source, or another business's runtime/state. The configured isolated runtime root, not a hardcoded local directory, defines the repair boundary.
 3. A completed receipt is never redone; reconcile before any rewrite.
 4. A repair counts only when its verification passes; attempts are recorded as attempts.
 5. Three attempts, then blocked and visible with everything tried listed.
@@ -285,12 +276,12 @@ Support keyboard navigation and readable layouts.
 
 The submission video and a judge running the prepared business follow this sequence; each step is one screen and one sentence, and each is backed by persisted evidence, not narration:
 
-1. One command starts Gather; the prepared business opens with no keys and no setup.
-2. In the composer, a typed invoice email and an injection attempt land in "Not an event inquiry" with reasons; a typed event inquiry becomes a booking.
+1. Open the prepared workspace using the documented inspection path; no live credentials are needed. This is not proof of hosted onboarding.
+2. Distinguish clearly unrelated messages from legitimate incomplete inquiries. A booking inquiry lacking a date stays eligible for qualification. Embedded malicious instructions are ignored and cannot grant authority; legitimate booking content remains usable.
 3. A seeded inquiry produces a grounded offer with cited evidence per fact.
 4. Owner changes the price; the earlier approval is visibly invalidated. Approving the new version produces a hold and an email with separate receipts.
 5. The judge triggers a fault mid-action from the fault panel; the repair thread appears; the action completes with no duplicate hold. A second fault ends in an honest blocked state.
-6. A malicious inquiry claiming an owner-approved discount is rejected with its reason; the floor holds.
+6. A customer claim of an owner-approved discount is rejected as authority, not automatically as an inquiry; the floor holds while legitimate qualification can continue.
 7. Owner tells Gather a new rule in plain language; the next affected inquiry respects it and cites it; the trend chart moves after the correction.
 
 The live-mode recording (developer's own test account) adds: Google consent, a real Gmail inquiry, and hold and email receipts re-read from Calendar and Gmail.
@@ -308,15 +299,14 @@ Optional sponsor adapters (model provider, voice, owner-facing agent interface) 
 Do not silently switch providers or send data to every sponsor.
 One codebase supports different submission configurations; each must satisfy its own event rules and disclose reused versus newly built work.
 
-### 8.1 The local OpenClaw instance
+### 8.1 Managed OpenClaw instances
 
-OpenClaw is the selected runtime.
-One installation runs one business; the business scope is derived server-side and the model cannot select another tenant or another business's data.
+OpenClaw is selected. Gather operates one isolated business runtime per business, with separately scoped workspace, state, credentials, sessions and tools. The model cannot select another tenant. Host infrastructure can be shared only with a verified isolation boundary; separate directories alone do not establish hosted tenant security.
 
-- The pinned OpenClaw runtime is installed lazily under `.runtime/openclaw/` the first time live mode is chosen; the prepared-business path never installs it.
-- The instance is configured through the existing isolation environment (own `OPENCLAW_HOME`, state, config, workspace, port, tokens and channels disabled) and never reads or writes the user's personal `~/.openclaw`.
-- Gather manages provisioning, readiness, health and recovery; the recurring startup timeout observed in local verification is a tracked reliability defect that the repair path in section 6 handles, not an accepted behavior.
-- The runtime boundary (`src/runtime/`) remains the only place that knows it is talking to OpenClaw.
+- The host provisions a pinned runtime, readiness checks and resource limits; customers do not install it.
+- Development/test instances use isolated roots, ports and tokens, never personal `~/.openclaw` state.
+- External supervisor controls own startup, stop and recovery outside the business agent.
+- `src/runtime/` owns the Gateway/process boundary. Existing adapters are not proof that hosted lifecycle/authentication is finished.
 
 ### 8.2 Runtime updates and failure recovery
 
@@ -335,18 +325,16 @@ For this release a pinned deployment and a documented, tested restart/recovery p
 
 ### 8.3 Models, secrets and budgets
 
-- The model runs through the user's own access: a supported OpenClaw subscription login (OAuth, personal use on this machine) or a user-provided API key.
-  Sponsor-provided credits are used for the relevant event's configuration.
-  The operator pays nothing per user and holds no user data.
-- Bound every run: maximum tool calls, maximum tokens and a wall-clock timeout, all configurable.
-- Secrets (OAuth tokens, gateway and MCP tokens, model credentials) live under `.runtime/secrets/` with owner-only permissions, behind a file-backed secret-store adapter; the macOS Keychain adapter is development-only.
-- Nothing may spend money without an explicit key the user supplied; there is no operator billing path in this release.
-- The fault panel (section 6.5) exists only on the prepared business and is visibly labeled.
+- Use explicitly configured, commercially supported model access; sponsor access is isolated to its relevant event configuration. Do not assume personal subscription OAuth can serve hosted customers.
+- Attribute usage per business and bound tools, tokens, wall-clock time, concurrency and retries. A timeout must cancel work or leave its outcome uncertain, not merely stop waiting while writes continue.
+- Secrets stay server-side behind protected storage with revocation/rotation. The existing macOS Keychain adapter is development plumbing, not hosted credential management.
+- Hosting, inference and connector operations have costs. No zero-operator-cost or unlimited-usage promise. Purchases and paid execution require separate authority.
+- Fault controls are restricted to isolated test/fixture environments, never a customer production reset surface.
 
 ### 8.4 Design before implementation
 
 The PRD remains the source of truth.
-Implementation proceeds through the ADRs in `docs/adr/`; each ADR cites its PRD sections, owns explicit files, forbids explicit files and defines its own acceptance evidence.
+ADRs in `docs/adr/` record consistent design contracts and future acceptance evidence, not a complete release plan or execution queue. Existing defect repairs are authorized during cleanup, including application code and regression tests. New feature implementation remains paused; before it resumes, the relevant design must map to actual interfaces and an explicitly bounded implementation scope.
 Any future authorized implementation must read its accepted ADR alongside the relevant PRD sections and existing interfaces. An ADR cannot override the product requirements or resolve an open design choice by assumption.
 
 For each subsystem, define inputs, authoritative stored state, model responsibilities, deterministic enforcement, triggers, failure/recovery behavior and observable acceptance scenarios.
@@ -403,7 +391,7 @@ References: [OpenClaw embedding](https://docs.openclaw.ai/gateway/embedding), [m
 | Booking lifecycle | Matching/ambiguity rules, qualification calculations, hold duration, follow-up cadence, pause/takeover/resume behavior and evidence for confirmation/handoff. |
 | Owner experience | First-run understanding review, approval presentation and notification defaults; consequential alerts versus routine progress. |
 | Repair catalog | Exact repair actions, their preconditions and verification probes; which failure signatures are deterministic; give-up thresholds. |
-| Engineering validation | Loopback OAuth feasibility on an unverified client, Composio fallback decision, provisioning targets, event ordering, action reconciliation and measured readiness targets. |
+| Engineering validation | Hosted OAuth/data-flow requirements, provisioning/isolation targets, event ordering, action reconciliation and measured readiness targets. |
 
 ## 9. Completion and honest scope
 
@@ -421,12 +409,12 @@ These exclusions do not waive authorization, durable storage or correctness for 
 
 | Gate | Required proof |
 |---|---|
-| Local run | On a machine with only Node, one command reaches the prepared-business workspace with no keys, no OpenClaw install and no external accounts; transcript attached |
-| First run | Both choices are presented; "Connect your own" states its requirements honestly and is disabled until the live path ships |
+| Developer inspection | Documented clone/install/build/start commands reach the fictional workspace without live credentials; this does not certify hosted onboarding |
+| First run | Customer onboarding needs no runtime installation; unavailable connections and incomplete provisioning stay explicit. Current local setup is labeled developer inspection |
 | Prepared business | Simulated connectors labeled on every screen; seed and reset verified; six seeded inbox messages including non-events |
-| Scope boundary | Judge-typed invoice, newsletter and injection emails land in "Not an event inquiry" with reasons; the injection attempt invokes no tool; a typed valid inquiry becomes a booking |
-| Live mode | Google consent through the loopback flow on a fresh account (or the documented Composio fallback decision), real inquiry to offer to hold and email with each receipt re-read from the provider |
-| Local runtime | OpenClaw installs and runs under `.runtime/`; the personal `~/.openclaw` is verified untouched |
+| Scope boundary | Unrelated messages are separated; incomplete booking inquiries remain eligible; injected instructions cannot grant authority or widen tools/recipients even when legitimate inquiry content is processed |
+| Live mode | Approved Google OAuth/data flow, real inquiry to offer to hold and email, each receipt independently re-read; scripted transports and authentication alone do not satisfy this |
+| Managed runtime | Host-provisioned isolated business runtime, pinned version, readiness and external-supervisor control; no customer installation and no personal runtime access |
 | Runtime lifecycle | Pinned version recorded; basic restart/recovery verified without duplicated actions |
 | Understanding | Attributable facts, remembered owner corrections and correct handling of conflicting evidence; a plain-language owner rule applies to the next affected inquiry with citation |
 | Progressive ingestion | First useful work before full import; interrupted import resumes; changed/deleted evidence and excluded-record sampling are checked without false completeness claims |
@@ -439,7 +427,7 @@ These exclusions do not waive authorization, durable storage or correctness for 
 | Recovery | Duplicate delivery, partial success, uncertain outcome and restart scenarios preserve correct state |
 | Self-healing | For each injected fault: automatic detection without a report, recorded diagnosis, a catalog action, verification and resumed intent with no duplicate external effect; at least one fault ends in an honest blocked state with the attempts listed |
 | Budgets | Per-run tool-call, token and wall-clock limits enforced with a visible refusal |
-| Isolation | One business per installation; no tool or retrieval path can reach another business or data outside the configured accounts |
+| Isolation | Per-business runtime, authenticated server scope and provider bindings; no tool, retrieval, file or callback path reaches another business |
 | External-content boundary | Malicious inquiry/document instructions cannot change authority or commercial terms; rejection recorded with reason |
 | UX | Rendered and interactive checks of the demonstration script, mobile layout and error/reconnection states |
 | Submission | Public open-source license present; runnable instructions; demonstration video of the actual journey; event-specific technology/reuse requirements verified |
@@ -456,7 +444,7 @@ NextStep (environmental theme, students only), OpenServ (existing-project eligib
 
 ### One build, per-event configuration
 
-All events are served by the same local-first application and repository.
+All events use the same application and repository; developer inspection and submission configuration do not change the managed customer-delivery decision.
 Each event gets its own configuration profile that enables exactly the adapters that event requires, its own recorded baseline commit and change log, and its own demonstration.
 A sponsor adapter that is enabled but not exercised on a real booking task in that event's demonstration does not count.
 Mandatory items across the set:
@@ -489,7 +477,7 @@ Mandatory items across the set:
 
 - Deadline: October 30, 2026, 10:00 PDT.
 - Mandatory: make a runtime call to Nebius Token Factory or run on Nebius AI Cloud, and use at least one NVIDIA open-source model.
-- Selected track: Personal AI ("always-on, private assistant, keeping your data under your control, persistent memory, reusable skills"), for which local-first Gather on OpenClaw is a direct fit; the project remains eligible for Best Apps and Agents.
+- Selected track: Personal AI ("always-on, private assistant, keeping your data under your control, persistent memory, reusable skills"), as a candidate fit for the isolated business operator; verify the managed deployment against current track rules before submission rather than assuming local-first eligibility.
 - Gather configuration: the model adapter routes booking reasoning through Nemotron on Token Factory.
   A qualifying Token Factory inference call satisfies the runtime route; deploying the whole application on Nebius is not universally required.
 - Existing projects require significant updates during the submission window beginning August 26, explained in the submission.

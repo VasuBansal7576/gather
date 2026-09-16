@@ -29,22 +29,32 @@ The similarly named modules above are not automatically duplicates. For example,
 - The existing knowledge service stores confirmed facts in SQLite. The PRD selects native OpenClaw recall/wiki as the first-choice future direction, subject to evidence gates. No migration or second knowledge system is authorized by this cleanup.
 - Intake currently records inquiries/replies without the proposed event-domain gate. Existing source identity and approval checks must not be confused with that missing classifier.
 - Durable execution claims, receipts and waiting-work records already exist. A general durable user-intent runner, incident catalog and owner-facing repair thread do not. Any later design must reuse/reconcile existing progression owners rather than stack another runner on top.
-- The store supports multiple business rows and setup allows creating them; the PRD's one-business-per-installation rule is a target, not an enforced installation invariant today.
+- The store supports multiple business rows and setup allows creating them; the PRD's authenticated per-business runtime isolation is a target, not an enforced installation invariant today.
 - Default tests exercise local logic, SQLite, loopback servers and scripted transports. They do not run paid models or prove Google effects. Optional real-OpenClaw process tests are explicitly opted into and separately reported.
 
 ## Design conflicts to resolve before implementation
 
-The original ADR task lists remain available for review, but [ADRs 001–006](adr/) are **paused proposals**, not an implementation queue.
+The earlier conflicts are reconciled in ADRs 001–006. The heading remains stable for existing links. These are design contracts, not an implementation queue; their earlier contradictory task lists are superseded and remain available in Git history.
 
-1. **Distribution and state:** ADR-001 changes the default database path but omits the runtime/store files that own it. `npx github:` packaging, writable-state location, reset boundaries and existing-database handling need one consistent design. Do not silently strand existing `data/gather.sqlite` records.
-2. **Progression and crash recovery:** ADR-002 introduces intents beside existing execution claims and the waiting-work ledger. The design must identify the single progression owner and reconcile an external success whose receipt was not persisted before a crash. Skipping recorded steps alone does not solve uncertain outcomes.
-3. **Qualification versus rejection:** ADR-003 rejects a message without a date plus guest count/event type. That also rejects legitimate incomplete inquiries (for example, asking about packages before choosing a date), contrary to progressive qualification. Define incomplete/needs-question versus out-of-domain before implementing the gate. Suspicious text alone cannot imply zero tools when a legitimate inquiry also needs handling.
-4. **Prepared mode versus repair:** ADR-001 requires no OpenClaw/model in prepared mode, while ADR-004 asks for runtime restart and model-led diagnosis there. Define which component is real, which failure is simulated, and how it is labeled without inventing recovery evidence.
-5. **Knowledge ownership:** ADR-005's new fact schema/store work and deferred native-memory gate conflict with the PRD's native-recall-first choice. Resolve the candidate/authority/transaction boundary and vocabulary before building another knowledge layer.
-6. **Live connection feasibility:** ADR-006 assumes a distributed OAuth-client/picker flow, broader model authentication, a new secret adapter and budget controls. These are not existing capabilities. Validate provider requirements and data flow before treating the proposed login or fallback as implementable. A hosted fallback also needs an explicit hosting/cost decision.
-7. **Release coverage:** Customer acceptance links, progressive import UX and other PRD requirements are not completely assigned by the six ADRs. Existing acceptance/deposit records are not a customer-facing acceptance or payment integration. Do not call the ADR set a complete release plan.
+| Boundary | Reconciled direction |
+| --- | --- |
+| Delivery/state (ADR-001) | Managed customer hosting; local checkout is inspection only. Preserve existing database paths and records; no implicit migration/reset. |
+| Progression (ADR-002) | One logical progression owner, reusing execution claims/receipts and waiting work. Reconcile provider success lost before receipt persistence; never blind-replay. |
+| Qualification (ADR-003) | Incomplete inquiries remain eligible. Reject injected authority, not all legitimate content; enforce exact scoped actions deterministically. |
+| Recovery (ADR-004) | External supervisor, bounded actions, verified useful continuation. Simulated fixtures cannot prove real runtime/model recovery. |
+| Knowledge (ADR-005) | Native recall/wiki first, gated before adoption. Existing SQLite modules are prototype code; no second knowledge engine or destructive migration by default. |
+| Connections (ADR-006) | Managed web OAuth/model access with protected credentials and explicit provider requirements; no customer installer or unverified-app bypass strategy. |
 
-These are design questions, not authorization to resolve them by changing product behavior. They should be reconciled with the owner before feature work resumes.
+### Release coverage, not an implied six-ADR release plan
+
+The PRD also requires customer acceptance, confirmation/handoff, progressive ingestion, budgets and owner UX. Existing acceptance/deposit/readiness records do not establish a customer acceptance link, payment integration or full journey. No ADR set covers all of these as implementation-ready tasks.
+
+- Acceptance must bind to the exact offer and authorized party; superseded offers cannot be accepted. Acceptance alone never confirms a booking.
+- Confirmation/handoff consume authoritative configured-condition evidence and preserve accepted terms. Existing code/tests may be repaired without adding missing customer-facing flows.
+- Ingestion must preserve source provenance and incomplete-coverage states; live provider/model integration remains independently gated.
+- Specific retention defaults, full repair preconditions and hosted operational configuration still need their proper design evidence. Do not invent settled behavior or execute the backlog to hide those gaps.
+
+Repository recovery includes existing application defects, documentation and PRD/ADR contradictions, plus build/test/CI problems. It does not start unbuilt product features. A green test count alone never closes a behavioral audit.
 
 ## Reading technical guides
 

@@ -2,13 +2,13 @@
 
 ## Current scope
 
-Feature implementation is paused at the owner's request. The active task is repository recovery: understand the product, correct misleading documentation and conflicting instructions, and repair build/test/CI reproducibility. Do not implement planned features, remove existing modules, migrate data, or redesign the product as part of cleanup.
+Feature implementation is paused at the owner's request. The active task is repository recovery: understand the product, correct misleading documentation and conflicting PRD/ADR instructions, repair existing application defects, and repair build/test/CI reproducibility. Application code is in scope for evidenced repairs; do not execute the unbuilt PRD/ADR backlog, remove existing modules, migrate data, or invent a new product direction.
 
-Read [README.md](README.md) and [docs/README.md](docs/README.md) first. The [PRD](docs/HACKATHON_PRD.md) describes intended behavior, not current capabilities. ADRs 001–006 are paused proposals needing reconciliation; their file lists and acceptance criteria are not approved implementation tasks. Only an explicit owner instruction resumes feature work.
+Read [README.md](README.md) and [docs/README.md](docs/README.md) first. The [PRD](docs/HACKATHON_PRD.md) describes intended behavior, not current capabilities. ADRs 001–006 record reconciled design boundaries and future acceptance evidence; they are not approved implementation tasks. Only an explicit owner instruction resumes feature work.
 
 ## Workflow
 
-- Inspect Git state and use a fresh worktree from `origin/main`; never overwrite another worker's files or runtime state.
+- Inspect Git state and use an isolated worktree; continue the existing clean PR worktree for follow-up repairs, or create a fresh one from `origin/main` for a new task. Never overwrite another worker's files or runtime state.
 - Use the repository's `isolate`, `build`, `prove`, and `ship` skills in `.agents/skills/`. Maintenance can use a bounded PR scope; feature work requires an accepted ADR. User instructions take precedence over either.
 - No delegation or parallel workers unless requested. An ADR marked ready is not a dispatch instruction.
 - Keep changes reviewable. Record before/after evidence and unresolved findings in the PR, not a new progress ledger. Do not mark planned work implemented or a PR merged without evidence.
@@ -28,4 +28,4 @@ Read [README.md](README.md) and [docs/README.md](docs/README.md) first. The [PRD
 
 Node.js 26+; use `.node-version` for the checked baseline. Run `npm ci`, `npm test`, `npm run typecheck`, and `npm run build`. The doctor also needs an existing `.runtime/` directory. `npm run lint` currently aliases typechecking.
 
-Keep skips visible. The golden-path test does not exist yet; do not claim it passed or create it during a cleanup-only task. Once separately implemented, it must remain green. UI changes need rendered evidence; docs/config-only changes do not need invented screenshots.
+Keep skips visible. The full product golden-path test does not exist yet; do not claim it passed. Add focused regression/integration tests for existing behavior repaired during cleanup; this does not authorize building the missing product journey. Once separately implemented, it must remain green. UI changes need rendered evidence; docs/config-only changes do not need invented screenshots.

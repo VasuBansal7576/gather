@@ -1,6 +1,6 @@
 # Business knowledge boundary
 
-This documents the existing SQLite-backed module, not the PRD's proposed native OpenClaw recall/wiki integration. That design boundary remains unresolved; see the [repository guide](README.md#design-conflicts-to-resolve-before-implementation).
+This documents the existing SQLite-backed module, not the PRD's proposed native OpenClaw recall/wiki integration. Native knowledge is the selected direction; integration and migration remain unimplemented. For the reconciled ownership boundary, see the [repository guide](README.md#design-conflicts-to-resolve-before-implementation).
 
 `src/knowledge/` implements the source-linked business understanding boundary:
 extracted content from connected documents/messages arrives as **untrusted
