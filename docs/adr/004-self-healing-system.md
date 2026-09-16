@@ -1,56 +1,64 @@
-# ADR-004: Self-healing system
+# ADR-004: Bounded incident diagnosis and verified repair
 
-Status: paused proposal — requires design reconciliation and explicit authorization before implementation
-Depends on: ADR-002
-PRD: 6 (all subsections), 10 (Self-healing gate, Recovery gate)
+Status: specified — implementation paused
+Depends on: ADR-002, ADR-007, ADR-009, ADR-010
+Authorization: planning only; explicit owner instruction is required to start implementation.
+PRD: 6, 6.1, 6.2, 6.3, 6.4, 6.5, 6.6, 8.2; gates Recovery, Self-healing
+Contracts: C06, C08, C09, C10 in [shared contracts](CONTRACTS.md)
 
-> The task list below is retained for design review, not execution. See [repository design conflicts](../README.md#design-conflicts-to-resolve-before-implementation). No feature work is authorized during cleanup.
+## Decision
 
-## Proposed decision
-Failures are detected automatically from failed intents, runtime health probes and dead-lettered work, recorded as incidents, and repaired by a Gather-owned repair agent choosing only from a fixed catalog of actions, each verified before the original intent resumes. The owner sees a plain-language repair thread or an honest blocked state. A labeled fault-injection panel on the prepared business drives simulated faults through the same state path. Actual runtime restart/model diagnosis is tested separately with an explicitly configured isolated runtime; the credential-free path cannot prove real process recovery.
+Use a supervisor outside the booking agent, an explicit repair catalog and separately verified continuation. Consume implemented runtime/sync/progression ports; do not depend on the later live-composition ADR.
+
+## Existing code and scope
+
+Read the source paths below and their module guides before editing. Existing implementations are reusable foundations, not evidence that this ADR is complete. Follow the [execution index](README.md) and shared contracts; references are not competing work orders.
 
 ## Owns
-- New `src/incidents/**` (contracts, store, detector, catalog, repair runner, verifier)
-- `src/server/sqlite-store.ts` (new `incidents`, `repair_attempts` tables and migration only)
-- `src/server/operator-runtime/health.ts`, `src/server/operator-runtime/due-work.ts` (emit incidents)
-- New `app/api/incidents/**`, `app/api/faults/**` (prepared business only)
-- Recoveries view and repair-thread components in `src/components/gather/**`, `src/host/**`
-- `tests/incidents*.test.ts`, `tests/faults*.test.ts`; extend `tests/golden-path.test.ts` steps 11 to 14
+
+- `src/incidents/**` (new)
+- `src/server/sqlite-store.ts` (additive incidents schema)
+- `src/server/operator-runtime/health.ts`
+- `src/server/operator-runtime/due-work.ts` (incident emission only)
+- `app/api/incidents/**` (new)
+- `app/api/faults/**` (new)
+- `src/components/gather/recoveries/**` (new)
+- `tests/incidents*.test.ts` (new)
+- `tests/faults*.test.ts` (new)
 
 ## Must not touch
-- `src/runtime/**` beyond calling its existing start/stop/health methods
-- Pricing, approval, receipt logic; `src/connectors/google/**`; `~/.openclaw`
 
-## Do
-- Incident record: `id, businessId, source (intent | probe | deadletter | injected), signature, symptom, evidence (json: logs, step, error), state (open | repairing | recovered | blocked), attempts[], resumedIntentId?, createdAt`.
-- Detector: subscribe to intent transitions to `failed`; poll runtime health at a fixed interval; scan dead letters. Deduplicate by `signature + businessId` while an incident is open.
-- Catalog (`src/incidents/catalog.ts`), each entry `{ id, matches(incident), preconditions, run, verify }`:
-  `restart_runtime`, `resume_sync_from_cursor`, `reconcile_execution_by_external_id`, `refresh_access`, `request_reconnect`, `rollback_config_known_good`, `rerun_resumable_intent`, `mark_blocked`. Nothing else is callable by the repair runner.
-- Tier 1: deterministic mapping from known signatures to catalog entries. Implement for at least: runtime not responding, access expired, sync cursor corrupt, email failed after hold succeeded, database locked.
-- Tier 2: for unknown signatures, a model call that receives the incident evidence and the catalog ids, and must return one catalog id plus a one-paragraph diagnosis. Validate the id against the catalog; any other output falls back to `mark_blocked`. The model never receives write tools.
-- Verification is per catalog entry and must pass before state becomes `recovered`; `rerun_resumable_intent` then resumes the original intent through ADR-002's runner. Completed receipts are never redone.
-- Bound to three attempts per incident, then `blocked` with all attempts listed. `request_reconnect` produces a reconnect action for the owner, never a claimed repair.
-- Fault panel (prepared business only, behind a visible "Break something (simulated)" control): simulate runtime stop and expired access, corrupt a fixture sync cursor, fail next Calendar call, fail email after hold, and one unrepairable fault ("provider permanently rejects") that must end `blocked`. Each injected incident is marked `source: injected`.
-- Recoveries view: list of incidents with state; detail shows symptom -> diagnosis -> action -> verification -> resumed, in plain language. Workspace shows a small "Gather recovered from X" affordance linking to it.
-- Golden path additions: 11) inject "fail email after hold" during execute -> incident opens -> recovered -> exactly one hold receipt, one email receipt; 12) inject runtime stop -> restart_runtime -> pending intent resumes; 13) inject unrepairable -> blocked after three attempts, attempts listed; 14) inject expire access -> state shows reconnect action, no fake recovery.
+- Personal `~/.openclaw`, unrelated installations, private SaaS files, credentials or live customer data.
+- Paths outside Owns, including other in-flight ADR files. Shared paths require the index's exclusive write lock and predecessor integration; no simultaneous writers.
+- Product requirements, acceptance criteria or shared contract semantics. Return a contradiction to Chief with source evidence; do not silently redesign.
 
-## Don't
-- Don't let the business agent repair itself; the repair runner is a separate module with its own narrow interface.
-- Don't add free-form shell, file or network tools to the repair agent.
-- Don't recreate a hold because an email failed.
-- Don't mark `recovered` on "action returned without error". Verification is a separate function.
-- Don't auto-apply code changes. If a signature suggests a code defect, write `.runtime/repairs/<incident>.md` with the reproduction and stop.
-- Don't retry the same failing action past the bound, and don't hide the give-up.
+## Inputs, outputs and integration
+
+Intent failure / health / deadletter -> scoped incident + attempts. Catalog methods use C09 preconditions and verification. RuntimeControl from ADR-009 and source port from ADR-007 are dependencies; prepared adapters are scripted, not real restart proof.
+
+## Implementation steps
+
+1. Deduplicate incidents by affected operation/resource and signature. Persist symptom, diagnosis, selected action, verification, resumed intent and remaining impact.
+2. Known signatures use deterministic repair; unknown diagnosis is budgeted, read-only, validates catalog choice, and blocks on unavailable/invalid model output.
+3. Implement all C09 catalog entries without arbitrary shell/provider/authority access. Maximum three attempts; unchanged permanent denial may stop earlier.
+4. Provide prepared fault API and recovery components; real process tests explicitly opt in. Code-defect branch produces isolated reproduction, proposed patch and failing regression artifact without applying it.
+
+## Failure and recovery
+
+Use the cited contracts' durable, scoped error paths. A capability/credential gate may block real verification without blocking scripted development; name the exact missing evidence. Do not substitute simulated success, relax authority, add a second progression owner or change vendors to make acceptance pass.
 
 ## Out of scope
-Real provider failures (ADR-006 will route them here unchanged). Eval trend (ADR-005).
+
+Private hosted SaaS, billing, revenue-recovery strategy and autonomous code deployment. Adjacent subsystems belong to their named ADRs in the index. No merge, external deployment, purchases or submission is authorized here.
 
 ## Acceptance
-- Clearly labeled simulated screen recording or screenshot sequence for each of the four golden-path faults: fault panel click -> incident open -> repair thread -> recovered or blocked -> intent completed or reconnect action.
-- SQL counts after fault 11: one hold receipt, one email receipt for the booking.
-- Repair thread screenshot showing all five sections in plain language.
-- Blocked incident screenshot listing three attempts and the operator message.
-- Test asserting the repair runner cannot call anything outside the catalog (attempt an unknown action id, assert rejection).
-- Separately prove actual isolated runtime stop/restart if claiming runtime recovery; do not install OpenClaw or call a model in default fixture tests.
-- Golden path green including steps 11 to 14.
-- `npm test`, `npm run typecheck`, `npm run build` pass.
+
+- **004-A01:** Each catalog action has precondition/verification tests, including denied wrong-resource operations and unknown action IDs.
+- **004-A02:** Hold-success/email-failure recovers with one hold; repeated transient failure exhausts three attempts; permanent rejection and revoked consent remain honestly blocked.
+- **004-A03:** Real isolated process stop/restart verifies useful read and resumed work separately from scripted fixture evidence.
+- **004-A04:** Unknown diagnosis cannot invoke arbitrary tools, spend beyond budget or claim recovery from command success. Code patch proposal never changes running source.
+- **004-CHECKS:** `npm test`, `npm run typecheck`, `npm run build` pass; report optional skips honestly. Run the existing golden suite after ADR-002 introduces it; do not claim later release cases before their owning ADR lands. Attach source/command evidence, and rendered evidence for UI changes.
+
+## Completion handoff
+
+Return changed files, local/remote commit IDs, acceptance-ID evidence and remaining blockers to the Orca coordinator. Commit and push the task branch; verify matching remote SHA. Do not self-mark shipped or merge. The coordinator reviews actual artifacts and integrated behaviour, not only the worker summary.

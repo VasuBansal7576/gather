@@ -1,6 +1,6 @@
 # Gather: Public Hackathon PRD
 
-Status: requirements under reconciliation, not a claim of implementation or live verification. Feature implementation is paused by the owner; this document and the ADRs are not execution authorization. See [repository design conflicts](README.md#design-conflicts-to-resolve-before-implementation).
+Status: public execution design specified; implementation and live verification are not claimed. Feature implementation remains paused; this planning change is not execution authorization. Start with the [ADR execution index](adr/README.md) and [shared contracts](adr/CONTRACTS.md).
 Updated: 2026-09-16.
 
 ## 1. Product and audience
@@ -12,7 +12,7 @@ Promise: **Connect your tools. Gather handles booking coordination. Approve the 
 
 Gather is local-first.
 The target is one-command installation on the owner's machine, with local application state. Connected Google services and a configured remote model receive the data necessary for live operations; local-first does not mean offline or that source content never leaves the machine.
-A hosted multi-tenant service is a later offering, not part of this release.
+A hosted multi-tenant service is a later offering, not part of this release. Public prepared/live mode is one business per active installation; no SaaS operating-business or lead-recovery strategy is imported here.
 
 This document defines the public hackathon release: one build, configured per event.
 It does not publish the private product strategy or roadmap. Its local-first delivery and hackathon ADRs are independent of the private SaaS delivery model; do not replace them with SaaS requirements.
@@ -34,19 +34,19 @@ Model login and Google consent are required only for the live path in section 2.
 ### 2.1 Local-first distribution
 
 - Distribution is `npx github:VasuBansal7576/gather` running the packaged CLI, and `npm ci && npm start` from a clone for developers.
-- The CLI checks the Node version, creates `.runtime/` inside the working directory, runs the doctor, builds the app if needed, starts on `127.0.0.1` with a free port and opens the browser.
+- Target macOS and Linux on Node 26+. The CLI resolves the invocation directory as its installation root, stages/builds the packaged app under `.runtime/app/<revision>/`, runs the doctor, starts on `127.0.0.1` with a free port and opens the browser. Test the packed artifact outside a checkout; npm cache paths are not the business-state root.
 - All state lives under `.runtime/` (SQLite database, secrets, OpenClaw installation when live mode is used, repair artifacts).
-- Nothing outside the working directory is created or modified; the developer's personal `~/.openclaw` is never touched.
+- Gather-managed state stays inside the installation root; the developer's personal `~/.openclaw` is never read or modified. npm bootstrap may use its normal package cache and needs network; do not promise offline installation or zero package-manager writes. Subsequent staged builds use a cache inside `.runtime/`.
 - The prepared-business path installs no runtime and asks for no credentials.
 
 ### 2.2 Prepared business and live mode
 
 - **Try the prepared business** opens a fictional venue with seeded inquiries, documents and calendar.
   Its connectors are explicitly simulated and labeled as such on every screen where they appear.
-- **Connect your own** installs the pinned OpenClaw runtime under `.runtime/` on first use, asks the user to sign into a supported model (OpenClaw's own subscription login or a user-provided API key) and then connects Gmail, Drive and Calendar through Gather's OAuth client (section 3).
+- **Connect your own** installs the pinned OpenClaw runtime under `.runtime/` on first use, asks the user to sign into a supported model (a provider login supported by the pinned OpenClaw runtime or a user-provided API key) and then connects Gmail, Drive and Calendar through Gather's OAuth client (section 3).
   It performs real reads and writes on the user's own accounts.
 - Live sends are restricted to the inquiry sender subject to an optional operator-configured test-recipient restriction; there is no free-recipient send tool.
-- A reset action restores the prepared business to its seed at any time.
+- Prepared and live state are separate; switching never seeds fictional records into live accounts. A confirmed reset restores only the prepared state with its runner stopped and database safely closed. Existing/custom databases are never silently migrated or deleted. See contract C01 for the reference business, scenarios, mode lock and migration boundary.
 
 ## 3. Connections
 
@@ -56,11 +56,11 @@ Keep real multi-application execution in live mode; do not replace connectors wi
 Primary path: a Gather-operated Google OAuth client using the desktop/loopback flow, direct to Google, with no third party in the data path.
 The client identifier ships in the application; the loopback flow needs no shipped client secret.
 
-- Use the narrowest scopes that support the journey: `gmail.readonly`, `gmail.send`, `calendar.events` and `drive.file` with the Google Picker for the owner to select menu, package and policy documents, instead of full Drive read access.
-- While the OAuth client is unverified, Google shows a "Google hasn't verified this app" screen; the connection UI states this plainly with the "Advanced, continue" instruction, and the unverified-client completion of the required scopes is verified on a fresh account before this path is declared usable.
-- If restricted scopes cannot complete on the unverified client, the fallback is a Composio Connect Link path behind a connector flag, served through a minimal operator-hosted broker so the Composio key never ships in the application.
-  That path discloses in the UI that mail transits Composio during synchronization even though storage remains local.
-- Keep credentials and connection operations server-side in the local process; tokens are stored under `.runtime/secrets/` with owner-only permissions, behind the existing secret-store interface.
+- Use the narrowest scopes that support the journey: `openid`, `email`, `gmail.readonly`, `gmail.send`, `calendar.events`, `calendar.freebusy` and `drive.file` with the Google Picker for the owner to select menu, package and policy documents, instead of full Drive read access.
+- Gather's operator supplies the OAuth client and Picker project/API configuration; the live user does not create a Google Cloud project. Verify the combined loopback/Picker path on an authorized fresh test account before declaring it usable.
+- Show actual testing-user, scope, token-expiry and verification restrictions. Do not promise an unverified-app bypass or assume arbitrary judges can consent.
+- Direct Google is the selected initial path. Composio remains a contingency, not an automatic fallback: a blocked capability test returns evidence to Chief. A broker requires a reviewed plan amendment, explicit data-flow/cost disclosure and separate deployment authority; do not implement or silently activate one just because consent failed.
+- Keep credentials and connection operations server-side in the local process; tokens are stored under `.runtime/live/secrets/` with owner-only permissions, behind the existing secret-store interface.
 - Derive business scope server-side from the local store, not from model arguments or untrusted callback parameters.
 - Validate connection ownership and callback completion before attaching accounts.
 - Expose only authorized tools through Gather's controlled execution boundary.
@@ -115,7 +115,7 @@ Concessions are off unless the owner has granted an explicit, scoped concession 
 Importing the full authorized business history is permitted when practical; storing that history does not require sending it all to the model on every turn.
 Do not require a full-account import before Gather becomes useful.
 Prioritize current commercial documents and active inquiry threads, expand related evidence and older history in the background or on demand, and show incomplete coverage honestly.
-Select initial search windows and limits through representative tests rather than inventing a universal cutoff.
+Use the visible configurable initial scope and history-expansion defaults in contract C03; validate them with representative and excluded-record tests. A scheduling window is not a universal relevance cutoff or a claim to have scanned the whole account.
 
 - Narrow candidates through supported provider searches and metadata before expensive model processing; include relevant sent replies and thread context.
   Test excluded-record samples so faster ingestion does not simply conceal missed evidence.
@@ -139,8 +139,8 @@ Business memory is information, not authority.
 These rules are enforced in code, not prompt text.
 
 1. Typed facts only.
-   Memory accepts only facts with a domain type: package, price, capacity, space, policy, customer arrangement, owner rule, booking.
-   The typed write path is the only writer; the agent cannot free-write into memory.
+   Commercial memory accepts only assertions with a domain type: package, price, capacity, space, policy, customer arrangement, owner rule, booking.
+   Source documents may remain unstructured evidence; only the typed, provenance-preserving, owner-confirmed path can establish commercial assertions. Native wiki synthesis or auto-capture cannot mint policy authority.
 2. No source, no fact.
    Every fact carries source, observation time, scope (business, customer or booking), version and effective period.
    Fetched or generated text without provenance never becomes memory.
@@ -157,7 +157,7 @@ These rules are enforced in code, not prompt text.
 6. External content is evidence.
    Inquiries and documents can add candidate facts pending confirmation; they cannot change rules, prices, recipients or authority.
 7. Forgetting follows the source.
-   Disconnecting or deleting a source marks facts derived from it stale or removes them, and pending work that relied on them is blocked rather than silently continued.
+   Disconnecting, excluding or deleting a source immediately invalidates derived knowledge and blocks dependent pending work. Purge cached bodies/searchable derivatives, retain minimal tombstones and immutable accepted terms/receipts as specified in C03; reconnection requires revalidation.
 8. One business per installation, derived server-side.
    No cross-business retrieval, ever; the rule holds so that a later hosted offering cannot weaken it.
 9. Recall is checked, not trusted.
@@ -170,7 +170,7 @@ Gather acts on event bookings and declines everything else, enforced by capabili
 - **Domain gate and qualification are separate.** Classify messages as eligible event inquiries, clearly unrelated, or uncertain/requires review, with evidence and reasons. A legitimate inquiry missing a date, guest count or event type remains eligible; missing fields trigger qualification, not automatic rejection. Extraction/classification may use the model, but server-side validation and authority checks decide which actions can execute. Ambiguous messages cannot trigger external writes merely because the model called them bookings.
 - **Booking-scoped tools.** The agent's tool surface takes a booking, proposal or server-derived business identity.
   There is no tool to read arbitrary mail, search arbitrary Drive, or send to arbitrary recipients, so there is nothing callable outside the domain.
-- **Visible refusal.** Messages that fail the gate appear in a "Not an event inquiry" list with the reason.
+- **Visible refusal.** Clearly unrelated messages appear in a "Not an event inquiry" list with the reason; ambiguous messages appear in review rather than being silently rejected.
   An empty scan reports that no event inquiries were found.
   Out-of-domain owner requests receive a one-line refusal.
 - **Judge-testable.** The prepared business includes a composer where anyone can type an email (an invoice, a newsletter, an injection attempt, or a real inquiry) and watch it classified: unrelated requests cannot trigger business actions, while legitimate inquiries remain eligible even with missing fields or embedded malicious instructions. Injected claims never grant authority; safe qualification may continue. Show prepared/model simulation honestly.
@@ -199,8 +199,8 @@ Permit owner pause and takeover; reconcile the latest external state before hand
 ### 5.1 Customer acceptance
 
 The inquirer needs no Gather account.
-The sent offer carries a signed acceptance link (and accepts a plain "yes" reply where supported) that binds acceptance to the exact offer version and the authorized accepting party.
-Acceptance of a superseded version is rejected with an explanation.
+The sent offer carries a signed **Accept by email** (`mailto:`) link that opens a reply with an opaque version-bound token. The customer must send the reply; opening the link is not acceptance. This local-first transport works for a remote customer without pointing to the owner's localhost or requiring a hosted acceptance server.
+Bind acceptance to the exact offer version and authorized accepting mailbox using signature, expiry, correlation to the original sent offer and trusted sender-authentication evidence. A signed-token reply may start a new thread; a plain yes requires unambiguous existing-thread correlation. A forwarded token from another sender, stale version or ambiguous authentication cannot auto-accept. A plain "yes" reply is supported only when one current offer and its accepting party are unambiguously verified; otherwise ask for clarification. See contract C07.
 Acceptance moves the booking to accepted; it does not confirm the booking (section 9).
 Payment collection is out of scope for this release; a payment link may be included but is never treated as payment.
 
@@ -291,14 +291,14 @@ The submission video and a judge running the prepared business follow this seque
 4. Owner changes the price; the earlier approval is visibly invalidated. Approving the new version produces a hold and an email with separate receipts.
 5. The judge triggers a fault mid-action from the fault panel; the repair thread appears; the action completes with no duplicate hold. A second fault ends in an honest blocked state.
 6. A claim of an owner-approved discount is rejected as authority with its reason; the floor holds while legitimate inquiry qualification may continue.
-7. Owner tells Gather a new rule in plain language; the next affected inquiry respects it and cites it; the trend chart moves after the correction.
+7. Owner tells Gather a new rule in plain language; the next affected inquiry respects it and cites it; the trend chart shows before/after evaluation on the same versioned case set. An unchanged or worse score is reported honestly, not forced to rise.
 8. A separately selectable empty/non-event fixture shows the scanned count/scope and "No event inquiries found" without generated leads or invented business facts. Separate partial-import and failed-connection fixtures demonstrate that neither is misreported as a completed empty scan.
 
 The live-mode recording (developer's own test account) adds: Google consent, a real Gmail inquiry, and hold and email receipts re-read from Calendar and Gmail.
 
 ## 8. Reusable architecture
 
-Owner UI -> Gather backend -> isolated OpenClaw runtime -> controlled Gather tools -> connected business applications.
+Live: Owner UI -> Gather backend -> isolated OpenClaw runtime -> controlled Gather tools -> connected business applications. Prepared mode uses labelled scripted runtime/knowledge/provider adapters through the same Gather contracts; it cannot prove native or live behaviour.
 Intake channels enter the backend through the single contract in section 3.1; the ops agent in section 6 sits beside the business agent under a separate supervisor.
 
 Shared foundation: runtime integration, connectors/synchronization, memory/evidence, approvals, durable work, recovery, intake, isolation and activity logs.
@@ -314,7 +314,7 @@ One codebase supports different submission configurations; each must satisfy its
 OpenClaw is the selected runtime.
 One installation runs one business; the business scope is derived server-side and the model cannot select another tenant or another business's data.
 
-- The pinned OpenClaw runtime is installed lazily under `.runtime/openclaw/` the first time live mode is chosen; the prepared-business path never installs it.
+- The pinned OpenClaw runtime is installed lazily under `.runtime/live/openclaw/` the first time live mode is chosen; the prepared-business path never installs it.
 - The instance is configured through the existing isolation environment (own `OPENCLAW_HOME`, state, config, workspace, port, tokens and channels disabled) and never reads or writes the user's personal `~/.openclaw`.
 - Gather manages provisioning, readiness, health and recovery; the recurring startup timeout observed in local verification is a tracked reliability defect that the repair path in section 6 handles, not an accepted behavior.
 - The runtime boundary (`src/runtime/`) remains the only place that knows it is talking to OpenClaw.
@@ -340,7 +340,7 @@ For this release a pinned deployment and a documented, tested restart/recovery p
   Sponsor-provided credits are used for the relevant event's configuration.
   No Gather-managed per-user model billing is part of this release. Local source storage does not eliminate external Google/model processing; any optional broker requires explicit cost and data-flow disclosure.
 - Bound every run: maximum tool calls, maximum tokens and a wall-clock timeout, all configurable.
-- Secrets (OAuth tokens, gateway and MCP tokens, model credentials) live under `.runtime/secrets/` with owner-only permissions, behind a file-backed secret-store adapter; the macOS Keychain adapter is development-only.
+- Secrets (OAuth tokens, gateway and MCP tokens, model credentials) live under `.runtime/live/secrets/` with owner-only permissions, behind a file-backed secret-store adapter; the macOS Keychain adapter is development-only.
 - Nothing may spend money without an explicit key the user supplied; there is no operator billing path in this release.
 - The fault panel (section 6.5) exists only on the prepared business and is visibly labeled.
 
@@ -348,7 +348,7 @@ For this release a pinned deployment and a documented, tested restart/recovery p
 
 The PRD remains the source of truth.
 Implementation proceeds through the ADRs in `docs/adr/`; each ADR cites its PRD sections, owns explicit files, forbids explicit files and defines its own acceptance evidence.
-Chief owns completion and reconciliation of that plan before execution: requirement-to-ADR coverage, contracts, dependency ordering, ownership conflicts and acceptance scenarios. Orca is the execution orchestrator for the resulting ready work orders, not the owner of unfinished product design. Workers must return contradictions to Chief rather than inventing requirements. The six existing feature proposals are not a complete execution-ready release plan.
+Chief owns completion and reconciliation of that plan before execution: requirement-to-ADR coverage, contracts, dependency ordering, ownership conflicts and acceptance scenarios. Orca is the execution orchestrator for the resulting ready work orders, not the owner of unfinished product design. Workers must return contradictions to Chief rather than inventing requirements. The [16-ADR index](adr/README.md) maps the full release, shared contracts, dependency waves and acceptance ownership. Its specified status does not claim implementation or authorize execution.
 Any future authorized implementation must read its accepted ADR alongside the relevant PRD sections and existing interfaces. An ADR cannot override the product requirements or resolve an open design choice by assumption.
 
 For each subsystem, define inputs, authoritative stored state, model responsibilities, deterministic enforcement, triggers, failure/recovery behavior and observable acceptance scenarios.
@@ -363,7 +363,7 @@ The owner installs nothing but the one command and needs no infrastructure accou
 | Responsibility | Selected direction | Adoption boundary |
 |---|---|---|
 | Agent runtime and conversational continuity | OpenClaw with native recall, under `.runtime/` | Do not replace its memory automatically or introduce competing auto-capture systems |
-| Application connections | Proposed Gather Google OAuth client via loopback; Composio fallback subject to verification | Existing direct-Google adapters are developer-configured; product onboarding and any hosted fallback need feasibility, data-flow and cost decisions before implementation |
+| Application connections | Gather Google OAuth client via loopback plus selected-document Picker, with capability gate | ADR-012 verifies operator configuration and consent; failure blocks live proof. Composio requires a Chief-reviewed amendment, never an automatic fallback |
 | Transactional booking, offer, approval, pending-action and verified-result records | SQLite under `.runtime/` | Keep storage behind one server-side layer so a later move to PostgreSQL is contained |
 | Business understanding and source-backed policies | OpenClaw native recall + bundled memory-wiki, first choice | Prove changed prices, scoped exceptions, deleted evidence and restart recall before committing; do not treat stale compiled context as current authority |
 | Additional semantic evidence retrieval | No separate pgvector/pgContext pipeline initially | Add only for a measured gap that native recall/wiki cannot adequately address |
@@ -393,19 +393,24 @@ Integration contracts:
 
 References: [OpenClaw embedding](https://docs.openclaw.ai/gateway/embedding), [memory wiki](https://docs.openclaw.ai/plugins/memory-wiki), [Docling](https://github.com/docling-project/docling), [promptfoo](https://github.com/promptfoo/promptfoo).
 
-### 8.6 Remaining design decisions
+### 8.6 Specified release defaults and capability gates
 
-| Area | Decision still needed |
+The following are the public execution decisions, not verified implementation claims. Detailed interfaces and error semantics are in [contracts C01–C12](adr/CONTRACTS.md); ownership and all requirement/gate mappings are in the [ADR index](adr/README.md). Chief owns amendments. Orca implements these contracts rather than selecting product policy during dispatch.
+
+| Area | Execution decision |
 |---|---|
-| Initial business template | Which venue, private-dining or catering scenario anchors the prepared business, and which fields/resources/calculations differ across the supported audiences? |
-| Source scope and retention | Import defaults, owner exclusions, history expansion and retention/deletion behavior; effect of disconnection and revoked access on stored evidence and derived knowledge. |
-| Policy authority | Which facts become usable from authoritative documents, which need owner confirmation, and how conflicts, effective dates and customer/booking exceptions are resolved. |
-| Questions and readiness | Minimum knowledge per action, interrupt versus batch, and behavior while an answer is missing. |
-| Operating authority | One-time approval versus standing authority; material-change, limit, expiry and revocation rules; default concession policy (off). |
-| Booking lifecycle | Matching/ambiguity rules, qualification calculations, hold duration, follow-up cadence, pause/takeover/resume behavior and evidence for confirmation/handoff. |
-| Owner experience | First-run understanding review, approval presentation and notification defaults; consequential alerts versus routine progress. |
-| Repair catalog | Exact repair actions, their preconditions and verification probes; which failure signatures are deterministic; give-up thresholds. |
-| Engineering validation | Loopback OAuth feasibility on an unverified client, Composio fallback decision, provisioning targets, event ordering, action reconciliation and measured readiness targets. |
+| Reference business | Fictional Glasshouse private-event venue; one exclusive 100-person room, USD, America/New_York, 4-hour $50/person package, $1,000 minimum, explicit no-extra-fees fixture policy. Live businesses need their own confirmed facts. |
+| Modes and packaging | Prepared is credential-free and scripted; live is separate and real; actual native-runtime proof is opt-in. macOS/Linux Node 26+, writable staged package under the invocation root; safe reset, no silent legacy migration. |
+| Source scope/retention | Visible initial 30-day inbox/sent window, selected documents/calendar, bounded pages and active-thread priority; explicit older expansion and excluded-record tests. Purge disconnected/deleted source bodies and invalidate derivatives; preserve minimal audit/commitment snapshots. |
+| Policy authority | Imported claims start as candidates; owner confirms inspected typed claims (batch allowed). Scoped confirmed exceptions apply only within scope. Conflicting current claims block until owner resolution. |
+| Questions/readiness | Qualify incomplete event inquiries; batch unanswered questions and avoid repeats. Missing pricing/terms blocks pricing, not inquiry discovery. Fresh resource evidence and exact approval precede execution. |
+| Operating authority | Exact per-action/bundle approval; no standing outbound authority by default. Concessions off unless explicit scoped/cumulative policy permits them; sending still requires exact approval. |
+| Lifecycle | Stable verified identity or owner ambiguity resolution; price-only revision reuses unchanged hold; date/resource change needs approved replacement/release. 48-hour reference hold/offer expiry capped at event start; one follow-up draft after 24 hours, never automatic sending. Replies first; takeover/resume reconciles state. |
+| Acceptance/confirmation | Signed acceptance-by-email link and verified reply; no localhost customer URL. Exact offer/party/expiry/replay checks. Accepted is separate from confirmed; required resource/payment evidence must exist. Reference fixture has no deposit requirement. |
+| Owner experience | Today/Booking/Connections/Understanding/Recoveries/trend, in-app consequential notifications, mobile/keyboard and honest empty/partial/error states. |
+| Repair | Separate supervisor/ops agent; catalog preconditions and independent probes in C09, maximum three attempts, unchanged permanent failures may block sooner. Patch/test proposals only, never running code mutation. |
+| Runtime budgets | Default 15 tool calls, 32,000 total input/output tokens, five-minute execution deadline, 50 runs/day; configurable and persisted. Reserve before calls, fence after deadline, never equate wait timeout with cancellation. |
+| Engineering capability gates | ADR-008 proves supported native knowledge; ADR-009 pins/proves runtime/model access; ADR-012 proves actual OAuth/Picker. Unavailable capability gives a concrete blocker, not an invented replacement architecture. Event ADRs prove sponsor-specific execution. |
 
 ## 9. Completion and honest scope
 
@@ -427,7 +432,7 @@ These exclusions do not waive authorization, durable storage or correctness for 
 | First run | Both choices are presented; "Connect your own" states its requirements honestly and is disabled until the live path ships |
 | Prepared business | Simulated connectors labeled on every screen; seed and reset verified; six seeded inbox messages including non-events |
 | Scope boundary | Unrelated invoice/newsletter/pure-injection messages are separated; incomplete legitimate inquiries remain eligible. Mixed inquiry/injection content cannot change authority, recipients or commercial terms |
-| Live mode | Google consent through the loopback flow on a fresh account (or the documented Composio fallback decision), real inquiry to offer to hold and email with each receipt re-read from the provider |
+| Live mode | Google consent and selected-document Picker on an authorized fresh account through the configured direct flow, real inquiry to offer to hold and email with each receipt re-read from the provider |
 | Local runtime | OpenClaw installs and runs under `.runtime/`; the personal `~/.openclaw` is verified untouched |
 | Runtime lifecycle | Pinned version recorded; basic restart/recovery verified without duplicated actions |
 | Understanding | Attributable facts, remembered owner corrections and correct handling of conflicting evidence; a plain-language owner rule applies to the next affected inquiry with citation |
@@ -436,11 +441,11 @@ These exclusions do not waive authorization, durable storage or correctness for 
 | Knowledge lifecycle | Scoped exception and owner correction apply to the right pending work; accepted commitments stay unchanged; unavailable or stale derived context cannot silently authorize an action |
 | Evaluation | Human-reviewed scenarios; deterministic authority/arithmetic/isolation checks and calibrated semantic rubrics where useful; judge output never substitutes for provider evidence |
 | Booking journey | Actual model invocation and verified inquiry-to-offer-to-approval-to-provisional-hold-and-sent-email execution with per-fact evidence shown |
-| Customer acceptance | Acceptance link binds to the exact version; superseded version rejected; state moves to accepted without claiming confirmation |
+| Customer acceptance | Signed acceptance-by-email link binds exact version and verified sender; click alone does nothing; superseded/forwarded-wrong-sender/replayed tokens handled; accepted does not imply confirmed |
 | Exact authority | Stale/changed approvals and cross-booking authorization rejected; price floor and concession limits hold against model output |
 | Recovery | Duplicate delivery, partial success, uncertain outcome and restart scenarios preserve correct state |
 | Self-healing | For each injected fault: automatic detection without a report, recorded diagnosis, a catalog action, verification and resumed intent with no duplicate external effect; at least one fault ends in an honest blocked state with the attempts listed |
-| Budgets | Per-run tool-call, token and wall-clock limits enforced with a visible refusal |
+| Budgets | Per-run tool-call, reserved input/output-token and actual execution-deadline limits enforced with visible refusal; wait timeout cannot imply cancellation |
 | Isolation | One business per installation; no tool or retrieval path can reach another business or data outside the configured accounts |
 | External-content boundary | Malicious inquiry/document instructions cannot change authority or commercial terms; rejection recorded with reason |
 | UX | Rendered and interactive checks of the demonstration script, mobile layout and error/reconnection states |

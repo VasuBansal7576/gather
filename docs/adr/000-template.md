@@ -1,9 +1,10 @@
 # ADR-NNN: <one-line decision>
 
-Status: proposed | paused | accepted | in-progress | shipped (<merge commit>)
+Status: specified — implementation paused | in-progress (authorized) | shipped (<verified merge commit>)
 Depends on: ADR-XXX
 Authorization: <explicit owner instruction; a status alone is not permission to implement>
 PRD: <section numbers this ADR implements, e.g. 4.3, 10 (gate name)>
+Contracts: <C01–C12 references from CONTRACTS.md; changes require Chief reconciliation>
 
 ## Decision
 <What we are doing and the one or two sentences of why. A worker should be able to restate this without reading the PRD.>
@@ -17,6 +18,12 @@ PRD: <section numbers this ADR implements, e.g. 4.3, 10 (gate name)>
 ## Do
 - <Concrete, ordered instructions. File names. Function names where they matter. Test names.>
 
+## Inputs, outputs and integration
+<Exact port/data contracts, current modules to reuse, schema/migration effects and downstream consumers. Name authoritative state and progression ownership.>
+
+## Failure and recovery
+<Retry versus uncertain effect, cancellation, capability prerequisites, blocked outcome and verification. Never ask an implementation worker to select missing product policy.>
+
 ## Don't
 - <The mistakes a capable model would otherwise make here. Be specific.>
 
@@ -27,3 +34,6 @@ PRD: <section numbers this ADR implements, e.g. 4.3, 10 (gate name)>
 <Each line is provable by one artifact. The PR evidence table mirrors this list exactly.>
 - ...
 - `npm test`, `npm run typecheck`, `npm run build` pass; report skips. Run the golden path if it exists; otherwise state it is absent.
+
+## Completion handoff
+<Acceptance IDs/artifacts, files changed, task branch and matching local/remote SHA, remaining blockers. Update static coverage/dependencies in README.md when adding scope; do not create a second progress ledger. Orca owns execution coordination, Chief owns design amendments; neither status alone authorizes merge or deployment.>

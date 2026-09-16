@@ -4,7 +4,7 @@
 
 Gather is intended to coordinate event bookings on behalf of a business owner, using the business's existing tools. The owner supplies policy and operating authority, reviews consequential decisions, and sees evidence of completed work. The product is not a generic email agent, a workflow builder, or a collection of independent model demos.
 
-The [PRD](HACKATHON_PRD.md) describes that destination. It is not an inventory of shipped behavior. The current code is a partially integrated prototype, and feature implementation is paused while its design and repository are reconciled. The [README](../README.md) describes the runnable inspection path; [AGENTS.md](../AGENTS.md) governs changes.
+The [PRD](HACKATHON_PRD.md) describes that destination. It is not an inventory of shipped behavior. The current code is a partially integrated prototype, and feature implementation is paused; the reconciled execution design is now in the ADR index. The [README](../README.md) describes the runnable inspection path; [AGENTS.md](../AGENTS.md) governs changes.
 
 ## Existing code map
 
@@ -32,23 +32,15 @@ The similarly named modules above are not automatically duplicates. For example,
 - The store supports multiple business rows and setup allows creating them; the PRD's one-business-per-installation rule is a target, not an enforced installation invariant today.
 - Default tests exercise local logic, SQLite, loopback servers and scripted transports. They do not run paid models or prove Google effects. Optional real-OpenClaw process tests are explicitly opted into and separately reported.
 
-## Design conflicts to resolve before implementation
+## Execution design and remaining evidence
 
-The original ADR task lists remain available for review, but [ADRs 001–006](adr/) are **paused proposals**, not an implementation queue.
+Chief has specified the public [16-ADR execution plan](adr/README.md), its [shared contracts](adr/CONTRACTS.md), requirement coverage, dependency waves and bounded file ownership. This replaces the earlier six-proposal partial plan; it is not a shipped-product claim or implementation authorization.
 
-Chief owns the remaining PRD/ADR reconciliation, complete requirement coverage, dependency contracts and safe execution order. Orca will execute the prepared plan using the configured workers; it is not being assigned the missing design work. Until that preparation is complete, do not describe these proposals as ready for Orca or ask its workers to fill product gaps. The next planning pass must close the unassigned release requirements listed below and reconcile the existing ADR dependency/ownership conflicts before any execution handoff.
+The plan resolves the previously conflicting incomplete-inquiry gate, honest empty versus failed scans, prepared/native/live evidence, one progression owner, price-only hold reuse, runtime cancellation versus wait timeout, customer acceptance from a remote mailbox, and Chief-versus-Orca responsibility. It assigns progressive ingestion, native knowledge, runtime provisioning, Google onboarding, full booking lifecycle, acceptance/handoff and all three sponsor profiles.
 
-The public local-first product and its hackathon task lists are restored; the private hosted SaaS must not override them. The following corrections stay within hackathon scope:
+Existing code remains the partial prototype mapped above. Engineering proof still belongs to the named tasks: native recall/wiki capability and migration (008), isolated pinned runtime/model budgets (009), configured Google client/Picker (012), full live composition (006), and real sponsor use plus release evidence (013–016). No client credential, consent bypass, model capability or paid service is assumed. A failed capability gate returns concrete evidence to Chief; workers do not choose another product architecture.
 
-1. **Distribution/state:** keep the one-command local target; require Node 26 and inventory runtime/store owners before any path migration. Existing records are not moved by this cleanup.
-2. **Progression/recovery:** reuse existing claims, receipts and waiting work under one owner; explicitly reconcile success lost before a receipt was persisted. Preserve confirmed/cancelled state on replay.
-3. **Qualification:** missing dates/counts do not disqualify legitimate inquiries. Embedded instructions cannot grant authority, but legitimate qualification remains permitted.
-4. **Prepared-mode evidence:** default fixtures simulate runtime/model failures. Actual process/model recovery requires a separate opt-in harness and separately labeled evidence.
-5. **Knowledge:** native recall/wiki is first-choice and gated before adoption. Preserve prototype modules without authorizing a second general knowledge engine.
-6. **Live connections:** retain the local-account/loopback proposal. The proposed client, Picker, secret adapter and model-login paths need actual feasibility evidence; an optional broker is not free or automatically exempt from provider obligations.
-7. **Release coverage:** these six proposals are not a complete implemented release. Customer acceptance, progressive import UX and other PRD gates remain required; existing acceptance/deposit records do not prove customer-facing integration.
-
-Feature implementation stays paused. Existing defects and contradictions may be repaired; unbuilt journeys and provider feasibility must not be presented as complete. Hackathon-specific choices are not defects merely because the private SaaS differs.
+Orca receives the index's execution prompt after the owner resumes implementation. It does not receive an instruction to redesign the PRD, discover missing requirements or silently import private SaaS decisions. The current planning pass changes no application behavior.
 
 ## Reading technical guides
 

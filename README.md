@@ -4,7 +4,7 @@ An owner-side AI booking operator for event venues, private-dining restaurants, 
 
 The goal is to coordinate inquiries across a business's existing email, documents, and calendar: understand the business, prepare evidence-backed offers, ask for consequential decisions, and track what actually happened. OpenClaw supplies the agent runtime; Gather owns booking rules, exact approvals, and action receipts.
 
-**Gather is an unfinished prototype undergoing cleanup.** It is not a finished booking product or a submission-ready demo. Feature implementation is paused while the existing repository and design are reconciled. There is no product demonstration video yet.
+**Gather is an unfinished prototype undergoing cleanup.** It is not a finished booking product or a submission-ready demo. Feature implementation is paused until the owner starts execution of the reconciled plan. There is no product demonstration video yet.
 
 This public repository targets hackathons. Its local-first requirements and ADRs are distinct from the private SaaS plan; neither is a substitute for the other.
 
@@ -21,7 +21,7 @@ The fixture path starts with two pre-created bookings and proposals. It does **n
 
 The one-command installer, prepared-inbox composer and reset flow, event-only intake gate, durable user-intent runner, automatic incident/repair experience, native-memory integration, and finished live onboarding are proposed work—not shipped capabilities. The end-to-end golden-path test is also not present.
 
-The [product requirements](docs/HACKATHON_PRD.md) describe the intended product. The [repository guide](docs/README.md) maps the existing code and unresolved design conflicts. ADRs are proposals unless explicitly accepted; they are not permission to start implementation.
+The [product requirements](docs/HACKATHON_PRD.md) describe the intended product. The [repository guide](docs/README.md) maps the existing code. The [16-ADR execution index](docs/adr/README.md) contains the reconciled requirement coverage, contracts, dependency waves and Orca handoff. These are specifications, not permission to start implementation.
 
 ## Inspect the prototype locally
 

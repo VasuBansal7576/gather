@@ -5,7 +5,7 @@ description: Reconcile Gather design and supervise explicitly authorized impleme
 
 # Coordinate
 
-Read `AGENTS.md`. Feature implementation is currently paused. Do not dispatch paused ADRs, infer delegation from their presence, or resume implementation during repository cleanup.
+Read `AGENTS.md`, `docs/adr/README.md` and `docs/adr/CONTRACTS.md`. The public plan is specified; feature implementation is currently paused. Do not infer execution authorization from a specification or resume implementation during planning.
 
 ## Before a feature ADR is accepted
 
@@ -19,6 +19,8 @@ Chief owns this entire preparation stage. Orca is reserved for execution of the 
 - An ADR is ready only after its design and scope are accepted; ready does not itself authorize execution.
 
 ## Explicitly authorized coordination
+
+Use the execution index's dependency waves and paste-ready handoff. Preserve ADR numbering and contracts; do not ask Orca to re-decompose the PRD. Select the remote revision containing this plan, not an older main checkout. Track dependency completion through reviewed integrated code and acceptance evidence, not agent prose or branch existence. Common files require exclusive write ownership even across nominally independent tasks.
 
 Use workers only when the owner requests delegation. Give each the approved scope and relevant design context, not only an isolated task list. Respect dependency order and overlapping ownership. Delegation does not remove coordinator responsibility to inspect the diff and actual evidence.
 

@@ -6,11 +6,11 @@ This public repository is the **hackathon build**, governed by `docs/HACKATHON_P
 
 Feature implementation is paused at the owner's request. The active task is repository recovery: understand the product, correct misleading documentation and conflicting PRD/ADR instructions, repair existing application defects, and repair build/test/CI reproducibility. Application code is in scope for evidenced repairs; do not execute the unbuilt PRD/ADR backlog, remove existing modules, migrate data, or invent a new product direction.
 
-Read [README.md](README.md) and [docs/README.md](docs/README.md) first. The [PRD](docs/HACKATHON_PRD.md) describes intended behavior, not current capabilities. ADRs 001–006 are hackathon proposals with future acceptance evidence; they are not approved implementation tasks. Only an explicit owner instruction resumes feature work.
+Read [README.md](README.md) and [docs/README.md](docs/README.md) first. The [PRD](docs/HACKATHON_PRD.md) describes intended behavior, not current capabilities. ADRs 001–016 are specified hackathon work orders with future acceptance evidence; the [execution index](docs/adr/README.md) and [shared contracts](docs/adr/CONTRACTS.md) define their scope and dependencies. Their presence is not implementation authorization. Only an explicit owner instruction resumes feature work.
 
 ## Workflow
 
-- Chief owns pre-execution reconciliation: the public PRD, complete ADR coverage, interface contracts, dependency order, conflicting file ownership and acceptance evidence. Do not hand that unfinished planning to Orca or ask implementation workers to infer product scope.
+- Chief owns pre-execution reconciliation and amendments. Follow the completed public execution index, contract definitions, coverage and dependency waves; do not re-decompose the PRD in Orca or ask workers to infer missing product scope. Return evidenced contract contradictions to Chief.
 - Orca is the intended execution orchestrator after that plan is ready and the owner explicitly resumes implementation. It coordinates the configured workers and handoffs; it does not have authority to invent requirements, import private SaaS scope or resolve product contradictions silently. An unresolved planning dependency returns to Chief before dispatch.
 
 - Inspect Git state and use an isolated worktree; continue the existing clean PR worktree for follow-up repairs, or create a fresh one from `origin/main` for a new task. Never overwrite another worker's files or runtime state.

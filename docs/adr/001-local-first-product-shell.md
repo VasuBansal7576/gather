@@ -1,51 +1,73 @@
-# ADR-001: Local-first product shell
+# ADR-001: Local-first shell and prepared business
 
-Status: paused proposal — requires design reconciliation and explicit authorization before implementation
-Depends on: ADR-000
-PRD: 2, 2.1, 2.2, 7, 7.1, 10 (Local run gate, UX gate, Submission gate)
+Status: specified — implementation paused
+Depends on: none
+Authorization: planning only; explicit owner instruction is required to start implementation.
+PRD: 1, 2, 2.1, 2.2, 7, 7.1; gates Local run, First run, Prepared business, Isolation
+Contracts: C01, C10 in [shared contracts](CONTRACTS.md)
 
-> The task list below is retained for design review, not execution. See [repository design conflicts](../README.md#design-conflicts-to-resolve-before-implementation). No feature work is authorized during cleanup.
+## Decision
 
-## Proposed decision
-Gather is distributed as a local-first app started with one command. `npx github:VasuBansal7576/gather` (and `npm start` from a clone) boots the prepared business with Node only: no keys, no OpenClaw install, no network provider. The first screen offers "Try the prepared business" and "Connect your own" (the latter gated by ADR-006). All judge-testable behavior in this build runs in the prepared business with visibly simulated connectors.
+Reuse setup and fixture initialization, but separate the existing two-proposal regression seed from a new inquiry-first product fixture. Deliver the packaged local entry and safe mode/reset boundaries without implementing booking intelligence.
+
+## Existing code and scope
+
+Read the source paths below and their module guides before editing. Existing implementations are reusable foundations, not evidence that this ADR is complete. Follow the [execution index](README.md) and shared contracts; references are not competing work orders.
 
 ## Owns
-- `package.json` (`bin`, `scripts.start`, `files`), `scripts/gather-start.mjs`, `scripts/gather-doctor.mjs`, new `scripts/gather-cli.mjs`
-- `app/setup/**`, `app/page.tsx`, `app/layout.tsx`, `app/globals.css`
+
+- `package.json`
+- `package-lock.json`
+- `scripts/gather-cli.mjs` (new)
+- `scripts/gather-start.mjs`
+- `scripts/gather-doctor.mjs`
+- `app/setup/**`
+- `app/page.tsx`
+- `app/layout.tsx`
+- `app/globals.css`
 - `src/setup/**`
-- `src/server/runtime.ts`, `src/server/sqlite-store.ts` (state-path inventory and explicit migration design only)
-- `src/server/demo-fixtures.ts` (seed content only; keep exported IDs stable)
+- `src/server/demo-fixtures.ts`
+- `src/server/runtime.ts` (mode/path selection only)
+- `app/api/demo/init/route.ts`
+- `app/api/setup/**`
+- `tests/cli*.test.ts` (new)
+- `tests/setup*.test.ts`
+- `tests/fixtures/prepared/**` (new)
 - `README.md`
-- `tests/setup*.test.ts`, `tests/cli*.test.ts`
 
 ## Must not touch
-- `src/runtime/**`, `src/server/connections/**`, `src/server/live-model/**`, `src/connectors/google/**`
-- `~/.openclaw` or any path outside the repo and its `.runtime/`
 
-## Do
-- Add `"bin": { "gather": "scripts/gather-cli.mjs" }`. The CLI: verify Node >= 26, create `.runtime/`, run the doctor, `next build` if `.next/` is missing, start on `127.0.0.1` with a free port, print the URL, open the browser (`open`/`xdg-open`/`start`, ignore failure). Flags: `--port`, `--no-open`, `--reset` (deletes only `.runtime/prepared-business.sqlite`).
-- Default database path when unset: `.runtime/prepared-business.sqlite`. Never default to a path outside the repo. Before changing the existing `data/gather.sqlite` default, specify an explicit backup/migration path and verify all store/runtime consumers; do not strand existing records. This cleanup itself preserves the current default.
-- Make the first-run screen two cards: "Try the prepared business" (one click, seeds fixtures, enters the workspace) and "Connect your own apps" (explains it needs a model login and Google consent; button disabled with that copy until ADR-006 ships). Remove the timezone/business-name form from the first run; the prepared business supplies its own.
-- Every prepared-business screen shows a persistent, non-dismissable "Prepared business, simulated connectors" badge. Keep the existing `fictional: true` source labels.
-- Extend the prepared business seed with: one venue policy document, one package/price list, one calendar with two existing holds, six inbox messages (three event inquiries, three non-events: an invoice, a newsletter, a vendor pitch). Non-events are needed by ADR-003.
-- Add a "Reset prepared business" action in the workspace header that reseeds from scratch and confirms before doing so.
-- Rewrite `README.md` top to: one-paragraph promise, an actual video link only once a verified recording exists, "Run: `npx github:VasuBansal7576/gather`", "What is simulated", "Connect your own (coming in ADR-006)". Keep the developer section below.
-- Tests: CLI argument parsing, doctor runs, default DB path, seed idempotency, first-run render at 1440x900 and 390x844 with the badge present.
+- Personal `~/.openclaw`, unrelated installations, private SaaS files, credentials or live customer data.
+- Paths outside Owns, including other in-flight ADR files. Shared paths require the index's exclusive write lock and predecessor integration; no simultaneous writers.
+- Product requirements, acceptance criteria or shared contract semantics. Return a contradiction to Chief with source evidence; do not silently redesign.
 
-## Don't
-- Don't install or spawn OpenClaw in this path. Demo mode is deterministic and stays that way.
-- Don't publish to npm; `npx github:` is the distribution.
-- Don't ask for a model key, Google client id, or any env var on first run.
-- Don't touch the existing `/api/demo/init` contract; call it.
-- Don't write a new status document. The README states what is simulated; nothing else.
+## Inputs, outputs and integration
+
+Installation root + selected mode -> validated state paths, single-business store and fixture scenario. Preserve legacy seed exports/callers; expose a separate product-scenario selector rather than silently changing regression data. /api/demo/init remains compatible for existing clients.
+
+## Implementation steps
+
+1. Implement C01 package staging, process lock, free loopback port, --port/--no-open and browser launch with printable URL fallback. npm start remains a developer entry and must not recursively invoke itself.
+2. Implement two first-run choices; live remains disabled until ADR-006 passes. Preserve no-credential prepared entry and persistent simulation badge.
+3. Implement inquiry-first and honest-absence fixtures, idempotent seed and safe reset. Protect explicit custom databases and live state. Existing data migration is an explicit backed-up copy with refusal for ambiguous multi-business stores.
+4. Keep runnable README claims behind actual artifact verification. No video or installation-success claim from a source-tree build alone.
+
+## Failure and recovery
+
+Use the cited contracts' durable, scoped error paths. A capability/credential gate may block real verification without blocking scripted development; name the exact missing evidence. Do not substitute simulated success, relax authority, add a second progression owner or change vendors to make acceptance pass.
 
 ## Out of scope
-Live Google and model login (ADR-006). Classification of the seeded non-event emails (ADR-003). Durable intents behind the buttons (ADR-002).
+
+Private hosted SaaS, billing, revenue-recovery strategy and autonomous code deployment. Adjacent subsystems belong to their named ADRs in the index. No merge, external deployment, purchases or submission is authorized here.
 
 ## Acceptance
-- Fresh clone, `npx github:VasuBansal7576/gather` on a machine with only Node: browser opens, prepared business visible within the doctor's reported time. Terminal transcript attached.
-- Screenshot of first-run screen at 1440x900 and 390x844 showing both cards and the disabled "Connect your own" copy.
-- Screenshot of the workspace with the simulated badge and the six seeded inbox messages.
-- Reset action reseeds; screenshot before and after with different booking timestamps.
-- `--reset` deletes only the prepared-business database (directory listing before/after).
-- `npm test`, `npm run typecheck`, `npm run build` pass.
+
+- **001-A01:** Packed artifact invoked from a fresh writable directory on Linux/macOS reaches prepared setup without credentials/OpenClaw; show state location and package contents.
+- **001-A02:** Six product inbox messages, two busy blocks, zero product offers before preparation; legacy regression fixture still passes. Empty/non-event/partial/error scenarios selectable.
+- **001-A03:** Reset refuses live/custom/symlink escape and active foreign process; original legacy DB remains intact; repeated seed/reset produces documented state.
+- **001-A04:** Two mode roots cannot access each other; second business creation denied; mobile/desktop first-run and keyboard flow evidenced.
+- **001-CHECKS:** `npm test`, `npm run typecheck`, `npm run build` pass; report optional skips honestly. Run the existing golden suite after ADR-002 introduces it; do not claim later release cases before their owning ADR lands. Attach source/command evidence, and rendered evidence for UI changes.
+
+## Completion handoff
+
+Return changed files, local/remote commit IDs, acceptance-ID evidence and remaining blockers to the Orca coordinator. Commit and push the task branch; verify matching remote SHA. Do not self-mark shipped or merge. The coordinator reviews actual artifacts and integrated behaviour, not only the worker summary.

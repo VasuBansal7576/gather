@@ -17,4 +17,4 @@ Remove hand-maintained status ledgers and personal identifiers from the reposito
 ## Historical rules (not current instructions)
 - No status documents. Progress is merged PRs and ADR statuses.
 - No personal identifiers in tracked files.
-- The reset required one ADR and an evidence table per change. Current AGENTS.md distinguishes maintenance from authorized feature work and pauses ADRs 001–006.
+- The reset required one ADR and an evidence table per change. Current AGENTS.md distinguishes maintenance from authorized feature work; the execution index now specifies ADRs 001–016 without lifting the implementation pause.
