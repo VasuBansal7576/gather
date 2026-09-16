@@ -5,6 +5,53 @@ export type FetchImpl = (url: string | URL, init?: RequestInit) => Promise<Respo
 const DEFAULT_TIMEOUT_MS = 10_000;
 const DEFAULT_MAX_BYTES = 64 * 1024;
 
+// Only known structural codes may reach caller-visible errors. Provider
+// strings (including its `error` field) are untrusted and can contain secrets.
+const OAUTH_ERROR_CODES = new Set([
+  "invalid_request", "invalid_client", "invalid_grant", "unauthorized_client",
+  "unsupported_grant_type", "invalid_scope", "access_denied", "server_error",
+  "temporarily_unavailable", "interaction_required", "login_required",
+  "consent_required", "invalid_token", "insufficient_scope",
+]);
+
+async function readObject(response: Response, signal: AbortSignal, maxBytes: number, label: string): Promise<Record<string, unknown>> {
+  const reader = response.body?.getReader();
+  if (!reader) throw new ConnectionError("EXCHANGE_FAILED", `${label} response was empty`);
+  const cancel = (): void => { void reader.cancel().catch(() => undefined); };
+  signal.addEventListener("abort", cancel, { once: true });
+  try {
+    signal.throwIfAborted();
+    const chunks: Uint8Array[] = [];
+    let bytes = 0;
+    while (true) {
+      const part = await reader.read();
+      signal.throwIfAborted();
+      if (part.done) break;
+      bytes += part.value.byteLength;
+      if (bytes > maxBytes) {
+        cancel();
+        throw new ConnectionError("EXCHANGE_FAILED", `${label} response exceeded the size bound`);
+      }
+      chunks.push(part.value);
+    }
+    let value: unknown;
+    const malformedOptions = { retryable: response.status === 429 || response.status >= 500 };
+    try { value = JSON.parse(Buffer.concat(chunks).toString("utf8")); }
+    catch { throw new ConnectionError("EXCHANGE_FAILED", `${label} response was not valid JSON`, malformedOptions); }
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+      throw new ConnectionError("EXCHANGE_FAILED", `${label} response was not a JSON object`, malformedOptions);
+    }
+    return value as Record<string, unknown>;
+  } catch (error) {
+    if (error instanceof ConnectionError) throw error;
+    cancel();
+    throw new ConnectionError("EXCHANGE_FAILED", `${label} response failed (network or timeout)`, { retryable: true });
+  } finally {
+    signal.removeEventListener("abort", cancel);
+    reader.releaseLock();
+  }
+}
+
 /**
  * Fetch-backed OAuth transport — the production adapter behind the injected
  * OAuthTransport port. Requests are bounded (timeout + response size), the
@@ -29,31 +76,23 @@ export class FetchOAuthTransport implements OAuthTransport {
     for (const [key, value] of Object.entries(params)) {
       if (value !== undefined) body.set(key, value);
     }
+    const signal = AbortSignal.timeout(this.timeoutMs);
     let response: Response;
     try {
       response = await this.fetchImpl(url, {
         method: "POST",
         headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
         body: body.toString(),
-        signal: AbortSignal.timeout(this.timeoutMs),
+        signal,
       });
     } catch {
       throw new ConnectionError("EXCHANGE_FAILED", "Token endpoint request failed (network or timeout)", {
         retryable: true,
       });
     }
-    const text = await response.text();
-    if (text.length > this.maxBytes) {
-      throw new ConnectionError("EXCHANGE_FAILED", "Token endpoint response exceeded the size bound");
-    }
-    let json: Record<string, unknown>;
-    try {
-      json = JSON.parse(text) as Record<string, unknown>;
-    } catch {
-      json = {};
-    }
+    const json = await readObject(response, signal, this.maxBytes, "Token endpoint");
     if (!response.ok) {
-      const providerError = typeof json.error === "string" ? json.error : `http_${response.status}`;
+      const providerError = typeof json.error === "string" && OAUTH_ERROR_CODES.has(json.error) ? json.error : `http_${response.status}`;
       throw new ConnectionError("EXCHANGE_FAILED", `Token endpoint rejected the request (${providerError})`, {
         providerError,
         retryable: providerError !== "invalid_grant" && providerError !== "unauthorized_client",
@@ -104,29 +143,21 @@ export class FetchOAuthTransport implements OAuthTransport {
     userinfoEndpoint: string;
     accessToken: string;
   }): Promise<VerifiedAccountIdentity> {
+    const signal = AbortSignal.timeout(this.timeoutMs);
     let response: Response;
     try {
       response = await this.fetchImpl(input.userinfoEndpoint, {
         headers: { authorization: `Bearer ${input.accessToken}`, accept: "application/json" },
-        signal: AbortSignal.timeout(this.timeoutMs),
+        signal,
       });
     } catch {
       throw new ConnectionError("EXCHANGE_FAILED", "Account identity request failed (network or timeout)", {
         retryable: true,
       });
     }
-    const text = await response.text();
-    if (text.length > this.maxBytes) {
-      throw new ConnectionError("EXCHANGE_FAILED", "Account identity response exceeded the size bound");
-    }
+    const json = await readObject(response, signal, this.maxBytes, "Account identity");
     if (!response.ok) {
       throw new ConnectionError("EXCHANGE_FAILED", `Account identity lookup failed (HTTP ${response.status})`);
-    }
-    let json: Record<string, unknown>;
-    try {
-      json = JSON.parse(text) as Record<string, unknown>;
-    } catch {
-      throw new ConnectionError("EXCHANGE_FAILED", "Account identity response was not valid JSON");
     }
     const sub = typeof json.sub === "string" ? json.sub : undefined;
     if (!sub) throw new ConnectionError("EXCHANGE_FAILED", "Account identity response had no stable sub");

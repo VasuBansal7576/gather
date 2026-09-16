@@ -402,6 +402,20 @@ export function getWorkspace(store: GatherStore, deps?: Pick<BookingServiceDeps,
   };
 }
 
+/** Cancellation revokes permission for new booking execution, even after awaits. */
+function requireActiveBooking(store: GatherStore, bookingId: string): void {
+  if (store.getBooking(bookingId).status === "cancelled") {
+    throw new ServiceError("CONFLICT", "This booking was cancelled; no further booking actions are permitted", false);
+  }
+}
+
+/** Execution progress cannot undo cancellation or proof-gated confirmation. */
+function updateExecutionStatus(store: GatherStore, bookingId: string, status: Booking["status"]): void {
+  const current = store.getBooking(bookingId).status;
+  if (current === "cancelled" || (current === "confirmed" && status === "provisional_hold")) return;
+  store.updateBookingStatus(bookingId, status);
+}
+
 /** Exact-version approval gate shared by approve + retry paths. */
 function requireExactApproval(store: GatherStore, input: ApproveRequestDTO) {
   let action;
@@ -421,6 +435,7 @@ function requireExactApproval(store: GatherStore, input: ApproveRequestDTO) {
     );
   }
   requireCurrentBinding(store, action.id);
+  requireActiveBooking(store, action.bookingId);
   return action;
 }
 
@@ -453,6 +468,7 @@ function reserveStep(
   key: string,
   step: "hold" | "email",
 ): { reservation: StepReservation; claimToken: string } {
+  requireActiveBooking(deps.store, deps.store.getProposedAction(actionId).bookingId);
   const claimToken = randomUUID();
   try {
     const reservation = deps.store.reserveStepExecution(actionId, version, key, {
@@ -485,7 +501,7 @@ function hasLiveApproval(store: GatherStore, actionId: string): boolean {
 
 function isStale(store: GatherStore, actionId: string, version: number): boolean {
   const action = store.getProposedAction(actionId);
-  return action.proposalVersion !== version || !store.isCurrentProposalAction(actionId) || !hasLiveApproval(store, actionId);
+  return store.getBooking(action.bookingId).status === "cancelled" || action.proposalVersion !== version || !store.isCurrentProposalAction(actionId) || !hasLiveApproval(store, actionId);
 }
 
 /**
@@ -496,9 +512,10 @@ function isStale(store: GatherStore, actionId: string, version: number): boolean
  */
 function assertLiveApprovalAfterWait(store: GatherStore, actionId: string, version: number): void {
   const action = store.getProposedAction(actionId);
+  requireActiveBooking(store, action.bookingId);
   if (action.proposalVersion === version && store.isCurrentProposalAction(actionId) && hasLiveApproval(store, actionId)) return;
   try {
-    store.updateBookingStatus(action.bookingId, "uncertain");
+    updateExecutionStatus(store, action.bookingId, "uncertain");
   } catch {
     // Booking already gone; the STALE error below still carries the signal.
   }
@@ -751,31 +768,32 @@ async function requireFreshAvailability(
     startAt: params.startAt,
     endAt: params.endAt,
   });
+  requireActiveBooking(store, bookingId);
   if (availability.status === "failed") {
     const kind = availability.error.kind;
     if (kind === "access_revoked" || kind === "authorization_denied") {
-      store.updateBookingStatus(bookingId, "uncertain");
+      updateExecutionStatus(store, bookingId, "uncertain");
       throw new ServiceError("ACCESS_REVOKED", availability.error.message, false);
     }
-    store.updateBookingStatus(bookingId, "failed");
+    updateExecutionStatus(store, bookingId, "failed");
     throw new ServiceError("SLOT_UNAVAILABLE", availability.error.message, false);
   }
   if (availability.status === "uncertain") {
-    store.updateBookingStatus(bookingId, "uncertain");
+    updateExecutionStatus(store, bookingId, "uncertain");
     throw new ServiceError("UNCERTAIN", "Availability check was uncertain; retry approval", true);
   }
   const startMs = Date.parse(params.startAt);
   const endMs = Date.parse(params.endAt);
   const blocked = availability.data.slots.find((slot) => !slot.available);
   if (blocked) {
-    store.updateBookingStatus(bookingId, "failed");
+    updateExecutionStatus(store, bookingId, "failed");
     throw new ServiceError("SLOT_UNAVAILABLE", blocked.reason ?? "Requested date is unavailable", false);
   }
   const fullyCovered = availability.data.slots.some(
     (slot) => slot.available && Date.parse(slot.startAt) <= startMs && Date.parse(slot.endAt) >= endMs,
   );
   if (!fullyCovered) {
-    store.updateBookingStatus(bookingId, "failed");
+    updateExecutionStatus(store, bookingId, "failed");
     throw new ServiceError("SLOT_UNAVAILABLE", "No available slot fully covers the requested range", false);
   }
   const durableConflict = store.findHoldConflict(params.calendarId, params.startAt, params.endAt, {
@@ -783,7 +801,7 @@ async function requireFreshAvailability(
     nowMs: clockMs(deps),
   });
   if (durableConflict) {
-    store.updateBookingStatus(bookingId, "failed");
+    updateExecutionStatus(store, bookingId, "failed");
     throw new ServiceError("SLOT_UNAVAILABLE", durableWindowMessage(durableConflict), false);
   }
 }
@@ -806,6 +824,7 @@ export async function approveAndExecute(deps: BookingServiceDeps, input: Approve
   const { store } = deps;
   const action = requireExactApproval(store, input);
   const booking = store.getBooking(action.bookingId);
+  requireActiveBooking(store, booking.id);
   requireSupportedKind(action.kind);
   // Validate the executable consequences BEFORE recording an approval: an
   // invalid (or past) proposal must never gain an approval row.
@@ -823,14 +842,14 @@ export async function approveAndExecute(deps: BookingServiceDeps, input: Approve
 
   const holdExecution = await runHoldStep(deps, action.id, action.proposalVersion, params);
   if (holdExecution.status === "failed") {
-    store.updateBookingStatus(booking.id, "failed");
+    updateExecutionStatus(store, booking.id, "failed");
     if (isDurableWindowConflict(holdExecution.error)) {
       throw new ServiceError("SLOT_UNAVAILABLE", holdExecution.error as string, false);
     }
     throw new ServiceError("EXECUTION_FAILED", holdExecution.error ?? "Provisional hold failed", false);
   }
   // Hold exists (or its outcome is still uncertain): booking is provisional at best.
-  store.updateBookingStatus(booking.id, holdExecution.status === "uncertain" ? "uncertain" : "provisional_hold");
+  updateExecutionStatus(store, booking.id, holdExecution.status === "uncertain" ? "uncertain" : "provisional_hold");
   if (holdExecution.status === "uncertain") {
     const current = store.getBooking(booking.id);
     return {
@@ -850,7 +869,7 @@ export async function approveAndExecute(deps: BookingServiceDeps, input: Approve
   // Aggregate uncertainty: a hold with an uncertain email is not cleanly
   // provisional — the booking must show uncertainty until reconciled.
   if (emailExecution.status === "uncertain") {
-    store.updateBookingStatus(booking.id, "uncertain");
+    updateExecutionStatus(store, booking.id, "uncertain");
   }
   const current = store.getBooking(booking.id);
   return {
@@ -863,7 +882,7 @@ export async function approveAndExecute(deps: BookingServiceDeps, input: Approve
     availabilityFresh: true as const,
     confirmedBooking: false as const,
     note: emailExecution.status === "uncertain"
-      ? "DEMO ONLY: email outcome is uncertain; reconcile before retrying. A hold is never a confirmed booking."
+      ? "Email outcome is uncertain; reconcile before retrying. A hold is never a confirmed booking."
       : completionNote(holdExecution, emailExecution),
   };
 }
@@ -894,7 +913,7 @@ function completionNote(hold: ActionExecution, email: ActionExecution): string {
 export async function retryFailedSteps(deps: BookingServiceDeps, proposedActionId: string): Promise<RetryResponseDTO> {
   const { store } = deps;
   const action = store.getProposedAction(proposedActionId);
-  store.getBooking(action.bookingId);
+  requireActiveBooking(store, action.bookingId);
   // Even when every step already succeeded, retry must verify the current
   // proposal still carries a live exact-version approval.
   requireLiveApproval(store, action.id);
@@ -918,20 +937,20 @@ export async function retryFailedSteps(deps: BookingServiceDeps, proposedActionI
   // Re-run hold only when it has not already succeeded.
   const hold = holdExisting?.status === "succeeded" ? holdExisting : await runHoldStep(deps, action.id, action.proposalVersion, params);
   if (hold.status === "uncertain") {
-    store.updateBookingStatus(action.bookingId, "uncertain");
+    updateExecutionStatus(store, action.bookingId, "uncertain");
     throw new ServiceError("RECONCILE_REQUIRED", hold.error ?? "Hold retry is uncertain; reconcile before retrying", false);
   }
   if (hold.status !== "succeeded") {
-    store.updateBookingStatus(action.bookingId, "failed");
+    updateExecutionStatus(store, action.bookingId, "failed");
     if (isDurableWindowConflict(hold.error)) {
       throw new ServiceError("SLOT_UNAVAILABLE", hold.error as string, false);
     }
     throw new ServiceError("EXECUTION_FAILED", hold.error ?? "Hold retry did not succeed", false);
   }
-  store.updateBookingStatus(action.bookingId, "provisional_hold");
+  updateExecutionStatus(store, action.bookingId, "provisional_hold");
   const email = mailExisting?.status === "succeeded" ? mailExisting : await runEmailStep(deps, action.id, action.proposalVersion, params);
   if (email.status === "uncertain") {
-    store.updateBookingStatus(action.bookingId, "uncertain");
+    updateExecutionStatus(store, action.bookingId, "uncertain");
     throw new ServiceError("RECONCILE_REQUIRED", email.error ?? "Email retry is uncertain; reconcile before retrying", false);
   }
   return {
@@ -992,7 +1011,7 @@ export async function reconcileExecution(deps: BookingServiceDeps, executionId: 
   const booking = store.getBooking(action.bookingId);
   // After a hold reconciles to success the booking is provisional, never confirmed.
   if (kind === "hold" && booking.status !== "provisional_hold") {
-    store.updateBookingStatus(booking.id, "provisional_hold");
+    updateExecutionStatus(store, booking.id, "provisional_hold");
   }
   refreshBookingAggregate(store, booking.id);
   return {
@@ -1018,11 +1037,11 @@ function refreshBookingAggregate(store: GatherStore, bookingId: string): void {
   const booking = store.getBooking(bookingId);
   const executions = store.listProposedActionsForBooking(bookingId).flatMap((action) => store.listActionExecutions(action.id));
   if (executions.some((item) => item.status === "uncertain" || item.status === "partial")) {
-    if (booking.status !== "uncertain") store.updateBookingStatus(bookingId, "uncertain");
+    if (booking.status !== "uncertain") updateExecutionStatus(store, bookingId, "uncertain");
     return;
   }
   const holdSucceeded = executions.some((item) => item.status === "succeeded" && stepOf(item.idempotencyKey) === "hold");
   if (holdSucceeded && booking.status === "uncertain") {
-    store.updateBookingStatus(bookingId, "provisional_hold");
+    updateExecutionStatus(store, bookingId, "provisional_hold");
   }
 }
