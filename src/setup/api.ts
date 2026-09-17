@@ -5,6 +5,7 @@ import {
   parseCreateBusinessResult,
   parseDisconnectResult,
   parseSetupBusiness,
+  parseSetupMode,
   parseSetupSummary,
   type ApiErrorDTO,
   type AuthorizationStartDTO,
@@ -14,7 +15,9 @@ import {
   type ConnectionStatus,
   type CreateBusinessResultDTO,
   type DisconnectResultDTO,
+  type PreparedScenarioIdDTO,
   type SetupBusinessDTO,
+  type SetupModeDTO,
   type SetupSummaryDTO,
 } from "./contracts.ts";
 
@@ -27,7 +30,9 @@ export type {
   ConnectionStatus,
   CreateBusinessResultDTO,
   DisconnectResultDTO,
+  PreparedScenarioIdDTO,
   SetupBusinessDTO,
+  SetupModeDTO,
   SetupSummaryDTO,
 };
 
@@ -106,7 +111,8 @@ export interface SetupApi {
   disconnectGoogleAccount(accountId: string, businessId: string): Promise<DisconnectResultDTO>;
   getBusinesses(): Promise<SetupBusinessDTO[]>;
   createBusiness(name: string, timezone: string): Promise<CreateBusinessResultDTO>;
-  startDemo(): Promise<{ businessId: string; bookingIds: string[] }>;
+  startDemo(scenario?: PreparedScenarioIdDTO): Promise<{ businessId: string; bookingIds: string[]; scenario?: string }>;
+  getMode(): Promise<SetupModeDTO>;
 }
 
 /**
@@ -177,11 +183,11 @@ export function createSetupApi(fetchImpl: SetupFetch): SetupApi {
         "business creation",
       );
     },
-    async startDemo(): Promise<{ businessId: string; bookingIds: string[] }> {
+    async startDemo(scenario?: PreparedScenarioIdDTO): Promise<{ businessId: string; bookingIds: string[]; scenario?: string }> {
       const result = await request<Record<string, unknown>>(
         fetchImpl,
         "/api/demo/init",
-        sameOriginJson("POST", { demo: true }),
+        sameOriginJson("POST", scenario === undefined ? { demo: true } : { demo: true, scenario }),
         (value) => (isRecord(value) ? value : undefined),
         "demo start",
       );
@@ -195,7 +201,14 @@ export function createSetupApi(fetchImpl: SetupFetch): SetupApi {
           200,
         );
       }
-      return { businessId, bookingIds };
+      return {
+        businessId,
+        bookingIds,
+        ...(typeof result.scenario === "string" ? { scenario: result.scenario } : {}),
+      };
+    },
+    getMode(): Promise<SetupModeDTO> {
+      return request(fetchImpl, "/api/setup/mode", { method: "GET" }, parseSetupMode, "mode overview");
     },
   };
 }
