@@ -7,3 +7,22 @@ body {
   background: #0b0b0e;
   color: #ececf0;
 }
+
+/* Persistent simulation/mode badge — fixed to the viewport corner on every
+   page so prepared/demo state can never be mistaken for live data. */
+.gather-mode-badge {
+  position: fixed;
+  top: 10px;
+  right: 12px;
+  z-index: 60;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid #a495fd;
+  background: #17131f;
+  color: #cfc4ff;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, "Helvetica Neue", Arial, sans-serif;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  pointer-events: none;
+}

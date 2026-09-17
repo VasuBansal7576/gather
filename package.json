@@ -2,13 +2,30 @@
   "name": "gather",
   "version": "0.1.0",
   "type": "module",
+  "bin": {
+    "gather": "scripts/gather-cli.mjs"
+  },
+  "files": [
+    "app",
+    "src",
+    "scripts",
+    "tests/fixtures/prepared",
+    "next.config.ts",
+    "tsconfig.json",
+    ".node-version",
+    "npm-shrinkwrap.json"
+  ],
   "scripts": {
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
+    "gather": "node scripts/gather-cli.mjs",
     "lint": "tsc --noEmit",
     "typecheck": "tsc --noEmit",
-    "test": "node --experimental-strip-types --test \"tests/*.test.ts\" \"src/**/*.test.ts\""
+    "test": "node --experimental-strip-types --test \"tests/*.test.ts\" \"src/**/*.test.ts\"",
+    "test:golden": "node --experimental-strip-types --test tests/golden-path.test.ts",
+    "prepack": "cp package-lock.json npm-shrinkwrap.json",
+    "postpack": "rm -f npm-shrinkwrap.json"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.30.0",

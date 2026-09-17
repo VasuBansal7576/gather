@@ -452,11 +452,20 @@ export interface ProactiveHostConfig {
   intervalMs?: number;
   maxConsecutiveErrors?: number;
   clock?: () => number;
+  /**
+   * ADR-002 intent drain: the durable-intent progression owner runs INSIDE
+   * this binding's existing guarded tick — one scheduler per account, never
+   * a second timer. The callback claims and advances due intents scoped to
+   * this binding's business; absent, the sweep is intake + due-work only.
+   */
+  drainIntents?: (businessId: string) => Promise<unknown>;
 }
 
 export interface ProactiveHostSweep {
   intake: Awaited<ReturnType<typeof runIntakeSweep>>;
   dueWork: Awaited<ReturnType<typeof drainDueWork>>;
+  /** Intent drain report when the host wired the progression owner. */
+  intents?: unknown;
 }
 
 /**
@@ -475,7 +484,8 @@ export function startProactiveAccount(config: ProactiveHostConfig): ProactiveBin
     runSweep: async (): Promise<ProactiveHostSweep> => {
       const intake = await runIntakeSweep(runtime);
       const dueWork = await drainDueWork(runtime);
-      return { intake, dueWork };
+      const intents = config.drainIntents === undefined ? undefined : await config.drainIntents(runtime.businessId);
+      return { intake, dueWork, ...(intents === undefined ? {} : { intents }) };
     },
     ...(config.intervalMs === undefined ? {} : { intervalMs: config.intervalMs }),
     ...(config.maxConsecutiveErrors === undefined ? {} : { maxConsecutiveErrors: config.maxConsecutiveErrors }),

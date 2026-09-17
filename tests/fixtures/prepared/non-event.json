@@ -1,0 +1,10 @@
+{
+  "id": "non-event",
+  "label": "Non-event inbox",
+  "description": "Prepared business whose inbox holds only non-event mail (invoice, newsletter, vendor pitch).",
+  "coverage": "complete",
+  "coverageDetail": "Scanned 3 emails. No event inquiries found.",
+  "inboxKeys": ["invoice-1042", "newsletter-october", "vendor-pitch-photobooth"],
+  "calendar": [],
+  "expected": { "inboxCount": 3, "busyBlockCount": 0, "offerCount": 0 }
+}
