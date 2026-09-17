@@ -23,6 +23,7 @@
     "lint": "tsc --noEmit",
     "typecheck": "tsc --noEmit",
     "test": "node --experimental-strip-types --test \"tests/*.test.ts\" \"src/**/*.test.ts\"",
+    "test:golden": "node --experimental-strip-types --test tests/golden-path.test.ts",
     "prepack": "cp package-lock.json npm-shrinkwrap.json",
     "postpack": "rm -f npm-shrinkwrap.json"
   },

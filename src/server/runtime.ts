@@ -1,6 +1,7 @@
 import { lstatSync, mkdirSync, realpathSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
 import { createDemoConnectors, type DemoConnectorSet } from "../connectors/demo.ts";
+import { IntentService } from "../intents/index.ts";
 import type { BookingServiceDeps } from "./booking-service.ts";
 import { demoFixtureSlots, preparedFixtureSlots } from "./demo-fixtures.ts";
 import { DurableDemoCalendar, DurableDemoEmail } from "./durable-demo-connectors.ts";
@@ -26,6 +27,13 @@ export interface ServerRuntime {
   deps: BookingServiceDeps;
   /** Composition hook for later intake/operator assembly. */
   providers: ProviderConnectors;
+  /**
+   * The one durable-intent progression owner (ADR-002 / C06). Composes the
+   * existing operator drain, CoordinationLedger, and action-execution
+   * claims; it owns no scheduler of its own — process lifecycle stays in
+   * this host and periodic drain rides the proactive binding's tick.
+   */
+  intents: IntentService;
 }
 
 let cached: ServerRuntime | null = null;
@@ -202,7 +210,12 @@ export function getRuntime(): ServerRuntime {
     ownerId: ownerId(),
     now: () => new Date(clockMs()).toISOString(),
   };
-  cached = { store, connectors, deps, providers };
+  const intents = new IntentService({
+    booking: deps,
+    mode: gatherMode(),
+    now: () => new Date(clockMs()).toISOString(),
+  });
+  cached = { store, connectors, deps, providers, intents };
   // Lazy host entry: on first boot in this process, automatically register
   // every eligible connected Gmail account for durable inquiry capture.
   // Best-effort by design — a failed bootstrap never breaks boot — and a
@@ -218,10 +231,19 @@ export function getRuntime(): ServerRuntime {
       // A managed prepared install is fully simulated; anything the host
       // wires there must never be labelled as live provider mail.
       ...(managedPrepared ? { provenance: { simulated: true, label: "prepared-fixture" } } : {}),
+      // The intent progression owner drains inside the binding's existing
+      // guarded tick — one scheduler per account, never a second timer.
+      drainIntents: async (businessId) => intents.drainDue({ owner: "proactive-sweep", businessId }),
     });
   } catch {
     // Boot proceeds; the automation status route reports the truth.
   }
+  // Restart reconciliation for the intent lane (ADR-002 step 1): every
+  // `running` intent's prior claim owner is dead at process start. Effects
+  // are checked read-only before the row is reclaimed — never blind-retried.
+  // Best-effort: a recovery failure never blocks boot, and the next sweep
+  // (or explicit advance) re-derives the same evidence-driven states.
+  void intents.recoverInterrupted().catch(() => undefined);
   return cached;
 }
 
