@@ -1,0 +1,11 @@
+{
+  "id": "partial",
+  "label": "Partial import",
+  "description": "Prepared business whose initial import stopped partway: only some inbox messages and some venue facts are present, honestly labelled as incomplete.",
+  "coverage": "partial",
+  "coverageDetail": "Import incomplete: 3 of 6 messages imported before the scan paused. Pricing facts were not imported — no price is known yet.",
+  "inboxKeys": ["ava-reyes-wedding", "invoice-1042", "newsletter-october"],
+  "calendarKeys": ["open-nov14"],
+  "factKeys": ["venue.room"],
+  "expected": { "inboxCount": 3, "busyBlockCount": 0, "offerCount": 0 }
+}
