@@ -1,0 +1,105 @@
+{
+  "id": "glasshouse",
+  "label": "Fictional Glasshouse — inquiry-first",
+  "description": "Reference prepared business: six inbox messages (three event inquiries — one complete, one missing a date, one with conflicting dates — plus an invoice, a newsletter and a vendor pitch), two busy calendar blocks and owner-confirmed fictional venue facts. No offers are prebuilt.",
+  "coverage": "complete",
+  "coverageDetail": "Scanned 6 emails. 3 look like event inquiries; 3 are not event inquiries.",
+  "business": {
+    "id": "prepared-business-glasshouse",
+    "name": "Fictional Glasshouse (DEMO ONLY)",
+    "timezone": "America/New_York"
+  },
+  "accounts": [
+    { "id": "prepared-account-gmail-001", "provider": "gmail", "displayName": "DEMO ONLY fictional Gmail", "status": "connected" },
+    { "id": "prepared-account-calendar-001", "provider": "google_calendar", "displayName": "DEMO ONLY fictional Calendar", "status": "connected" }
+  ],
+  "facts": [
+    { "key": "venue.room", "value": { "name": "The Glasshouse Room", "exclusive": true, "capacity": 100 } },
+    { "key": "pricing.package", "value": { "kind": "per_guest", "currency": "USD", "amountMinor": 5000, "durationHours": 4, "minimumTotalMinor": 100000 } },
+    { "key": "policy.concessions", "value": { "allowed": false } },
+    { "key": "policy.taxes_fees", "value": { "extraTaxes": false, "extraFees": false } },
+    { "key": "policy.setup_teardown", "value": { "minutesEachSide": 30 } }
+  ],
+  "inbox": [
+    {
+      "key": "ava-reyes-wedding",
+      "kind": "event_inquiry",
+      "threadId": "prepared-thread-ava-001",
+      "from": "ava.reyes@example.test",
+      "to": "events@glasshouse.example.test",
+      "subject": "Wedding dinner — November 14?",
+      "body": "Hello! We're planning our wedding dinner for Saturday November 14, 2026, about 90 guests, 6:30pm to 11pm. Is the Glasshouse available, and what would it cost?",
+      "receivedAt": "2026-09-28T14:12:00.000Z"
+    },
+    {
+      "key": "jordan-lee-anniversary",
+      "kind": "event_inquiry",
+      "threadId": "prepared-thread-jordan-002",
+      "from": "jordan.lee@example.test",
+      "to": "events@glasshouse.example.test",
+      "subject": "Anniversary party for ~60",
+      "body": "Hi — we'd like to host my parents' 40th anniversary at your venue, roughly 60 guests, evening. We haven't picked a date yet. What are the options?",
+      "receivedAt": "2026-09-28T16:40:00.000Z"
+    },
+    {
+      "key": "sam-okafor-holiday",
+      "kind": "event_inquiry",
+      "threadId": "prepared-thread-sam-003",
+      "from": "sam.okafor@example.test",
+      "to": "events@glasshouse.example.test",
+      "subject": "Holiday reception — Nov 21 or Dec 5?",
+      "body": "Our company holiday reception, around 80 people. The invite says November 21, but half the team asked for December 5 — the body of this message is genuinely ambiguous about which date we want.",
+      "receivedAt": "2026-09-29T09:05:00.000Z"
+    },
+    {
+      "key": "invoice-1042",
+      "kind": "invoice",
+      "threadId": "prepared-thread-invoice-004",
+      "from": "billing@linenworks.example.test",
+      "to": "events@glasshouse.example.test",
+      "subject": "Invoice #1042 — September linens",
+      "body": "Attached: invoice #1042 for September linen rental, $412.00 due Oct 15.",
+      "receivedAt": "2026-09-29T11:30:00.000Z"
+    },
+    {
+      "key": "newsletter-october",
+      "kind": "newsletter",
+      "threadId": "prepared-thread-news-005",
+      "from": "newsletter@venueweekly.example.test",
+      "to": "events@glasshouse.example.test",
+      "subject": "Venue Weekly: October booking trends",
+      "body": "This week: weekday weddings keep climbing; holiday corporate dates are filling fast.",
+      "receivedAt": "2026-09-29T13:00:00.000Z"
+    },
+    {
+      "key": "vendor-pitch-photobooth",
+      "kind": "vendor_pitch",
+      "threadId": "prepared-thread-vendor-006",
+      "from": "sales@snapbooth.example.test",
+      "to": "events@glasshouse.example.test",
+      "subject": "Partner with SnapBooth photo booths",
+      "body": "We'd love to be your preferred photo booth vendor. Revenue share available.",
+      "receivedAt": "2026-09-30T08:15:00.000Z"
+    }
+  ],
+  "calendar": [
+    {
+      "key": "busy-private-event-nov21",
+      "startAt": "2026-11-21T17:00:00.000Z",
+      "endAt": "2026-11-21T23:00:00.000Z",
+      "available": false,
+      "reason": "DEMO ONLY busy block: existing private event"
+    },
+    {
+      "key": "busy-buyout-nov28",
+      "startAt": "2026-11-28T17:00:00.000Z",
+      "endAt": "2026-11-28T23:00:00.000Z",
+      "available": false,
+      "reason": "DEMO ONLY busy block: full-venue buyout"
+    },
+    { "key": "open-nov14", "startAt": "2026-11-14T00:00:00.000Z", "endAt": "2026-11-15T00:00:00.000Z", "available": true },
+    { "key": "open-dec05", "startAt": "2026-12-05T00:00:00.000Z", "endAt": "2026-12-06T00:00:00.000Z", "available": true }
+  ],
+  "demoClockAnchor": "2026-10-01T12:00:00.000Z",
+  "expected": { "inboxCount": 6, "busyBlockCount": 2, "offerCount": 0 }
+}
