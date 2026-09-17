@@ -276,3 +276,32 @@ Rules worth knowing:
   the cause is fixed.
 - In prepared mode every step's receipt stays simulated and labelled
   DEMO ONLY — nothing here ever claims a live provider write.
+
+## ADR-010 hold lifecycle: price-only reuse vs replacement (C06/C07)
+
+Holds belong to booking/resource/window, not to every offer price version
+(`findReusableHold`, `listSucceededHolds` in `src/server/booking-service.ts`):
+
+- A price-only revision (same `calendarId`/`startAt`/`endAt`) reuses the
+  verified, unexpired hold receipt and creates only the newly approved email
+  action — no second hold, no hold row under the new action key. The receipt
+  note states the reuse explicitly.
+- A date/resource change with a live hold on another window is refused with
+  `409 CONFLICT` unless the approved payload names the superseded hold in
+  `replacesHoldOperationKey` **and** carries `releaseAuthorizedBy` equal to
+  the approving owner identity. Old receipts are preserved; the response
+  carries a release advisory because release is a separate approved action.
+- Expired holds are never resurrected on replay: reuse requires
+  `expiresAt` in the future, and approval of an expired window keeps failing
+  at the executable-consequences check.
+- `cancelBookingWithReleasePlan` revokes new execution, preserves receipts,
+  blocks unsent steps, and returns the per-hold release plan. Sent email is
+  never undone.
+- Terminal states never demote: `confirmed` and `cancelled` bookings keep
+  their state against replayed executions, and a verified hold is never
+  talked back down to a pre-offer state.
+
+Owner-facing lifecycle snapshots for ADR-006 surfaces live in
+`src/domain/lifecycle.ts` (`BookingLifecycleDTO`, `stageForBooking`,
+`stageWithAcceptance`); the store-backed builder is
+`describeBookingLifecycle` in `src/server/business-operator/lifecycle.ts`.

@@ -553,6 +553,240 @@ function stepOf(key: string): "hold" | "email" {
   return key.includes(":send:") ? "email" : "hold";
 }
 
+/* ------------------------------------------------------------------ *
+ * ADR-010 hold lifecycle: price-only reuse vs date/resource            *
+ * replacement with explicit release authority, expiry and              *
+ * cancellation semantics (C06/C07).                                    *
+ *                                                                      *
+ * Holds belong to booking/resource/window, not to every offer price    *
+ * version. A price-only revision reuses the verified same hold and     *
+ * creates only the newly approved email action. Date/resource changes  *
+ * require explicit replacement/release authority in the approved       *
+ * payload; old receipts are preserved, never silently replaced or      *
+ * deleted. Expired holds are never resurrected on replay.              *
+ * ------------------------------------------------------------------ */
+
+/** Resource window identifying one hold: calendar + exact event range. */
+export interface HoldWindow {
+  calendarId: string;
+  startAt: string;
+  endAt: string;
+  expiresAt: string;
+}
+
+function rawWindowOfPayload(payload: Record<string, unknown>): HoldWindow | undefined {
+  const calendarId = str(payload.calendarId);
+  const startAt = str(payload.startAt);
+  const endAt = str(payload.endAt);
+  const expiresAt = str(payload.expiresAt);
+  if (!calendarId || !startAt || !endAt || !expiresAt) return undefined;
+  if (!validRange(startAt, endAt)) return undefined;
+  return { calendarId, startAt, endAt, expiresAt };
+}
+
+function sameHoldWindow(left: HoldWindow, right: HoldWindow): boolean {
+  return left.calendarId === right.calendarId && left.startAt === right.startAt && left.endAt === right.endAt;
+}
+
+function holdIdOfExecution(execution: ActionExecution): string | undefined {
+  if (!isRecord(execution.result)) return undefined;
+  const hold = execution.result.hold;
+  if (!isRecord(hold) || typeof hold.holdId !== "string") return undefined;
+  return hold.holdId;
+}
+
+/** One verified (succeeded) hold receipt found on the booking. */
+export interface PriorSucceededHold {
+  proposedActionId: string;
+  proposalVersion: number;
+  operationKey: string;
+  execution: ActionExecution;
+  window: HoldWindow;
+  holdId?: string;
+}
+
+/**
+ * List every succeeded hold receipt on the booking, newest action first.
+ * Reads durable execution rows only; never the provider. Callers decide
+ * reuse vs replacement vs expiry from the returned windows.
+ */
+export function listSucceededHolds(store: GatherStore, bookingId: string): PriorSucceededHold[] {
+  const out: PriorSucceededHold[] = [];
+  let actions: ReturnType<GatherStore["listProposedActionsForBooking"]> = [];
+  try {
+    actions = store.listProposedActionsForBooking(bookingId);
+  } catch {
+    return out;
+  }
+  for (const action of actions) {
+    const window = rawWindowOfPayload(asRecord(action.payload));
+    if (!window) continue;
+    const execution = store.getExecutionByIdempotencyKey(holdOperationKey(action.id, action.proposalVersion));
+    if (!execution || execution.status !== "succeeded") continue;
+    const holdId = holdIdOfExecution(execution);
+    out.push({
+      proposedActionId: action.id,
+      proposalVersion: action.proposalVersion,
+      operationKey: holdOperationKey(action.id, action.proposalVersion),
+      execution,
+      window,
+      ...(holdId === undefined ? {} : { holdId }),
+    });
+  }
+  return out;
+}
+
+/**
+ * Price-only reuse: the booking already holds the exact requested
+ * resource window under a verified, unexpired receipt. Returns that hold
+ * for reuse so approval creates only the newly approved email action and
+ * never a second hold. Price/email/recipient changes do NOT affect reuse:
+ * only the resource window binds. An expired receipt is never returned
+ * (expired holds need new authority; no resurrection on replay).
+ */
+export function findReusableHold(
+  store: GatherStore,
+  bookingId: string,
+  params: HoldParams,
+  nowMs: number,
+  excludeActionId?: string,
+): PriorSucceededHold | undefined {
+  const wanted: HoldWindow = {
+    calendarId: params.calendarId,
+    startAt: params.startAt,
+    endAt: params.endAt,
+    expiresAt: params.expiresAt,
+  };
+  for (const prior of listSucceededHolds(store, bookingId)) {
+    if (excludeActionId !== undefined && prior.proposedActionId === excludeActionId) continue;
+    if (!sameHoldWindow(prior.window, wanted)) continue;
+    const expiryMs = Date.parse(prior.window.expiresAt);
+    if (!Number.isFinite(expiryMs) || expiryMs <= nowMs) continue;
+    return prior;
+  }
+  return undefined;
+}
+
+export interface HoldReplacementAdvisory {
+  /** The superseded hold the owner must release under a separate approval. */
+  supersededOperationKey: string;
+  supersededHoldId?: string;
+  calendarId: string;
+  startAt: string;
+  endAt: string;
+  note: string;
+}
+
+/**
+ * Date/resource replacement gate. When the booking carries an unexpired
+ * verified hold on a DIFFERENT window, the new payload must explicitly
+ * name that hold (`replacesHoldOperationKey`) and carry explicit release
+ * authority (`releaseAuthorizedBy` equal to the approving owner identity).
+ * Otherwise approval is refused with CONFLICT: the old hold is never
+ * silently dropped and no second hold is added without a decision.
+ * Returns a release advisory for the superseded hold (a separate approved
+ * action; release is never executed implicitly here).
+ */
+export function requireHoldReplacementAuthority(
+  store: GatherStore,
+  input: {
+    bookingId: string;
+    payload: Record<string, unknown>;
+    window: HoldWindow;
+    nowMs: number;
+    approver: string;
+    excludeActionId?: string;
+  },
+): HoldReplacementAdvisory | undefined {
+  const priors = listSucceededHolds(store, input.bookingId).filter((prior) =>
+    input.excludeActionId === undefined ? true : prior.proposedActionId !== input.excludeActionId,
+  );
+  const live = priors.filter((prior) => {
+    const expiryMs = Date.parse(prior.window.expiresAt);
+    return Number.isFinite(expiryMs) && expiryMs > input.nowMs;
+  });
+  const other = live.find((prior) => !sameHoldWindow(prior.window, input.window));
+  if (!other) return undefined;
+  const payload = asRecord(input.payload);
+  const names = str(payload.replacesHoldOperationKey);
+  const authorizedBy = str(payload.releaseAuthorizedBy);
+  if (names !== other.operationKey) {
+    throw new ServiceError(
+      "CONFLICT",
+      `Date/resource change replaces a verified hold (${other.operationKey} ${other.window.startAt} to ${other.window.endAt}); the approved payload must name it in replacesHoldOperationKey with explicit release authority — the old hold is preserved until released under a separate approval`,
+      false,
+    );
+  }
+  if (authorizedBy !== input.approver) {
+    throw new ServiceError(
+      "CONFLICT",
+      "Date/resource change names the superseded hold but carries no explicit release authority: payload releaseAuthorizedBy must equal the approving owner identity",
+      false,
+    );
+  }
+  return {
+    supersededOperationKey: other.operationKey,
+    ...(other.holdId === undefined ? {} : { supersededHoldId: other.holdId }),
+    calendarId: other.window.calendarId,
+    startAt: other.window.startAt,
+    endAt: other.window.endAt,
+    note: `Superseded hold ${other.operationKey} is preserved; release it under a separate approved hold-release action. It was not deleted by this replacement.`,
+  };
+}
+
+export interface BookingCancellationPlan {
+  booking: Booking;
+  /** Unsent executions blocked by this cancellation (their keys stay for audit). */
+  blockedUnsentKeys: string[];
+  /** Verified holds that survive as receipts and need a separate approved release. */
+  releasePlan: HoldReplacementAdvisory[];
+  note: string;
+}
+
+/**
+ * Owner cancellation: revokes permission for new booking execution
+ * (requireActiveBooking keeps enforcing it afterwards), preserves every
+ * receipt, and returns the release plan for surviving holds. Email already
+ * sent is never undone — the plan says so explicitly.
+ */
+export function cancelBookingWithReleasePlan(
+  store: GatherStore,
+  bookingId: string,
+  nowMs: number,
+): BookingCancellationPlan {
+  const booking = store.getBooking(bookingId);
+  if (booking.status === "cancelled") {
+    throw new ServiceError("CONFLICT", "This booking is already cancelled", false);
+  }
+  store.updateBookingStatus(bookingId, "cancelled");
+  const blockedUnsentKeys: string[] = [];
+  for (const action of store.listProposedActionsForBooking(bookingId)) {
+    for (const key of [holdOperationKey(action.id, action.proposalVersion), emailOperationKey(action.id, action.proposalVersion)]) {
+      const execution = store.getExecutionByIdempotencyKey(key);
+      if (execution && execution.status !== "succeeded") blockedUnsentKeys.push(key);
+    }
+  }
+  const releasePlan: HoldReplacementAdvisory[] = listSucceededHolds(store, bookingId)
+    .filter((prior) => {
+      const expiryMs = Date.parse(prior.window.expiresAt);
+      return Number.isFinite(expiryMs) && expiryMs > nowMs;
+    })
+    .map((prior) => ({
+      supersededOperationKey: prior.operationKey,
+      ...(prior.holdId === undefined ? {} : { supersededHoldId: prior.holdId }),
+      calendarId: prior.window.calendarId,
+      startAt: prior.window.startAt,
+      endAt: prior.window.endAt,
+      note: `Hold ${prior.operationKey} survives cancellation as a receipt; release it under a separate approved hold-release action.`,
+    }));
+  return {
+    booking: store.getBooking(bookingId),
+    blockedUnsentKeys,
+    releasePlan,
+    note: "Cancellation blocks unsent work and offers approved hold-release actions; email already sent cannot be undone.",
+  };
+}
+
 /**
  * Trusted connector proof preserved on every completed step execution
  * result. The proof carries the connector's own mode/simulated declaration
@@ -762,7 +996,17 @@ function requireActiveBooking(store: GatherStore, bookingId: string): void {
 /** Execution progress cannot undo cancellation or proof-gated confirmation. */
 function updateExecutionStatus(store: GatherStore, bookingId: string, status: Booking["status"]): void {
   const current = store.getBooking(bookingId).status;
-  if (current === "cancelled" || (current === "confirmed" && status === "provisional_hold")) return;
+  // Terminal states are never demoted or overwritten by replay: a confirmed
+  // or cancelled booking keeps its state no matter what a stale execution
+  // reports afterwards (ADR-010 A03).
+  if (current === "cancelled" || current === "confirmed") return;
+  // A verified hold is never talked down to a pre-offer state by replay.
+  if (
+    current === "provisional_hold" &&
+    (status === "inquiry" || status === "proposed" || status === "pending_approval")
+  ) {
+    return;
+  }
   store.updateBookingStatus(bookingId, status);
 }
 
@@ -1185,16 +1429,34 @@ export async function approveAndExecute(deps: BookingServiceDeps, input: Approve
   checkProposalAuthority(store, { bookingId: action.bookingId, payload: action.payload, nowMs: clockMs(deps), excludeActionId: action.id });
   const approvedBy = ownerIdentity(deps);
   const approval = store.approveProposedAction(action.id, approvedBy);
+  const nowMs = clockMs(deps);
+
+  // ADR-010 hold lifecycle: a price-only revision reuses the verified same
+  // hold and creates only the newly approved email action — no second hold.
+  // Date/resource changes go through the replacement gate instead.
+  const reused = findReusableHold(store, booking.id, params, nowMs, action.id);
+  let replacement: HoldReplacementAdvisory | undefined;
+  if (!reused) {
+    replacement = requireHoldReplacementAuthority(store, {
+      bookingId: booking.id,
+      payload: action.payload,
+      window: { calendarId: params.calendarId, startAt: params.startAt, endAt: params.endAt, expiresAt: params.expiresAt },
+      nowMs,
+      approver: approvedBy,
+      excludeActionId: action.id,
+    });
+  }
 
   // A repeated approval whose own hold already succeeded reuses receipts: no
-  // new write can occur, so a fresh availability read must not fail it.
+  // new write can occur, so a fresh availability read must not fail it. A
+  // reused cross-version hold likewise performs no write.
   const ownHold = store.getExecutionByIdempotencyKey(holdOperationKey(action.id, action.proposalVersion));
-  if (ownHold?.status !== "succeeded") {
+  if (ownHold?.status !== "succeeded" && !reused) {
     await requireFreshAvailability(deps, booking.id, params, holdOperationKey(action.id, action.proposalVersion));
     assertLiveApprovalAfterWait(store, action.id, action.proposalVersion);
   }
 
-  const holdExecution = await runHoldStep(deps, action.id, action.proposalVersion, params);
+  const holdExecution = reused?.execution ?? await runHoldStep(deps, action.id, action.proposalVersion, params);
   if (holdExecution.status === "failed") {
     updateExecutionStatus(store, booking.id, "failed");
     if (isDurableWindowConflict(holdExecution.error)) {
@@ -1226,6 +1488,10 @@ export async function approveAndExecute(deps: BookingServiceDeps, input: Approve
     updateExecutionStatus(store, booking.id, "uncertain");
   }
   const current = store.getBooking(booking.id);
+  const lifecycleNote = [
+    reused ? `Price-only revision: reused verified hold ${reused.operationKey} (no second hold created); only the newly approved email action was created.` : "",
+    replacement ? `Date/resource replacement under explicit release authority. ${replacement.note}` : "",
+  ].filter((part) => part.length > 0).join(" ");
   return {
     ...evidenceMarkerFor(booking, [holdExecution, emailExecution]),
     approval,
@@ -1236,8 +1502,8 @@ export async function approveAndExecute(deps: BookingServiceDeps, input: Approve
     availabilityFresh: true as const,
     confirmedBooking: false as const,
     note: emailExecution.status === "uncertain"
-      ? "Email outcome is uncertain; reconcile before retrying. A hold is never a confirmed booking."
-      : completionNote(holdExecution, emailExecution),
+      ? `Email outcome is uncertain; reconcile before retrying. A hold is never a confirmed booking.${lifecycleNote ? ` ${lifecycleNote}` : ""}`
+      : `${completionNote(holdExecution, emailExecution)}${lifecycleNote ? ` ${lifecycleNote}` : ""}`,
   };
 }
 
@@ -1288,12 +1554,19 @@ export async function retryFailedSteps(deps: BookingServiceDeps, proposedActionI
     throw new ServiceError("INVALID_REQUEST", "Hold step is not in a retryable state", false);
   }
   // Fresh availability before any new hold write (skipped only when the hold
-  // already succeeded and no write can occur).
-  if (holdExisting?.status !== "succeeded") {
+  // already succeeded and no write can occur). A verified cross-version hold
+  // on the same window is reused instead of written (restart partial success:
+  // the pre-crash hold is preserved by receipt, never re-dispatched).
+  const crossVersionReuse = holdExisting?.status === "succeeded"
+    ? undefined
+    : findReusableHold(store, action.bookingId, params, clockMs(deps), action.id);
+  if (holdExisting?.status !== "succeeded" && !crossVersionReuse) {
     await requireFreshAvailability(deps, action.bookingId, params, holdKey);
   }
   // Re-run hold only when it has not already succeeded.
-  const hold = holdExisting?.status === "succeeded" ? holdExisting : await runHoldStep(deps, action.id, action.proposalVersion, params);
+  const hold = holdExisting?.status === "succeeded"
+    ? holdExisting
+    : (crossVersionReuse?.execution ?? await runHoldStep(deps, action.id, action.proposalVersion, params));
   if (hold.status === "uncertain") {
     updateExecutionStatus(store, action.bookingId, "uncertain");
     throw new ServiceError("RECONCILE_REQUIRED", hold.error ?? "Hold retry is uncertain; reconcile before retrying", false);
@@ -1317,7 +1590,9 @@ export async function retryFailedSteps(deps: BookingServiceDeps, proposedActionI
     hold: toReceipt(hold),
     email: toReceipt(email),
     resentSucceededStep: false as const,
-    note: "Retry reused succeeded receipts; no successful provider step was resent.",
+    note: crossVersionReuse
+      ? `Retry reused verified hold ${crossVersionReuse.operationKey} for the same window; no successful provider step was resent.`
+      : "Retry reused succeeded receipts; no successful provider step was resent.",
   };
 }
 

@@ -230,3 +230,222 @@ test("002-A04: golden-path scaffold — durable approve intent over simulated pr
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+export const GOLDEN_010_A05_LABEL =
+  "GOLDEN 010-A05 (ADR-010): three fresh inquiries with zero initial proposals — qualification, deterministic pricing, identity, exact approval, hold/email, version invalidation, restart partial success. SCRIPTED over simulated providers; DEMO ONLY; no live provider is exercised.";
+
+const A05_NOW = "2030-01-01T00:00:00.000Z";
+const A05_OWNER = "golden-010-owner";
+const A05_CAL = "demo-calendar-001";
+const A05_SRC = (locator: string) => [{ kind: "document" as const, locator, label: locator, fictional: true as const }];
+const A05_FIX = (locator: string) => [{ kind: "fixture" as const, locator, fictional: true as const }];
+
+function a05CoverSlot() {
+  return {
+    slotId: "slot-cover",
+    calendarId: A05_CAL,
+    startAt: "2030-06-12T00:00:00.000Z",
+    endAt: "2030-06-14T00:00:00.000Z",
+    available: true as const,
+    sourceReferences: [{ kind: "fixture" as const, locator: "demo://golden-010/slot", fictional: true as const }],
+  };
+}
+
+test("010-A05: full prepared inquiry-to-offer-to-approved-hold/email golden path (scripted)", async (t) => {
+  t.diagnostic(GOLDEN_010_A05_LABEL);
+  const dir = mkdtempSync(join(tmpdir(), "gather-golden-010-"));
+  const report: Array<{ stage: string; state: string; evidence: string }> = [];
+  const path = join(dir, "gather.sqlite");
+  try {
+    const { prepareFreshInquiry } = await import("../src/server/business-operator/index.ts");
+    const { approveAndExecute, reconcileExecution, retryFailedSteps } = await import("../src/server/booking-service.ts");
+    const { KnowledgeService } = await import("../src/knowledge/index.ts");
+
+    const openServices = (opts: { crashEmailOnce?: { crashed: boolean } } = {}) => {
+      const store = new GatherStore(path);
+      const demo = createDemoConnectors({ calendarSlots: [a05CoverSlot()], nowMs: () => Date.parse(A05_NOW) });
+      const calendar = new DurableDemoCalendar(store, demo.calendar, () => Date.parse(A05_NOW));
+      const innerEmail = new DurableDemoEmail(store, demo.email);
+      let holdCalls = 0;
+      const countingCalendar = {
+        checkAvailability: (req: never) => calendar.checkAvailability(req as never) as never,
+        createProvisionalHold: (async (req: CreateProvisionalHoldRequest) => {
+          holdCalls += 1;
+          return calendar.createProvisionalHold(req);
+        }) as never,
+        reconcileProvisionalHold: ((req: OperationRequest) => innerEmail && calendar.reconcileProvisionalHold(req)) as never,
+      };
+      const email = {
+        sendEmail: (async (req: SendEmailRequest) => {
+          if (opts.crashEmailOnce && !opts.crashEmailOnce.crashed) {
+            opts.crashEmailOnce.crashed = true;
+            await innerEmail.sendEmail(req); // provider accepted; the response is lost
+            throw new Error("simulated process crash mid-dispatch");
+          }
+          return innerEmail.sendEmail(req);
+        }) as never,
+        reconcileSentEmail: ((req: OperationRequest) => innerEmail.reconcileSentEmail(req)) as never,
+      };
+      const bookingDeps = { store, calendar: countingCalendar, email, ownerId: A05_OWNER, now: () => A05_NOW } as never;
+      const operatorDeps = {
+        store, booking: bookingDeps, ownerId: A05_OWNER,
+        availability: calendar as never,
+      } as never;
+      return { store, demo, bookingDeps, operatorDeps, holdCalls: () => holdCalls };
+    };
+
+    // -- Stage 0: reference business, zero bookings, zero proposals --------
+    const w0 = openServices();
+    const business = w0.store.createBusiness({ name: "Fictional Glasshouse", timezone: "America/New_York" });
+    w0.store.upsertConnectedAccount({ id: "acct-1", businessId: business.id, provider: "other", displayName: "Test", status: "connected" });
+    const svc = new KnowledgeService(w0.store);
+    for (const fact of [
+      { key: "space", subjectId: "hall", value: { spaceId: "hall", name: "Hall", capacityMin: 1, capacityMax: 100 } },
+      { key: "price_line", subjectId: "package", value: { lineId: "package", label: "Event package", pricingBasis: "per_guest", unitCents: 5000 } },
+      { key: "pricing_bounds", value: { currency: "USD", floorCents: 100000, costsComplete: false } },
+      { key: "service", subjectId: "dinner", value: { serviceId: "dinner", label: "Dinner", available: true } },
+    ]) {
+      const candidate = svc.intakeCandidate({
+        businessId: business.id, ...fact, confidence: "probable", sourceReferences: A05_SRC("demo://golden-010/kb/" + fact.key),
+      });
+      svc.confirmCandidate({ businessId: business.id, actor: { kind: "owner", id: A05_OWNER }, candidateId: candidate.id });
+    }
+    assert.equal(w0.store.listBookings(business.id).length, 0, "product scenario starts with zero bookings and zero prebuilt offers");
+    report.push({ stage: "seed", state: "empty", evidence: "reference business + confirmed fixture facts; no bookings, no proposals" });
+
+    const inquiryInput = (inquiryId: string, externalId: string, overrides: Record<string, unknown> = {}) => ({
+      businessId: business.id,
+      identity: {
+        components: {
+          provider: "email", accountId: "acct-1", businessId: business.id,
+          sourceKind: "email", externalId, threadId: `thread-${externalId}`,
+        },
+      },
+      inquiry: {
+        inquiryId, businessId: business.id, eventType: "dinner",
+        startAt: "2030-06-12T17:00:00.000Z", endAt: "2030-06-12T23:00:00.000Z",
+        guestCount: 40, serviceRequirements: ["dinner"],
+        sourceReferences: A05_SRC(`demo://golden-010/${inquiryId}`),
+        ...overrides,
+      },
+      calendarId: A05_CAL,
+      expiresAt: "2030-06-13T23:00:00.000Z",
+      email: { to: ["guest@example.test"], subject: "DEMO ONLY fictional offer", body: "DEMO ONLY fictional hold." },
+    });
+
+    // -- Inquiry 1 (complete): qualify -> price -> exact approve -> hold+email
+    const fresh1 = await prepareFreshInquiry(w0.operatorDeps, inquiryInput("inq-g1", "msg-g1"));
+    assert.equal(fresh1.outcome, "prepared");
+    if (fresh1.outcome !== "prepared") throw new Error("inquiry 1 did not prepare");
+    assert.equal(fresh1.prepare.offer.primaryOffer?.totalCents, 200000, "40 guests @ $50 = $2,000, grounded in confirmed facts");
+    assert.ok(fresh1.prepare.proposal, "feasible offer persists to an exact proposal");
+    assert.equal(fresh1.lifecycle?.stage, "proposed", "owner-facing lifecycle tracks the fresh booking");
+    const action1 = fresh1.prepare.proposal.action;
+    // Wrong fingerprint is refused: approval binds the exact version.
+    await assert.rejects(
+      () => approveAndExecute(w0.bookingDeps, {
+        bookingId: fresh1.bookingId, proposedActionId: action1.id,
+        proposalVersion: action1.proposalVersion, proposalFingerprint: "deadbeef",
+      }),
+      /Stale proposal/,
+      "exact-version approval refuses a forged fingerprint",
+    );
+    const done1 = await approveAndExecute(w0.bookingDeps, {
+      bookingId: fresh1.bookingId, proposedActionId: action1.id,
+      proposalVersion: action1.proposalVersion, proposalFingerprint: action1.proposalFingerprint,
+    });
+    assert.equal(done1.hold.execution.status, "succeeded");
+    assert.equal(done1.email?.execution.status, "succeeded");
+    assert.ok(isSimulatedStepProof(done1.hold.execution.result), "hold receipt carries simulated proof (DEMO ONLY)");
+    report.push({ stage: "inquiry-1", state: "provisional_hold", evidence: "fresh inquiry -> $2,000 offer -> exact approval -> hold+email, all simulated" });
+
+    // -- Inquiry 1 price-only v2: reuse + version invalidation --------------
+    const fresh1v2 = await prepareFreshInquiry(w0.operatorDeps, {
+      ...inquiryInput("inq-g1", "msg-g1"),
+      email: { to: ["guest@example.test"], subject: "DEMO ONLY fictional offer v2", body: "DEMO ONLY fictional hold v2." },
+    });
+    assert.equal(fresh1v2.outcome, "prepared");
+    if (fresh1v2.outcome !== "prepared") throw new Error("inquiry 1 v2 did not prepare");
+    const action1v2 = fresh1v2.prepare.proposal!.action;
+    const holdsBefore = w0.holdCalls();
+    const done1v2 = await approveAndExecute(w0.bookingDeps, {
+      bookingId: fresh1v2.bookingId, proposedActionId: action1v2.id,
+      proposalVersion: action1v2.proposalVersion, proposalFingerprint: action1v2.proposalFingerprint,
+    });
+    assert.equal(w0.holdCalls(), holdsBefore, "price-only v2 creates no second hold");
+    assert.equal(done1v2.email?.execution.status, "succeeded", "only the new email action is created");
+    await assert.rejects(
+      () => approveAndExecute(w0.bookingDeps, {
+        bookingId: fresh1.bookingId, proposedActionId: action1.id,
+        proposalVersion: action1.proposalVersion, proposalFingerprint: action1.proposalFingerprint,
+      }),
+      /Stale proposal|no longer current/,
+      "the superseded v1 approval is invalidated by the v2 publish",
+    );
+    report.push({ stage: "inquiry-1-v2", state: "reused", evidence: "price-only revision reuses the hold; v1 approval invalidated" });
+
+    // -- Inquiry 2: crash mid-email -> restart -> resume only the unsent step
+    const crash = { crashed: false };
+    w0.store.close();
+    const w1 = openServices({ crashEmailOnce: crash });
+    const fresh2 = await prepareFreshInquiry(w1.operatorDeps, inquiryInput("inq-g2", "msg-g2", {
+      startAt: "2030-06-13T17:00:00.000Z", endAt: "2030-06-13T23:00:00.000Z",
+    }));
+    assert.equal(fresh2.outcome, "prepared");
+    if (fresh2.outcome !== "prepared") throw new Error("inquiry 2 did not prepare");
+    const action2 = fresh2.prepare.proposal!.action;
+    const partial = await approveAndExecute(w1.bookingDeps, {
+      bookingId: fresh2.bookingId, proposedActionId: action2.id,
+      proposalVersion: action2.proposalVersion, proposalFingerprint: action2.proposalFingerprint,
+    });
+    assert.equal(partial.hold.execution.status, "succeeded", "hold landed before the crash");
+    assert.equal(partial.email?.execution.status, "uncertain", "lost send stays uncertain, never assumed");
+    const holdsAtCrash = w1.holdCalls();
+    w1.store.close();
+    // Restart under a fresh world: the lost send reconciles against the
+    // durable provider receipt (timeout-after-success heals); the hold is
+    // preserved by receipt and never re-dispatched.
+    const w2 = openServices();
+    const crashedEmail = w2.store.getExecutionByIdempotencyKey(emailOperationKey(action2.id, action2.proposalVersion));
+    assert.equal(crashedEmail?.status, "uncertain", "restart finds the lost send honestly uncertain");
+    const healed = await reconcileExecution(w2.bookingDeps, crashedEmail!.id);
+    assert.equal(healed.execution.status, "succeeded", "durable provider evidence heals the send on reconcile");
+    const resumed = await retryFailedSteps(w2.bookingDeps, action2.id);
+    assert.equal(w2.holdCalls(), 0, "the pre-crash hold is preserved by receipt, never re-dispatched");
+    assert.equal(resumed.email?.execution.status, "succeeded", "only the unsent email step re-runs");
+    assert.equal(w2.store.getBooking(fresh2.bookingId).status, "provisional_hold");
+    void holdsAtCrash;
+    report.push({ stage: "inquiry-2-restart", state: "provisional_hold", evidence: "crashed send reconciles to uncertainty; restart resumes only the email" });
+
+    // -- Inquiry 3 (conflicting date): grounded block, no proposal ---------
+    const w3store = w2.store;
+    void w3store;
+    const fresh3 = await prepareFreshInquiry(w2.operatorDeps, inquiryInput("inq-g3", "msg-g3", {
+      startAt: "2030-06-20T17:00:00.000Z", endAt: "2030-06-20T23:00:00.000Z",
+    }));
+    assert.equal(fresh3.outcome, "prepared");
+    if (fresh3.outcome !== "prepared") throw new Error("inquiry 3 did not prepare");
+    assert.equal(fresh3.prepare.proposal, null, "a conflicting date persists no executable proposal");
+    assert.ok(fresh3.prepare.missingForProposal.length > 0, "the block is itemized, never silent");
+    const availabilityGap = [
+      ...fresh3.prepare.offer.conflicts.map((conflict) => conflict.code),
+      ...fresh3.prepare.offer.missingInformation.map((item) => item.code),
+      ...fresh3.prepare.missingForProposal.map((item) => item.code),
+    ];
+    assert.ok(
+      availabilityGap.some((code) => /availability|conflict/.test(code)),
+      `the uncovered window is explicit evidence (${availabilityGap.join(",")})`,
+    );
+    report.push({ stage: "inquiry-3", state: "blocked", evidence: "uncovered date grounded to an explicit availability gap; nothing approvable" });
+
+    w2.store.close();
+    for (const entry of report) t.diagnostic(`golden-010[${entry.stage}] -> ${entry.state} :: ${entry.evidence}`);
+    assert.match(GOLDEN_010_A05_LABEL, /010-A05/);
+  } finally {
+    try {
+      const reopen = new GatherStore(path);
+      reopen.close();
+    } catch { /* already closed */ }
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

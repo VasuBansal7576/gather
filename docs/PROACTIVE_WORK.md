@@ -241,3 +241,33 @@ reconcile → cancel over simulated providers with prebuilt regression
 proposals. It does not claim the full product journey: ADR-010 adds fresh
 inquiry-to-offer generation in front of this lane and ADR-016 closes
 release coverage.
+
+The same file now also carries the scripted 010-A05 golden test (ADR-010):
+three fresh inquiries with zero initial proposals — full
+inquiry-to-offer-to-approved-hold/email, price-only reuse with version
+invalidation, crash restart with reconcile-then-resume, and a grounded
+blocked inquiry — over simulated providers, clearly labelled scripted.
+
+## ADR-010 follow-up ordering, drafts, takeover (C07)
+
+- Fresh replies drain before due follow-ups: ingest-time suppression,
+  claim-time recheck, and dispatch-time reply-since-claim checks compose, so
+  an answered follow-up is never handed out — including across restarts
+  (durable `coord_events`/`coord_waiting` rows, never memory).
+- One default draft: the first inquiry opens a follow-up draft due 24h later
+  (explicit per-event `followupDueAt` hints still override). Further auto
+  drafts for the same booking are annotated `repeatDraft: true` — acting on
+  them needs a new owner decision. Drafts are recommendations
+  (`draft_followup_for_approval`, approval required); nothing is ever sent
+  automatically.
+- Opt-out is durable: a reply carrying `optOut: true` suppresses open
+  follow-ups at ingest and at claim time (`isOptedOut`), and dispatch keeps
+  suppressing later follow-ups for that booking.
+- Stale sync blocks follow-up completion: `intakeSyncHealth` (durable intake
+  batches/failures) gates the done-resolution in
+  `src/server/operator-runtime/due-work.ts` — a follow-up is never resolved
+  done on stale evidence; it stays open for the owner.
+- Pause/takeover/resume reconciles first: `resumeAndReconcile` reopens
+  paused work through attested owner control, reconciles uncertain/partial
+  steps on the current proposal read-only, and re-reads approvals without
+  refreshing them — a stale approval stays stale and needs re-approval.
