@@ -53,6 +53,8 @@ Gmail v1 (verified against developers.google.com/gmail/api):
 - Inquiry reads + send reconciliation: `gmail.readonly`.
 - Sends: `gmail.send`.
 - Never requested: `mail.google.com`, `gmail.modify`, `gmail.compose`.
+- Selected documents: `drive.file` is requested for browser Picker-selected IDs; Gather never requests `drive.readonly` for this flow and never performs an account-wide Drive list.
+- Calendar availability and event operations are mapped independently to `calendar.freebusy` and `calendar.events`; the broad `calendar` scope is not a default requirement.
 
 ## Deterministic ids and reconciliation
 
@@ -116,6 +118,8 @@ into success). Missing/failed token supply → `access_revoked` (live gate
 BLOCKED); no HTTP call is attempted.
 
 ## Boundary validation and secrets
+
+Picker results are treated as an owner-selected allowlist. IDs are validated and deduplicated before they enter the source pipeline; every subsequent read uses an explicit ID. A successful OAuth callback only creates a scoped account binding and does not claim that document sync completed.
 
 All provider JSON crosses `unknown` guards (no `any`); recipients must be
 plain ASCII addresses; Subject/addresses reject CR/LF (header-injection
