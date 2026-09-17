@@ -66,3 +66,25 @@ unchanged. Process isolation, lifecycle, tool policy, MCP handling, and
 the child-env allowlist are untouched; every config rewrite path
 (provision, MCP re-write, rollback) carries the model through one
 `configOptions()` source.
+
+## Isolated login/key flow (ADR-009 step 2)
+
+`src/runtime/auth.ts` implements the supported local-user login/key
+flow. Secrets are file-backed refs under the Gather-owned layout's
+`secretsDir` (files 0600, dir 0700) via `writeSecretRef` /
+`readSecretRef` / `hasSecretRef` / `deleteSecretRef`. Names are
+restricted to `[a-z0-9_-]` (no traversal, no absolute paths), and
+`assertIsolatedPath` refuses anything escaping the layout root or
+reaching personal `~/.openclaw` — which is never read or written.
+
+Login choices (`loginChoices` / `requireLoginRoute`) are shown only
+when the route is supported by the pinned runtime AND provider-verified.
+Today only `oauth` (subscription-only) is on the supported surface;
+`api_key` is permanently `LOGIN_UNSUPPORTED_ROUTE` — never offered,
+never substituted. A missing capability returns a recorded blocker
+(`LOGIN_BLOCKED` with the exact missing evidence, e.g. "no hello-ok
+handshake observed"), not an alternate vendor or silent downgrade.
+
+Secrets never enter tracked files or diagnostics: `redactForDiagnostics`
+scrubs known values from log payloads and `containsSecret` gates backup
+writes (`RuntimeControl.backup` fails closed on any detected leak).

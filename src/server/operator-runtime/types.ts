@@ -2,6 +2,7 @@ import type { GmailInboxPoller } from "../../connectors/google/incremental.ts";
 import type { BookingServiceDeps } from "../booking-service.ts";
 import type { CoordinationLedger } from "../../coordination/ledger.ts";
 import type { GatherStore } from "../sqlite-store.ts";
+import type { BoundSourcePort } from "../sources/types.ts";
 
 /**
  * Operator-runtime boundary types.
@@ -42,6 +43,12 @@ export interface OperatorRuntimeDeps {
   businessId: string;
   now?: () => string;
   connections?: ConnectionDirectoryPort;
+  /**
+   * ADR-007 progressive source pipeline, pre-bound to this account's
+   * server-derived scope (like the inbox poller). Absent → source
+   * scan/coverage routes report not-configured rather than fabricating one.
+   */
+  sources?: BoundSourcePort;
 }
 
 export type IntakeItemStatus =

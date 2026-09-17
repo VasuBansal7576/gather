@@ -184,3 +184,48 @@ The following describes module coverage, not a current run receipt. Test counts 
   `costsComplete`, denied non-owner actors (audited), cross-business
   rejection (audited), restart durability, and mid-confirmation transactional
   rollback.
+
+## ADR-008 native adapter and selection gate (specified; live BLOCKED)
+
+`src/knowledge/port.ts` publishes the thin C04 `KnowledgePort`
+(`ingestSource`, `proposeCandidates`, `confirmCandidate`, `correctFact`,
+`addScopedException`, `invalidateSource`, `query`, `snapshotForOffer`,
+`health`) — a Gather interface, not a claim about upstream RPC names.
+Exactly one authority is active per mode; consumers (ADR-005/010) program
+against the port.
+
+- `src/runtime/knowledge.ts` (only translation point) maps the required
+  native surfaces — `memory_search`/`memory_get`, `wiki_search`/`wiki_get`/
+  `wiki_apply`, gateway `wiki.overview`/`wiki.get`, CLI ingest/compile,
+  source-deletion recompile, agent-scoped vaults — against the exact
+  ADR-009 pinned manifest method table. Each surface is traceable to the
+  public embedding / memory-wiki docs; no RPC is invented and no private
+  runtime database is inspected (the embedding contract forbids it).
+- `src/knowledge/prepared.ts` is the labelled scripted implementation over
+  this module's `KnowledgeService`, plus a source-version registry on the
+  same handle (restart-durable). Deletion/revocation purges derived
+  candidates/revisions into stale/review so snapshots withhold them;
+  `query` blocks per applicable fact group with explicit reasons.
+- `src/knowledge/native.ts` is the native candidate. Current verdict:
+  **BLOCKED** — 0/11 surfaces live-verified on the pinned manifest and no
+  live method-table probe has run. Every operation throws
+  `blocked_native_unavailable` with the exact missing evidence; `health()`
+  reports unavailable (never empty). Live stays disabled.
+- `src/knowledge/migration.ts` exports confirmed facts through the public
+  service, compares migration output, and activates the live port only
+  after verified capability + full C04 gate + clean comparison —
+  otherwise it refuses and prepared remains sole authority. Rollback
+  preserves the prepared store read-only; there is no dual-writer policy
+  store.
+- `src/runtime/config.ts` carries the knowledge capability allowlist
+  (`prepared-scripted`, `native-live`) with an explicit selection gate:
+  `native-live` without verified capability, or any second-vendor name,
+  throws instead of silently falling back.
+
+Gate evidence: `tests/native-knowledge-gate.test.ts` (C04 cases on
+fictional isolated data: changed price, customer exception, deleted
+source, conflicts, injected instruction, restart recall, cross-mode
+denial) and `tests/native-knowledge-capability.test.ts` (capability
+mapping, blocked evidence, selection gate, migration). Live cutover
+remains BLOCKED pending an explicit harness (`GATHER_TEST_OPENCLAW_BIN`),
+an enabled memory-wiki plugin, and an observed method table.
