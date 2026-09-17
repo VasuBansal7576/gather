@@ -211,3 +211,33 @@ about external duplication.
    effect, since in-flight ledger rows never block a send by themselves.
 5. Owner-experience surfacing of pending/due/paused/suppressed work, and
    monitoring-failure visibility. No UI was changed here.
+
+## Durable intent lane (ADR-002)
+
+Submitted owner commands are durable intents (`intents` table) progressed by
+ONE owner: the `IntentService` in `src/intents/`. It composes the existing
+pieces rather than adding new ones — claims live on the same SQLite store as
+`action_executions`, owner pause/resume/cancel stays with
+`CoordinationLedger.applyOwnerControl`, and provider truth comes from the
+existing `reserveStepExecution` / `reconcileExecution` machinery. Receipt
+authority is not duplicated.
+
+Scheduling: there is NO intent scheduler. Periodic progression rides inside
+each proactive binding's existing guarded sweep (automation.ts calls
+`drainIntents` after intake + due-work), and process start runs
+`recoverInterrupted()` once — `running` rows from a dead process are
+evidence-checked, then parked `retryable`/`uncertain`/`completed`. Owner
+pause/cancel is consulted at every step boundary and after every provider
+await, so an intent can never dispatch a further effect after control lands;
+already-landed effects keep their receipts.
+
+Cancellation fences the live claim (`fencing_token` + `run_id` + lease): a
+stale claim's guarded writes fail, and replayed `command_key`s return the
+same intent row canonically.
+
+Golden path: `npm run test:golden` runs `tests/golden-path.test.ts`, an
+explicitly labelled SCAFFOLD exercising enqueue → drive → restart recovery →
+reconcile → cancel over simulated providers with prebuilt regression
+proposals. It does not claim the full product journey: ADR-010 adds fresh
+inquiry-to-offer generation in front of this lane and ADR-016 closes
+release coverage.

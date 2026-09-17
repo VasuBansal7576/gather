@@ -12,6 +12,10 @@ function usage() {
 Run the Gather app through the existing npm dev script after local checks pass.
 This command never installs packages, downloads anything, or starts a separate runtime.
 
+This is the developer entry for a source checkout. Packaged installs use
+scripts/gather-cli.mjs (the "gather" bin), which stages and serves the app
+under <invocation-directory>/.runtime with a process lock and mode isolation.
+
 Options:
   --help      Show this help.
   --dry-run   Run all checks and print the command that would be launched.

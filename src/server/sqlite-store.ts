@@ -203,6 +203,34 @@ export class GatherStore {
         expires_at TEXT NOT NULL,
         created_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS intents (
+        id TEXT PRIMARY KEY,
+        command_key TEXT NOT NULL UNIQUE,
+        kind TEXT NOT NULL CHECK (kind IN ('approve_booking_proposal', 'reconcile_execution', 'owner_control')),
+        payload_json TEXT NOT NULL,
+        payload_hash TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        business_id TEXT,
+        booking_id TEXT,
+        proposed_action_id TEXT,
+        proposal_version INTEGER,
+        state TEXT NOT NULL CHECK (state IN ('queued', 'running', 'completed', 'retryable', 'uncertain', 'blocked', 'cancelled')),
+        steps_json TEXT NOT NULL,
+        lease_owner TEXT,
+        fencing_token INTEGER NOT NULL DEFAULT 0,
+        lease_expires_at TEXT,
+        deadline_at TEXT,
+        run_id TEXT,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        cancelled_by TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        completed_at TEXT,
+        cancelled_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_intents_state ON intents(state);
+      CREATE INDEX IF NOT EXISTS idx_intents_booking ON intents(booking_id);
     `);
     // Migrations for databases created before these columns/tables existed.
     this.ensureColumn("action_executions", "claim_token", "TEXT");
