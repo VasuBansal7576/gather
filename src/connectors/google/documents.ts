@@ -28,6 +28,25 @@ import {
   authorized,
 } from "./transport.ts";
 
+/** Picker output is an allowlist, not a search scope: only these ids may be read. */
+export interface SelectedGoogleDocument {
+  documentId: string;
+  name?: string;
+  mimeType?: string;
+}
+
+export const GOOGLE_SELECTED_DOCUMENT_SCOPE = "https://www.googleapis.com/auth/drive.file" as const;
+
+export function validateSelectedGoogleDocuments(documents: readonly SelectedGoogleDocument[], max = 100): SelectedGoogleDocument[] {
+  if (!Number.isInteger(max) || max < 1 || documents.length > max) throw new Error("Picker selection exceeds the configured document limit");
+  const seen = new Set<string>();
+  return documents.map((document) => {
+    if (!/^[A-Za-z0-9_-]{1,512}$/.test(document.documentId) || seen.has(document.documentId)) throw new Error("Picker returned an invalid or duplicate document id");
+    seen.add(document.documentId);
+    return { documentId: document.documentId, ...(document.name === undefined ? {} : { name: document.name }), ...(document.mimeType === undefined ? {} : { mimeType: document.mimeType }) };
+  });
+}
+
 /**
  * Explicit-ID Google Drive/Docs retrieval (no account scan).
  *
