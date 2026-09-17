@@ -70,6 +70,15 @@ export interface InboxDelta {
   /** True when the cursor expired: full-sync, then adopt the fresh cursor. */
   resetRequired: boolean;
   changes: InboxChange[];
+  /**
+   * Provider-attested message deletions observed in the same history window
+   * (`messagesDeleted` records). These are revocation signals for previously
+   * emitted records — consumers must invalidate derived state, never treat
+   * the absence of a deletion record as proof a record still exists.
+   */
+  deleted: InboxChange[];
+  /** Provider history/list pages read this poll (coverage accounting). */
+  pages: number;
   /** Present unless resetRequired; commit only after durable ingestion ack. */
   nextCursor?: string;
   truncated: boolean;
@@ -116,8 +125,18 @@ export interface InboxCursorScope {
   query?: string;
   /** Continuation token for the uncompleted page, if any. */
   pageToken?: string;
+  /**
+   * Bootstrap snapshot in progress: resume the id listing — never history
+   * — because un-emitted snapshot ids predate the watermark and would
+   * otherwise be skipped. `listToken` is the first un-drained list page
+   * (absent = restart the listing from its first page).
+   */
+  listPhase?: boolean;
+  listToken?: string;
   /** Message ids already emitted from the uncompleted page. */
   seen?: string[];
+  /** Deletion ids already emitted from the uncompleted page. */
+  seenDeleted?: string[];
 }
 
 /**
@@ -197,7 +216,10 @@ export function encodeCursor(historyId: string, scope: InboxCursorScope = {}): s
   if (scope.account !== undefined) payload.account = scope.account;
   if (scope.query !== undefined) payload.q = scope.query;
   if (scope.pageToken !== undefined) payload.pageToken = scope.pageToken;
+  if (scope.listPhase === true) payload.list = true;
+  if (scope.listToken !== undefined) payload.listTok = scope.listToken;
   if (scope.seen !== undefined && scope.seen.length > 0) payload.seen = scope.seen.slice(-MAX_CURSOR_SEEN);
+  if (scope.seenDeleted !== undefined && scope.seenDeleted.length > 0) payload.seenDel = scope.seenDeleted.slice(-MAX_CURSOR_SEEN);
   return `${CURSOR_PREFIX}${Buffer.from(JSON.stringify(payload), "utf-8").toString("base64url")}`;
 }
 
@@ -206,7 +228,10 @@ interface DecodedCursor {
   account?: string;
   query?: string;
   pageToken?: string;
+  listPhase: boolean;
+  listToken?: string;
   seen: string[];
+  seenDeleted: string[];
 }
 
 function decodeCursor(cursor: string): DecodedCursor | undefined {
@@ -216,7 +241,7 @@ function decodeCursor(cursor: string): DecodedCursor | undefined {
     if (!isRecord(parsed) || parsed.v !== CURSOR_VERSION) return undefined;
     const base = asString(parsed.base);
     if (base === undefined || base.length === 0) return undefined;
-    const out: DecodedCursor = { base, seen: [] };
+    const out: DecodedCursor = { base, listPhase: parsed.list === true, seen: [], seenDeleted: [] };
     const account = asString(parsed.account);
     const query = asString(parsed.q);
     const pageToken = asString(parsed.pageToken);
@@ -229,6 +254,11 @@ function decodeCursor(cursor: string): DecodedCursor | undefined {
       if (pageToken.length === 0) return undefined;
       out.pageToken = pageToken;
     }
+    const listToken = asString(parsed.listTok);
+    if (listToken !== undefined) {
+      if (listToken.length === 0) return undefined;
+      out.listToken = listToken;
+    }
     if (parsed.seen !== undefined) {
       if (!Array.isArray(parsed.seen)) return undefined;
       for (const entry of parsed.seen) {
@@ -236,6 +266,15 @@ function decodeCursor(cursor: string): DecodedCursor | undefined {
         out.seen.push(entry);
       }
       out.seen = out.seen.slice(-MAX_CURSOR_SEEN);
+    }
+    if (parsed.seenDel !== undefined) {
+      if (!Array.isArray(parsed.seenDel)) return undefined;
+      const deleted: string[] = [];
+      for (const entry of parsed.seenDel) {
+        if (typeof entry !== "string") return undefined;
+        deleted.push(entry);
+      }
+      out.seenDeleted = deleted.slice(-MAX_CURSOR_SEEN);
     }
     return out;
   } catch {
@@ -263,11 +302,12 @@ interface HistoryPage {
   historyId?: string;
   nextPageToken?: string;
   added: InboxChange[];
+  deleted: InboxChange[];
 }
 
 function parseHistoryPage(body: unknown): HistoryPage | undefined {
   if (!isRecord(body)) return undefined;
-  const page: HistoryPage = { added: [] };
+  const page: HistoryPage = { added: [], deleted: [] };
   const historyId = asString(body.historyId);
   if (historyId !== undefined) page.historyId = historyId;
   const token = asString(body.nextPageToken);
@@ -278,8 +318,12 @@ function parseHistoryPage(body: unknown): HistoryPage | undefined {
     for (const record of history) {
       if (!isRecord(record)) return undefined;
       const recordId = asString(record.id);
-      const buckets = [record.messagesAdded, record.messages];
-      for (const bucket of buckets) {
+      const buckets: Array<{ bucket: unknown; into: InboxChange[] }> = [
+        { bucket: record.messagesAdded, into: page.added },
+        { bucket: record.messagesDeleted, into: page.deleted },
+        { bucket: record.messages, into: page.added },
+      ];
+      for (const { bucket, into } of buckets) {
         if (bucket === undefined) continue;
         if (!Array.isArray(bucket)) return undefined;
         for (const item of bucket) {
@@ -290,10 +334,10 @@ function parseHistoryPage(body: unknown): HistoryPage | undefined {
           if (id === undefined) return undefined;
           const threadId = asString(message.threadId);
           const historyIdValue = asString(message.historyId) ?? recordId;
-          page.added.push(
+          into.push(
             threadId === undefined ? { messageId: id } : { messageId: id, threadId },
           );
-          const last = page.added[page.added.length - 1];
+          const last = into[into.length - 1];
           if (last !== undefined && historyIdValue !== undefined) last.historyId = historyIdValue;
         }
       }
@@ -383,38 +427,63 @@ export class GmailInboxPoller {
     if (decoded.account !== this.accountId() || (decoded.query ?? undefined) !== (options.query ?? undefined)) {
       return { status: "failed", metadata: liveMetadata(operationKey, []), error: invalidRequest("Cursor is bound to a different account or query; reset with a cursor-less full sync") };
     }
+    if (decoded.listPhase) {
+      // Resume an uncompleted bootstrap snapshot at its list page; the
+      // watermark in `base` is preserved so the catch-up delta still closes
+      // the list-then-observe race once the listing drains.
+      return this.fullSync(operationKey, options.query, scope, maxPages, maxMessages, {
+        watermark: decoded.base,
+        ...(decoded.listToken === undefined ? {} : { listToken: decoded.listToken }),
+        seen: decoded.seen,
+        seenDeleted: decoded.seenDeleted,
+      });
+    }
     return this.deltaSync(operationKey, decoded, options.query, scope.labelId, maxPages, maxMessages);
   }
 
   /**
-   * Drain one history page into the shared change set. Returns the page's
+   * Drain one history page into the shared change sets. Returns the page's
    * next token (undefined when the result set is exhausted here). Items
    * already emitted from this page in an earlier poll are skipped; items
    * beyond the message cap set truncated without being marked seen, so a
-   * resume replays them instead of losing them.
+   * resume replays them instead of losing them. Deletions share the cap so
+   * an interrupted page cannot silently drop an invalidation.
    */
   private drainHistoryPage(
     parsed: HistoryPage,
     seen: Set<string>,
+    seenDeleted: Set<string>,
     changes: InboxChange[],
+    deleted: InboxChange[],
     maxMessages: number,
   ): { nextPageToken: string | undefined; truncated: boolean } {
     let truncated = false;
     for (const change of parsed.added) {
       if (seen.has(change.messageId)) continue;
-      if (changes.length >= maxMessages) {
+      if (changes.length + deleted.length >= maxMessages) {
         truncated = true;
         continue;
       }
       seen.add(change.messageId);
       changes.push(change);
     }
-    if (seen.size > MAX_CURSOR_SEEN * 2) {
-      // Bound memory: drop the oldest remembered ids. Replays may repeat
-      // (the consumer de-duplicates by id); nothing is ever skipped blind.
-      const kept = [...seen].slice(-MAX_CURSOR_SEEN);
-      seen.clear();
-      for (const id of kept) seen.add(id);
+    for (const change of parsed.deleted) {
+      if (seenDeleted.has(change.messageId)) continue;
+      if (changes.length + deleted.length >= maxMessages) {
+        truncated = true;
+        continue;
+      }
+      seenDeleted.add(change.messageId);
+      deleted.push(change);
+    }
+    for (const tracked of [seen, seenDeleted]) {
+      if (tracked.size > MAX_CURSOR_SEEN * 2) {
+        // Bound memory: drop the oldest remembered ids. Replays may repeat
+        // (the consumer de-duplicates by id); nothing is ever skipped blind.
+        const kept = [...tracked].slice(-MAX_CURSOR_SEEN);
+        tracked.clear();
+        for (const id of kept) tracked.add(id);
+      }
     }
     return { nextPageToken: parsed.nextPageToken, truncated };
   }
@@ -425,12 +494,14 @@ export class GmailInboxPoller {
     query: string | undefined,
     pageToken: string | undefined,
     seen: Set<string>,
+    seenDeleted: Set<string>,
   ): string {
     return encodeCursor(base, {
       account,
       ...(query === undefined ? {} : { query }),
       ...(pageToken === undefined ? {} : { pageToken }),
       seen: [...seen].slice(-MAX_CURSOR_SEEN),
+      seenDeleted: [...seenDeleted].slice(-MAX_CURSOR_SEEN),
     });
   }
 
@@ -444,16 +515,19 @@ export class GmailInboxPoller {
   ): Promise<ConnectorResult<InboxDelta>> {
     const provenance = this.provenance();
     const seen = new Set<string>(cursor.seen);
+    const seenDeleted = new Set<string>(cursor.seenDeleted);
     const changes: InboxChange[] = [];
+    const deleted: InboxChange[] = [];
     let truncated = false;
     let latestHistoryId: string | undefined;
     let pageToken = cursor.pageToken;
     let resumeToken = cursor.pageToken;
+    let pages = 0;
     try {
       for (let page = 0; page < maxPages; page += 1) {
         const url = withQuery(`${GMAIL_BASE_URL}/users/${encodeURIComponent(this.userId())}/history`, {
           startHistoryId: cursor.base,
-          historyTypes: "messageAdded",
+          historyTypes: "messageAdded,messagesDeleted",
           // The only documented server scoping for history: `labelId`.
           // This endpoint documents no `q`, so none is ever sent here.
           ...(labelId === undefined ? {} : { labelId }),
@@ -461,9 +535,10 @@ export class GmailInboxPoller {
           pageToken,
         });
         const response = await authorized(this.options, { method: "GET", url });
+        pages += 1;
         if (response.status === 404) {
           // Documented expiry signal: the cursor is dead; full-sync instead.
-          return { status: "succeeded", metadata: liveMetadata(operationKey, provenance), data: { resetRequired: true, changes: [], truncated: false, provenance } };
+          return { status: "succeeded", metadata: liveMetadata(operationKey, provenance), data: { resetRequired: true, changes: [], deleted: [], pages, truncated: false, provenance } };
         }
         if (response.status !== 200) {
           const error = mapGoogleHttpError(response.status, safeParseJson(response.text), "pollInbox");
@@ -474,7 +549,7 @@ export class GmailInboxPoller {
           return { status: "failed", metadata: liveMetadata(operationKey, []), error: transportError("Gmail history.list returned an unrecognized JSON shape") };
         }
         if (parsed.historyId !== undefined) latestHistoryId = parsed.historyId;
-        const drained = this.drainHistoryPage(parsed, seen, changes, maxMessages);
+        const drained = this.drainHistoryPage(parsed, seen, seenDeleted, changes, deleted, maxMessages);
         if (drained.truncated) {
           // Resume the exact page that still holds un-emitted messages.
           truncated = true;
@@ -503,9 +578,11 @@ export class GmailInboxPoller {
       data: {
         resetRequired: false,
         changes,
+        deleted,
+        pages,
         nextCursor: advanced
           ? encodeCursor(latestHistoryId, { account: this.accountId(), ...(query === undefined ? {} : { query }) })
-          : this.continuationCursor(cursor.base, this.accountId(), query, resumeToken, seen),
+          : this.continuationCursor(cursor.base, this.accountId(), query, resumeToken, seen, seenDeleted),
         truncated,
         provenance,
       },
@@ -518,37 +595,44 @@ export class GmailInboxPoller {
     scope: PollScope,
     maxPages: number,
     maxMessages: number,
+    resume?: { watermark: string; listToken?: string; seen: string[]; seenDeleted: string[] },
   ): Promise<ConnectorResult<InboxDelta>> {
     const provenance = this.provenance();
-    const seen = new Set<string>();
+    const seen = new Set<string>(resume?.seen ?? []);
+    const seenDeleted = new Set<string>(resume?.seenDeleted ?? []);
     const changes: InboxChange[] = [];
+    const deleted: InboxChange[] = [];
     let truncated = false;
     let latestHistoryId: string | undefined;
     let pagesLeft = maxPages;
+    let pages = 0;
     const account = this.accountId();
     // Phase 0: pre-list watermark. Arrivals during the snapshot below are
     // caught by the catch-up delta instead of being skipped by a
-    // post-list-only cursor.
-    let watermark: string | undefined;
-    try {
-      const profile = await authorized(this.options, {
-        method: "GET",
-        url: `${GMAIL_BASE_URL}/users/${encodeURIComponent(this.userId())}/profile`,
-      });
-      if (profile.status === 200) {
-        const parsed = safeParseJson(profile.text);
-        if (isRecord(parsed)) {
-          const historyId = asString(parsed.historyId);
-          if (historyId !== undefined) watermark = historyId;
+    // post-list-only cursor. On resume the watermark is the original one —
+    // re-reading it now would skip arrivals since the first attempt.
+    let watermark: string | undefined = resume?.watermark;
+    if (watermark === undefined) {
+      try {
+        const profile = await authorized(this.options, {
+          method: "GET",
+          url: `${GMAIL_BASE_URL}/users/${encodeURIComponent(this.userId())}/profile`,
+        });
+        if (profile.status === 200) {
+          const parsed = safeParseJson(profile.text);
+          if (isRecord(parsed)) {
+            const historyId = asString(parsed.historyId);
+            if (historyId !== undefined) watermark = historyId;
+          }
         }
+      } catch {
+        watermark = undefined;
       }
-    } catch {
-      watermark = undefined;
     }
     const finish = (cursor: string | undefined): ConnectorResult<InboxDelta> => ({
       status: "succeeded",
       metadata: liveMetadata(operationKey, provenance),
-      data: { resetRequired: false, changes, nextCursor: cursor, truncated, provenance },
+      data: { resetRequired: false, changes, deleted, pages, nextCursor: cursor, truncated, provenance },
     });
     try {
       // Phase 1: bounded id snapshot. Scoping uses the exact provider
@@ -558,9 +642,16 @@ export class GmailInboxPoller {
       // has no such exclusion, so omitting the flag would lose existing
       // spam/trash messages and split unfiltered snapshot/delta
       // membership). No `q` alias is relied on for scope here.
-      let pageToken: string | undefined;
+      let pageToken: string | undefined = resume?.listToken;
+      // Token naming the first page whose ids have not all been emitted:
+      // a mid-page cut re-reads the page (seen-ids dedupe); a clean page
+      // boundary resumes at the next page. listResumeToken stays current
+      // for the pages-exhausted case too.
+      let listResumeToken: string | undefined;
+      let listExhausted = false;
       while (pagesLeft > 0) {
         pagesLeft -= 1;
+        const tokenForPage = pageToken;
         const url = withQuery(`${GMAIL_BASE_URL}/users/${encodeURIComponent(this.userId())}/messages`, {
           ...(scope.labelId === undefined ? {} : { labelIds: scope.labelId }),
           includeSpamTrash: scope.includeSpamTrash ? "true" : "false",
@@ -568,6 +659,7 @@ export class GmailInboxPoller {
           pageToken,
         });
         const response = await authorized(this.options, { method: "GET", url });
+        pages += 1;
         if (response.status !== 200) {
           const error = mapGoogleHttpError(response.status, safeParseJson(response.text), "pollInbox");
           return { status: "failed", metadata: liveMetadata(operationKey, []), error };
@@ -577,33 +669,71 @@ export class GmailInboxPoller {
           return { status: "failed", metadata: liveMetadata(operationKey, []), error: transportError("Gmail messages.list returned an unrecognized JSON shape") };
         }
         if (parsed.historyId !== undefined) latestHistoryId = parsed.historyId;
+        let pageDrained = true;
         for (const item of parsed.ids) {
           if (seen.has(item.id)) continue;
           if (changes.length >= maxMessages) {
             truncated = true;
+            pageDrained = false;
             continue;
           }
           seen.add(item.id);
           changes.push(item.threadId === undefined ? { messageId: item.id } : { messageId: item.id, threadId: item.threadId });
         }
+        if (!pageDrained) {
+          listResumeToken = tokenForPage;
+          break;
+        }
         pageToken = parsed.nextPageToken;
-        if (pageToken === undefined) break;
+        if (pageToken === undefined) {
+          listExhausted = true;
+          break;
+        }
+        listResumeToken = pageToken;
       }
-      if (pageToken !== undefined) truncated = true;
+      if (!listExhausted) {
+        // The snapshot is unfinished: commit a list-resume cursor, never a
+        // history cursor — un-emitted snapshot ids predate the watermark
+        // and would be skipped by any history-based resume.
+        const base = watermark ?? latestHistoryId;
+        if (base === undefined) {
+          return { status: "failed", metadata: liveMetadata(operationKey, []), error: transportError("Gmail returned no historyId; no cursor can be committed") };
+        }
+        return finish(encodeCursor(base, {
+          account,
+          ...(query === undefined ? {} : { query }),
+          listPhase: true,
+          ...(listResumeToken === undefined ? {} : { listToken: listResumeToken }),
+          seen: [...seen].slice(-MAX_CURSOR_SEEN),
+          seenDeleted: [...seenDeleted].slice(-MAX_CURSOR_SEEN),
+        }));
+      }
       // Phase 2: catch-up delta from the pre-list watermark, merging with
       // the snapshot (already-seen ids dedupe). This closes the
       // list-then-observe race: arrivals during phase 1 are returned here
       // instead of being skipped by a post-list cursor.
       let catchupResume: string | undefined;
       if (watermark !== undefined && pagesLeft > 0) {
-        const caught = await this.catchUp(operationKey, watermark, scope.labelId, pagesLeft, maxMessages, seen, changes);
+        const caught = await this.catchUp(operationKey, watermark, scope.labelId, pagesLeft, maxMessages, seen, seenDeleted, changes, deleted);
+        pages += pagesLeft - caught.pagesLeft;
         if (caught.resetRequired) {
-          return { status: "succeeded", metadata: liveMetadata(operationKey, provenance), data: { resetRequired: true, changes: [], truncated: false, provenance } };
+          return { status: "succeeded", metadata: liveMetadata(operationKey, provenance), data: { resetRequired: true, changes: [], deleted: [], pages, truncated: false, provenance } };
         }
         if (caught.latestHistoryId !== undefined) latestHistoryId = caught.latestHistoryId;
         if (caught.truncated) truncated = true;
         pagesLeft = caught.pagesLeft;
         catchupResume = caught.resumePageToken;
+      } else if (watermark !== undefined) {
+        // The listing consumed the whole page budget: history after the
+        // watermark is not yet drained, so resume it as a delta rather
+        // than committing a cursor that jumps past unobserved mail.
+        truncated = true;
+        return finish(encodeCursor(watermark, {
+          account,
+          ...(query === undefined ? {} : { query }),
+          seen: [...seen].slice(-MAX_CURSOR_SEEN),
+          seenDeleted: [...seenDeleted].slice(-MAX_CURSOR_SEEN),
+        }));
       }
       if (truncated && watermark !== undefined) {
         // Resume from the watermark (replaying already-seen ids, which
@@ -614,6 +744,7 @@ export class GmailInboxPoller {
           ...(query === undefined ? {} : { query }),
           ...(catchupResume === undefined ? {} : { pageToken: catchupResume }),
           seen: [...seen].slice(-MAX_CURSOR_SEEN),
+          seenDeleted: [...seenDeleted].slice(-MAX_CURSOR_SEEN),
         }));
       }
     } catch (error) {
@@ -648,7 +779,9 @@ export class GmailInboxPoller {
     pagesLeft: number,
     maxMessages: number,
     seen: Set<string>,
+    seenDeleted: Set<string>,
     changes: InboxChange[],
+    deleted: InboxChange[],
   ): Promise<{ resetRequired: boolean; latestHistoryId?: string; truncated: boolean; pagesLeft: number; resumePageToken?: string }> {
     void operationKey;
     let truncated = false;
@@ -658,7 +791,7 @@ export class GmailInboxPoller {
       pagesLeft -= 1;
       const url = withQuery(`${GMAIL_BASE_URL}/users/${encodeURIComponent(this.userId())}/history`, {
         startHistoryId: watermark,
-        historyTypes: "messageAdded",
+        historyTypes: "messageAdded,messagesDeleted",
         // Same contract as deltaSync: labelId only, never q.
         ...(labelId === undefined ? {} : { labelId }),
         maxResults: "500",
@@ -675,7 +808,7 @@ export class GmailInboxPoller {
         throw new CatchUpFailedError("Gmail history.list returned an unrecognized JSON shape");
       }
       if (parsed.historyId !== undefined) latestHistoryId = parsed.historyId;
-      const drained = this.drainHistoryPage(parsed, seen, changes, maxMessages);
+      const drained = this.drainHistoryPage(parsed, seen, seenDeleted, changes, deleted, maxMessages);
       if (drained.truncated) {
         truncated = true;
         break;

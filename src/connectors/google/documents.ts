@@ -2,6 +2,7 @@ import type {
   ConnectorResult,
   DocumentRecord,
   DocumentRetriever,
+  OperationRequest,
   RetrieveDocumentRequest,
   RetrieveDocumentResponse,
   SourceReference,
@@ -65,6 +66,9 @@ interface FileMetadata {
   name?: string;
   mimeType?: string;
   canDownload?: boolean;
+  /** Provider revision marker (Drive `version` field) — source versioning. */
+  version?: string;
+  modifiedTime?: string;
 }
 
 function parseMetadata(body: unknown): FileMetadata | undefined {
@@ -76,11 +80,38 @@ function parseMetadata(body: unknown): FileMetadata | undefined {
   const mimeType = asString(body.mimeType);
   if (name !== undefined) meta.name = name;
   if (mimeType !== undefined) meta.mimeType = mimeType;
+  const version = asString(body.version);
+  const modifiedTime = asString(body.modifiedTime);
+  if (version !== undefined) meta.version = version;
+  if (modifiedTime !== undefined) meta.modifiedTime = modifiedTime;
   if (isRecord(body.capabilities)) {
     const canDownload = body.capabilities.canDownload;
     if (typeof canDownload === "boolean") meta.canDownload = canDownload;
   }
   return meta;
+}
+
+/**
+ * Provider metadata for one owner-selected document: the source pipeline's
+ * cheap change-detection read (`version`/`modifiedTime`) before any content
+ * fetch. Same explicit-ID contract as retrieval — never a Drive scan.
+ */
+export interface DocumentMetadata {
+  documentId: string;
+  name?: string;
+  mimeType?: string;
+  canDownload?: boolean;
+  version?: string;
+  modifiedTime?: string;
+}
+
+export interface ReadDocumentMetadataRequest extends OperationRequest {
+  documentId: string;
+}
+
+export interface ReadDocumentMetadataResponse {
+  document: DocumentMetadata;
+  provenance: SourceReference[];
 }
 
 function tokenFailure(operationKey: string): ConnectorResult<never> {
@@ -112,6 +143,74 @@ export class GoogleDocumentRetriever implements DocumentRetriever {
     };
   }
 
+  /**
+   * Shared metadata fetch (single files.get call): fields include the
+   * provider `version`/`modifiedTime` markers the source pipeline uses for
+   * change detection and source-version records.
+   */
+  private async fetchFileMetadata(
+    operationKey: string,
+    fileId: string,
+  ): Promise<{ ok: true; meta: FileMetadata } | { ok: false; result: ConnectorResult<never> }> {
+    try {
+      const metaResponse = await authorized(this.options, {
+        method: "GET",
+        url: withQuery(`${DRIVE_BASE_URL}/drive/v3/files/${encodeURIComponent(fileId)}`, {
+          fields: "id,name,mimeType,capabilities/canDownload,version,modifiedTime",
+          supportsAllDrives: "true",
+        }),
+      });
+      if (metaResponse.status !== 200) {
+        const error = mapGoogleHttpError(metaResponse.status, safeParseJson(metaResponse.text), "retrieveDocument");
+        return { ok: false, result: { status: "failed", metadata: liveMetadata(operationKey, []), error } };
+      }
+      const parsed = parseMetadata(safeParseJson(metaResponse.text));
+      if (parsed === undefined) {
+        return {
+          ok: false,
+          result: { status: "failed", metadata: liveMetadata(operationKey, []), error: transportError("Drive files.get returned an unrecognized metadata shape") },
+        };
+      }
+      return { ok: true, meta: parsed };
+    } catch (error) {
+      if (error instanceof TokenUnavailableError) return { ok: false, result: tokenFailure(operationKey) };
+      if (error instanceof TransportBodyTooLargeError) {
+        return { ok: false, result: { status: "failed", metadata: liveMetadata(operationKey, []), error: transportError(`Drive metadata exceeds the ${error.limitBytes}-byte retrieval bound; request a narrower document instead of a truncated one`) } };
+      }
+      if (error instanceof TransportTimeoutError || error instanceof TransportNetworkError) {
+        return { ok: false, result: { status: "failed", metadata: liveMetadata(operationKey, []), error: transportError("Drive metadata read timed out; no write was attempted so retry is safe") } };
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Metadata-only read for change detection/deletion checks (read path).
+   * A 404 here is the provider's deletion signal for the scan pipeline.
+   */
+  async readDocumentMetadata(request: ReadDocumentMetadataRequest): Promise<ConnectorResult<ReadDocumentMetadataResponse>> {
+    if (request.operationKey.trim().length === 0 || request.documentId.trim().length === 0) {
+      return {
+        status: "failed",
+        metadata: liveMetadata(request.operationKey, []),
+        error: invalidRequest("operationKey and an explicit documentId are required"),
+      };
+    }
+    const fetched = await this.fetchFileMetadata(request.operationKey, request.documentId);
+    if (!fetched.ok) return fetched.result;
+    const meta = fetched.meta;
+    const provenance = [this.driveSource(meta.id)];
+    const document: DocumentMetadata = {
+      documentId: meta.id,
+      ...(meta.name === undefined ? {} : { name: meta.name }),
+      ...(meta.mimeType === undefined ? {} : { mimeType: meta.mimeType }),
+      ...(meta.canDownload === undefined ? {} : { canDownload: meta.canDownload }),
+      ...(meta.version === undefined ? {} : { version: meta.version }),
+      ...(meta.modifiedTime === undefined ? {} : { modifiedTime: meta.modifiedTime }),
+    };
+    return { status: "succeeded", metadata: liveMetadata(request.operationKey, provenance), data: { document, provenance } };
+  }
+
   async retrieveDocument(request: RetrieveDocumentRequest): Promise<ConnectorResult<RetrieveDocumentResponse>> {
     if (request.operationKey.trim().length === 0 || request.documentId.trim().length === 0) {
       return {
@@ -121,38 +220,9 @@ export class GoogleDocumentRetriever implements DocumentRetriever {
       };
     }
     const fileId = request.documentId;
-    let meta: FileMetadata;
-    try {
-      const metaResponse = await authorized(this.options, {
-        method: "GET",
-        url: withQuery(`${DRIVE_BASE_URL}/drive/v3/files/${encodeURIComponent(fileId)}`, {
-          fields: "id,name,mimeType,capabilities/canDownload",
-          supportsAllDrives: "true",
-        }),
-      });
-      if (metaResponse.status !== 200) {
-        const error = mapGoogleHttpError(metaResponse.status, safeParseJson(metaResponse.text), "retrieveDocument");
-        return { status: "failed", metadata: liveMetadata(request.operationKey, []), error };
-      }
-      const parsed = parseMetadata(safeParseJson(metaResponse.text));
-      if (parsed === undefined) {
-        return {
-          status: "failed",
-          metadata: liveMetadata(request.operationKey, []),
-          error: transportError("Drive files.get returned an unrecognized metadata shape"),
-        };
-      }
-      meta = parsed;
-    } catch (error) {
-      if (error instanceof TokenUnavailableError) return tokenFailure(request.operationKey);
-      if (error instanceof TransportBodyTooLargeError) {
-        return { status: "failed", metadata: liveMetadata(request.operationKey, []), error: transportError(`Drive metadata exceeds the ${error.limitBytes}-byte retrieval bound; request a narrower document instead of a truncated one`) };
-      }
-      if (error instanceof TransportTimeoutError || error instanceof TransportNetworkError) {
-        return { status: "failed", metadata: liveMetadata(request.operationKey, []), error: transportError("Drive metadata read timed out; no write was attempted so retry is safe") };
-      }
-      throw error;
-    }
+    const fetched = await this.fetchFileMetadata(request.operationKey, fileId);
+    if (!fetched.ok) return fetched.result;
+    const meta = fetched.meta;
     if (meta.canDownload === false) {
       return {
         status: "failed",
