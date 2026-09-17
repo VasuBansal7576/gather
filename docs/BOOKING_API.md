@@ -235,3 +235,44 @@ curl -s -X POST localhost:3000/api/executions/<executionId>/reconcile
   from the displayed proposal; `409 STALE_PROPOSAL` means refresh the workspace.
 - Blocked states: `SLOT_UNAVAILABLE` (unavailable date), `ACCESS_REVOKED`
   (reconnect), `RECONCILE_REQUIRED` (reconcile action), `UNCERTAIN` (retry later).
+
+## Durable intent API (ADR-002)
+
+Submitted commands become durable intents BEFORE execution: `POST /api/intents`
+validates the command, persists it under a stable command key, then returns
+`202` with the durable status. The response `intent.state` is the persisted
+truth — never a premature success claim.
+
+```sh
+# Submit an approval intent (approve -> provisional hold -> email).
+curl -s -X POST localhost:3000/api/intents \
+  -H 'Content-Type: application/json' \
+  -d '{"command":{"kind":"approve_booking_proposal","bookingId":"demo-booking-clara-01","proposedActionId":"demo-proposal-clara-v1","proposalVersion":1,"proposalFingerprint":"<from workspace>"},"commandKey":"owner-approve-1"}'
+
+# Read durable progress / list scoped intents.
+curl -s localhost:3000/api/intents/<intentId>
+curl -s "localhost:3000/api/intents?bookingId=demo-booking-clara-01"
+
+# Owner cancellation (fences in-flight progression; terminal intents keep their state).
+curl -s -X POST localhost:3000/api/intents/<intentId>/cancel
+
+# Explicit re-drive of a runnable intent; reconcile one operation key read-only.
+curl -s -X POST localhost:3000/api/intents/<intentId>/advance
+curl -s -X POST localhost:3000/api/intents/reconcile \
+  -H 'Content-Type: application/json' -d '{"operationKey":"<execution idempotencyKey>"}'
+```
+
+Rules worth knowing:
+
+- Replaying the same `commandKey` with identical command content returns the
+  same intent (`duplicate:true`); a reused key carrying different content is
+  `409 CONFLICT`. When `commandKey` is omitted the server derives it
+  deterministically from the command.
+- States: `queued`, `running`, `completed`, `retryable`, `uncertain`,
+  `blocked`, `cancelled`. `uncertain` means a provider outcome is unproven —
+  reconcile by operation key; it never licenses a blind retry. `blocked`
+  means owner attention (stale proposal, cancelled booking, owner pause,
+  deadline passed, unavailable slot); `POST .../advance` re-drives it after
+  the cause is fixed.
+- In prepared mode every step's receipt stays simulated and labelled
+  DEMO ONLY — nothing here ever claims a live provider write.
