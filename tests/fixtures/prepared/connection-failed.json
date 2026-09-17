@@ -1,0 +1,14 @@
+{
+  "id": "connection-failed",
+  "label": "Connection failed",
+  "description": "Prepared business whose inbox connection failed during the first scan: nothing was imported.",
+  "coverage": "failed",
+  "coverageDetail": "Connection failed during the initial scan; no messages were imported. There is no last successful sync to report.",
+  "inbox": [],
+  "calendar": [],
+  "accounts": [
+    { "id": "prepared-account-gmail-001", "provider": "gmail", "status": "error" },
+    { "id": "prepared-account-calendar-001", "provider": "google_calendar", "status": "connected" }
+  ],
+  "expected": { "inboxCount": 0, "busyBlockCount": 0, "offerCount": 0 }
+}
