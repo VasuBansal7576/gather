@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { defineGatherTool, type GatherTool } from "../../runtime/mcp.ts";
+import { IntakeDomainStore } from "../../intake/store.ts";
 import { operatorHealth } from "./health.ts";
 import { OperatorIntakeStore } from "./store.ts";
 import type { OperatorRuntimeDeps } from "./types.ts";
@@ -62,7 +63,19 @@ export function operatorMcpTools(deps: OperatorRuntimeDeps): GatherTool[] {
       const intake = new OperatorIntakeStore(deps.store.db);
       const latest = intake.latestBatch(deps.accountId) ?? null;
       const cursor = intake.getCursor(deps.accountId) ?? null;
-      const report = { latest, cursor, simulation: intake.latestSimulation(deps.accountId) };
+      // ADR-003: surface the durable domain-gate decisions for this account
+      // so review/refusal reasons are readable by the owner lane (ADR-006).
+      const domain = new IntakeDomainStore(deps.store.db);
+      const report = {
+        latest,
+        cursor,
+        simulation: intake.latestSimulation(deps.accountId),
+        domain: {
+          counts: domain.counts(deps.accountId),
+          review: domain.list(deps.accountId, "needs_review", 25),
+          declined: domain.list(deps.accountId, "unrelated", 25),
+        },
+      };
       return {
         content: [{ type: "text", text: JSON.stringify(report, null, 2) }],
         structuredContent: { intake: report as unknown as Record<string, unknown> },
