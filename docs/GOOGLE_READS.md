@@ -26,10 +26,17 @@ Gmail (`users.history.list` reference; `messages.list`/`get`, `profile`):
   `is:unread|starred|important`), enforced via `labelId`; any other query
   is rejected as `invalid_request` before any HTTP call, never silently
   broadened and never filtered by a local semantic heuristic. Scope
-  acceptance covers `messageAdded` intake only: the poller requests no
-  other history type, so label removals, deletions, and other mailbox
+  acceptance covers `messageAdded` and `messagesDeleted` only: the poller
+  requests exactly those history types, so label removals and other mailbox
   mutations are not mirrored — never treat a scoped poll as a complete
-  view of label membership or as capturing all mailbox mutations. An invalid
+  view of label membership or as capturing all mailbox mutations.
+  `messagesDeleted` records surface as `InboxDelta.deleted` invalidation
+  signals sharing the same message cap and resume guarantee (an
+  interrupted page replays rather than dropping an invalidation).
+  Deletions that already happened before a bootstrap's watermark cannot
+  appear in history, so the source pipeline additionally reconciles
+  absence from a COMPLETE `messages.list` snapshot as deletion evidence.
+  An invalid
   or expired
   `startHistoryId` (valid ≥ a week, sometimes only hours) returns **HTTP
   404 — the documented expiry signal, verified by test, not an assumed
@@ -44,15 +51,23 @@ Gmail (`users.history.list` reference; `messages.list`/`get`, `profile`):
   (otherwise existing spam/trash messages would be lost and unfiltered
   snapshot/delta membership would disagree).
   `GET …/messages/{id}`, `GET …/profile` (`historyId` bootstrap).
+  `GET …/messages/{id}?format=metadata&metadataHeaders=…` is the cheap
+  per-message metadata read (`readMessageMetadata`): label ids, thread id
+  and provider `internalDate` — the progressive pipeline's window-bucketing
+  evidence. Provider `internalDate` (ms epoch) is authoritative for the
+  declared window; sender-supplied `Date` headers are never trusted for
+  scope decisions.
 - Quota (Gmail quota doc): `history.list` 2 units, `messages.list` 5,
   `messages.get` 20.
 
 Drive (`files.get` / `files.export` references, "Download and export files"
 guide):
 
-- `GET /drive/v3/files/{fileId}?fields=id,name,mimeType,capabilities/canDownload&supportsAllDrives=true`
+- `GET /drive/v3/files/{fileId}?fields=id,name,mimeType,capabilities/canDownload,version,modifiedTime&supportsAllDrives=true`
   for metadata; `capabilities/canDownload` is honored before any content
-  fetch.
+  fetch. `version`/`modifiedTime` are the provider's revision markers —
+  `readDocumentMetadata` exposes them as the source pipeline's cheap
+  change-detection and deletion signal (a 404 here tombstones the record).
 - Google Workspace types via `files.export?mimeType=` (Docs→`text/plain`,
   Sheets→`text/csv`, Slides→`text/plain`; provider-side export cap 10 MB).
 - Blobs via `files.get?alt=media` with a `Range` cap; binary MIMEs are
@@ -91,8 +106,14 @@ guide):
 - Cursor-less bootstrap reads the profile watermark first, snapshots ids,
   then runs a bounded catch-up delta from that watermark within the same
   page budget, so arrivals during listing are returned instead of skipped by
-  a post-list cursor. If the budget fills first, the watermark itself is
-  named as the next base (replays dedupe). History earlier than the cursor's
+  a post-list cursor. If the snapshot itself does not finish inside the
+  bounds, the cursor commits a **list-phase resume** (`list` marker plus
+  the first un-drained `messages.list` page token, or none to restart the
+  listing): un-emitted snapshot ids predate the watermark, so resuming via
+  history would skip them forever. If the listing drains but the page
+  budget is spent before the catch-up runs, the cursor resumes history
+  from the watermark (seen-ids dedupe) instead of committing past
+  unobserved mail. History earlier than the cursor's
   validity window still requires reset, not data drop.
 - **Commit only after durable ingestion acknowledgement**: the adapter keeps
   no second store; if the consumer crashes before persisting `nextCursor`,
@@ -159,10 +180,75 @@ unknown JSON → `transport_error` fail-closed. Drive: undownloadable →
 `authorization_denied`; unexportable/binary → `unsupported`; over-cap →
 fail-closed instead of silent truncation.
 
+## Progressive source pipeline (ADR-007 / C03)
+
+`src/server/sources/` layers the resumable scan contract over these read
+adapters. Everything below is exercised only against scripted transports
+(`tests/source-sync.test.ts`, SIMULATED); **no live account verification
+has been performed — the live gate stays BLOCKED.**
+
+- **Port**: `SourcePipeline.scan(scope, {limit})` /
+  `read(sourceKey)` / `expandHistory(n)` (via `createBoundSourcePort`),
+  emitting C02 envelopes (`SourceRecordEnvelope`: stable source key,
+  provider version, content hash, parser version, provenance,
+  `simulated`/`mode` labels) plus durable `versioned`/`deleted`/`revoked`
+  events. The knowledge consumer is an injected port
+  (`SourceKnowledgeConsumer`); the only wired implementation is a
+  recording test consumer — real knowledge work is ADR-008 territory.
+- **Visible initial scope**: recent inbox + sent threads (sent context is
+  classified by the provider `SENT` label, correlated by shared
+  `threadId`), owner-selected Drive document ids (explicit IDs only —
+  still no `files.list`), a declared calendar (the adapters expose
+  freeBusy/holds, not event enumeration, so it lands in coverage
+  `exclusions` honestly), and a 30-day window. Provider `internalDate`
+  buckets records; older/out-of-scope records are counted and a bounded
+  id sample is persisted in `source_exclusions` — expansion surfaces them,
+  nothing is silently classified as irrelevant.
+- **Paging/cursor transactions**: the pipeline cursor (`gsc.` v1) binds a
+  scope fingerprint (account, business, documents, sent inclusion, query,
+  calendar — window and active threads are excluded so expansion never
+  invalidates progress) and carries the poller's `ghi.` cursor. Record
+  versions, event rows and cursor progress commit in ONE SQLite
+  transaction (`SourceSyncStore.inTransaction`) in the shared Gather
+  database; events form an outbox delivered and acked after commit, so a
+  crash replays rather than loses invalidations. An incompatible-scope
+  cursor is rejected, never adopted.
+- **Progressive, not blocking**: `priorityThreadIds` (active/linked
+  inquiry threads) emit first and bypass the window; a truncated scan is
+  `partial`, not "empty". `expandHistory(windows)` widens the durable
+  window by 30-day steps and re-buckets persisted exclusions.
+- **Bounds**: at most 2 provider fetches in flight
+  (`SOURCE_FETCH_CONCURRENCY`), ≤100 records per scan call by default,
+  ≤1000 persisted exclusion samples per scope.
+- **Dedupe/cache**: `source_records` upserts on the stable source key and
+  skip re-emission when `(contentHash, parserVersion)` is unchanged;
+  `source_content_cache` keys content on `(contentHash, parserVersion)`.
+  A stale (revoked) record that the provider re-attests re-emits —
+  reconnection requires revalidation, never automatic unstaling.
+- **Honest states**: coverage is `complete`/`partial`/`failed`/`running`
+  per scan with per-partition detail; `describeScanState` maps it to the
+  contract's sentences — failed never reads as a completed empty scan,
+  and zero facts is stated as "No business information found yet".
+  `GET /api/operator/intake/coverage` exposes coverage + the message;
+  `POST /api/operator/intake/scan` triggers a scan or
+  `{expandWindows: n}` expansion (scope is server-derived; the body can
+  never retarget account or provider).
+- **Deletion/disconnect**: `messagesDeleted` events, Drive metadata 404s
+  and absence from a COMPLETE listing all tombstone the record — the body
+  is purged (`text = NULL`) while key/version/provenance stay so existing
+  commitments remain explainable. Access loss (`access_revoked` /
+  `authorization_denied`) marks records `stale` and emits `revoked`
+  invalidations before dependent work; `disconnect()` tombstones
+  everything and clears cursors so reconnection full-syncs. The
+  durable outbox guarantees deletions are delivered before the records
+  that follow them in the same scan.
+
 ## Manual limits
 
 History earlier than the cursor's validity window is unrecoverable except
 by full sync; `messages.list` ordering is provider-defined, so intake must
 tolerate any order. Drive revisions, comments/suggestions views, and
-export-format negotiation beyond plain text/CSV are unbuilt. Simulation
-proves contract handling, not live mailbox/drive behavior.
+export-format negotiation beyond plain text/CSV are unbuilt. Calendar
+event enumeration and Gmail label-removal mirroring are not covered —
+absence is only authoritative on a complete listing. Simulation proves
+contract handling, not live mailbox/drive behavior.

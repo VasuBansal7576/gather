@@ -387,3 +387,45 @@
     align-items: flex-start;
   }
 }
+
+/* First-run mode chooser (ADR-001): two cards — prepared enabled, live disabled. */
+.setup-choice-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 12px;
+  margin-top: 8px;
+}
+
+.setup-mode-card {
+  border: 1px solid #26262e;
+  border-radius: 10px;
+  background: #101014;
+  padding: 16px;
+  display: grid;
+  gap: 8px;
+  align-content: start;
+}
+
+.setup-mode-card h3 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.setup-mode-card.is-disabled {
+  opacity: 0.6;
+}
+
+.setup-field select {
+  padding: 10px 12px;
+  border: 1px solid #26262e;
+  border-radius: 8px;
+  background: #0b0b0e;
+  color: #ececf0;
+  font-size: 14px;
+  max-width: 420px;
+}
+
+.setup-shell select:focus-visible {
+  outline: 2px solid #a495fd;
+  outline-offset: 2px;
+}
