@@ -69,6 +69,12 @@ export interface ProactiveHostOptions {
    * state and operator wiring survive so re-enable resumes cleanly.
    */
   disabled?: boolean;
+  /**
+   * ADR-002 progression owner hook: when provided, each binding's existing
+   * guarded sweep also drains due durable intents for its business — no
+   * second scheduler is created for intents.
+   */
+  drainIntents?: (businessId: string) => Promise<unknown>;
 }
 
 /**
@@ -288,6 +294,7 @@ export async function refreshProactiveHost(drainTimeoutMs = 5000): Promise<Proac
         ...(context.intervalMs === undefined ? {} : { intervalMs: context.intervalMs }),
         ...(context.maxConsecutiveErrors === undefined ? {} : { maxConsecutiveErrors: context.maxConsecutiveErrors }),
         ...(context.clock === undefined ? {} : { clock: context.clock }),
+        ...(context.drainIntents === undefined ? {} : { drainIntents: context.drainIntents }),
       });
       managed.set(account.id, { businessId: business.id });
       eligible.add(account.id);

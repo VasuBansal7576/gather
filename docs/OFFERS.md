@@ -210,3 +210,21 @@ Round 2 (integration blockers) tightened four more areas:
   packaging are future work for the host.
 - `requestedVersion`/`supersedesFingerprint` are carried, not enforced:
   the store-side approval boundary owns invalidation.
+
+## ADR-010 fresh inquiry-to-offer composition (C02/C04/C05)
+
+`prepareFreshInquiry` (`src/server/business-operator/lifecycle.ts`) composes
+identity, qualification, deterministic pricing, and persistence without
+replacing any module algorithm:
+
+- Identity first: `proposeBookingIdentity` links verified keys; weak hints
+  (sender/date/name) with candidates block as `needs_decision` before any
+  booking-specific write; zero candidates creates one `inquiry` booking with
+  zero initial proposals and binds it under the versioned owner decision, so
+  an exact replay re-links instead of duplicating.
+- Qualification batches one question per unresolved field/version
+  (`batchQualificationQuestions`); deterministic pricing comes from confirmed
+  facts only — unknown price/currency/tax blocks or asks, never fabricates.
+- Reference check (scripted): 40 guests at the $50 fixture rate prices at
+  exactly $2,000 with the pricing-bounds policy cited in provenance
+  (`tests/booking-lifecycle.test.ts`, 010-A01).

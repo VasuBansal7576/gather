@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getRuntime } from "../../../../src/server/runtime.ts";
+import { getRuntime, secondBusinessDenial } from "../../../../src/server/runtime.ts";
 import { refreshProactiveHost } from "../../../../src/server/proactive/index.ts";
 import { assertSameOrigin, readHeaders, ValidationError } from "../../../../src/server/validation.ts";
 import { connectionErrorResponse } from "../../connections/_helpers.ts";
@@ -44,6 +44,13 @@ export async function POST(req: Request): Promise<NextResponse> {
       if (existing) {
         store.db.exec("COMMIT");
         return NextResponse.json({ business: { id: existing.id, name, timezone }, created: false, ownerId: deps.ownerId });
+      }
+      // Managed installs hold exactly one business per mode (C01): a second,
+      // distinct venue is refused rather than silently accumulated.
+      const denial = secondBusinessDenial(store, name, timezone);
+      if (denial !== undefined) {
+        store.db.exec("COMMIT");
+        return NextResponse.json({ code: "SECOND_BUSINESS_DENIED", message: denial, retryable: false }, { status: 409 });
       }
       const business = store.createBusiness({ name, timezone });
       store.db.exec("COMMIT");
