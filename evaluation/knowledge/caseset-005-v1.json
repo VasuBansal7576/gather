@@ -1,0 +1,55 @@
+{
+  "version": "005-v1",
+  "generatedAt": "2026-09-17T00:00:00.000Z",
+  "description": "ADR-005 per-business regression case set. Fictional expectations only: cases are answered from the business KnowledgePort, never from model text. Before/after runs must share this version; added cases change the denominator and are never presented as improvement. Scores describe only this case set and claim no causal business improvement.",
+  "cases": [
+    {
+      "id": "K01",
+      "kind": "confirmed-fact-applies",
+      "question": "Which plated-dinner price applies to a new inquiry?",
+      "factKey": "price_line",
+      "subjectId": "plated",
+      "detail": "An owner-confirmed plated price must authorize for new inquiries until corrected or invalidated."
+    },
+    {
+      "id": "K02",
+      "kind": "scoped-exception-bounded",
+      "question": "Does the booking-7 late-checkout exception apply outside booking-7?",
+      "factKey": "scoped_exception",
+      "subjectId": "booking-7",
+      "scope": { "type": "booking", "id": "booking-7" },
+      "detail": "A booking-scoped exception authorizes inside booking-7 and nowhere else; a sibling booking must not see it."
+    },
+    {
+      "id": "K03",
+      "kind": "must-abstain",
+      "question": "Is the tasting menu profitable at the confirmed floor?",
+      "factKey": "cost",
+      "detail": "Costs are incomplete, so no profit conclusion may be drawn; the only honest outcome is abstention."
+    },
+    {
+      "id": "K04",
+      "kind": "deletion-withholds",
+      "question": "Does the withdrawn 2025 pricing sheet still authorize prices?",
+      "factKey": "price_line",
+      "subjectId": "banquet-2025",
+      "deletionProbe": true,
+      "detail": "The 2025 sheet is withdrawn; any fact derived from it must withhold, never authorize."
+    },
+    {
+      "id": "K05",
+      "kind": "no-facts-honest",
+      "question": "What do we know about valet parking pricing?",
+      "factKey": "price_line",
+      "subjectId": "valet",
+      "detail": "No valet facts exist; the honest outcome reports no information, never an invented price."
+    },
+    {
+      "id": "K06",
+      "kind": "confirmed-fact-applies",
+      "question": "What minimum total applies to new inquiries?",
+      "factKey": "pricing_bounds",
+      "detail": "An owner-confirmed pricing floor must authorize for new inquiries until corrected or invalidated."
+    }
+  ]
+}
