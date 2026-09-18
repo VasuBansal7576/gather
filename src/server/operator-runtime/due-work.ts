@@ -2,6 +2,7 @@ import { emailOperationKey, holdOperationKey, reconcileExecution, ServiceError }
 import type { WaitingItem, WaitingKind } from "../../coordination/contracts.ts";
 import type { DueWorkReport, OperatorRuntimeDeps } from "./types.ts";
 import { OperatorIntakeStore } from "./store.ts";
+import { IncidentStore } from "../../incidents/store.ts";
 
 function nowIso(deps: OperatorRuntimeDeps): string {
   return deps.now ? deps.now() : new Date().toISOString();
@@ -341,6 +342,7 @@ export function bindWaitingToProposal(
 export async function drainDueWork(
   deps: OperatorRuntimeDeps,
   input: { limit?: number; claimedBy?: string } = {},
+  incidents?: IncidentStore,
 ): Promise<DueWorkReport> {
   const report: DueWorkReport = {
     simulation: deriveSimulation(deps),
@@ -362,11 +364,81 @@ export async function drainDueWork(
   report.reconciled.push(...dispatched.reconciled);
   report.awaitingOwner.push(...dispatched.awaitingOwner);
   report.skipped.push(...dispatched.skipped);
+  if (incidents) {
+    // ADR-004 incident emission only: derive scoped incidents from durable
+    // failures/dead-letters/uncertain steps. Emission never changes drain
+    // outcomes and never throws into the report path.
+    try {
+      emitIncidentsFromSweep(deps, incidents);
+    } catch {
+      // Emission is best-effort observability; the drain report stands.
+    }
+  }
   return report;
 }
 
 function deriveSimulation(deps: OperatorRuntimeDeps): boolean {
   return deps.inbox.provenance.simulated;
+}
+
+/**
+ * ADR-004 incident emission (the ONLY ADR-004 write path in this file).
+ *
+ * Scans durable evidence scoped to this runtime's business/account and
+ * emits deduplicated incidents — dead-lettered intake items, recorded
+ * intake failures, and uncertain/partial action executions on this
+ * business's bookings. Read-only against every table except the incident
+ * tables (owned by IncidentStore). Returns the emitted incident ids.
+ */
+export function emitIncidentsFromSweep(deps: OperatorRuntimeDeps, sink: IncidentStore): string[] {
+  const emitted: string[] = [];
+  const intake = new OperatorIntakeStore(deps.store.db);
+  for (const item of intake.listDeadLettered(deps.accountId, 50)) {
+    const { incident } = sink.emit({
+      source: "deadletter",
+      symptom: {
+        signature: "intake_deadletter",
+        resource: `account:${deps.accountId}`,
+        operation: item.messageId,
+        detail: `Dead-lettered intake item ${item.messageId}: ${item.error ?? "terminal failure, never auto-retried"}`,
+        evidence: intake.latestSimulation(deps.accountId) ? "prepared" : "live-provider",
+      },
+    });
+    emitted.push(incident.id);
+  }
+  const failures = intake.listFailures(deps.accountId, 10);
+  if (failures.length > 0 && intake.listDeadLettered(deps.accountId, 1).length === 0) {
+    const { incident } = sink.emit({
+      source: "health",
+      symptom: {
+        signature: "intake_sync_failed",
+        resource: `account:${deps.accountId}`,
+        operation: "intake_sweep",
+        detail: `Recorded intake failure: ${failures[0]?.message ?? "unknown"}`,
+        evidence: intake.latestSimulation(deps.accountId) ? "prepared" : "live-provider",
+      },
+    });
+    emitted.push(incident.id);
+  }
+  for (const booking of deps.store.listBookings(deps.businessId)) {
+    for (const action of deps.store.listProposedActionsForBooking(booking.id)) {
+      for (const execution of deps.store.listActionExecutions(action.id)) {
+        if (execution.status !== "uncertain" && execution.status !== "partial") continue;
+        const { incident } = sink.emit({
+          source: "intent_failure",
+          symptom: {
+            signature: "execution_uncertain",
+            resource: `booking:${booking.id}`,
+            operation: execution.idempotencyKey,
+            detail: `Step ${execution.id} (${execution.idempotencyKey}) is ${execution.status}: ${execution.error ?? "outcome unknown"}`,
+            evidence: "prepared",
+          },
+        });
+        emitted.push(incident.id);
+      }
+    }
+  }
+  return [...new Set(emitted)];
 }
 
 export interface ResumeReconciliation {

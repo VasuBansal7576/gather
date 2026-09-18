@@ -3,6 +3,7 @@ import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { proposalFingerprint } from "../domain/proposals.ts";
+import { ensureIncidentSchema } from "../incidents/store.ts";
 import type {
   ActionExecution,
   ActionExecutionStatus,
@@ -240,6 +241,10 @@ export class GatherStore {
     this.ensureColumn("provider_receipts", "end_at", "TEXT");
     this.ensureColumn("proposed_actions", "proposal_seq", "INTEGER");
     this.backfillProposalAuthority();
+    // ADR-004 additive incidents schema (this wave's only central-store
+    // write): creates exactly the incidents + incident_attempts tables when
+    // absent; never alters existing tables. DDL lives in src/incidents/.
+    ensureIncidentSchema(this.db);
   }
 
   private ensureColumn(table: string, column: string, ddl: string): void {
