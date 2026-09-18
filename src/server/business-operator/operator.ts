@@ -10,6 +10,8 @@ import { adaptBusinessFacts, buildAvailabilityEvidence } from "../../offers/adap
 import { prepareOffer } from "../../offers/prepare.ts";
 import type { OfferPreparationResult } from "../../offers/index.ts";
 import type { GatherStore } from "../sqlite-store.ts";
+import { DeliveryStore } from "../booking-delivery/store.ts";
+import { issueAcceptanceToken, type AcceptanceKeyring } from "../acceptance/index.ts";
 import {
   previewConsequences,
   resolveHoldParams,
@@ -43,6 +45,30 @@ export interface OperatorDeps {
    * itself can never supply availability evidence.
    */
   availability: CalendarAvailabilityReader;
+  /** Host-owned keyring; acceptance URLs never carry the binding payload. */
+  acceptanceKeyring?: AcceptanceKeyring;
+}
+
+/**
+ * Compose the customer-facing acceptance affordance from the exact persisted
+ * action. This deliberately returns copy plus a mailto link, never accepts a
+ * click; the customer must send the generated reply through the provider.
+ */
+export function composeAcceptanceLink(
+  deps: Pick<OperatorDeps, "store" | "acceptanceKeyring">,
+  action: { bookingId: string; proposalVersion: number; proposalFingerprint: string; payload: Record<string, unknown> },
+  input: { businessId: string; customerEmail: string; mailbox: string; issuedAt: string; expiresAt: string },
+): { label: "Accept by email"; mailto: string; explanation: string } {
+  const keyring = deps.acceptanceKeyring;
+  if (keyring === undefined) throw new Error("Acceptance signing keyring is not configured");
+  const delivery = new DeliveryStore(deps.store.db);
+  const issued = issueAcceptanceToken(delivery, {
+    businessId: input.businessId,
+    bookingId: action.bookingId, proposalVersion: action.proposalVersion, proposalFingerprint: action.proposalFingerprint,
+    authorizedSender: input.customerEmail, mailbox: input.mailbox, issuedAt: input.issuedAt, expiresAt: input.expiresAt,
+    keyVersion: keyring.activeVersion,
+  }, keyring);
+  return { label: "Accept by email", mailto: issued.mailto, explanation: "Select Accept by email, then send the opened reply. Opening the link alone does not accept the offer." };
 }
 
 function clockMs(deps: OperatorDeps): number {
