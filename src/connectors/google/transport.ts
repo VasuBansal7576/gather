@@ -162,7 +162,33 @@ export const GOOGLE_SCOPES = {
   calendarWrite: "https://www.googleapis.com/auth/calendar.events",
   gmailRead: "https://www.googleapis.com/auth/gmail.readonly",
   gmailSend: "https://www.googleapis.com/auth/gmail.send",
+  /** Picker-selected Drive files only; never an account-wide Drive scan. */
+  driveFile: "https://www.googleapis.com/auth/drive.file",
 } as const;
+
+export type GoogleCapability =
+  | "identity"
+  | "gmail_read"
+  | "gmail_send"
+  | "calendar_freebusy"
+  | "calendar_events"
+  | "selected_document_read";
+
+/** C11's least-privilege scope-to-capability mapping. */
+export const GOOGLE_SCOPE_CAPABILITIES: Readonly<Record<string, GoogleCapability>> = Object.freeze({
+  openid: "identity",
+  email: "identity",
+  "https://www.googleapis.com/auth/userinfo.email": "identity",
+  "https://www.googleapis.com/auth/gmail.readonly": "gmail_read",
+  "https://www.googleapis.com/auth/gmail.send": "gmail_send",
+  "https://www.googleapis.com/auth/calendar.freebusy": "calendar_freebusy",
+  "https://www.googleapis.com/auth/calendar.events": "calendar_events",
+  "https://www.googleapis.com/auth/drive.file": "selected_document_read",
+});
+
+export function capabilitiesForGoogleScopes(scopes: readonly string[]): Set<GoogleCapability> {
+  return new Set(scopes.map((scope) => GOOGLE_SCOPE_CAPABILITIES[scope]).filter((value): value is GoogleCapability => value !== undefined));
+}
 
 export type FetchImpl = (
   url: string,

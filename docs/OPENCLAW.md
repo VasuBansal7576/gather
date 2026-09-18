@@ -251,6 +251,55 @@ missing/unknown session ids get `404` per the MCP spec.
   OpenClaw's tool approval is a separate mechanism that confers no Gather
   booking authority.
 
+## RuntimeControl (ADR-009, C08)
+
+`src/runtime/control.ts` publishes the `RuntimeControlPort` consumed by
+knowledge and recovery: `provision` (live-only, pinned manifest),
+`start`, `health`, `submit`, `observe`, `stop`, `backup`,
+`restoreCompatible`, plus the bounded repair catalog
+(`restart_runtime`, `mark_blocked` — no shell, no upgrades).
+
+- **Manifest first** (`scripts/gather-runtime-manifest.json`,
+  `src/runtime/manifest.ts`): the one exact tested combination
+  (`@openclaw/gateway-client 2026.9.4`, `@modelcontextprotocol/sdk
+  1.30.0`, `zod 4.6.4` with registry integrity hashes, Node ≥ 26,
+  macOS/Linux). `provisionPreflight` validates Node/platform, exact
+  installed pins (never `latest`), and the executable source (absolute
+  path only; no PATH lookup, global install, or personal `~/.openclaw`)
+  BEFORE any state is created. Prepared mode never calls provision —
+  it uses `ScriptedRuntimeControl`, the same port with deterministic
+  stand-ins.
+- **Budgets** (`src/server/budget.ts`): C08 defaults (15 tool calls,
+  32,000 tokens/run, 5-minute deadline, 50 runs/business/day,
+  configurable before running). The next call's maximums are reserved
+  BEFORE dispatch — a denied reservation never reaches the gateway.
+  State is file-backed JSON (atomic writes), so usage survives
+  restarts; restored runs resume fenced. The module composes with the
+  ADR-001 installation lease through read-only `installLeaseStatus`
+  evidence — it creates no lock of its own. Exhaustion maps to the
+  shared 429 path.
+- **Timeout separation**: `observe` takes an observation-only wait
+  budget (`agent.wait` timeout never stops the run, never starts a
+  duplicate) while the real execution deadline fences tools and
+  requests supported cancellation. No `agent.cancel` RPC is invented —
+  the pinned protocol exposes none; cancellation fences immediately
+  and stops only the owned isolated process with an observed exit.
+- **Backup/restore**: backup refuses active unfenced runs, carries an
+  allowlist payload (pins, redacted config, budget snapshot), and
+  fails when isolated secret material is detected. Restore checks
+  schema/version/pins and requires confirmed external reconciliation —
+  it never replays external effects.
+- **Health is agent-independent**: process/connection liveness plus an
+  optional gateway-level `status` RPC. No agent RPC is ever issued, so
+  a broken booking agent cannot fail health.
+
+Contract-ready (scripted) verification lives in
+`tests/runtime-control.test.ts`, `tests/runtime-manifest-auth.test.ts`
+and `tests/budget-persistence.test.ts`. Live proof is explicitly
+blocked: no `GATHER_TEST_OPENCLAW_BIN`, no approved model credentials,
+and no bounded provider-call hook in the `tasks.ts` RPC surface —
+recorded as blockers, not substituted.
+
 ## Verification boundary
 
 `npm test` includes runtime contract, isolation, model configuration, cancellation and loopback MCP tests using controlled fixtures/transports. It does not require an installed OpenClaw binary and does not call a model or Google.

@@ -1,0 +1,10 @@
+{
+  "id": "empty",
+  "label": "Empty inbox",
+  "description": "Prepared business with a connected inbox that contains nothing at all.",
+  "coverage": "complete",
+  "coverageDetail": "Scanned 0 emails. No event inquiries found.",
+  "inbox": [],
+  "calendar": [],
+  "expected": { "inboxCount": 0, "busyBlockCount": 0, "offerCount": 0 }
+}
