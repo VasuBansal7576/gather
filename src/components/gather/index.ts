@@ -1,4 +1,12 @@
 export { GatherWorkspace } from './GatherWorkspace';
+export {
+  AcceptanceHandoffPanel,
+  ComposerPanel,
+  IdentityPanel,
+  TakeoverPanel,
+  TrendPanel,
+  UnderstandingPanel,
+} from './composition-panels';
 export { DEMO_BOOKINGS, DEMO_CONNECTIONS } from './demo-data';
 export type {
   ActionReceipt,

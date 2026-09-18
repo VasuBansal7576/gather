@@ -5,6 +5,8 @@ import { IntentService } from "../intents/index.ts";
 import type { BookingServiceDeps } from "./booking-service.ts";
 import { demoFixtureSlots, preparedFixtureSlots } from "./demo-fixtures.ts";
 import { DurableDemoCalendar, DurableDemoEmail } from "./durable-demo-connectors.ts";
+import { createLiveAcceptanceValidator, liveAcceptanceWired } from "./live-model/acceptance-callback.ts";
+import { liveGateReport } from "./live-model/live-status.ts";
 import { createProviderConnectors, type ProviderConnectors } from "./provider-runtime/index.ts";
 import { ensureProactiveHost, resetProactiveHostForTests } from "./proactive/index.ts";
 import { GatherStore } from "./sqlite-store.ts";
@@ -221,6 +223,34 @@ export function getRuntime(): ServerRuntime {
   // Best-effort by design — a failed bootstrap never breaks boot — and a
   // no-op for unconfigured, account-less, or demo-only setups (no external
   // calls). Connection/setup lifecycle routes refresh explicitly afterwards.
+  //
+  // ADR-006 composition: the deferred ADR-011 live inbound mailbox callback
+  // (acceptance-reply validator) rides the same bootstrap behind the same
+  // live gate. Prepared installs wire nothing — token-looking fixtures stay
+  // inert and the sweep keeps capture-only behavior. The gate read itself
+  // performs no provider calls; a failed read wires nothing and never
+  // breaks boot.
+  let liveAcceptance: Parameters<typeof ensureProactiveHost>[0]["acceptance"] | undefined;
+  try {
+    const gate = liveGateReport(
+      {
+        store,
+        providerReadiness: () => {
+          try {
+            return providers.connectionService.providerReadiness();
+          } catch {
+            return [];
+          }
+        },
+      },
+      "base",
+    );
+    if (liveAcceptanceWired({ mode: gatherMode(), liveGatePasses: gate.liveReady })) {
+      liveAcceptance = createLiveAcceptanceValidator({ store, liveTransport: true });
+    }
+  } catch {
+    liveAcceptance = undefined;
+  }
   try {
     ensureProactiveHost({
       store,
@@ -231,6 +261,7 @@ export function getRuntime(): ServerRuntime {
       // A managed prepared install is fully simulated; anything the host
       // wires there must never be labelled as live provider mail.
       ...(managedPrepared ? { provenance: { simulated: true, label: "prepared-fixture" } } : {}),
+      ...(liveAcceptance === undefined ? {} : { acceptance: liveAcceptance }),
       // The intent progression owner drains inside the binding's existing
       // guarded tick — one scheduler per account, never a second timer.
       drainIntents: async (businessId) => intents.drainDue({ owner: "proactive-sweep", businessId }),

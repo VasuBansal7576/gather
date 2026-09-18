@@ -75,6 +75,14 @@ export interface ProactiveHostOptions {
    * second scheduler is created for intents.
    */
   drainIntents?: (businessId: string) => Promise<unknown>;
+  /**
+   * ADR-006 composition seam for the deferred ADR-011 live inbound mailbox
+   * callback: a host-owned acceptance validator run by the sweep before the
+   * new-inquiry gate. Wired only behind the live gate (live transport on
+   * explicitly authorized accounts); absent keeps the sweep capture-only
+   * with byte-identical behavior.
+   */
+  acceptance?: IntakeDeps["acceptance"];
 }
 
 /**
@@ -276,6 +284,10 @@ export async function refreshProactiveHost(drainTimeoutMs = 5000): Promise<Proac
         accountId: account.id,
         businessId: business.id,
         ...(context.now === undefined ? {} : { now: context.now }),
+        // Deferred 011 callback, live-gated by the host composition: only
+        // live sweeps validate acceptance replies; prepared sweeps never see
+        // the hook and keep capture-only behavior.
+        ...(context.acceptance === undefined ? {} : { acceptance: context.acceptance }),
         connections: directoryFor(connectionService),
         threads: {
           provenance,

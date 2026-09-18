@@ -195,6 +195,7 @@ export default function SetupPage(): React.JSX.Element {
   const [demoState, setDemoState] = useState<LoadState>({ kind: "idle" });
   const [status, setStatus] = useState("");
   const [mode, setMode] = useState<SetupModeDTO | undefined>(undefined);
+  const [liveGate, setLiveGate] = useState<{ liveReady: boolean; blockedBy: string[] } | undefined>(undefined);
   const [scenario, setScenario] = useState<PreparedScenarioIdDTO>("glasshouse");
   const zones = useMemo(timezones, []);
 
@@ -252,6 +253,22 @@ export default function SetupPage(): React.JSX.Element {
     api.getMode()
       .then((info) => {
         if (!cancelled) setMode(info);
+      })
+      .catch(() => undefined);
+    // ADR-006 live gate: owner-visible capability report. A failed read
+    // leaves the card in its disabled state — never an enabled guess.
+    fetch("/api/live-model/status?profile=base", { headers: { accept: "application/json" } })
+      .then(async (response) => {
+        if (cancelled || !response.ok) return;
+        const body = (await response.json().catch(() => undefined)) as
+          | { gate?: { liveReady?: boolean; blockedBy?: string[] } }
+          | undefined;
+        if (body?.gate) {
+          setLiveGate({
+            liveReady: body.gate.liveReady === true,
+            blockedBy: Array.isArray(body.gate.blockedBy) ? body.gate.blockedBy.map(String) : [],
+          });
+        }
       })
       .catch(() => undefined);
     return () => {
@@ -422,6 +439,18 @@ export default function SetupPage(): React.JSX.Element {
                 Connect your real Google inbox and calendar.{" "}
                 {mode?.live.reason ?? "Live onboarding is not available in this build."}
               </p>
+              {liveGate && !liveGate.liveReady && liveGate.blockedBy.length > 0 ? (
+                <div role="status">
+                  <p className="setup-muted"><strong>Live verification is blocked — missing:</strong></p>
+                  <ul className="setup-muted">
+                    {liveGate.blockedBy.map((missing) => <li key={missing}>{missing}</li>)}
+                  </ul>
+                  <p className="setup-muted">Prepared mode above stays fully usable. No fixture evidence counts as live proof.</p>
+                </div>
+              ) : null}
+              {liveGate?.liveReady ? (
+                <p className="setup-muted" role="status">Capability gates pass. Continue below to connect Google on your own explicitly authorized accounts — live sends stay restricted to your configured test recipient.</p>
+              ) : null}
               <button type="button" className="setup-button is-secondary" disabled>
                 Not available yet
               </button>

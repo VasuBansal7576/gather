@@ -592,6 +592,8 @@ export interface AdaptedWorkspace {
   pendingApprovals: string[];
   approvalIdentity: string;
   notice: string;
+  /** Server-derived businesses (id + display fields only — minimal client payload). */
+  businesses: Array<{ id: string; name: string; timezone: string }>;
 }
 
 export function adaptWorkspace(workspace: WorkspaceDTO): AdaptedWorkspace {
@@ -625,5 +627,6 @@ export function adaptWorkspace(workspace: WorkspaceDTO): AdaptedWorkspace {
     pendingApprovals: [...pendingApprovals],
     approvalIdentity: workspace.approvalIdentity,
     notice: workspace.notice,
+    businesses: workspace.businesses.map((business) => ({ id: business.id, name: business.name, timezone: business.timezone })),
   };
 }
