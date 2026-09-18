@@ -41,6 +41,7 @@ export type ServiceErrorCode =
   | "RECONCILE_PENDING"
   | "EXECUTION_FAILED"
   | "UNCERTAIN"
+  | "DENIED"
   | "INVALID_REQUEST";
 
 export class ServiceError extends Error {
@@ -183,6 +184,355 @@ export function previewConsequences(
   }
 }
 
+/* ------------------------------------------------------------------ *
+ * ADR-003 deterministic server-side commercial authority.               *
+ *                                                                      *
+ * The proposal payload is model/customer-influenced text. It can never   *
+ * self-authorize a concession, a recipient, a price, or an expiry:       *
+ * every concession entry must bind to an owner-confirmed                 *
+ * `policy.concessions` business fact (by fact id), the policy must       *
+ * allow concessions now and in this scope, and the cumulative reduction  *
+ * across the whole booking must stay inside the policy cap and the       *
+ * commercial floor. Facts with confidence below "verified" (or absent    *
+ * entirely) are never authority. Approval itself is separately enforced  *
+ * by requireExactApproval/requireLiveApproval; this check covers the     *
+ * payload fields the fingerprint alone cannot police.                    *
+ * ------------------------------------------------------------------ */
+
+/** A single concession entry inside a proposal payload. */
+export interface PayloadConcession {
+  label: string;
+  amountMinor?: number;
+  percentBps?: number;
+  /** Id of the owner-confirmed policy.concessions fact the entry binds to. */
+  policyId?: string;
+  scope?: ConcessionScope;
+}
+
+export interface ConcessionScope {
+  eventDates?: string[];
+  packages?: string[];
+  customerIds?: string[];
+}
+
+export interface ConcessionPolicy {
+  allowed: boolean;
+  maxCumulativeReductionMinor?: number;
+  maxReductionBps?: number;
+  floorMinor?: number;
+  scope?: ConcessionScope;
+  expiresAt?: string;
+}
+
+function nonNegativeInt(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : undefined;
+}
+
+function cleanStringList(value: unknown, max: number): string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) return undefined;
+  const out: string[] = [];
+  for (const entry of value) {
+    if (typeof entry !== "string" || entry.trim().length === 0) return undefined;
+    out.push(entry);
+    if (out.length > max) return undefined;
+  }
+  return out;
+}
+
+function parseScope(value: unknown): ConcessionScope | undefined {
+  if (value === undefined) return {};
+  if (!isRecord(value)) return undefined;
+  const scope: ConcessionScope = {};
+  for (const key of ["eventDates", "packages", "customerIds"] as const) {
+    if (value[key] === undefined) continue;
+    const list = cleanStringList(value[key], 50);
+    if (list === undefined) return undefined;
+    scope[key] = list;
+  }
+  return scope;
+}
+
+function scopeAllows(scope: ConcessionScope | undefined, context: { eventDate?: string; packageId?: string; customerId?: string }): string | undefined {
+  if (scope === undefined) return undefined;
+  if (scope.eventDates !== undefined && scope.eventDates.length > 0) {
+    if (context.eventDate === undefined || !scope.eventDates.includes(context.eventDate)) {
+      return `event date ${context.eventDate ?? "(none)"} is outside the concession policy scope`;
+    }
+  }
+  if (scope.packages !== undefined && scope.packages.length > 0) {
+    if (context.packageId === undefined || !scope.packages.includes(context.packageId)) {
+      return `package ${context.packageId ?? "(none)"} is outside the concession policy scope`;
+    }
+  }
+  if (scope.customerIds !== undefined && scope.customerIds.length > 0) {
+    if (context.customerId === undefined || !scope.customerIds.includes(context.customerId)) {
+      return "the customer is outside the concession policy scope";
+    }
+  }
+  return undefined;
+}
+
+/** Strictly parse a verified policy.concessions fact value. Malformed policy values are never authority. */
+function parseConcessionPolicy(value: unknown): ConcessionPolicy | undefined {
+  if (!isRecord(value)) return undefined;
+  if (value.allowed !== true && value.allowed !== false) return undefined;
+  const scope = parseScope(value.scope);
+  if (value.scope !== undefined && scope === undefined) return undefined;
+  const policy: ConcessionPolicy = { allowed: value.allowed, ...(scope ? { scope } : {}) };
+  for (const key of ["maxCumulativeReductionMinor", "maxReductionBps", "floorMinor"] as const) {
+    if (value[key] === undefined) continue;
+    const num = nonNegativeInt(value[key]);
+    if (num === undefined) return undefined;
+    policy[key] = num;
+  }
+  if (value.expiresAt !== undefined) {
+    if (typeof value.expiresAt !== "string" || !Number.isFinite(Date.parse(value.expiresAt))) return undefined;
+    policy.expiresAt = value.expiresAt;
+  }
+  return policy;
+}
+
+function parseConcessions(raw: unknown): PayloadConcession[] {
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw)) {
+    throw new ServiceError("DENIED", "Proposal payload concessions must be an array of entries bound to an owner-confirmed policy", false);
+  }
+  return raw.map((entry, index) => {
+    if (!isRecord(entry)) {
+      throw new ServiceError("DENIED", `Concession entry ${index} is malformed; concessions are structured records, not free text`, false);
+    }
+    const label = str(entry.label);
+    if (label === undefined) {
+      throw new ServiceError("DENIED", `Concession entry ${index} has no label`, false);
+    }
+    const amountMinor = nonNegativeInt(entry.amountMinor);
+    const percentBps = nonNegativeInt(entry.percentBps);
+    if (amountMinor === undefined && percentBps === undefined) {
+      throw new ServiceError("DENIED", `Concession "${label}" carries no verifiable amount (amountMinor or percentBps required)`, false);
+    }
+    if (percentBps !== undefined && percentBps > 10_000) {
+      throw new ServiceError("DENIED", `Concession "${label}" percentBps exceeds 100%`, false);
+    }
+    const scope = parseScope(entry.scope);
+    if (entry.scope !== undefined && scope === undefined) {
+      throw new ServiceError("DENIED", `Concession "${label}" carries a malformed scope`, false);
+    }
+    const policyId = entry.policyId;
+    return {
+      label,
+      ...(amountMinor !== undefined ? { amountMinor } : {}),
+      ...(percentBps !== undefined ? { percentBps } : {}),
+      ...(typeof policyId === "string" && policyId.trim().length > 0 ? { policyId } : {}),
+      ...(scope !== undefined ? { scope } : {}),
+    };
+  });
+}
+
+/** The newest owner-confirmed policy.concessions fact, if any. Only verified confidence counts. */
+function confirmedConcessionPolicy(store: GatherStore, businessId: string): { factId: string; policy: ConcessionPolicy } | undefined {
+  const facts = store
+    .listBusinessFacts(businessId)
+    .filter((fact) => fact.key === "policy.concessions" && fact.confidence === "verified")
+    .sort((a, b) => b.observedAt.localeCompare(a.observedAt));
+  for (const fact of facts) {
+    const policy = parseConcessionPolicy(fact.value);
+    if (policy !== undefined) return { factId: fact.id, policy };
+  }
+  return undefined;
+}
+
+/** Commercial floor from owner-confirmed facts: explicit bounds first, then the package minimum. */
+function confirmedFloorMinor(store: GatherStore, businessId: string): number | undefined {
+  const verified = store.listBusinessFacts(businessId).filter((fact) => fact.confidence === "verified");
+  const bounds = verified
+    .filter((fact) => fact.key === "pricing_bounds")
+    .sort((a, b) => b.observedAt.localeCompare(a.observedAt));
+  for (const fact of bounds) {
+    if (isRecord(fact.value)) {
+      const floor = nonNegativeInt(fact.value.floorMinor) ?? nonNegativeInt(fact.value.floorCents);
+      if (floor !== undefined) return floor;
+    }
+  }
+  const packages = verified
+    .filter((fact) => fact.key === "pricing.package")
+    .sort((a, b) => b.observedAt.localeCompare(a.observedAt));
+  for (const fact of packages) {
+    if (isRecord(fact.value)) {
+      const floor = nonNegativeInt(fact.value.minimumTotalMinor);
+      if (floor !== undefined) return floor;
+    }
+  }
+  return undefined;
+}
+
+/** The proposal's declared base total in minor units, from explicit payload fields only. */
+function payloadBaseTotalMinor(payload: Record<string, unknown>): number | undefined {
+  const offer = isRecord(payload.offer) ? payload.offer : undefined;
+  const direct = nonNegativeInt(payload.totalMinor)
+    ?? nonNegativeInt(offer?.totalCents)
+    ?? nonNegativeInt(payload.totalCents);
+  if (direct !== undefined) return direct;
+  const gbp = typeof payload.totalGbp === "number" && Number.isFinite(payload.totalGbp) && payload.totalGbp >= 0
+    ? payload.totalGbp
+    : undefined;
+  return gbp === undefined ? undefined : Math.round(gbp * 100);
+}
+
+function concessionAmount(entry: PayloadConcession, baseMinor: number | undefined): number {
+  if (entry.amountMinor !== undefined) return entry.amountMinor;
+  if (baseMinor === undefined) {
+    throw new ServiceError("DENIED", `Concession "${entry.label}" is percentage-based but the proposal declares no base total to verify it against`, false);
+  }
+  return Math.round((entry.percentBps! * baseMinor) / 10_000);
+}
+
+/**
+ * Deterministic payload-authority check, applied identically at proposal
+ * creation and before execution (approve AND retry paths):
+ *
+ * - Recipients: when the payload declares a server-bound controlledRecipient
+ *   or authorizedRecipients list, every emailTo must be inside it. (The
+ *   fingerprint already covers emailTo as-displayed; this narrows it to the
+ *   server-designated set, additional-only.)
+ * - Concessions/floors: every concession entry must bind by fact id to an
+ *   owner-confirmed, currently-valid, in-scope concession policy; the
+ *   booking-cumulative reduction must stay inside the policy cap and the
+ *   confirmed floor. A discount claimed in customer text, a guessed policy
+ *   id, an expired or scoped-out policy, or a cumulative total past the cap
+ *   is a DENIED refusal with a displayable reason — never an approval.
+ *
+ * `excludeActionId` excludes the candidate action itself when the check
+ * runs against a persisted proposal (its own concessions are summed from
+ * `payload`, not double-counted from the row).
+ */
+export function checkProposalAuthority(
+  store: GatherStore,
+  input: {
+    bookingId: string;
+    payload: Record<string, unknown>;
+    nowMs: number;
+    excludeActionId?: string;
+  },
+): void {
+  const payload = asRecord(input.payload);
+  const booking = store.getBooking(input.bookingId);
+
+  // --- Recipient narrowing (server-bound fields only; never widened) ---
+  const emailTo = Array.isArray(payload.emailTo)
+    ? payload.emailTo.filter((item): item is string => typeof item === "string")
+    : [];
+  const controlled = str(payload.controlledRecipient);
+  if (controlled !== undefined && emailTo.some((recipient) => recipient !== controlled)) {
+    throw new ServiceError(
+      "DENIED",
+      `Proposal recipient is outside the server-controlled recipient ${controlled}; the payload cannot redirect the offer email`,
+      false,
+    );
+  }
+  const authorized = Array.isArray(payload.authorizedRecipients)
+    ? payload.authorizedRecipients.filter((item): item is string => typeof item === "string")
+    : undefined;
+  if (authorized !== undefined && authorized.length > 0 && emailTo.some((recipient) => !authorized.includes(recipient))) {
+    throw new ServiceError(
+      "DENIED",
+      "Proposal recipient is outside the server-authorized recipient set; the payload cannot widen it",
+      false,
+    );
+  }
+
+  // --- Concessions and commercial floors ---
+  const concessions = parseConcessions(payload.concessions);
+  if (concessions.length === 0) return;
+
+  const confirmed = confirmedConcessionPolicy(store, booking.businessId);
+  if (confirmed === undefined) {
+    throw new ServiceError(
+      "DENIED",
+      "No owner-confirmed concession policy exists for this business; a concession can never self-authorize from proposal or customer text",
+      false,
+    );
+  }
+  const { policy, factId } = confirmed;
+  if (!policy.allowed) {
+    throw new ServiceError("DENIED", "The owner-confirmed concession policy does not allow concessions", false);
+  }
+  if (policy.expiresAt !== undefined && Date.parse(policy.expiresAt) <= input.nowMs) {
+    throw new ServiceError("DENIED", "The owner-confirmed concession policy has expired", false);
+  }
+  const eventDate = (str(payload.startAt) ?? booking.startAt ?? "").slice(0, 10) || undefined;
+  const scopeContext = {
+    eventDate,
+    packageId: str(payload.packageId),
+    customerId: str(payload.customerId),
+  };
+  const scopeDenial = scopeAllows(policy.scope, scopeContext);
+  if (scopeDenial !== undefined) {
+    throw new ServiceError("DENIED", `Concession denied: ${scopeDenial}`, false);
+  }
+  const baseMinor = payloadBaseTotalMinor(payload);
+  let cumulative = 0;
+  for (const entry of concessions) {
+    if (entry.policyId !== factId) {
+      throw new ServiceError(
+        "DENIED",
+        `Concession "${entry.label}" is not bound to the owner-confirmed concession policy (${factId}); unbound or guessed policy references never authorize a reduction`,
+        false,
+      );
+    }
+    const entryDenial = scopeAllows(entry.scope, scopeContext);
+    if (entryDenial !== undefined) {
+      throw new ServiceError("DENIED", `Concession "${entry.label}" denied: ${entryDenial}`, false);
+    }
+    cumulative += concessionAmount(entry, baseMinor);
+  }
+  // Cumulative across the booking: a proposal's concessions keep counting
+  // while it is live OR once it ever carried an approval (its reduction was
+  // authorized even if the proposal was later superseded), so splitting a
+  // discount across sequential proposals cannot launder past the ceiling.
+  // A superseded-never-approved proposal's concessions never took effect
+  // and do not count.
+  for (const other of store.listProposedActionsForBooking(booking.id)) {
+    if (other.id === input.excludeActionId) continue;
+    if (other.status === "superseded" && store.listApprovals(other.id).length === 0) continue;
+    for (const entry of parseConcessions(other.payload.concessions)) {
+      cumulative += concessionAmount(entry, payloadBaseTotalMinor(other.payload) ?? baseMinor);
+    }
+  }
+  if (policy.maxCumulativeReductionMinor !== undefined && cumulative > policy.maxCumulativeReductionMinor) {
+    throw new ServiceError(
+      "DENIED",
+      `Cumulative concessions ${cumulative} exceed the confirmed policy cap of ${policy.maxCumulativeReductionMinor} minor units for this booking`,
+      false,
+    );
+  }
+  if (policy.maxReductionBps !== undefined) {
+    if (baseMinor === undefined) {
+      throw new ServiceError("DENIED", "The concession policy is percentage-capped but the proposal declares no base total to verify it against", false);
+    }
+    if (cumulative > Math.round((policy.maxReductionBps * baseMinor) / 10_000)) {
+      throw new ServiceError(
+        "DENIED",
+        `Cumulative concessions ${cumulative} exceed the confirmed percentage cap (${policy.maxReductionBps} bps of ${baseMinor}) for this booking`,
+        false,
+      );
+    }
+  }
+  const floor = confirmedFloorMinor(store, booking.businessId);
+  if (floor !== undefined) {
+    if (baseMinor === undefined) {
+      throw new ServiceError("DENIED", "A commercial floor is confirmed but the proposal declares no base total to verify it against", false);
+    }
+    if (baseMinor - cumulative < floor) {
+      throw new ServiceError(
+        "DENIED",
+        `Concessions would take the booking total to ${baseMinor - cumulative}, below the confirmed commercial floor of ${floor} minor units`,
+        false,
+      );
+    }
+  }
+}
+
 export function holdOperationKey(proposedActionId: string, proposalVersion: number): string {
   return stableOperationKey({
     connector: "calendar",
@@ -201,6 +551,240 @@ export function emailOperationKey(proposedActionId: string, proposalVersion: num
 
 function stepOf(key: string): "hold" | "email" {
   return key.includes(":send:") ? "email" : "hold";
+}
+
+/* ------------------------------------------------------------------ *
+ * ADR-010 hold lifecycle: price-only reuse vs date/resource            *
+ * replacement with explicit release authority, expiry and              *
+ * cancellation semantics (C06/C07).                                    *
+ *                                                                      *
+ * Holds belong to booking/resource/window, not to every offer price    *
+ * version. A price-only revision reuses the verified same hold and     *
+ * creates only the newly approved email action. Date/resource changes  *
+ * require explicit replacement/release authority in the approved       *
+ * payload; old receipts are preserved, never silently replaced or      *
+ * deleted. Expired holds are never resurrected on replay.              *
+ * ------------------------------------------------------------------ */
+
+/** Resource window identifying one hold: calendar + exact event range. */
+export interface HoldWindow {
+  calendarId: string;
+  startAt: string;
+  endAt: string;
+  expiresAt: string;
+}
+
+function rawWindowOfPayload(payload: Record<string, unknown>): HoldWindow | undefined {
+  const calendarId = str(payload.calendarId);
+  const startAt = str(payload.startAt);
+  const endAt = str(payload.endAt);
+  const expiresAt = str(payload.expiresAt);
+  if (!calendarId || !startAt || !endAt || !expiresAt) return undefined;
+  if (!validRange(startAt, endAt)) return undefined;
+  return { calendarId, startAt, endAt, expiresAt };
+}
+
+function sameHoldWindow(left: HoldWindow, right: HoldWindow): boolean {
+  return left.calendarId === right.calendarId && left.startAt === right.startAt && left.endAt === right.endAt;
+}
+
+function holdIdOfExecution(execution: ActionExecution): string | undefined {
+  if (!isRecord(execution.result)) return undefined;
+  const hold = execution.result.hold;
+  if (!isRecord(hold) || typeof hold.holdId !== "string") return undefined;
+  return hold.holdId;
+}
+
+/** One verified (succeeded) hold receipt found on the booking. */
+export interface PriorSucceededHold {
+  proposedActionId: string;
+  proposalVersion: number;
+  operationKey: string;
+  execution: ActionExecution;
+  window: HoldWindow;
+  holdId?: string;
+}
+
+/**
+ * List every succeeded hold receipt on the booking, newest action first.
+ * Reads durable execution rows only; never the provider. Callers decide
+ * reuse vs replacement vs expiry from the returned windows.
+ */
+export function listSucceededHolds(store: GatherStore, bookingId: string): PriorSucceededHold[] {
+  const out: PriorSucceededHold[] = [];
+  let actions: ReturnType<GatherStore["listProposedActionsForBooking"]> = [];
+  try {
+    actions = store.listProposedActionsForBooking(bookingId);
+  } catch {
+    return out;
+  }
+  for (const action of actions) {
+    const window = rawWindowOfPayload(asRecord(action.payload));
+    if (!window) continue;
+    const execution = store.getExecutionByIdempotencyKey(holdOperationKey(action.id, action.proposalVersion));
+    if (!execution || execution.status !== "succeeded") continue;
+    const holdId = holdIdOfExecution(execution);
+    out.push({
+      proposedActionId: action.id,
+      proposalVersion: action.proposalVersion,
+      operationKey: holdOperationKey(action.id, action.proposalVersion),
+      execution,
+      window,
+      ...(holdId === undefined ? {} : { holdId }),
+    });
+  }
+  return out;
+}
+
+/**
+ * Price-only reuse: the booking already holds the exact requested
+ * resource window under a verified, unexpired receipt. Returns that hold
+ * for reuse so approval creates only the newly approved email action and
+ * never a second hold. Price/email/recipient changes do NOT affect reuse:
+ * only the resource window binds. An expired receipt is never returned
+ * (expired holds need new authority; no resurrection on replay).
+ */
+export function findReusableHold(
+  store: GatherStore,
+  bookingId: string,
+  params: HoldParams,
+  nowMs: number,
+  excludeActionId?: string,
+): PriorSucceededHold | undefined {
+  const wanted: HoldWindow = {
+    calendarId: params.calendarId,
+    startAt: params.startAt,
+    endAt: params.endAt,
+    expiresAt: params.expiresAt,
+  };
+  for (const prior of listSucceededHolds(store, bookingId)) {
+    if (excludeActionId !== undefined && prior.proposedActionId === excludeActionId) continue;
+    if (!sameHoldWindow(prior.window, wanted)) continue;
+    const expiryMs = Date.parse(prior.window.expiresAt);
+    if (!Number.isFinite(expiryMs) || expiryMs <= nowMs) continue;
+    return prior;
+  }
+  return undefined;
+}
+
+export interface HoldReplacementAdvisory {
+  /** The superseded hold the owner must release under a separate approval. */
+  supersededOperationKey: string;
+  supersededHoldId?: string;
+  calendarId: string;
+  startAt: string;
+  endAt: string;
+  note: string;
+}
+
+/**
+ * Date/resource replacement gate. When the booking carries an unexpired
+ * verified hold on a DIFFERENT window, the new payload must explicitly
+ * name that hold (`replacesHoldOperationKey`) and carry explicit release
+ * authority (`releaseAuthorizedBy` equal to the approving owner identity).
+ * Otherwise approval is refused with CONFLICT: the old hold is never
+ * silently dropped and no second hold is added without a decision.
+ * Returns a release advisory for the superseded hold (a separate approved
+ * action; release is never executed implicitly here).
+ */
+export function requireHoldReplacementAuthority(
+  store: GatherStore,
+  input: {
+    bookingId: string;
+    payload: Record<string, unknown>;
+    window: HoldWindow;
+    nowMs: number;
+    approver: string;
+    excludeActionId?: string;
+  },
+): HoldReplacementAdvisory | undefined {
+  const priors = listSucceededHolds(store, input.bookingId).filter((prior) =>
+    input.excludeActionId === undefined ? true : prior.proposedActionId !== input.excludeActionId,
+  );
+  const live = priors.filter((prior) => {
+    const expiryMs = Date.parse(prior.window.expiresAt);
+    return Number.isFinite(expiryMs) && expiryMs > input.nowMs;
+  });
+  const other = live.find((prior) => !sameHoldWindow(prior.window, input.window));
+  if (!other) return undefined;
+  const payload = asRecord(input.payload);
+  const names = str(payload.replacesHoldOperationKey);
+  const authorizedBy = str(payload.releaseAuthorizedBy);
+  if (names !== other.operationKey) {
+    throw new ServiceError(
+      "CONFLICT",
+      `Date/resource change replaces a verified hold (${other.operationKey} ${other.window.startAt} to ${other.window.endAt}); the approved payload must name it in replacesHoldOperationKey with explicit release authority — the old hold is preserved until released under a separate approval`,
+      false,
+    );
+  }
+  if (authorizedBy !== input.approver) {
+    throw new ServiceError(
+      "CONFLICT",
+      "Date/resource change names the superseded hold but carries no explicit release authority: payload releaseAuthorizedBy must equal the approving owner identity",
+      false,
+    );
+  }
+  return {
+    supersededOperationKey: other.operationKey,
+    ...(other.holdId === undefined ? {} : { supersededHoldId: other.holdId }),
+    calendarId: other.window.calendarId,
+    startAt: other.window.startAt,
+    endAt: other.window.endAt,
+    note: `Superseded hold ${other.operationKey} is preserved; release it under a separate approved hold-release action. It was not deleted by this replacement.`,
+  };
+}
+
+export interface BookingCancellationPlan {
+  booking: Booking;
+  /** Unsent executions blocked by this cancellation (their keys stay for audit). */
+  blockedUnsentKeys: string[];
+  /** Verified holds that survive as receipts and need a separate approved release. */
+  releasePlan: HoldReplacementAdvisory[];
+  note: string;
+}
+
+/**
+ * Owner cancellation: revokes permission for new booking execution
+ * (requireActiveBooking keeps enforcing it afterwards), preserves every
+ * receipt, and returns the release plan for surviving holds. Email already
+ * sent is never undone — the plan says so explicitly.
+ */
+export function cancelBookingWithReleasePlan(
+  store: GatherStore,
+  bookingId: string,
+  nowMs: number,
+): BookingCancellationPlan {
+  const booking = store.getBooking(bookingId);
+  if (booking.status === "cancelled") {
+    throw new ServiceError("CONFLICT", "This booking is already cancelled", false);
+  }
+  store.updateBookingStatus(bookingId, "cancelled");
+  const blockedUnsentKeys: string[] = [];
+  for (const action of store.listProposedActionsForBooking(bookingId)) {
+    for (const key of [holdOperationKey(action.id, action.proposalVersion), emailOperationKey(action.id, action.proposalVersion)]) {
+      const execution = store.getExecutionByIdempotencyKey(key);
+      if (execution && execution.status !== "succeeded") blockedUnsentKeys.push(key);
+    }
+  }
+  const releasePlan: HoldReplacementAdvisory[] = listSucceededHolds(store, bookingId)
+    .filter((prior) => {
+      const expiryMs = Date.parse(prior.window.expiresAt);
+      return Number.isFinite(expiryMs) && expiryMs > nowMs;
+    })
+    .map((prior) => ({
+      supersededOperationKey: prior.operationKey,
+      ...(prior.holdId === undefined ? {} : { supersededHoldId: prior.holdId }),
+      calendarId: prior.window.calendarId,
+      startAt: prior.window.startAt,
+      endAt: prior.window.endAt,
+      note: `Hold ${prior.operationKey} survives cancellation as a receipt; release it under a separate approved hold-release action.`,
+    }));
+  return {
+    booking: store.getBooking(bookingId),
+    blockedUnsentKeys,
+    releasePlan,
+    note: "Cancellation blocks unsent work and offers approved hold-release actions; email already sent cannot be undone.",
+  };
 }
 
 /**
@@ -412,7 +996,17 @@ function requireActiveBooking(store: GatherStore, bookingId: string): void {
 /** Execution progress cannot undo cancellation or proof-gated confirmation. */
 function updateExecutionStatus(store: GatherStore, bookingId: string, status: Booking["status"]): void {
   const current = store.getBooking(bookingId).status;
-  if (current === "cancelled" || (current === "confirmed" && status === "provisional_hold")) return;
+  // Terminal states are never demoted or overwritten by replay: a confirmed
+  // or cancelled booking keeps its state no matter what a stale execution
+  // reports afterwards (ADR-010 A03).
+  if (current === "cancelled" || current === "confirmed") return;
+  // A verified hold is never talked down to a pre-offer state by replay.
+  if (
+    current === "provisional_hold" &&
+    (status === "inquiry" || status === "proposed" || status === "pending_approval")
+  ) {
+    return;
+  }
   store.updateBookingStatus(bookingId, status);
 }
 
@@ -829,18 +1423,40 @@ export async function approveAndExecute(deps: BookingServiceDeps, input: Approve
   // Validate the executable consequences BEFORE recording an approval: an
   // invalid (or past) proposal must never gain an approval row.
   const params = resolveHoldParams(action.payload, { nowMs: clockMs(deps) });
+  // ADR-003 deterministic commercial authority: recipient narrowing plus
+  // owner-confirmed concession/floor checks, re-verified at approval so a
+  // payload can never smuggle a reduction the owner policy did not allow.
+  checkProposalAuthority(store, { bookingId: action.bookingId, payload: action.payload, nowMs: clockMs(deps), excludeActionId: action.id });
   const approvedBy = ownerIdentity(deps);
   const approval = store.approveProposedAction(action.id, approvedBy);
+  const nowMs = clockMs(deps);
+
+  // ADR-010 hold lifecycle: a price-only revision reuses the verified same
+  // hold and creates only the newly approved email action — no second hold.
+  // Date/resource changes go through the replacement gate instead.
+  const reused = findReusableHold(store, booking.id, params, nowMs, action.id);
+  let replacement: HoldReplacementAdvisory | undefined;
+  if (!reused) {
+    replacement = requireHoldReplacementAuthority(store, {
+      bookingId: booking.id,
+      payload: action.payload,
+      window: { calendarId: params.calendarId, startAt: params.startAt, endAt: params.endAt, expiresAt: params.expiresAt },
+      nowMs,
+      approver: approvedBy,
+      excludeActionId: action.id,
+    });
+  }
 
   // A repeated approval whose own hold already succeeded reuses receipts: no
-  // new write can occur, so a fresh availability read must not fail it.
+  // new write can occur, so a fresh availability read must not fail it. A
+  // reused cross-version hold likewise performs no write.
   const ownHold = store.getExecutionByIdempotencyKey(holdOperationKey(action.id, action.proposalVersion));
-  if (ownHold?.status !== "succeeded") {
+  if (ownHold?.status !== "succeeded" && !reused) {
     await requireFreshAvailability(deps, booking.id, params, holdOperationKey(action.id, action.proposalVersion));
     assertLiveApprovalAfterWait(store, action.id, action.proposalVersion);
   }
 
-  const holdExecution = await runHoldStep(deps, action.id, action.proposalVersion, params);
+  const holdExecution = reused?.execution ?? await runHoldStep(deps, action.id, action.proposalVersion, params);
   if (holdExecution.status === "failed") {
     updateExecutionStatus(store, booking.id, "failed");
     if (isDurableWindowConflict(holdExecution.error)) {
@@ -872,6 +1488,10 @@ export async function approveAndExecute(deps: BookingServiceDeps, input: Approve
     updateExecutionStatus(store, booking.id, "uncertain");
   }
   const current = store.getBooking(booking.id);
+  const lifecycleNote = [
+    reused ? `Price-only revision: reused verified hold ${reused.operationKey} (no second hold created); only the newly approved email action was created.` : "",
+    replacement ? `Date/resource replacement under explicit release authority. ${replacement.note}` : "",
+  ].filter((part) => part.length > 0).join(" ");
   return {
     ...evidenceMarkerFor(booking, [holdExecution, emailExecution]),
     approval,
@@ -882,8 +1502,8 @@ export async function approveAndExecute(deps: BookingServiceDeps, input: Approve
     availabilityFresh: true as const,
     confirmedBooking: false as const,
     note: emailExecution.status === "uncertain"
-      ? "Email outcome is uncertain; reconcile before retrying. A hold is never a confirmed booking."
-      : completionNote(holdExecution, emailExecution),
+      ? `Email outcome is uncertain; reconcile before retrying. A hold is never a confirmed booking.${lifecycleNote ? ` ${lifecycleNote}` : ""}`
+      : `${completionNote(holdExecution, emailExecution)}${lifecycleNote ? ` ${lifecycleNote}` : ""}`,
   };
 }
 
@@ -919,6 +1539,10 @@ export async function retryFailedSteps(deps: BookingServiceDeps, proposedActionI
   requireLiveApproval(store, action.id);
   requireSupportedKind(action.kind);
   const params = resolveHoldParams(action.payload, { nowMs: clockMs(deps) });
+  // ADR-003: the same commercial authority gate re-runs before retry —
+  // a policy tightened after approval (or a cumulative cap now exceeded)
+  // must stop the retried write, not just the original approval.
+  checkProposalAuthority(store, { bookingId: action.bookingId, payload: action.payload, nowMs: clockMs(deps), excludeActionId: action.id });
   const holdKey = holdOperationKey(action.id, action.proposalVersion);
   const mailKey = emailOperationKey(action.id, action.proposalVersion);
   const holdExisting = store.getExecutionByIdempotencyKey(holdKey);
@@ -930,12 +1554,19 @@ export async function retryFailedSteps(deps: BookingServiceDeps, proposedActionI
     throw new ServiceError("INVALID_REQUEST", "Hold step is not in a retryable state", false);
   }
   // Fresh availability before any new hold write (skipped only when the hold
-  // already succeeded and no write can occur).
-  if (holdExisting?.status !== "succeeded") {
+  // already succeeded and no write can occur). A verified cross-version hold
+  // on the same window is reused instead of written (restart partial success:
+  // the pre-crash hold is preserved by receipt, never re-dispatched).
+  const crossVersionReuse = holdExisting?.status === "succeeded"
+    ? undefined
+    : findReusableHold(store, action.bookingId, params, clockMs(deps), action.id);
+  if (holdExisting?.status !== "succeeded" && !crossVersionReuse) {
     await requireFreshAvailability(deps, action.bookingId, params, holdKey);
   }
   // Re-run hold only when it has not already succeeded.
-  const hold = holdExisting?.status === "succeeded" ? holdExisting : await runHoldStep(deps, action.id, action.proposalVersion, params);
+  const hold = holdExisting?.status === "succeeded"
+    ? holdExisting
+    : (crossVersionReuse?.execution ?? await runHoldStep(deps, action.id, action.proposalVersion, params));
   if (hold.status === "uncertain") {
     updateExecutionStatus(store, action.bookingId, "uncertain");
     throw new ServiceError("RECONCILE_REQUIRED", hold.error ?? "Hold retry is uncertain; reconcile before retrying", false);
@@ -959,7 +1590,9 @@ export async function retryFailedSteps(deps: BookingServiceDeps, proposedActionI
     hold: toReceipt(hold),
     email: toReceipt(email),
     resentSucceededStep: false as const,
-    note: "Retry reused succeeded receipts; no successful provider step was resent.",
+    note: crossVersionReuse
+      ? `Retry reused verified hold ${crossVersionReuse.operationKey} for the same window; no successful provider step was resent.`
+      : "Retry reused succeeded receipts; no successful provider step was resent.",
   };
 }
 

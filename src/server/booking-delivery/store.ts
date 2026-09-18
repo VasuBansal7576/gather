@@ -69,6 +69,22 @@ export interface PersistedHandoff {
   createdAt: string;
 }
 
+export interface AcceptanceToken {
+  id: string;
+  handleDigest: string;
+  nonceDigest: string;
+  businessId: string;
+  bookingId: string;
+  proposalVersion: number;
+  proposalFingerprint: string;
+  authorizedSender: string;
+  issuedAt: string;
+  expiresAt: string;
+  keyVersion: string;
+  usedAt?: string;
+  supersededAt?: string;
+}
+
 export class DeliveryStore {
   readonly db: DatabaseSync;
 
@@ -92,6 +108,16 @@ export class DeliveryStore {
         source_refs_json TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_delivery_acceptance_scope ON delivery_acceptance(business_id, booking_id);
+      CREATE TABLE IF NOT EXISTS delivery_acceptance_tokens (
+        id TEXT PRIMARY KEY, handle_digest TEXT NOT NULL UNIQUE, nonce_digest TEXT NOT NULL,
+        business_id TEXT NOT NULL, booking_id TEXT NOT NULL, proposal_version INTEGER NOT NULL,
+        proposal_fingerprint TEXT NOT NULL, authorized_sender TEXT NOT NULL, issued_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL, key_version TEXT NOT NULL, used_at TEXT, superseded_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_delivery_acceptance_tokens_scope ON delivery_acceptance_tokens(business_id, booking_id);
+      CREATE TABLE IF NOT EXISTS delivery_acceptance_token_uses (
+        token_id TEXT PRIMARY KEY, token_use_digest TEXT NOT NULL UNIQUE, acceptance_id TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS delivery_deposit_receipts (
         id TEXT PRIMARY KEY,
         business_id TEXT NOT NULL,
@@ -221,6 +247,66 @@ export class DeliveryStore {
         sourceRefs: parseJson(value.source_refs_json, []),
       };
     });
+  }
+
+  issueAcceptanceToken(token: AcceptanceToken): void {
+    this.transaction(() => {
+      this.db.prepare(`UPDATE delivery_acceptance_tokens SET superseded_at = COALESCE(superseded_at, $issuedAt)
+      WHERE business_id = $businessId AND booking_id = $bookingId AND proposal_version = $version
+      AND proposal_fingerprint = $fingerprint AND used_at IS NULL`).run({
+      $issuedAt: token.issuedAt, $businessId: token.businessId, $bookingId: token.bookingId,
+      $version: token.proposalVersion, $fingerprint: token.proposalFingerprint,
+      });
+      this.db.prepare(`INSERT INTO delivery_acceptance_tokens
+      (id, handle_digest, nonce_digest, business_id, booking_id, proposal_version, proposal_fingerprint, authorized_sender, issued_at, expires_at, key_version)
+      VALUES ($id, $handle, $nonce, $businessId, $bookingId, $version, $fingerprint, $sender, $issuedAt, $expiresAt, $keyVersion)`).run({
+      $id: token.id, $handle: token.handleDigest, $nonce: token.nonceDigest, $businessId: token.businessId,
+      $bookingId: token.bookingId, $version: token.proposalVersion, $fingerprint: token.proposalFingerprint,
+      $sender: token.authorizedSender, $issuedAt: token.issuedAt, $expiresAt: token.expiresAt, $keyVersion: token.keyVersion,
+      });
+    });
+  }
+
+  getAcceptanceToken(handleDigest: string): AcceptanceToken | undefined {
+    const found = this.db.prepare("SELECT * FROM delivery_acceptance_tokens WHERE handle_digest = $handle").get({ $handle: handleDigest });
+    if (!found) return undefined;
+    const value = row(found);
+    return {
+      id: String(value.id), handleDigest: String(value.handle_digest), nonceDigest: String(value.nonce_digest),
+      businessId: String(value.business_id), bookingId: String(value.booking_id), proposalVersion: Number(value.proposal_version),
+      proposalFingerprint: String(value.proposal_fingerprint), authorizedSender: String(value.authorized_sender),
+      issuedAt: String(value.issued_at), expiresAt: String(value.expires_at), keyVersion: String(value.key_version),
+      ...(value.used_at ? { usedAt: String(value.used_at) } : {}), ...(value.superseded_at ? { supersededAt: String(value.superseded_at) } : {}),
+    };
+  }
+
+  acceptanceForToken(tokenId: string): AcceptanceRecord | undefined {
+    const found = this.db.prepare("SELECT acceptance_id FROM delivery_acceptance_token_uses WHERE token_id = $token").get({ $token: tokenId });
+    return found ? this.getAcceptanceById(String(row(found).acceptance_id)) : undefined;
+  }
+
+  consumeAcceptanceToken(tokenId: string, tokenUseDigest: string, record: Omit<AcceptanceRecord, "resolver"> & { businessId: string }): AcceptanceRecord {
+    return this.transaction(() => this.consumeAcceptanceTokenInTransaction(tokenId, tokenUseDigest, record));
+  }
+
+  private consumeAcceptanceTokenInTransaction(tokenId: string, tokenUseDigest: string, record: Omit<AcceptanceRecord, "resolver"> & { businessId: string }): AcceptanceRecord {
+    const existing = this.acceptanceForToken(tokenId);
+    if (existing) return existing;
+    const acceptanceId = randomUUID();
+    this.db.prepare("INSERT INTO delivery_acceptance (id, business_id, booking_id, proposal_version, proposal_fingerprint, accepted_at, accepted_by, revoked, source_refs_json) VALUES ($id, $businessId, $bookingId, $version, $fingerprint, $acceptedAt, $acceptedBy, 0, $refs)").run({
+      $id: acceptanceId, $businessId: record.businessId, $bookingId: record.bookingId, $version: record.proposalVersion,
+      $fingerprint: record.proposalFingerprint, $acceptedAt: record.acceptedAt, $acceptedBy: record.acceptedBy ?? null, $refs: JSON.stringify(record.sourceRefs),
+    });
+    this.db.prepare("INSERT INTO delivery_acceptance_token_uses (token_id, token_use_digest, acceptance_id) VALUES ($token, $digest, $acceptance)").run({ $token: tokenId, $digest: tokenUseDigest, $acceptance: acceptanceId });
+    this.db.prepare("UPDATE delivery_acceptance_tokens SET used_at = $usedAt WHERE id = $id AND used_at IS NULL").run({ $usedAt: record.acceptedAt, $id: tokenId });
+    return { resolver: "acceptance_record", ...record };
+  }
+
+  private getAcceptanceById(id: string): AcceptanceRecord {
+    const found = this.db.prepare("SELECT * FROM delivery_acceptance WHERE id = $id").get({ $id: id });
+    if (!found) throw new Error("Acceptance token use references a missing acceptance");
+    const value = row(found);
+    return { resolver: "acceptance_record", bookingId: String(value.booking_id), proposalVersion: Number(value.proposal_version), proposalFingerprint: String(value.proposal_fingerprint), acceptedAt: String(value.accepted_at), acceptedBy: value.accepted_by ? String(value.accepted_by) : undefined, revoked: Number(value.revoked) === 1, sourceRefs: parseJson(value.source_refs_json, []) };
   }
 
   recordDepositReceipt(receipt: Omit<DepositReceipt, "resolver"> & { businessId: string }): DepositReceipt {

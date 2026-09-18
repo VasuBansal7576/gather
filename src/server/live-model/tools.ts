@@ -1,4 +1,5 @@
 import type { CalendarConnector, DocumentRetriever, InquiryThreadReader } from "../../connectors/contracts.ts";
+import { checkProposalAuthority } from "../booking-service.ts";
 import type { GatherStore } from "../sqlite-store.ts";
 import type {
   AvailabilityAttestation,
@@ -230,24 +231,36 @@ export function createLiveTools(ports: LiveToolPorts): LiveTools {
       // The approval pipeline executes exactly one plan: provisional hold +
       // offer email (kind "create_provisional_hold"). Every executable field
       // is explicit in the fingerprinted payload — no derived defaults.
+      const payload = {
+        startAt: terms.startAt,
+        endAt: terms.endAt,
+        expiresAt,
+        calendarId: ports.calendarId,
+        guestCount: terms.guestCount,
+        perPersonGbp: terms.perPersonGbp,
+        totalGbp: terms.totalGbp,
+        currency: input.policy.currency,
+        emailTo: [ports.recipient],
+        emailSubject: `GATHER TEST provisional offer: ${terms.guestCount} guests ${terms.startAt}`,
+        emailBody,
+        controlledRecipient: ports.recipient,
+        evidence: evidence.map((source) => ({ kind: source.kind, locator: source.locator, label: source.label })),
+      };
+      // ADR-003: the same deterministic commercial/recipient authority gate
+      // the approval pipeline enforces also runs at proposal creation —
+      // a payload that would be denied later is denied before it exists.
+      try {
+        checkProposalAuthority(ports.store, { bookingId: booking.id, payload, nowMs });
+      } catch (error) {
+        throw new LiveModelError(
+          "POLICY_VIOLATION",
+          error instanceof Error ? error.message : "proposal violates server-side commercial authority",
+        );
+      }
       const action = ports.store.createProposedAction({
         bookingId: booking.id,
         kind: "create_provisional_hold",
-        payload: {
-          startAt: terms.startAt,
-          endAt: terms.endAt,
-          expiresAt,
-          calendarId: ports.calendarId,
-          guestCount: terms.guestCount,
-          perPersonGbp: terms.perPersonGbp,
-          totalGbp: terms.totalGbp,
-          currency: input.policy.currency,
-          emailTo: [ports.recipient],
-          emailSubject: `GATHER TEST provisional offer: ${terms.guestCount} guests ${terms.startAt}`,
-          emailBody,
-          controlledRecipient: ports.recipient,
-          evidence: evidence.map((source) => ({ kind: source.kind, locator: source.locator, label: source.label })),
-        },
+        payload,
         sourceReferences: evidence,
       });
       return {

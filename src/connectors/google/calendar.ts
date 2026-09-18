@@ -31,6 +31,12 @@ import {
   authorized,
 } from "./transport.ts";
 
+/** C11 calendar operations intentionally avoid the broad `calendar` scope. */
+export const GOOGLE_CALENDAR_SCOPE_CAPABILITIES = Object.freeze({
+  freeBusy: "https://www.googleapis.com/auth/calendar.freebusy",
+  events: "https://www.googleapis.com/auth/calendar.events",
+} as const);
+
 const EXT_KEY = "gatherOperationKey";
 const EXT_BOOKING = "gatherBookingId";
 const EXT_EXPIRES = "gatherExpiresAt";

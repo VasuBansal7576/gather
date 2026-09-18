@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import { ModeBadge } from "./setup/mode-badge.tsx";
 
 export const metadata: Metadata = {
   title: "Gather",
@@ -11,7 +12,10 @@ export default function RootLayout({
 }: Readonly<{ children: React.ReactNode }>) {
   return (
     <html lang="en">
-      <body>{children}</body>
+      <body>
+        <ModeBadge />
+        {children}
+      </body>
     </html>
   );
 }

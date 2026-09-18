@@ -1,5 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { chmodSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync, openSync, closeSync, lstatSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { ConnectionError, type SecretStore } from "./types.ts";
 
 /**
@@ -188,6 +190,68 @@ export class EnvSecretStore implements SecretStore {
 
   delete(key: string): void {
     delete process.env[this.envKey(key)];
+  }
+}
+
+/**
+ * File-backed store for the managed live mode. Secret filenames are hashes of
+ * store keys, so a provider/account key can never escape the configured root.
+ * Writes use a same-directory temporary file followed by rename: readers see
+ * either the old complete token or the new complete token, never a partial
+ * value. This adapter never logs or serializes secret material elsewhere.
+ */
+export class FileSecretStore implements SecretStore {
+  private readonly root: string;
+
+  constructor(rootDir: string) {
+    this.root = resolve(rootDir);
+    mkdirSync(this.root, { recursive: true, mode: 0o700 });
+    const stat = lstatSync(this.root);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) throw new ConnectionError("UNAVAILABLE", "Secret store root is not a directory");
+    chmodSync(this.root, 0o700);
+  }
+
+  private pathFor(key: string): string {
+    return join(this.root, `${sha256(key)}.secret`);
+  }
+
+  get(key: string): string | undefined {
+    try {
+      const path = this.pathFor(key);
+      if (lstatSync(path).isSymbolicLink()) throw new Error("secret path is a symlink");
+      return readFileSync(path, "utf8");
+    } catch (error) {
+      if (error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      throw new ConnectionError("UNAVAILABLE", "Secret storage could not be read");
+    }
+  }
+
+  set(key: string, value: string): void {
+    const target = this.pathFor(key);
+    const temporary = `${target}.${process.pid}.${sha256(`${key}:${Date.now()}:${Math.random()}`).slice(0, 12)}.tmp`;
+    let fd: number | undefined;
+    try {
+      fd = openSync(temporary, "wx", 0o600);
+      writeFileSync(fd, value, { encoding: "utf8" });
+      closeSync(fd);
+      fd = undefined;
+      chmodSync(temporary, 0o600);
+      renameSync(temporary, target);
+      chmodSync(target, 0o600);
+    } catch {
+      if (fd !== undefined) closeSync(fd);
+      try { unlinkSync(temporary); } catch { /* best effort cleanup */ }
+      throw new ConnectionError("UNAVAILABLE", "Secret storage could not be updated");
+    }
+  }
+
+  delete(key: string): void {
+    try {
+      unlinkSync(this.pathFor(key));
+    } catch (error) {
+      if (error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw new ConnectionError("UNAVAILABLE", "Secret storage could not be cleaned up");
+    }
   }
 }
 

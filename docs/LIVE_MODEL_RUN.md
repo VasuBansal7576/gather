@@ -2,6 +2,46 @@
 
 The existing developer runner exposes four scoped Gather tools to a model through the isolated OpenClaw runtime. It reads designated inquiry/policy/calendar sources and persists a pending proposal. It does not provide completed customer onboarding, approve the proposal, send an offer, or prove a confirmed booking.
 
+## Live capability gate (ADR-006)
+
+`GET /api/live-model/status?profile=base` reports the owner-visible gate:
+the `IntegrationProfile` (`src/integrations/registry.ts` — base plus the
+specified-only AssemblyAI/Amazon/Nebius profiles consumed by event ADRs in
+016), per-capability results, and the exact missing evidence. Without
+operator-supplied accounts/credentials the report is explicitly BLOCKED —
+never passed — and no fixture is injected into the empty-account path:
+
+- pinned runtime harness (`GATHER_TEST_OPENCLAW_BIN`, presence only; never
+  booted or discovered implicitly; `~/.openclaw` is never touched),
+- native knowledge cutover (prepared simulator does not authorize live facts),
+- Google provider configuration plus a connected authorized account,
+- supported model access (`GATHER_MODEL_PROFILE_ID` / `GATHER_LIVE_CONSENT`),
+- restricted test recipient (`GATHER_TEST_RECIPIENT`),
+- acceptance signing key (`GATHER_ACCEPTANCE_KEY`).
+
+The setup page's live card renders these blocked reasons and stays disabled
+until the gate passes. Prepared mode remains fully usable either way.
+
+## Deferred 011 inbound acceptance callback (ADR-006)
+
+`src/server/live-model/acceptance-callback.ts` composes the reviewed
+`processAcceptanceReply` with the delivery token store, the durable
+current-proposal pointer, and the persisted email provider receipt as the
+original offer-send proof. Runtime composition wires it into the proactive
+bootstrap behind the same live gate: live sweeps validate token replies
+before the new-inquiry gate; prepared installs wire nothing. Fail-closed:
+no token → ignored; no keyring → ignored; missing send receipt or
+non-live transport → review, never acceptance.
+
+## Durable intent progress on long-running routes (ADR-006)
+
+`POST /api/bookings/:id/approve` and `POST /api/executions/:id/reconcile`
+accept an opt-in `{ intent: true }` body flag that commits the exact
+command as a durable intent and returns `202 { intentId, intent }` for
+persisted progress via `GET /api/intents/:id`. Authority and error mapping
+are identical to the synchronous path (enqueue validates the exact version
+first); without the flag both routes behave byte-identically to before.
+
 ## What is wired (`src/server/live-model/`)
 
 - `mcp-tools.ts` — `gather.read_inquiry`, `gather.read_venue_policy`,
