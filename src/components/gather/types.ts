@@ -1,4 +1,4 @@
-export type WorkspaceView = 'today' | 'bookings' | 'connections';
+export type WorkspaceView = 'today' | 'bookings' | 'connections' | 'understanding' | 'recoveries' | 'trend';
 
 /**
  * `hold-pending` is kept as a deprecated alias for `waiting` so existing hosts
@@ -238,6 +238,12 @@ export interface GatherWorkspaceProps {
   loading?: boolean;
   blockedState?: BlockedState;
   initialView?: WorkspaceView;
+  /**
+   * Host-derived business id for the composed panels (understanding, trend).
+   * Server-side identity; panels never let the owner switch businesses here —
+   * one business per installation, derived server-side.
+   */
+  businessId?: string;
   /**
    * Marks whether the data shown is simulated. Defaults to `'demo'` when the
    * local fixtures are in use and `'live'` when the host supplies both

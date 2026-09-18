@@ -52,7 +52,7 @@ Implementation: `src/server/connections/`, `app/api/connections/` and `tests/con
   deleted after commit, and a reauthorization that omits a new refresh
   token preserves the previously granted one.
 
-Connection metadata lives in the injected GatherStore SQLite database; secret material lives in the injected secret store, not SQLite.
+Connection metadata lives in the injected GatherStore SQLite database; secret material lives in the injected secret store, not SQLite. Managed live installs use a Gather-owned file store below `.runtime/live/secrets/connections/`, with owner-only directories/files and atomic same-directory replacement. Prepared mode does not create or require credential files; unmanaged development keeps the explicit Keychain adapter (or `GATHER_SECRETS=env` for scripted hosts).
 
 ## Trust boundary
 
@@ -126,7 +126,7 @@ instead. Internal diagnostics: `GATHER_*` variable names and the
 DTOs only ever say "Google connection is unavailable in this
 installation".
 
-`KeychainSecretStore` namespaces to
+`FileSecretStore` hashes keys into confined filenames, rejects a symlinked root, applies `0700` to its directory and `0600` to each token file, and atomically replaces values through a temporary sibling plus rename. `KeychainSecretStore` namespaces to
 `service=gather-connections-<workspaceHash>` — it can only touch entries
 it created. Writes go through a native SecItem boundary (`swift -e`
 helper) with the secret on stdin — never argv — because
@@ -160,4 +160,4 @@ Error bodies everywhere are `{ code, message, retryable }` with codes from
 
 ## Verification boundary
 
-The automated connection tests use scripted OAuth transports and an injected Keychain runner. They do not establish a working Google consent journey or real Keychain access. Live onboarding remains developer-configured; a Gather-operated OAuth client and cross-platform secret store are proposed work, not supplied by these routes. Default scopes in `config.ts` currently include full Calendar and Drive read access, not the PRD's proposed `calendar.events`/`drive.file` picker flow.
+The automated connection tests use scripted OAuth transports and injected secret stores. They do not establish a working Google consent journey or real Keychain/file-store access. Live onboarding remains developer-configured: a fresh authorized test account, configured desktop OAuth client, Picker API/key/origin settings, and harmless read evidence are required for 012-A03; no unverified-app bypass is promised. Default scopes use `calendar.events`, `calendar.freebusy`, and `drive.file`; document reads remain explicit Picker-selected IDs and never call Drive list/search. Composio is not implemented.

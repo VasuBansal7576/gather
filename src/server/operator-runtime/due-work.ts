@@ -2,6 +2,7 @@ import { emailOperationKey, holdOperationKey, reconcileExecution, ServiceError }
 import type { WaitingItem, WaitingKind } from "../../coordination/contracts.ts";
 import type { DueWorkReport, OperatorRuntimeDeps } from "./types.ts";
 import { OperatorIntakeStore } from "./store.ts";
+import { IncidentStore } from "../../incidents/store.ts";
 
 function nowIso(deps: OperatorRuntimeDeps): string {
   return deps.now ? deps.now() : new Date().toISOString();
@@ -74,6 +75,32 @@ function bookingBusiness(deps: OperatorRuntimeDeps, bookingId: string): string |
 }
 
 /**
+ * ADR-010 dispatch revalidation: stale/failed intake sync blocks follow-up
+ * progress. A sync that failed (or never succeeded) may have missed a
+ * customer reply or opt-out, so resolving follow-up work as done on stale
+ * evidence is refused: the item stays open for the owner instead.
+ * Reads the durable intake batches/failures for this runtime's account.
+ */
+export function intakeSyncHealth(deps: OperatorRuntimeDeps): { healthy: boolean; reason: string } {
+  const intake = new OperatorIntakeStore(deps.store.db);
+  const failures = intake.listFailures(deps.accountId, 1);
+  const latest = intake.latestBatch(deps.accountId);
+  if (!latest) {
+    return failures.length > 0
+      ? { healthy: false, reason: `intake sync never succeeded and recorded failures: ${failures[0]?.message ?? "unknown"}` }
+      : { healthy: true, reason: "no intake batches yet; nothing observed to go stale" };
+  }
+  if (latest.status === "failed") {
+    return { healthy: false, reason: `latest intake batch ${latest.id} failed; sync is stale until a batch drains` };
+  }
+  const latestFailure = failures[0];
+  if (latestFailure && latestFailure.at > latest.updatedAt) {
+    return { healthy: false, reason: `intake failure after the last drained batch: ${latestFailure.message}` };
+  }
+  return { healthy: true, reason: `intake batch ${latest.id} ${latest.status}` };
+}
+
+/**
  * Dispatch phase: revalidate EVERYTHING immediately before any effect —
  * the row must still be claimed by us with a matching token, the booking
  * must not be paused, no reply may have arrived since the claim, and the
@@ -128,6 +155,12 @@ async function dispatchOne(deps: OperatorRuntimeDeps, item: ClaimedWorkItem, cla
   }
   // 2. Booking still runnable? Pause (or cancel) after the claim stops dispatch.
   if (controlState(deps, item.bookingId) !== null) {
+    return "skipped";
+  }
+  // 2b. Durable opt-out suppresses followups: a customer who asked for no
+  // further follow-ups never gets one from dispatch, even when due.
+  if (current.kind === "followup" && deps.ledger.isOptedOut(item.bookingId)) {
+    deps.ledger.resolveWaiting({ id: item.id, resolution: "suppressed", note: "operator dispatch: booking opted out of follow-ups", claimToken: item.claimToken });
     return "skipped";
   }
   // 3. Reply since claim? A customer reply between claim and dispatch
@@ -186,6 +219,13 @@ async function dispatchOne(deps: OperatorRuntimeDeps, item: ClaimedWorkItem, cla
   const holdOk = deps.store.getExecutionByIdempotencyKey(holdKey)?.status === "succeeded";
   const mailOk = deps.store.getExecutionByIdempotencyKey(mailKey)?.status === "succeeded";
   if (holdOk && mailOk) {
+    // 6. Stale sync blocks follow-up completion: intake may have missed a
+    // reply or opt-out, so a followup is never resolved done on stale
+    // evidence — it stays open for the owner instead.
+    if (item.kind === "followup") {
+      const sync = intakeSyncHealth(deps);
+      if (!sync.healthy) return "awaitingOwner";
+    }
     await resolveDone(deps, item);
     return "reconciled";
   }
@@ -302,6 +342,7 @@ export function bindWaitingToProposal(
 export async function drainDueWork(
   deps: OperatorRuntimeDeps,
   input: { limit?: number; claimedBy?: string } = {},
+  incidents?: IncidentStore,
 ): Promise<DueWorkReport> {
   const report: DueWorkReport = {
     simulation: deriveSimulation(deps),
@@ -323,9 +364,152 @@ export async function drainDueWork(
   report.reconciled.push(...dispatched.reconciled);
   report.awaitingOwner.push(...dispatched.awaitingOwner);
   report.skipped.push(...dispatched.skipped);
+  if (incidents) {
+    // ADR-004 incident emission only: derive scoped incidents from durable
+    // failures/dead-letters/uncertain steps. Emission never changes drain
+    // outcomes and never throws into the report path.
+    try {
+      emitIncidentsFromSweep(deps, incidents);
+    } catch {
+      // Emission is best-effort observability; the drain report stands.
+    }
+  }
   return report;
 }
 
 function deriveSimulation(deps: OperatorRuntimeDeps): boolean {
   return deps.inbox.provenance.simulated;
+}
+
+/**
+ * ADR-004 incident emission (the ONLY ADR-004 write path in this file).
+ *
+ * Scans durable evidence scoped to this runtime's business/account and
+ * emits deduplicated incidents — dead-lettered intake items, recorded
+ * intake failures, and uncertain/partial action executions on this
+ * business's bookings. Read-only against every table except the incident
+ * tables (owned by IncidentStore). Returns the emitted incident ids.
+ */
+export function emitIncidentsFromSweep(deps: OperatorRuntimeDeps, sink: IncidentStore): string[] {
+  const emitted: string[] = [];
+  const intake = new OperatorIntakeStore(deps.store.db);
+  for (const item of intake.listDeadLettered(deps.accountId, 50)) {
+    const { incident } = sink.emit({
+      source: "deadletter",
+      symptom: {
+        signature: "intake_deadletter",
+        resource: `account:${deps.accountId}`,
+        operation: item.messageId,
+        detail: `Dead-lettered intake item ${item.messageId}: ${item.error ?? "terminal failure, never auto-retried"}`,
+        evidence: intake.latestSimulation(deps.accountId) ? "prepared" : "live-provider",
+      },
+    });
+    emitted.push(incident.id);
+  }
+  const failures = intake.listFailures(deps.accountId, 10);
+  if (failures.length > 0 && intake.listDeadLettered(deps.accountId, 1).length === 0) {
+    const { incident } = sink.emit({
+      source: "health",
+      symptom: {
+        signature: "intake_sync_failed",
+        resource: `account:${deps.accountId}`,
+        operation: "intake_sweep",
+        detail: `Recorded intake failure: ${failures[0]?.message ?? "unknown"}`,
+        evidence: intake.latestSimulation(deps.accountId) ? "prepared" : "live-provider",
+      },
+    });
+    emitted.push(incident.id);
+  }
+  for (const booking of deps.store.listBookings(deps.businessId)) {
+    for (const action of deps.store.listProposedActionsForBooking(booking.id)) {
+      for (const execution of deps.store.listActionExecutions(action.id)) {
+        if (execution.status !== "uncertain" && execution.status !== "partial") continue;
+        const { incident } = sink.emit({
+          source: "intent_failure",
+          symptom: {
+            signature: "execution_uncertain",
+            resource: `booking:${booking.id}`,
+            operation: execution.idempotencyKey,
+            detail: `Step ${execution.id} (${execution.idempotencyKey}) is ${execution.status}: ${execution.error ?? "outcome unknown"}`,
+            evidence: "prepared",
+          },
+        });
+        emitted.push(incident.id);
+      }
+    }
+  }
+  return [...new Set(emitted)];
+}
+
+export interface ResumeReconciliation {
+  resumedWaitingIds: string[];
+  reconciledExecutionIds: string[];
+  stillUncertainExecutionIds: string[];
+  /** Always false: resuming never refreshes a stale approval into a live one. */
+  approvalsRefreshed: false;
+  liveApprovalPresent: boolean;
+  note: string;
+}
+
+/**
+ * ADR-010 pause/takeover/resume with reconciliation (C07).
+ *
+ * Resume reopens paused waiting work through the attested owner control,
+ * then reconciles external reality BEFORE new effects: every uncertain or
+ * partial step on the booking's current proposal is reconciled against
+ * provider truth (read-only; never a new write). Previously recorded
+ * approvals are re-read, never refreshed — a stale approval stays stale and
+ * the owner must re-approve the displayed proposal. Takeover (another owner
+ * resuming) follows the same path: attestedBy names the resuming owner.
+ */
+export async function resumeAndReconcile(
+  deps: OperatorRuntimeDeps,
+  input: { bookingId: string; attestedBy: string; dedupeKey: string },
+): Promise<ResumeReconciliation> {
+  const control = deps.ledger.applyOwnerControl({
+    dedupeKey: input.dedupeKey,
+    kind: "resume",
+    bookingId: input.bookingId,
+    attestedBy: input.attestedBy,
+  });
+  const reconciledExecutionIds: string[] = [];
+  const stillUncertainExecutionIds: string[] = [];
+  try {
+    const current = deps.store.getCurrentProposalAction(input.bookingId);
+    if (current) {
+      for (const execution of deps.store.listActionExecutions(current.id)) {
+        if (execution.status !== "uncertain" && execution.status !== "partial") continue;
+        try {
+          await reconcileExecution(deps.booking, execution.id);
+          reconciledExecutionIds.push(execution.id);
+        } catch {
+          stillUncertainExecutionIds.push(execution.id);
+        }
+      }
+    }
+  } catch {
+    // No current proposal: nothing to reconcile; resume still stands.
+  }
+  let liveApprovalPresent = false;
+  try {
+    const current = deps.store.getCurrentProposalAction(input.bookingId);
+    if (current) {
+      liveApprovalPresent = deps.store.listApprovals(current.id).some(
+        (approval) =>
+          approval.status === "approved" &&
+          approval.proposalVersion === current.proposalVersion &&
+          approval.proposalFingerprint === current.proposalFingerprint,
+      );
+    }
+  } catch {
+    liveApprovalPresent = false;
+  }
+  return {
+    resumedWaitingIds: control.resumedWaitingIds,
+    reconciledExecutionIds,
+    stillUncertainExecutionIds,
+    approvalsRefreshed: false,
+    liveApprovalPresent,
+    note: "Resume reconciled provider effects before new work; stale approvals were not refreshed — re-approve the displayed proposal.",
+  };
 }

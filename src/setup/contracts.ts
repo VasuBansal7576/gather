@@ -262,3 +262,151 @@ export function parseCreateBusinessResult(value: unknown): CreateBusinessResultD
   if (!business || !ownerId || typeof value.created !== "boolean") return undefined;
   return { business, created: value.created, ownerId };
 }
+
+/* ------------------------------------------------------------------
+ * GET /api/setup/mode — installation mode, live availability and the
+ * prepared scenario's durable counts. Everything is server-derived; the UI
+ * renders only what this shape proves.
+ * ---------------------------------------------------------------- */
+
+export type PreparedScenarioIdDTO =
+  | "glasshouse"
+  | "empty"
+  | "non-event"
+  | "partial"
+  | "connection-failed"
+  | "legacy";
+
+export interface PreparedScenarioOptionDTO {
+  id: PreparedScenarioIdDTO;
+  label: string;
+  description: string;
+}
+
+export interface PreparedInboxItemDTO {
+  id: string;
+  kind: string;
+  subject: string;
+  from: string;
+  receivedAt: string;
+}
+
+export interface PreparedStateDTO {
+  scenario: PreparedScenarioIdDTO;
+  coverage: "complete" | "partial" | "failed";
+  coverageDetail: string;
+  inboxCount: number;
+  busyBlockCount: number;
+  offerCount: number;
+  demoClockAnchor: string;
+  inbox: PreparedInboxItemDTO[];
+}
+
+export interface SetupModeDTO {
+  managed: boolean;
+  mode: "prepared" | "live" | null;
+  installRoot: string | null;
+  stateDir: string | null;
+  databasePath: string;
+  customDatabasePath: boolean;
+  simulated: boolean;
+  live: { available: false; reason: string };
+  scenarios: PreparedScenarioOptionDTO[];
+  prepared: PreparedStateDTO | null;
+}
+
+const SCENARIO_IDS: readonly string[] = [
+  "glasshouse",
+  "empty",
+  "non-event",
+  "partial",
+  "connection-failed",
+  "legacy",
+];
+
+function parseScenarioOption(value: unknown): PreparedScenarioOptionDTO | undefined {
+  if (!isRecord(value)) return undefined;
+  if (typeof value.id !== "string" || !SCENARIO_IDS.includes(value.id)) return undefined;
+  const label = nonEmptyString(value.label);
+  const description = nonEmptyString(value.description);
+  if (!label || !description) return undefined;
+  return { id: value.id as PreparedScenarioIdDTO, label, description };
+}
+
+function parseInboxItem(value: unknown): PreparedInboxItemDTO | undefined {
+  if (!isRecord(value)) return undefined;
+  const id = nonEmptyString(value.id);
+  const kind = nonEmptyString(value.kind);
+  const subject = nonEmptyString(value.subject);
+  const from = nonEmptyString(value.from);
+  const receivedAt = nonEmptyString(value.receivedAt);
+  if (!id || !kind || !subject || !from || !receivedAt) return undefined;
+  return { id, kind, subject, from, receivedAt };
+}
+
+function parsePreparedState(value: unknown): PreparedStateDTO | undefined {
+  if (!isRecord(value)) return undefined;
+  if (typeof value.scenario !== "string" || !SCENARIO_IDS.includes(value.scenario)) return undefined;
+  if (value.coverage !== "complete" && value.coverage !== "partial" && value.coverage !== "failed") return undefined;
+  const coverageDetail = typeof value.coverageDetail === "string" ? value.coverageDetail : undefined;
+  if (coverageDetail === undefined) return undefined;
+  for (const count of [value.inboxCount, value.busyBlockCount, value.offerCount]) {
+    if (typeof count !== "number" || !Number.isInteger(count) || count < 0) return undefined;
+  }
+  const demoClockAnchor = nonEmptyString(value.demoClockAnchor);
+  if (!demoClockAnchor) return undefined;
+  if (!Array.isArray(value.inbox)) return undefined;
+  const inbox: PreparedInboxItemDTO[] = [];
+  for (const item of value.inbox) {
+    const parsed = parseInboxItem(item);
+    if (!parsed) return undefined;
+    inbox.push(parsed);
+  }
+  return {
+    scenario: value.scenario as PreparedScenarioIdDTO,
+    coverage: value.coverage,
+    coverageDetail,
+    inboxCount: value.inboxCount as number,
+    busyBlockCount: value.busyBlockCount as number,
+    offerCount: value.offerCount as number,
+    demoClockAnchor,
+    inbox,
+  };
+}
+
+/** Strict parse of GET /api/setup/mode. Returns undefined on any shape violation. */
+export function parseSetupMode(value: unknown): SetupModeDTO | undefined {
+  if (!isRecord(value)) return undefined;
+  if (typeof value.managed !== "boolean" || typeof value.customDatabasePath !== "boolean") return undefined;
+  if (typeof value.simulated !== "boolean") return undefined;
+  if (value.mode !== null && value.mode !== "prepared" && value.mode !== "live") return undefined;
+  if (value.installRoot !== null && typeof value.installRoot !== "string") return undefined;
+  if (value.stateDir !== null && typeof value.stateDir !== "string") return undefined;
+  const databasePath = nonEmptyString(value.databasePath);
+  if (!databasePath) return undefined;
+  if (!isRecord(value.live) || value.live.available !== false) return undefined;
+  const liveReason = nonEmptyString(value.live.reason);
+  if (!liveReason) return undefined;
+  if (!Array.isArray(value.scenarios)) return undefined;
+  const scenarios: PreparedScenarioOptionDTO[] = [];
+  for (const item of value.scenarios) {
+    const parsed = parseScenarioOption(item);
+    if (!parsed) return undefined;
+    scenarios.push(parsed);
+  }
+  const prepared: PreparedStateDTO | null =
+    value.prepared === null ? null : (parsePreparedState(value.prepared) ?? null);
+  if (value.prepared !== null && prepared === null) return undefined;
+  return {
+    managed: value.managed,
+    mode: value.mode,
+    installRoot: value.installRoot,
+    stateDir: value.stateDir,
+    databasePath,
+    customDatabasePath: value.customDatabasePath,
+    simulated: value.simulated,
+    live: { available: false, reason: liveReason },
+    scenarios,
+    prepared,
+  };
+}

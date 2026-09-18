@@ -28,3 +28,37 @@ export type {
   OffersKnowledgeSnapshot,
   WithheldFact,
 } from "./types.ts";
+// ADR-005 consumers over the ADR-008 port contract (review, rules, concessions).
+export {
+  batchConfirmCandidates,
+  correctAndPublish,
+  describeAvailability,
+  inspectSourceClaims,
+  listCorrectionEvents,
+  publishCorrectionEvent,
+  type BatchConfirmInput,
+  type BatchConfirmResult,
+  type CorrectAndPublishInput,
+  type CorrectAndPublishResult,
+  type CorrectionEvent,
+  type CorrectionEventInput,
+  type InspectedCandidate,
+  type KnowledgeAvailability,
+  type ReviewStorePort,
+  type SourceInspection,
+} from "./review.ts";
+export {
+  confirmParsedRule,
+  parseOwnerRuleText,
+  type ConfirmParsedRuleInput,
+  type ParsedRuleDraft,
+  type ParsedRuleKind,
+  type ParsedRuleScope,
+  type ParseOwnerRuleResult,
+} from "./rules.ts";
+export {
+  CONCESSION_APPROVAL_NOTICE,
+  validateConcessionForm,
+  type ConcessionFormInput,
+  type ValidatedConcessionForm,
+} from "./concessions.ts";

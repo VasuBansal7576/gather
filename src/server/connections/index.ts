@@ -8,7 +8,7 @@ export {
   ConnectionService,
   type ConnectionServiceDeps,
 } from "./service.ts";
-export { EnvSecretStore, KeychainSecretStore, MemorySecretStore, type KeychainRunner } from "./secrets.ts";
+export { EnvSecretStore, FileSecretStore, KeychainSecretStore, MemorySecretStore, type KeychainRunner } from "./secrets.ts";
 export { FetchOAuthTransport, type FetchImpl } from "./oauth.ts";
 export { googleProviderAppFromEnv, defaultSecretStore } from "./config.ts";
 export {

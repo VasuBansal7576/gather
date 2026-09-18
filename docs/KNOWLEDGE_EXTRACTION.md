@@ -209,3 +209,22 @@ registered by default — the host constructs it with a validated
 Tests fake only the gateway channel with explicit simulated fixtures
 (`simulated: true`). No live model, provider, gateway, or credentials were
 contacted; a real OpenClaw run remains unverified.
+
+## ADR-008 knowledge-port wiring (specified; live BLOCKED)
+
+Extraction output feeds the C04 `KnowledgePort`, not the service directly
+at the product seam: the ADR-007 pipeline's `ingestSource` /
+`invalidateSource` consumer is the active port (`PreparedKnowledgePort`
+today — labelled `prepared`, restart-durable source-version registry,
+deletion/revocation purges derived candidates into stale/review before
+dependent work). Nothing in this module confirms, corrects, or grants
+exceptions; owner decisions stay behind the port's explicit owner gate,
+and retrieved instructions remain inert data.
+
+Native cutover (recall/wiki adapter) is BLOCKED: 0/11 required surfaces
+are live-verified on the ADR-009 pinned manifest and no live method-table
+probe has run (`tests/native-knowledge-capability.test.ts` records the
+exact missing evidence). Migration exports confirmed facts through the
+public service and activates only after verified capability, a full C04
+gate, and a clean comparison — otherwise prepared remains the sole
+authority with rollback preserved.

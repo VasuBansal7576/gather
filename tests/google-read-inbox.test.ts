@@ -180,6 +180,88 @@ test("cursor-less full sync snapshots ids, catches arrivals, then names a cursor
   assert.ok(log[0]?.url.includes("/profile"), "watermark is read before the snapshot");
 });
 
+test("history messagesDeleted surface as invalidation signals, not silent absences", async () => {
+  const { poller: poll, log } = poller(() =>
+    json(200, {
+      historyId: "9100",
+      history: [
+        { id: "9099", messagesDeleted: [{ message: { id: "m-gone", threadId: "t-gone" } }] },
+        { id: "9098", messagesAdded: [{ message: { id: "m-new", threadId: "t-new" } }] },
+      ],
+    }),
+  );
+  const result = await poll.pollInbox("op-poll-del", { cursor: boundCursor("9000"), maxMessages: 10 });
+  assert.equal(result.status, "succeeded");
+  if (result.status !== "succeeded") return;
+  assert.deepEqual(result.data.deleted.map((change) => change.messageId), ["m-gone"]);
+  assert.deepEqual(result.data.changes.map((change) => change.messageId), ["m-new"]);
+  assert.equal(result.data.pages, 1);
+  assert.ok(log[0]?.url.includes("historyTypes=messageAdded%2CmessagesDeleted") || log[0]?.url.includes("historyTypes=messageAdded,messagesDeleted"));
+});
+
+test("a truncated bootstrap resumes the list phase so un-emitted snapshot ids are never skipped", async () => {
+  // Snapshot page carries three ids; cap at two. The resume cursor must
+  // restart the listing (seen-ids dedupe) rather than poll history —
+  // m-c predates the watermark and history would skip it forever.
+  const { poller: poll } = poller((req) => {
+    if (req.url.includes("/profile")) return json(200, { emailAddress: "owner@example.test", historyId: "8000" });
+    if (req.url.includes("/history")) return json(200, { historyId: "8000", history: [] });
+    return json(200, {
+      messages: [
+        { id: "m-a", threadId: "t-a" },
+        { id: "m-b", threadId: "t-b" },
+        { id: "m-c", threadId: "t-c" },
+      ],
+      resultSizeEstimate: 3,
+    });
+  });
+  const first = await poll.pollInbox("op-poll-list", { maxMessages: 2 });
+  assert.equal(first.status, "succeeded");
+  if (first.status !== "succeeded") return;
+  assert.deepEqual(first.data.changes.map((change) => change.messageId), ["m-a", "m-b"]);
+  assert.equal(first.data.truncated, true);
+  const resumed = await poll.pollInbox("op-poll-list-2", { cursor: first.data.nextCursor, maxMessages: 10 });
+  assert.equal(resumed.status, "succeeded");
+  if (resumed.status !== "succeeded") return;
+  assert.deepEqual(resumed.data.changes.map((change) => change.messageId), ["m-c"], "the un-emitted snapshot id replays instead of skipping");
+  assert.equal(resumed.data.truncated, false);
+  assert.equal(resumed.data.nextCursor, boundCursor("8000"));
+});
+
+test("message metadata read returns provider-internalDate bucketing evidence", async () => {
+  const { transport, log } = scripted(() =>
+    json(200, {
+      id: "m-meta",
+      threadId: "t-meta",
+      labelIds: ["INBOX", "UNREAD"],
+      internalDate: "1777881600000",
+      payload: {
+        headers: [
+          { name: "From", value: "guest@example.test" },
+          { name: "Subject", value: "Meta read" },
+          { name: "Date", value: "Tue, 28 Apr 2026 00:00:00 +0000" },
+        ],
+      },
+    }),
+  );
+  const reader = new GoogleGmailConnector({ transport, tokens: () => Promise.resolve("t") });
+  const result = await reader.readMessageMetadata({ operationKey: "op-meta-1", messageId: "m-meta" });
+  assert.equal(result.status, "succeeded");
+  if (result.status !== "succeeded") return;
+  assert.equal(result.data.message.messageId, "m-meta");
+  assert.equal(result.data.message.threadId, "t-meta");
+  assert.deepEqual(result.data.message.labelIds, ["INBOX", "UNREAD"]);
+  assert.equal(result.data.message.receivedAt, new Date(1777881600000).toISOString(), "internalDate drives windowing");
+  assert.equal(result.data.message.from, "guest@example.test");
+  assert.ok(log[0]?.url.includes("format=metadata"));
+  assert.ok(log[0]?.url.includes("metadataHeaders=Date"));
+
+  const missing = await reader.readMessageMetadata({ operationKey: "op-meta-2", messageId: "" });
+  assert.equal(missing.status, "failed");
+  if (missing.status !== "failed") return;
+  assert.equal(missing.error.kind, "invalid_request");
+});
+
 function b64url(text: string): string {
   return Buffer.from(text, "utf-8").toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
