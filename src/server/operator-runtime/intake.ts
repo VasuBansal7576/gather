@@ -38,6 +38,16 @@ export interface IntakeDeps extends OperatorRuntimeDeps {
    * unknown/unavailable verdicts also park for review.
    */
   domainGate?: DomainClassifier;
+  /**
+   * Host-owned acceptance validator. It runs before the new-inquiry gate so
+   * a signed token reply in a new thread can supply booking correlation;
+   * token-looking text without a validated result is ignored.
+   */
+  acceptance?: (input: { message: InquiryMessage; thread?: InquiryThread }) => Promise<{
+    outcome: "accepted" | "review" | "ignored";
+    bookingId?: string;
+    reason?: string;
+  }>;
 }
 
 function nowIso(deps: IntakeDeps): string {
@@ -388,6 +398,21 @@ async function drainItem(deps: IntakeDeps, intake: OperatorIntakeStore, item: In
       return otherMs !== undefined && otherMs < mineMs;
     });
     if (earlier.length > 0) kind = "reply";
+  }
+
+  // Acceptance is a scoped host validator, not an identity hint. Run it for
+  // every inbound message before the new-inquiry classifier; an ignored token
+  // candidate falls through normally and never grants booking authority.
+  if (view?.mine !== undefined && deps.acceptance !== undefined) {
+    const acceptance = await deps.acceptance({ message: view.mine, ...(view.thread === undefined ? {} : { thread: view.thread }) });
+    if (acceptance.outcome === "accepted" && acceptance.bookingId !== undefined) {
+      intake.updateItem(item.id, { status: "ingested", bookingId: acceptance.bookingId, error: undefined });
+      return "drained";
+    }
+    if (acceptance.outcome === "review") {
+      intake.updateItem(item.id, { status: "needs_decision", ...(acceptance.reason === undefined ? {} : { error: acceptance.reason }) });
+      return "needs_decision";
+    }
   }
 
   // Account scope resolves from the store's connected_accounts table first,

@@ -17,6 +17,12 @@ export interface AcceptanceTokenInput {
 
 export interface AcceptanceKeyring { activeVersion: string; keys: Record<string, string>; }
 
+/** Local host configuration; the signing secret is never returned to callers. */
+export function configuredAcceptanceKeyring(): AcceptanceKeyring | undefined {
+  const secret = process.env.GATHER_ACCEPTANCE_KEY?.trim();
+  return secret ? { activeVersion: "env-v1", keys: { "env-v1": secret } } : undefined;
+}
+
 export interface AcceptanceReply {
   body: string;
   sender: string;
