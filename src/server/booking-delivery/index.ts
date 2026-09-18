@@ -17,3 +17,4 @@ export type {
 } from "./service.ts";
 export { parseConfirmBody } from "./validation.ts";
 export { getDeliveryRuntime, resetDeliveryRuntimeForTests } from "./runtime.ts";
+export type { AcceptanceToken } from "./store.ts";

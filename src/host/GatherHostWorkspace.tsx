@@ -192,6 +192,7 @@ export function GatherHostWorkspace() {
         loading={loading}
         blockedState={notice}
         dataMode={adapted?.dataMode ?? 'demo'}
+        businessId={adapted?.businesses[0]?.id}
         pendingApprovals={adapted?.pendingApprovals ?? []}
         onApproveProposal={approve}
         onRetryAction={retry}

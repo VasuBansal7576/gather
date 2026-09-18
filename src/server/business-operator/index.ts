@@ -8,6 +8,14 @@ export {
   type OperatorDeps,
   type BuiltOffer,
 } from "./operator.ts";
+export {
+  batchQualificationQuestions,
+  describeBookingLifecycle,
+  prepareFreshInquiry,
+  type FreshInquiryIdentity,
+  type FreshInquiryRequest,
+  type FreshInquiryResult,
+} from "./lifecycle.ts";
 export type {
   OperatorPrepareEmail,
   OperatorPrepareRequest,

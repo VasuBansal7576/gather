@@ -1,0 +1,50 @@
+{
+  "$comment": "ADR-009 pinned runtime manifest. Exact tested release combination for the isolated OpenClaw runtime — never 'latest'. Recorded before provisioning per ADR-009 step 1. Integrity values mirror package-lock.json (npm's reproducibility source); provisioning validates pins against the installed tree, never a registry lookup.",
+  "schemaVersion": 1,
+  "releases": {
+    "@openclaw/gateway-client": {
+      "pinned": "2026.9.4",
+      "resolved": "https://registry.npmjs.org/@openclaw/gateway-client/-/gateway-client-2026.9.4.tgz",
+      "integrity": "sha512-MQSj/agWzPMvPbWIyh5azarYYJvxcrc9TVdPn22zdGAfW7SAOpocpa/ImOi8YcIDk6IILXvv0nRDFKXQnjMS6A==",
+      "role": "Gateway WebSocket protocol client (supported external-app path)"
+    },
+    "@modelcontextprotocol/sdk": {
+      "pinned": "1.30.0",
+      "resolved": "https://registry.npmjs.org/@modelcontextprotocol/sdk/-/sdk-1.30.0.tgz",
+      "integrity": "sha512-xKd8OIzlqNzcqcNumGAa6g+PW2kjD5vrpcKOnfldAUPP3j7lnqMPwlTXQm8gF+UwH72z0lqaRbjr9hqGz0eITA==",
+      "role": "Gather-owned MCP boundary (Streamable HTTP server + client)"
+    },
+    "zod": {
+      "pinned": "4.6.4",
+      "resolved": "https://registry.npmjs.org/zod/-/zod-4.6.4.tgz",
+      "integrity": "sha512-AXSD6hvGdvRjajG/l1cC+d6IrhH+sjmPKtYeQdJIK8MFJl3LyClzS+o/YsVC+zQZPupAaeH5skwwm8YqYH7BqA==",
+      "role": "MCP tool input schemas (satisfies the SDK's ^3.25 || ^4.0 range)"
+    }
+  },
+  "openclawRuntime": {
+    "$comment": "Host-installed openclaw binary is resolved as an explicit absolute path and verified via --version (OpenClaw x.y.z banner required). No version is pinned here because the binary is host-supplied, not npm-installed; the verified version is recorded in the doctor/provision log, never assumed.",
+    "pinned": null,
+    "resolution": "explicit-absolute-path-only",
+    "forbidden": ["latest-tag", "PATH-lookup", "global-install", "personal-~/.openclaw"]
+  },
+  "node": {
+    "minimum": "26.0.0",
+    "verified": "26.8.2",
+    "source": ".node-version + engines.node >= 26"
+  },
+  "platforms": ["darwin", "linux"],
+  "gatewayProtocol": {
+    "minProtocol": 4,
+    "readinessSignal": "hello-ok",
+    "methods": ["agent", "agent.wait", "chat.history", "sessions.list", "status", "config.get"]
+  },
+  "budgets": {
+    "$comment": "C08 release defaults, enforced by src/server/budget.ts. Configurable before running.",
+    "maxToolCallsPerRun": 15,
+    "maxTokensPerRun": 32000,
+    "runDeadlineMs": 300000,
+    "maxRunsPerBusinessPerDay": 50
+  },
+  "recordedAt": "2026-09-17",
+  "recordedFrom": "package-lock.json packages[] entries (this checkout, ADR-001 base 8ee0ea3)"
+}

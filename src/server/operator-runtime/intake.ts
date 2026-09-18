@@ -1,10 +1,17 @@
 import type { InquiryMessage, InquiryThread } from "../../connectors/contracts.ts";
 import { proposeBookingIdentity } from "../../identity/service.ts";
 import type { IdentityHints } from "../../identity/service.ts";
-import { decodeSourceKey } from "../../identity/source-key.ts";
+import { buildSourceKey, decodeSourceKey } from "../../identity/source-key.ts";
+import { ensureBookingIdentityTables, getActiveIdentityLink } from "../../identity/store.ts";
 import type { CoordinationLedger } from "../../coordination/ledger.ts";
 import type { GatherStore } from "../sqlite-store.ts";
 import { ServiceError } from "../booking-service.ts";
+import {
+  evaluateDomainGate,
+  type DomainClassifier,
+  type DomainGateInput,
+} from "../../intake/gate.ts";
+import { IntakeDomainStore } from "../../intake/store.ts";
 import { OperatorIntakeStore } from "./store.ts";
 import type {
   IntakeItemRecord,
@@ -22,6 +29,25 @@ export interface IntakeDeps extends OperatorRuntimeDeps {
   threads?: ThreadReaderPort;
   /** Account-owned sender addresses; their messages are never customer replies. */
   ownAddresses?: string[];
+  /**
+   * ADR-003 event-domain gate for NEW inquiries (unlinked, first-in-thread
+   * messages). Replies and already-linked items are correlated traffic and
+   * bypass the gate. Absent → every unlinked inquiry parks as needs_review
+   * (fail-closed: no classifier is never permission). Prepared mode wires
+   * the scripted classifier; a live classifier is an injected adapter whose
+   * unknown/unavailable verdicts also park for review.
+   */
+  domainGate?: DomainClassifier;
+  /**
+   * Host-owned acceptance validator. It runs before the new-inquiry gate so
+   * a signed token reply in a new thread can supply booking correlation;
+   * token-looking text without a validated result is ignored.
+   */
+  acceptance?: (input: { message: InquiryMessage; thread?: InquiryThread }) => Promise<{
+    outcome: "accepted" | "review" | "ignored";
+    bookingId?: string;
+    reason?: string;
+  }>;
 }
 
 function nowIso(deps: IntakeDeps): string {
@@ -374,28 +400,100 @@ async function drainItem(deps: IntakeDeps, intake: OperatorIntakeStore, item: In
     if (earlier.length > 0) kind = "reply";
   }
 
+  // Acceptance is a scoped host validator, not an identity hint. Run it for
+  // every inbound message before the new-inquiry classifier; an ignored token
+  // candidate falls through normally and never grants booking authority.
+  if (view?.mine !== undefined && deps.acceptance !== undefined) {
+    const acceptance = await deps.acceptance({ message: view.mine, ...(view.thread === undefined ? {} : { thread: view.thread }) });
+    if (acceptance.outcome === "accepted" && acceptance.bookingId !== undefined) {
+      intake.updateItem(item.id, { status: "ingested", bookingId: acceptance.bookingId, error: undefined });
+      return "drained";
+    }
+    if (acceptance.outcome === "review") {
+      intake.updateItem(item.id, { status: "needs_decision", ...(acceptance.reason === undefined ? {} : { error: acceptance.reason }) });
+      return "needs_decision";
+    }
+  }
+
   // Account scope resolves from the store's connected_accounts table first,
   // then the injected connections directory (independently owned lane).
   // Unknown accounts stay denied; they never silently bind.
   const directory = deps.connections;
-  const proposed = proposeBookingIdentity(store, {
-    components: {
-      provider: "gmail",
-      accountId: deps.accountId,
-      businessId: deps.businessId,
-      sourceKind: "email",
-      externalId: item.messageId,
-      threadId: item.threadId ?? "",
+  const accounts = directory === undefined ? undefined : {
+    getAccount: (accountId: string) => {
+      const entry = directory.getConnection(accountId);
+      return entry === undefined ? undefined : { businessId: entry.businessId, provider: entry.provider };
     },
+  };
+  const components = {
+    provider: "gmail" as const,
+    accountId: deps.accountId,
+    businessId: deps.businessId,
+    sourceKind: "email" as const,
+    externalId: item.messageId,
+    threadId: item.threadId ?? "",
+  };
+
+  // ADR-003 domain gate, applied only to NEW inquiries: messages already
+  // bound to a booking (active link) or sitting in reply position are
+  // correlated traffic and bypass it. Unlinked inquiries are classified
+  // before identity proposal so unrelated mail never reaches the booking
+  // lane — no ledger event, no booking write, no identity noise. A
+  // needs_review item still opens its identity decision so the owner's
+  // resolution path stays live while it waits.
+  if (kind === "inquiry") {
+    ensureBookingIdentityTables(store);
+    const linked = getActiveIdentityLink(store, buildSourceKey(components));
+    if (!linked) {
+      const gateInput: DomainGateInput | undefined = view?.mine === undefined ? undefined : {
+        messageId: item.messageId,
+        subject: view.mine.subject,
+        body: view.mine.body,
+        from: view.mine.from,
+        sourceTag: deps.inbox.provenance.label,
+      };
+      const gate = await evaluateDomainGate(deps.domainGate, gateInput);
+      const simulated = deps.inbox.provenance.simulated || (deps.threads?.provenance.simulated ?? true);
+      new IntakeDomainStore(store.db).record({
+        accountId: deps.accountId,
+        messageId: item.messageId,
+        sourceTag: deps.inbox.provenance.label,
+        decision: gate.decision,
+        classifier: gate.classifierId,
+        simulated,
+      });
+      const reason = gate.decision.reasons[0] ?? "domain gate decision";
+      if (gate.decision.outcome === "unrelated") {
+        intake.updateItem(item.id, { status: "skipped", error: `not an event inquiry: ${reason}` });
+        return "drained";
+      }
+      if (gate.decision.outcome === "needs_review") {
+        const proposed = proposeBookingIdentity(store, {
+          components,
+          hints,
+          ...(accounts === undefined ? {} : { accounts }),
+        });
+        if (proposed.outcome !== "linked") {
+          intake.updateItem(item.id, {
+            status: "needs_decision",
+            bookingId: undefined,
+            sourceKey: proposed.sourceKey,
+            error: `domain review: ${reason}`,
+          });
+          return "needs_decision";
+        }
+        // A verified/owner link landed between the check and propose:
+        // correlated traffic bypasses the gate and ingests normally below.
+      }
+      // eligible: fall through to the normal identity/ledger flow. Missing
+      // qualification fields ride the durable domain decision row.
+    }
+  }
+
+  const proposed = proposeBookingIdentity(store, {
+    components,
     hints,
-    ...(directory === undefined ? {} : {
-      accounts: {
-        getAccount: (accountId: string) => {
-          const entry = directory.getConnection(accountId);
-          return entry === undefined ? undefined : { businessId: entry.businessId, provider: entry.provider };
-        },
-      },
-    }),
+    ...(accounts === undefined ? {} : { accounts }),
   });
   intake.updateItem(item.id, { status: "linked", bookingId: proposed.outcome === "linked" ? proposed.bookingId : undefined, sourceKey: proposed.sourceKey });
   if (proposed.outcome !== "linked") {

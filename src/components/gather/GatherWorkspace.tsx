@@ -16,7 +16,9 @@ import type {
   WorkspaceView,
 } from './types';
 import { isApprovalInFlight, proposalApprovalComplete, receiptRecoveryKind, resolveSelectedBookingId } from './state';
+import { AcceptanceHandoffPanel, ComposerPanel, IdentityPanel, TakeoverPanel, TrendPanel, UnderstandingPanel } from './composition-panels';
 import { DEMO_BOOKINGS, DEMO_CONNECTIONS } from './demo-data';
+import { RecoveriesPanel } from './recoveries';
 import './GatherWorkspace.css';
 
 type IconName =
@@ -290,6 +292,14 @@ function Sidebar({
         <nav className="gather-nav" aria-label="Venue">
           <NavItem view="bookings" activeView={activeView} label="Bookings" icon="email" count={reviewCount} onClick={handleNavigate} />
           <NavItem view="connections" activeView={activeView} label="Connections" icon="link" onClick={handleNavigate} />
+          <NavItem view="understanding" activeView={activeView} label="Understanding" icon="document" onClick={handleNavigate} />
+        </nav>
+      </div>
+      <div className="gather-sidebar-section">
+        <span className="gather-sidebar-eyebrow">Care</span>
+        <nav className="gather-nav" aria-label="Care">
+          <NavItem view="recoveries" activeView={activeView} label="Recoveries" icon="refresh" onClick={handleNavigate} />
+          <NavItem view="trend" activeView={activeView} label="Trend" icon="clock" onClick={handleNavigate} />
         </nav>
       </div>
       <div className="gather-sidebar-bottom">
@@ -689,6 +699,7 @@ function BookingMeta({ booking }: { booking: BookingSummary }) {
 
 function BookingDetailPanel({
   booking,
+  allBookings,
   position,
   approvalPending,
   approvalFailed,
@@ -705,6 +716,7 @@ function BookingDetailPanel({
   onBack,
 }: {
   booking: BookingSummary;
+  allBookings: BookingSummary[];
   position: string;
   approvalPending: boolean;
   approvalFailed: boolean;
@@ -767,6 +779,8 @@ function BookingDetailPanel({
         <ReceiptsPanel booking={booking} onRetryAction={onRetryAction} onReconcileExecution={onReconcileExecution} />
         <SourcesPanel sources={proposal.sources} />
         <ActivityPanel booking={booking} />
+        <TakeoverPanel bookings={allBookings} />
+        <AcceptanceHandoffPanel bookingId={booking.id} />
       </div>
       <ApprovalFooter
         approvalPending={approvalPending}
@@ -888,6 +902,7 @@ function BookingsView({
         <>
           <BookingDetailPanel
             booking={selectedBooking}
+            allBookings={bookings}
             position={`${selectedIndex + 1} of ${bookings.length}`}
             approvalPending={approvalPending}
             approvalFailed={approvalFailed}
@@ -927,6 +942,7 @@ function ConnectionsView({ connections, dataBadge, hostWired, onConnect }: { con
     <div className="gather-connection-banner"><span className="gather-banner-icon"><Icon name="sparkle" size={19} /></span><div><strong>{connectedCount} of {connections.length} sources are ready</strong><p>{calendarNudge}</p></div><span className="gather-banner-progress" aria-label={`${connectedCount} of ${connections.length} connected`}><span style={{ width: `${connections.length ? (connectedCount / connections.length) * 100 : 0}%` }} /></span></div>
     <div className="gather-section-heading gather-connections-heading"><div><span className="gather-eyebrow">Connected tools</span><h2>Keep your context close</h2></div><span className="gather-muted-label">Your data stays yours</span></div>
     <div className="gather-connections-grid">{connections.map((connection) => <ConnectionCard key={connection.provider} connection={connection} hostWired={hostWired} onConnect={onConnect} />)}</div>
+    <IdentityPanel />
     <div className="gather-privacy-note"><span><Icon name="settings" size={17} /></span><p><strong>You define the boundaries.</strong> Gather only uses connected sources to prepare work for your review. It never treats a prepared offer as a booking until you approve it.</p></div>
   </>;
 }
@@ -938,6 +954,7 @@ export function GatherWorkspace({
   blockedState,
   initialView = 'today',
   dataMode,
+  businessId,
   pendingApprovals,
   onNavigate,
   onSelectBooking,
@@ -1056,6 +1073,19 @@ export function GatherWorkspace({
         {activeView === 'today' ? <TodayView bookings={bookings} connectedSourceCount={connections.filter((connection) => connection.connected).length} dataBadge={dataBadge} selectedBooking={selectedBooking} onOpen={openBooking} onNavigate={navigate} /> : null}
         {activeView === 'bookings' ? <BookingsView bookings={bookings} dataBadge={dataBadge} selectedBooking={selectedBooking} approvalPending={approvalPending} approvalFailed={approvalFailed} canApprove={onApproveProposal !== undefined} canEdit={onEditProposal !== undefined} canRetryBlocked={canRetryBlocked} onSelect={selectBooking} onApprove={approveProposal} onEdit={editProposal} onBlockedAction={retryBlocked} onReviewConnections={() => navigate('connections')} onRetryAction={retryAction} onReconcileExecution={reconcileExecution} mobileDetail={mobileDetail} onMobileDetailChange={setMobileDetail} /> : null}
         {activeView === 'connections' ? <ConnectionsView connections={connections} dataBadge={dataBadge} hostWired={onConnect !== undefined} onConnect={connect} /> : null}
+        {activeView === 'understanding' ? <>
+          <PageIntro eyebrow="Business context" title="Understanding" description="What Gather believes about your business, what still needs your review, and the rules you teach it.">{dataBadge ? <DataBadgeLabel badge={dataBadge} /> : null}</PageIntro>
+          <UnderstandingPanel businessId={businessId} />
+          <ComposerPanel enabled={dataBadge === 'demo'} disabledReason={dataBadge === 'demo' ? undefined : 'The inbox composer is prepared-mode only — live inboxes are read through the connected account, never written by typed mail.'} />
+        </> : null}
+        {activeView === 'recoveries' ? <>
+          <PageIntro eyebrow="Self-healing" title="Recoveries" description="What broke, what Gather did about it, and what remains. Every repair is verified before it counts.">{dataBadge ? <DataBadgeLabel badge={dataBadge} /> : null}</PageIntro>
+          <RecoveriesPanel />
+        </> : null}
+        {activeView === 'trend' ? <>
+          <PageIntro eyebrow="Measured, not claimed" title="Trend" description="Your evaluation score over past inquiries, recomputed when you correct Gather.">{dataBadge ? <DataBadgeLabel badge={dataBadge} /> : null}</PageIntro>
+          <TrendPanel businessId={businessId} />
+        </> : null}
       </>}
     </main>
   </div>;

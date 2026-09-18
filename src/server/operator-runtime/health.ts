@@ -1,3 +1,4 @@
+import type { DatabaseSync } from "node:sqlite";
 import type { OperatorHealth, OperatorRuntimeDeps } from "./types.ts";
 import { OperatorIntakeStore } from "./store.ts";
 import { getProactiveBinding } from "./automation.ts";
@@ -49,7 +50,7 @@ export function operatorHealth(deps: OperatorRuntimeDeps): OperatorHealth {
   // Simulation derives from durable evidence (latest batch wiring), never a
   // caller flag; with no evidence yet, assume simulated rather than live.
   const simulation = intake.latestSimulation(deps.accountId);
-  return {
+  const base: OperatorHealth = {
     simulation,
     generatedAt: nowIso(deps),
     accounts: [
@@ -77,4 +78,24 @@ export function operatorHealth(deps: OperatorRuntimeDeps): OperatorHealth {
     lastSweep: undefined,
     lastDueWork: undefined,
   };
+  // ADR-004 owner-visible incident counts. Read-only; stages without the
+  // incident tables report no summary rather than failing. Attached without
+  // widening the shared OperatorHealth contract (no other ADR owns it).
+  const summary = incidentSummary(deps.store.db);
+  return summary ? Object.assign(base, { incidents: summary }) : base;
+}
+
+/** Open/recovering/recovered/blocked incident counts, or undefined when the schema is absent. */
+export function incidentSummary(db: DatabaseSync): { open: number; recovering: number; recovered: number; blocked: number } | undefined {
+  try {
+    const rows = db.prepare("SELECT status AS status, COUNT(*) AS n FROM incidents GROUP BY status").all() as Array<Record<string, unknown>>;
+    const summary = { open: 0, recovering: 0, recovered: 0, blocked: 0 };
+    for (const item of rows) {
+      const status = String(item.status);
+      if (status in summary) summary[status as keyof typeof summary] = Number(item.n);
+    }
+    return summary;
+  } catch {
+    return undefined;
+  }
 }

@@ -1,4 +1,6 @@
-import { EnvSecretStore, KeychainSecretStore } from "./secrets.ts";
+import { EnvSecretStore, FileSecretStore, KeychainSecretStore } from "./secrets.ts";
+import { createHash } from "node:crypto";
+import { join, resolve } from "node:path";
 import type { GoogleProviderApp, SecretStore } from "./types.ts";
 
 /**
@@ -13,8 +15,9 @@ const DEFAULT_GOOGLE_SCOPES = [
   "email",
   "https://www.googleapis.com/auth/gmail.readonly",
   "https://www.googleapis.com/auth/gmail.send",
-  "https://www.googleapis.com/auth/calendar",
-  "https://www.googleapis.com/auth/drive.readonly",
+  "https://www.googleapis.com/auth/calendar.events",
+  "https://www.googleapis.com/auth/calendar.freebusy",
+  "https://www.googleapis.com/auth/drive.file",
 ];
 
 /**
@@ -48,5 +51,18 @@ export function googleProviderAppFromEnv(): GoogleProviderApp | undefined {
  */
 export function defaultSecretStore(namespace: string): SecretStore {
   if (process.env.GATHER_SECRETS === "env") return new EnvSecretStore();
+  // Managed live mode owns a separate root. Prepared mode never needs or
+  // creates credential files, and unmanaged development keeps Keychain as an
+  // explicit developer choice.
+  const installRoot = process.env.GATHER_INSTALL_ROOT?.trim();
+  if (installRoot && (process.env.GATHER_MODE ?? "prepared").trim().toLowerCase() === "live") {
+    const root = join(resolve(installRoot), ".runtime", "live", "secrets", "connections", sha256(namespace).slice(0, 16));
+    return new FileSecretStore(root);
+  }
   return new KeychainSecretStore({ namespace });
+}
+
+function sha256(value: string): string {
+  // Namespace hashing prevents database paths from becoming filesystem names.
+  return createHash("sha256").update(value).digest("hex");
 }

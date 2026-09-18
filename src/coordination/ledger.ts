@@ -92,7 +92,9 @@ function eventContentFingerprint(input: {
 function followupDueAt(input: CoordinationEventInput): string {
   const hint: unknown = input.payload?.followupDueAt;
   if (typeof hint === "string" && !Number.isNaN(Date.parse(hint))) return new Date(hint).toISOString();
-  return plusHours(input.observedAt, 48);
+  // C07 default: one follow-up draft after 24 hours without reply. An
+  // explicit per-event hint overrides the default; the default never sends.
+  return plusHours(input.observedAt, 24);
 }
 
 const EVENT_COLUMNS =
@@ -847,12 +849,15 @@ export class CoordinationLedger {
     if (this.isBlockedBySharedState(item.bookingId)) return "skipped";
     if (this.getControlState(item.bookingId) !== null) return "skipped";
     // Reply received after the list snapshot: suppress instead of handing
-    // out a reminder the customer already answered.
-    if (item.kind === "followup" && this.replyReceivedSince(item.bookingId, item.createdAt)) {
+    // out a reminder the customer already answered. A durable opt-out
+    // suppresses the same way: no further follow-ups for this booking.
+    if (item.kind === "followup" && (this.isOptedOut(item.bookingId) || this.replyReceivedSince(item.bookingId, item.createdAt))) {
       this.db
         .prepare(`UPDATE coord_waiting SET status = 'suppressed', resolution_note = $note, updated_at = $at WHERE id = $id`)
         .run({
-          $note: "Suppressed at claim time: reply received after the drain snapshot",
+          $note: this.isOptedOut(item.bookingId)
+            ? "Suppressed at claim time: booking opted out of follow-ups"
+            : "Suppressed at claim time: reply received after the drain snapshot",
           $at: this.now(),
           $id: id,
         });
@@ -1082,6 +1087,12 @@ export class CoordinationLedger {
 
     switch (input.kind) {
       case "inquiry": {
+        // C07 one-draft rule: the first inquiry opens the default follow-up
+        // draft (approval-gated, never auto-sent). Further auto drafts for
+        // the same booking are annotated as repeats: acting on them needs a
+        // new owner decision. Creation/drain/count semantics are unchanged —
+        // the annotation is additive detail, never a silent drop.
+        const priorFollowups = this.countFollowups(input.bookingId);
         const item = this.insertWaiting(
           input.bookingId,
           "followup",
@@ -1093,6 +1104,13 @@ export class CoordinationLedger {
             ...(this.entryStatus(input.bookingId, shared) === "invalidated"
               ? { reason: "booking_cancelled", note: "Booking is cancelled; followup invalidated at intake." }
               : { reason: "awaiting_customer_reply", sourceId: input.sourceId }),
+            ...(priorFollowups === 0
+              ? {}
+              : {
+                repeatDraft: true,
+                repeatNote:
+                  "A follow-up draft already exists for this booking; acting on this repeat draft needs a new owner decision.",
+              }),
           },
         );
         createdWaiting.push(item);
@@ -1102,7 +1120,9 @@ export class CoordinationLedger {
       case "reply": {
         // Received-order suppression: a non-stale reply received now answers
         // pending followups regardless of source-clock skew in observedAt.
-        for (const id of this.suppressFollowups(input.bookingId, timestamp)) {
+        // An explicit opt-out reply additionally records durable opt-out so
+        // later dispatches keep suppressing followups for this booking.
+        for (const id of this.suppressFollowups(input.bookingId, timestamp, this.isOptOutPayload(input.payload))) {
           suppressedWaitingIds.push(id);
         }
         break;
@@ -1214,7 +1234,7 @@ export class CoordinationLedger {
    * booking is answered by an event received now. Claimed items move too, so
    * their fencing tokens die with the obsolete work instead of completing it.
    */
-  private suppressFollowups(bookingId: string, timestamp: string): string[] {
+  private suppressFollowups(bookingId: string, timestamp: string, optOut = false): string[] {
     const ids: string[] = [];
     const pending = this.db
       .prepare(
@@ -1227,13 +1247,41 @@ export class CoordinationLedger {
       this.db
         .prepare(`UPDATE coord_waiting SET status = 'suppressed', resolution_note = $note, updated_at = $at WHERE id = $id`)
         .run({
-          $note: `Suppressed by received reply: customer answered before followup was acted on`,
+          $note: optOut
+            ? `Suppressed by opt-out reply: the customer asked for no further follow-ups`
+            : `Suppressed by received reply: customer answered before followup was acted on`,
           $at: timestamp,
           $id: id,
         });
       ids.push(id);
     }
     return ids;
+  }
+
+  /** Durable opt-out: a non-stale reply carrying an explicit opt-out flag. */
+  private isOptOutPayload(payload: Record<string, unknown> | undefined): boolean {
+    return payload?.optOut === true;
+  }
+
+  /** True when the booking has a durable non-stale opt-out reply on record. */
+  isOptedOut(bookingId: string): boolean {
+    const rows = this.db
+      .prepare(`SELECT payload_json FROM coord_events WHERE booking_id = $booking AND kind = 'reply' AND stale = 0`)
+      .all({ $booking: bookingId });
+    for (const row of rows) {
+      const payload = parseRecord(asRow(row).payload_json);
+      if (payload.optOut === true) return true;
+    }
+    return false;
+  }
+
+  /** Count followup drafts ever opened for a booking (drives the one-draft annotation). */
+  private countFollowups(bookingId: string): number {
+    const found = this.db
+      .prepare(`SELECT COUNT(*) AS total FROM coord_waiting WHERE booking_id = $booking AND kind = 'followup'`)
+      .get({ $booking: bookingId });
+    const total = found ? asRow(found).total : 0;
+    return typeof total === "number" ? total : 0;
   }
 
   private insertWaiting(

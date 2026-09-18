@@ -1,0 +1,14 @@
+{
+  "id": "assemblyai-scripted-uncertain-date",
+  "audioFixture": {
+    "byteLength": 52,
+    "contentType": "audio/mpeg",
+    "durationSeconds": 18,
+    "recordingLabel": "caller-fixture-uncertain"
+  },
+  "scripted": {
+    "text": "Hi, we'd like to host our company holiday reception, around 80 people. The invite says November 21, but half the team asked for December 5. Can you hold one of those?",
+    "confidence": 0.61
+  },
+  "provenance": "scripted:assemblyai-fixture (NOT a live transcription)"
+}

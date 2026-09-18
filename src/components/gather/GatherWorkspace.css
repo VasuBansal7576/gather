@@ -463,3 +463,30 @@
   .gather-main > * { padding: 14px 16px 32px; }
   .gather-briefing-grid { grid-template-columns: 1fr; }
 }
+
+/* ADR-006 composition panels: form controls inherit the workspace palette.
+   Native inputs keep keyboard/focus behavior; the accent matches selection. */
+.gather-app-shell .gather-review-block input[type="text"],
+.gather-app-shell .gather-review-block input[type="email"],
+.gather-app-shell .gather-review-block textarea,
+.gather-app-shell .gather-review-block select {
+  background: var(--gather-panel, #141418);
+  color: inherit;
+  border: 1px solid var(--gather-border-soft);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font: inherit;
+  font-size: 13px;
+}
+.gather-app-shell .gather-review-block input:disabled,
+.gather-app-shell .gather-review-block textarea:disabled,
+.gather-app-shell .gather-review-block select:disabled {
+  opacity: 0.55;
+}
+.gather-app-shell .gather-review-block input:focus-visible,
+.gather-app-shell .gather-review-block textarea:focus-visible,
+.gather-app-shell .gather-review-block select:focus-visible,
+.gather-app-shell .gather-meta-group select:focus-visible {
+  outline: 2px solid var(--gather-lavender);
+  outline-offset: 2px;
+}
