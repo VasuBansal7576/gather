@@ -196,6 +196,8 @@ export default function SetupPage(): React.JSX.Element {
   const [status, setStatus] = useState("");
   const [mode, setMode] = useState<SetupModeDTO | undefined>(undefined);
   const [liveGate, setLiveGate] = useState<{ liveReady: boolean; blockedBy: string[] } | undefined>(undefined);
+  const [profiles, setProfiles] = useState<Array<{ id: string; label: string; available: boolean }>>([]);
+  const [selectedProfile, setSelectedProfile] = useState<string>("base");
   const [scenario, setScenario] = useState<PreparedScenarioIdDTO>("glasshouse");
   const zones = useMemo(timezones, []);
 
@@ -255,13 +257,14 @@ export default function SetupPage(): React.JSX.Element {
         if (!cancelled) setMode(info);
       })
       .catch(() => undefined);
-    // ADR-006 live gate: owner-visible capability report. A failed read
-    // leaves the card in its disabled state — never an enabled guess.
+    // ADR-006 live gate + ADR-016 profile list: owner-visible capability
+    // report. A failed read leaves the card in its disabled state — never
+    // an enabled guess.
     fetch("/api/live-model/status?profile=base", { headers: { accept: "application/json" } })
       .then(async (response) => {
         if (cancelled || !response.ok) return;
         const body = (await response.json().catch(() => undefined)) as
-          | { gate?: { liveReady?: boolean; blockedBy?: string[] } }
+          | { gate?: { liveReady?: boolean; blockedBy?: string[] }; profiles?: Array<{ id?: string; label?: string; available?: boolean }> }
           | undefined;
         if (body?.gate) {
           setLiveGate({
@@ -269,8 +272,23 @@ export default function SetupPage(): React.JSX.Element {
             blockedBy: Array.isArray(body.gate.blockedBy) ? body.gate.blockedBy.map(String) : [],
           });
         }
+        if (Array.isArray(body?.profiles)) {
+          setProfiles(
+            body.profiles
+              .filter((entry) => typeof entry.id === "string" && typeof entry.label === "string")
+              .map((entry) => ({ id: entry.id as string, label: entry.label as string, available: entry.available === true })),
+          );
+        }
       })
       .catch(() => undefined);
+    try {
+      const stored = window.localStorage.getItem("gather:integration-profile");
+      if (stored === "assemblyai" || stored === "amazon" || stored === "nebius" || stored === "base") {
+        setSelectedProfile(stored);
+      }
+    } catch {
+      // Private-mode storage never blocks setup.
+    }
     return () => {
       cancelled = true;
     };
@@ -284,6 +302,23 @@ export default function SetupPage(): React.JSX.Element {
     setBusinessId(id);
     setStep("apps");
     setStatus("");
+  };
+
+  // ADR-016 profile selection (UI mount only): exactly one profile's mount
+  // renders in the workspace; unselected adapters receive no data. Server
+  // runs additionally honor GATHER_INTEGRATION_PROFILE (default base).
+  const chooseProfile = (id: string): void => {
+    setSelectedProfile(id);
+    try {
+      window.localStorage.setItem("gather:integration-profile", id);
+    } catch {
+      // Selection still applies to this page load.
+    }
+    try {
+      window.dispatchEvent(new CustomEvent("gather:profile-change"));
+    } catch {
+      // Older browsers ignore the event; the workspace reads on load.
+    }
   };
 
   const createBusiness = async (event: React.FormEvent): Promise<void> => {
@@ -385,6 +420,39 @@ export default function SetupPage(): React.JSX.Element {
       </header>
       <div className="setup-status" aria-live="polite">{status}</div>
       <main className="setup-main">
+        <section className="setup-panel" aria-label="Submission profile">
+          <h2>Submission profile</h2>
+          <p className="setup-muted">
+            One build, per-event configuration. Selecting a profile mounts only that profile&apos;s workspace panel —
+            unselected adapters receive no data. Server runs use <code>GATHER_INTEGRATION_PROFILE</code> (default{" "}
+            <code>base</code>).
+          </p>
+          {profiles.length > 0 ? (
+            <ul className="setup-choices">
+              {profiles.map((item) => (
+                <li key={item.id}>
+                  <button
+                    type="button"
+                    className="setup-choice"
+                    aria-pressed={selectedProfile === item.id}
+                    onClick={() => chooseProfile(item.id)}
+                  >
+                    <strong>{item.label}</strong>
+                    <span className="setup-muted">
+                      {item.id}
+                      {selectedProfile === item.id ? " — selected" : ""}
+                    </span>
+                    <span className={item.available ? "setup-pill is-ok" : "setup-pill is-attention"}>
+                      {item.available ? "Wired" : "Specified only"}
+                    </span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="setup-muted">Loading profiles…</p>
+          )}
+        </section>
         <section className="setup-panel" aria-label="Choose how to start">
           <h2>Choose how to start</h2>
           <div className="setup-choice-grid">

@@ -76,14 +76,18 @@ const EMPTY_EVIDENCE: LiveGateEvidence = {
 
 // ---------- C12 registry (consumed by event ADRs in 016) ----------
 
-test("006 registry: base is implemented; event profiles are specified-only", () => {
+test("006 registry: base is implemented; event profiles land explicitly in ADR-016", () => {
   const profiles = listProfiles();
   assert.deepEqual(profiles.map((profile) => profile.id).sort(), ["amazon", "assemblyai", "base", "nebius"]);
   assert.equal(getProfile("base").implementationStatus, "implemented");
   assert.equal(isProfileAvailable("base"), true);
+  // ADR-013/014/015 landed their adapters and ADR-016 registers the real
+  // exports (see tests/release-profile-routing.test.ts); availability here
+  // means "wired", not "credentialed" — live proof still gates on
+  // per-profile credentials. Consequential update by the 016 worker.
   for (const id of ["assemblyai", "amazon", "nebius"] as const) {
-    assert.equal(getProfile(id).implementationStatus, "specified");
-    assert.equal(isProfileAvailable(id), false, `${id} must stay inert until its owning ADR lands`);
+    assert.equal(getProfile(id).implementationStatus, "implemented");
+    assert.equal(isProfileAvailable(id), true, `${id} is registered by ADR-016`);
   }
   // No silent fallback: event profiles require their own capabilities.
   assert.ok(getProfile("assemblyai").requiredCapabilities.includes("voice"));

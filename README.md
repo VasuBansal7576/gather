@@ -19,7 +19,7 @@ The prepared path seeds the inquiry-first **Fictional Glasshouse** scenario: six
 
 ## What is not ready
 
-The prepared-inbox composer (turning seeded inquiries into offers), event-only intake gate, durable user-intent runner, automatic incident/repair experience, native-memory integration, and finished live onboarding are proposed work—not shipped capabilities. **Live mode is deliberately disabled in this build**: the first-run screen shows it as unavailable and fixture seeding is refused in a managed live-mode install. The end-to-end golden-path test is also not present.
+The prepared-inbox composer (turning seeded inquiries into offers), event-only intake gate, durable user-intent runner, automatic incident/repair experience, native-memory integration, and finished live onboarding are proposed work—not shipped capabilities. **Live mode is deliberately disabled in this build**: the first-run screen shows it as unavailable and fixture seeding is refused in a managed live-mode install. The scripted golden-path suites (`tests/golden-path.test.ts`, `tests/release-*.test.ts`) run green against simulated providers; they do not prove live provider outcomes.
 
 The [product requirements](docs/HACKATHON_PRD.md) describe the intended product. The [repository guide](docs/README.md) maps the existing code. The [16-ADR execution index](docs/adr/README.md) contains the reconciled requirement coverage, contracts and dependency waves. These are specifications, not permission to start implementation.
 
@@ -73,6 +73,17 @@ npm run build
 ```
 
 [CI](.github/workflows/ci.yml) runs these checks plus the local doctor on Linux and macOS, without model/provider credentials. Tests use temporary databases and scripted providers. Four optional real-OpenClaw process checks are reported as skipped unless explicitly enabled; see [local setup](docs/LOCAL_SETUP.md#optional-openclaw-process-checks). `npm run lint` is currently a compatibility alias for typechecking, not a separate lint pass.
+
+## Submission profiles
+
+One build serves every event through an explicit profile. The setup page offers a profile selector (base plus the AssemblyAI voice, Amazon owner-MCP, and Nebius model profiles); only the selected profile's workspace panel mounts, and unselected adapters receive no data. Server runs read `GATHER_INTEGRATION_PROFILE` (default `base`; unknown values fall back to `base`):
+
+```sh
+GATHER_INTEGRATION_PROFILE=assemblyai GATHER_DATABASE_PATH=.runtime/voice-demo.sqlite npm start -- --hostname 127.0.0.1 --port 3000
+node scripts/gather-doctor.mjs   # includes the per-profile capability report (missing credentials are BLOCKED skips)
+```
+
+The gate-by-gate proof index is [docs/RELEASE_EVIDENCE.md](docs/RELEASE_EVIDENCE.md). Live transcription, live provider effects, the demonstration video, and any registration/submission remain explicitly blocked or owner actions — see that index for the full blocker list.
 
 A green build or test suite does not establish live Google outcomes, model quality, or product completion.
 

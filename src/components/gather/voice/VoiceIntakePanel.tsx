@@ -3,7 +3,7 @@ import {
   VOICE_PRIVACY_NOTICE,
   VOICE_SOURCE_LABEL,
   type VoiceClarification,
-} from "../../../integrations/assemblyai/index.ts";
+} from "../../../integrations/assemblyai/intake.ts";
 
 const panel: React.CSSProperties = {
   border: "1px solid #d8d2c7",
