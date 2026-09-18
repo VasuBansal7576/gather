@@ -1,0 +1,14 @@
+{
+  "id": "assemblyai-scripted-complete",
+  "audioFixture": {
+    "byteLength": 48,
+    "contentType": "audio/wav",
+    "durationSeconds": 12,
+    "recordingLabel": "caller-fixture-complete"
+  },
+  "scripted": {
+    "text": "Hello! We're planning our wedding dinner for Saturday November 14, 2026, about 90 guests, 6:30pm to 11pm. Is the Glasshouse available, and what would it cost?",
+    "confidence": 0.97
+  },
+  "provenance": "scripted:assemblyai-fixture (NOT a live transcription)"
+}
