@@ -24,6 +24,10 @@ Checks:
   package.json and the supported npm commands
   installed package dependencies
   an existing, writable project-local .runtime directory
+  release capability report (ADR-016): selected submission profile plus
+  per-profile credential presence. Missing profile credentials are reported
+  as BLOCKED skips, never passes; the doctor performs no provider calls and
+  reads only credential names, never values.
 
 Options:
   --help  Show this help.
@@ -150,7 +154,71 @@ function checkRuntimeDirectory(cwd) {
   return check("pass", ".runtime", ".runtime is an existing writable project-local directory; doctor did not create it.");
 }
 
-export function runDoctor({ cwd = process.cwd(), emit } = {}) {
+/**
+ * ADR-016 release capability report (C12).
+ *
+ * Presence-level only: which submission profile is selected and which
+ * profile credentials are supplied. A missing credential is a BLOCKED skip
+ * with the exact missing evidence — never a pass, never a reason to contact
+ * a provider. Values are never read or printed.
+ */
+const RELEASE_PROFILE_IDS = Object.freeze(["base", "assemblyai", "amazon", "nebius"]);
+
+function selectedReleaseProfile(env) {
+  const raw = (env.GATHER_INTEGRATION_PROFILE ?? "").trim();
+  return RELEASE_PROFILE_IDS.includes(raw) ? raw : "base";
+}
+
+function envPresent(env, name) {
+  return (env[name] ?? "").trim().length > 0;
+}
+
+function checkReleaseCapabilities(env) {
+  const selected = selectedReleaseProfile(env);
+  const capability = (name, present, missingEvidence) =>
+    present
+      ? check("pass", name, `${name}: credential knob is supplied (presence only; value never read).`)
+      : check("skip", name, `BLOCKED: ${missingEvidence}. Prepared/scripted checks remain usable; no fixture evidence counts as live proof.`);
+  const modelAccess = envPresent(env, "GATHER_MODEL_PROFILE_ID") || envPresent(env, "GATHER_LIVE_CONSENT");
+  const checks = [
+    check("pass", "release profile", `Selected submission profile is "${selected}" (GATHER_INTEGRATION_PROFILE; default base). Unselected adapters receive no data.`),
+    capability(
+      "profile:base/model-access",
+      modelAccess,
+      "no supported model access authorized (GATHER_MODEL_PROFILE_ID or GATHER_LIVE_CONSENT required)",
+    ),
+    capability(
+      "profile:base/test-recipient",
+      envPresent(env, "GATHER_TEST_RECIPIENT"),
+      "GATHER_TEST_RECIPIENT is not set: live sends are restricted to an explicitly authorized test recipient",
+    ),
+    capability(
+      "profile:base/acceptance-signing",
+      envPresent(env, "GATHER_ACCEPTANCE_KEY"),
+      "GATHER_ACCEPTANCE_KEY is not set: live acceptance tokens cannot be signed",
+    ),
+    env.GATHER_ASSEMBLYAI_DISABLED === "1"
+      ? check("skip", "profile:assemblyai/voice-key", "BLOCKED: AssemblyAI voice profile is disabled (GATHER_ASSEMBLYAI_DISABLED=1); the adapter performs zero network activity.")
+      : capability(
+        "profile:assemblyai/voice-key",
+        envPresent(env, "GATHER_ASSEMBLYAI_API_KEY"),
+        "GATHER_ASSEMBLYAI_API_KEY is not set: live transcription is BLOCKED (013-A01 needs an operator-supplied recording plus this key)",
+      ),
+    check(
+      "pass",
+      "profile:amazon/owner-session",
+      "profile:amazon/owner-session: Amazon owner MCP surface is constructed per explicit owner/business session on loopback; there is no static credential to check. No anonymous surface exists.",
+    ),
+    capability(
+      "profile:nebius/token-factory",
+      envPresent(env, "GATHER_NEBIUS_API_KEY"),
+      "GATHER_NEBIUS_API_KEY is not set: Nebius Token Factory routing is BLOCKED (qualifying NVIDIA model call unsatisfied)",
+    ),
+  ];
+  return checks;
+}
+
+export function runDoctor({ cwd = process.cwd(), emit, env = process.env } = {}) {
   const projectDirectory = resolve(cwd);
   const packageInfo = readPackage(projectDirectory);
   const checks = [
@@ -159,6 +227,7 @@ export function runDoctor({ cwd = process.cwd(), emit } = {}) {
     checkDependencies(projectDirectory, packageInfo.packageJson),
     checkCommands(packageInfo.packageJson),
     checkRuntimeDirectory(projectDirectory),
+    ...checkReleaseCapabilities(env),
   ];
   const failed = checks.filter(({ status }) => status === "fail");
 

@@ -15,13 +15,34 @@ This public repository targets hackathons. Its local-first requirements and ADRs
 - Explicitly fictional fixtures for exercising approval, simulated actions, and recovery.
 - Google adapters, connection plumbing, deterministic offer/knowledge modules, and an isolated OpenClaw adapter with regression tests. Their presence is not proof of a complete live owner journey.
 
-The fixture path starts with two pre-created bookings and proposals. It does **not** demonstrate an agent reading a fresh inquiry, learning a venue, or preparing a priced offer end to end.
+The prepared path seeds the inquiry-first **Fictional Glasshouse** scenario: six inbox messages (three event inquiries — one complete, one missing a date, one with conflicting dates — plus an invoice, a newsletter and a vendor pitch), two busy calendar blocks, owner-confirmed fictional venue facts, and zero prebuilt offers. The older two-proposal seed remains available as the explicitly named `legacy` regression fixture. This still does **not** demonstrate an agent reading a fresh inquiry, learning a venue, or preparing a priced offer end to end.
 
 ## What is not ready
 
-The one-command installer, prepared-inbox composer and reset flow, event-only intake gate, durable user-intent runner, automatic incident/repair experience, native-memory integration, and finished live onboarding are proposed work—not shipped capabilities. The end-to-end golden-path test is also not present.
+The prepared-inbox composer (turning seeded inquiries into offers), event-only intake gate, durable user-intent runner, automatic incident/repair experience, native-memory integration, and finished live onboarding are proposed work—not shipped capabilities. **Live mode is deliberately disabled in this build**: the first-run screen shows it as unavailable and fixture seeding is refused in a managed live-mode install. The scripted golden-path suites (`tests/golden-path.test.ts`, `tests/release-*.test.ts`) run green against simulated providers; they do not prove live provider outcomes.
 
 The [product requirements](docs/HACKATHON_PRD.md) describe the intended product. The [repository guide](docs/README.md) maps the existing code. The [16-ADR execution index](docs/adr/README.md) contains the reconciled requirement coverage, contracts and dependency waves. These are specifications, not permission to start implementation.
+
+## Packaged local install
+
+The packaged entry is the `gather` bin (`npx github:VasuBansal7576/gather`, or `node scripts/gather-cli.mjs` inside the package). Run it from a fresh writable directory on macOS or Linux with Node 26+; the first run needs network access for npm. It stages and builds the app under `./.runtime/app/<revision>` (never runs from npm's cache), takes a process lock, picks a free loopback port, and serves the setup page — printing the URL always, opening a browser unless `--no-open`.
+
+```sh
+mkdir gather-demo && cd gather-demo
+npx github:VasuBansal7576/gather start --no-open
+```
+
+All state lives under `.runtime/`: the prepared business at `.runtime/prepared/gather.sqlite`, the (unused) live root at `.runtime/live/`, and an isolated npm cache at `.runtime/npm-cache/`. The two mode roots cannot reach each other, and one business is allowed per mode.
+
+```sh
+gather status                                  # install root, lock, seeded scenario
+gather seed --scenario glasshouse --yes        # seed while the app is stopped
+gather reset --confirm-reset --scenario empty  # preserve old DB set, reseed
+gather import --from data/gather.sqlite        # explicit, integrity-checked legacy copy
+gather doctor                                  # packaged-install prerequisites
+```
+
+`reset` requires `--confirm-reset`, refuses to run while the app holds the installation lease (`.runtime/installation.sqlite`), refuses an explicit `GATHER_DATABASE_PATH` and any symlinked state path, moves the previous DB/WAL/SHM set into `.runtime/prepared/reset-backup/`, and never touches live state or `data/gather.sqlite`. Scenario choices: `glasshouse` (default), `empty`, `non-event`, `partial`, `connection-failed`, and the `legacy` regression seed.
 
 ## Inspect the prototype locally
 
@@ -39,7 +60,7 @@ GATHER_DATABASE_PATH=.runtime/owner-demo.sqlite npm start -- --hostname 127.0.0.
 
 Open **http://127.0.0.1:3000/setup**, choose **Try demo**, then **Enter workspace**. Records and external effects on this path are fictional/simulated. A provisional hold is not a confirmed booking.
 
-The explicit database path above preserves this inspection's records in `.runtime/`. Without it, the existing application defaults to `data/gather.sqlite`; this cleanup does not migrate or delete existing state. `npx github:VasuBansal7576/gather` is not a working install command yet.
+The explicit database path above preserves this inspection's records in `.runtime/`. Without it, the existing application defaults to `data/gather.sqlite`; this cleanup does not migrate or delete existing state. When an existing `data/gather.sqlite` is found, the packaged CLI reports its location and leaves it untouched unless you copy it in explicitly with `gather import --from`.
 
 See [local setup](docs/LOCAL_SETUP.md) for development commands and troubleshooting. Keep the server bound to loopback; the current local-owner identity is not hosted authentication.
 
@@ -52,6 +73,17 @@ npm run build
 ```
 
 [CI](.github/workflows/ci.yml) runs these checks plus the local doctor on Linux and macOS, without model/provider credentials. Tests use temporary databases and scripted providers. Four optional real-OpenClaw process checks are reported as skipped unless explicitly enabled; see [local setup](docs/LOCAL_SETUP.md#optional-openclaw-process-checks). `npm run lint` is currently a compatibility alias for typechecking, not a separate lint pass.
+
+## Submission profiles
+
+One build serves every event through an explicit profile. The setup page offers a profile selector (base plus the AssemblyAI voice, Amazon owner-MCP, and Nebius model profiles); only the selected profile's workspace panel mounts, and unselected adapters receive no data. Server runs read `GATHER_INTEGRATION_PROFILE` (default `base`; unknown values fall back to `base`):
+
+```sh
+GATHER_INTEGRATION_PROFILE=assemblyai GATHER_DATABASE_PATH=.runtime/voice-demo.sqlite npm start -- --hostname 127.0.0.1 --port 3000
+node scripts/gather-doctor.mjs   # includes the per-profile capability report (missing credentials are BLOCKED skips)
+```
+
+The gate-by-gate proof index is [docs/RELEASE_EVIDENCE.md](docs/RELEASE_EVIDENCE.md). Live transcription, live provider effects, the demonstration video, and any registration/submission remain explicitly blocked or owner actions — see that index for the full blocker list.
 
 A green build or test suite does not establish live Google outcomes, model quality, or product completion.
 

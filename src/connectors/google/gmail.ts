@@ -5,6 +5,7 @@ import type {
   InquiryMessage,
   InquiryThread,
   InquiryThreadReader,
+  OperationRequest,
   ReadInquiryThreadRequest,
   ReadInquiryThreadResponse,
   SendEmailRequest,
@@ -314,6 +315,32 @@ export interface BoundedThreadResponse {
   completeness: ThreadBodyCompleteness;
 }
 
+/**
+ * Cheap per-message metadata (`messages.get?format=metadata`): the
+ * progressive source pipeline uses it to bucket observed ids into the
+ * declared history window before paying for a full thread read. Dates come
+ * from the provider `internalDate` (ms epoch), never from parsed headers,
+ * so windowing does not trust sender-supplied content.
+ */
+export interface MessageMetadata {
+  messageId: string;
+  threadId?: string;
+  labelIds: string[];
+  internalDate?: string;
+  receivedAt?: string;
+  from?: string;
+  subject?: string;
+}
+
+export interface ReadMessageMetadataRequest extends OperationRequest {
+  messageId: string;
+}
+
+export interface ReadMessageMetadataResponse {
+  message: MessageMetadata;
+  provenance: SourceReference[];
+}
+
 export interface GoogleGmailOptions extends GoogleAdapterOptions {
   /** Durable operationKey → approved-send lookup required for full reconcile identity. */
   resolveSentExpectation?: SentExpectationResolver;
@@ -435,6 +462,62 @@ export class GoogleGmailConnector implements InquiryThreadReader, EmailSender {
       },
       completeness: { complete: flagged.every((message) => message.complete), messages: flagged },
     };
+  }
+
+  /**
+   * Metadata-only message read (`format=metadata`, explicit header list).
+   * Read path only: used to window observed ids before full thread reads —
+   * never as authority, and never a substitute for the bounded body read.
+   */
+  async readMessageMetadata(request: ReadMessageMetadataRequest): Promise<ConnectorResult<ReadMessageMetadataResponse>> {
+    if (request.operationKey.trim().length === 0 || request.messageId.trim().length === 0) {
+      return {
+        status: "failed",
+        metadata: liveMetadata(request.operationKey, []),
+        error: invalidRequest("operationKey and messageId are required"),
+      };
+    }
+    // `metadataHeaders` is a repeated query parameter, which withQuery's
+    // flat record cannot express — the values are fixed constants, so the
+    // parameter list is appended literally (no caller input is interpolated).
+    const url = `${GMAIL_BASE_URL}/users/${encodeURIComponent(this.userId())}/messages/${encodeURIComponent(request.messageId)}?format=metadata&metadataHeaders=Date&metadataHeaders=From&metadataHeaders=Subject`;
+    let response: GoogleHttpResponse;
+    try {
+      response = await authorized(this.options, { method: "GET", url });
+    } catch (error) {
+      if (error instanceof TokenUnavailableError) return tokenFailure(request.operationKey);
+      if (error instanceof TransportTimeoutError || error instanceof TransportNetworkError) {
+        return { status: "failed", metadata: liveMetadata(request.operationKey, []), error: transportError("Gmail metadata read timed out; no write was attempted so retry is safe") };
+      }
+      throw error;
+    }
+    if (response.status !== 200) {
+      const error = mapGoogleHttpError(response.status, safeParseJson(response.text), "readMessageMetadata");
+      return { status: "failed", metadata: liveMetadata(request.operationKey, []), error };
+    }
+    const parsed = parseGmailMessage(safeParseJson(response.text));
+    if (parsed === undefined) {
+      return { status: "failed", metadata: liveMetadata(request.operationKey, []), error: transportError("Gmail messages.get returned an unrecognized JSON shape") };
+    }
+    const internalMs = parsed.internalDate !== undefined && /^\d+$/.test(parsed.internalDate) ? Number(parsed.internalDate) : undefined;
+    const headerDate = findHeader(parsed.headers, "Date");
+    const headerMs = headerDate !== undefined ? Date.parse(headerDate) : Number.NaN;
+    const receivedAt = internalMs !== undefined
+      ? new Date(internalMs).toISOString()
+      : Number.isFinite(headerMs) && headerDate !== undefined
+        ? new Date(headerMs).toISOString()
+        : undefined;
+    const provenance = [this.gmailSource(parsed.threadId ?? parsed.id)];
+    const message: MessageMetadata = {
+      messageId: parsed.id,
+      labelIds: parsed.labelIds,
+      ...(parsed.threadId === undefined ? {} : { threadId: parsed.threadId }),
+      ...(parsed.internalDate === undefined ? {} : { internalDate: parsed.internalDate }),
+      ...(receivedAt === undefined ? {} : { receivedAt }),
+      ...(findHeader(parsed.headers, "From") === undefined ? {} : { from: findHeader(parsed.headers, "From") }),
+      ...(findHeader(parsed.headers, "Subject") === undefined ? {} : { subject: findHeader(parsed.headers, "Subject") }),
+    };
+    return { status: "succeeded", metadata: liveMetadata(request.operationKey, provenance), data: { message, provenance } };
   }
 
   async readInquiryThread(request: ReadInquiryThreadRequest): Promise<ConnectorResult<ReadInquiryThreadResponse>> {

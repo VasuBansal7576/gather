@@ -27,9 +27,17 @@ Keep the server bound to loopback. The local owner identity and same-origin chec
 | `npm start -- --hostname 127.0.0.1` | Serve an existing build; does not install or build it. |
 | `npm run typecheck` | TypeScript check. |
 | `npm run lint` | Compatibility alias for typecheck; no separate linter is configured. |
-| `npm test` | Local regression suite, with optional OpenClaw process checks skipped unless requested. |
-| `node scripts/gather-doctor.mjs --json` | Read-only prerequisites check. |
+| `npm test` | Local regression suite, with optional OpenClaw process checks skipped unless requested. Includes the scripted golden-path (`tests/golden-path.test.ts`) and release (`tests/release-*.test.ts`) suites. |
+| `node scripts/gather-doctor.mjs --json` | Read-only prerequisites check, including the per-profile capability report (missing credentials are BLOCKED skips). |
 | `node scripts/gather-start.mjs --dry-run` | Check prerequisites and describe the legacy development launcher without starting it. |
+
+Submission profiles: server runs read `GATHER_INTEGRATION_PROFILE` (`base` default; demonstrated with `assemblyai` on loopback port 3102, `/setup` 200):
+
+```sh
+GATHER_INTEGRATION_PROFILE=assemblyai GATHER_DATABASE_PATH=.runtime/voice-demo.sqlite npm start -- --hostname 127.0.0.1 --port 3000
+```
+
+The setup page also offers a UI-only profile selector; only the selected profile's workspace panel mounts. See [release evidence](RELEASE_EVIDENCE.md) for the gate-by-gate proof index and blocker list.
 
 For development:
 
@@ -59,7 +67,7 @@ An invalid explicit path fails rather than skipping. These checks create isolate
 
 ## CI and evidence
 
-[CI](../.github/workflows/ci.yml) installs the lockfile, runs the doctor, typechecks, tests and builds on Linux and macOS using `.node-version`. It has read-only repository permissions, no provider secrets, and does not install OpenClaw or deploy the app. Optional process-test skips remain visible; there is no golden-path test yet.
+[CI](../.github/workflows/ci.yml) installs the lockfile, runs the doctor, typechecks, tests and builds on Linux and macOS using `.node-version`. It has read-only repository permissions, no provider secrets, and does not install OpenClaw or deploy the app. Optional process-test skips remain visible; the scripted golden-path and release suites run as part of `npm test`.
 
 For a PR, report the exact commands, failures/skips and the boundary exercised. A build or simulated receipt is not a live booking result. See the [README](../README.md#inspect-the-prototype-locally) for the inspection scope.
 

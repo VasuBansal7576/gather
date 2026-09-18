@@ -61,6 +61,21 @@ export async function approveProposal(identity: ProposalIdentity): Promise<unkno
   });
 }
 
+/**
+ * Durable variant: `{ intent: true }` commits the exact approval as a
+ * durable intent and returns `{ intentId, intent }` (202) for persisted
+ * progress via GET /api/intents/:id. Same authority and error mapping.
+ */
+export async function approveProposalAsync(identity: ProposalIdentity): Promise<{ intentId: string; intent: unknown }> {
+  return post(`/api/bookings/${encodeURIComponent(identity.bookingId)}/approve`, {
+    bookingId: identity.bookingId,
+    proposedActionId: identity.proposedActionId,
+    proposalVersion: identity.proposalVersion,
+    proposalFingerprint: identity.proposalFingerprint,
+    intent: true,
+  }) as Promise<{ intentId: string; intent: unknown }>;
+}
+
 /** POST /api/actions/:actionId/retry — retries failed steps only. */
 export async function retryAction(actionId: string): Promise<unknown> {
   return post(`/api/actions/${encodeURIComponent(actionId)}/retry`);
@@ -69,6 +84,22 @@ export async function retryAction(actionId: string): Promise<unknown> {
 /** POST /api/executions/:executionId/reconcile — reconcile uncertain/partial. */
 export async function reconcileExecution(executionId: string): Promise<unknown> {
   return post(`/api/executions/${encodeURIComponent(executionId)}/reconcile`);
+}
+
+/**
+ * Durable variant: commits the reconciliation as a durable intent (202 with
+ * `{ intentId, intent }`) for persisted progress via GET /api/intents/:id.
+ */
+export async function reconcileExecutionAsync(executionId: string): Promise<{ intentId: string; intent: unknown }> {
+  return post(`/api/executions/${encodeURIComponent(executionId)}/reconcile`, { intent: true }) as Promise<{
+    intentId: string;
+    intent: unknown;
+  }>;
+}
+
+/** GET /api/live-model/status — owner-visible live capability gate. */
+export async function fetchLiveStatus(profile = 'base'): Promise<unknown> {
+  return request(`/api/live-model/status?profile=${encodeURIComponent(profile)}`, { cache: 'no-store' });
 }
 
 /** POST /api/demo/init — seeds explicitly fictional demo fixtures. */

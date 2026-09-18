@@ -456,8 +456,9 @@ A build, screenshot, test count or worker report alone is not product completion
 
 ## 11. Hackathon-specific requirements and submission configurations
 
-Research snapshot: September 16, 2026.
-Three target events, rechecked against primary rules pages on that date.
+Research snapshot: September 16, 2026; rechecked against the primary rules
+pages on September 18, 2026 with all §11 facts confirmed accurate
+(per-event baselines and new-work logs in docs/RELEASE_EVIDENCE.md).
 Recheck linked primary rules before entry.
 NextStep (environmental theme, students only), OpenServ (existing-project eligibility unresolved, owner deprioritized), ForgeHacks (current students only), Waycode and Anna are excluded by owner decision.
 

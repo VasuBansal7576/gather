@@ -17,6 +17,9 @@ A delivery layer on top of the reviewed `src/delivery` evaluator
 - `src/server/booking-delivery/service.ts` — `readinessForBooking`
   (read-only), `confirmBooking` (guarded, idempotent, atomic),
   `handoffForBooking` (revised operational handoff).
+- `src/server/acceptance/` — opaque, version-bound `mailto:` acceptance
+  tokens and authenticated reply processing. The URL contains only a random
+  handle and signature; opening it never records acceptance.
 - Routes:
   - `GET  /api/bookings/[bookingId]/readiness` — read-only evaluation
   - `POST /api/bookings/[bookingId]/confirm` — guarded transition
@@ -34,6 +37,8 @@ scope and source references — never accepted from request payloads:
 | --- | --- | --- |
 | `delivery_policies` | Confirmation conditions per business | `business_id` |
 | `delivery_acceptance` | Customer acceptance / revocation | business + booking + version + fingerprint |
+| `delivery_acceptance_tokens` | Opaque token bindings and expiry | business + booking + version + fingerprint + sender |
+| `delivery_acceptance_token_uses` | Once-only token use and acceptance identity | token + use digest |
 | `delivery_deposit_receipts` | Payment ledger snapshots (incl. refunds) | business + booking + receipt |
 | `delivery_resource_commitments` | committed/revoked/expired resource records | business + booking + version + fingerprint + resource |
 | `delivery_waivers` | Owner waivers for optional conditions | business + booking + version + fingerprint + owner |
@@ -129,6 +134,23 @@ Both paths report `state`:
 
 Services, responsibilities, timings, and outstanding items come only
 from the accepted payload + decision evidence — nothing is invented.
+
+## Customer acceptance
+
+The operator composes an `Accept by email` affordance from the exact current
+proposal action. The mail client opens a reply containing an opaque signed
+handle; the customer must send that reply. The host validates provider
+authentication, authorized sender, original offer-send receipt, exact proposal
+version/fingerprint, expiry, and key version before atomically recording token
+use and acceptance evidence. New-thread token replies use the validated token
+for correlation; token-looking text alone grants no identity or authority,
+and plain `yes` without exact correlation remains review-only.
+
+Acceptance is evidence, not confirmation. Readiness is re-evaluated against
+the accepted version and configured resource/payment conditions, and handoff
+remains preliminary while required evidence is missing. A later price
+correction publishes a new proposal version; it never rewrites the accepted
+snapshot or its handoff binding.
 
 ## Provenance separation
 

@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { createSetupApi, SetupApiError, type CreateBusinessResultDTO, type SetupBusinessDTO, type SetupFetch } from "../../src/setup/api.ts";
+import { createSetupApi, SetupApiError, type CreateBusinessResultDTO, type PreparedScenarioIdDTO, type SetupBusinessDTO, type SetupFetch, type SetupModeDTO } from "../../src/setup/api.ts";
 import type {
   ConnectedAccountDTO,
   ConnectionsSummaryDTO,
@@ -194,6 +194,11 @@ export default function SetupPage(): React.JSX.Element {
   const [disconnectingId, setDisconnectingId] = useState<string | undefined>(undefined);
   const [demoState, setDemoState] = useState<LoadState>({ kind: "idle" });
   const [status, setStatus] = useState("");
+  const [mode, setMode] = useState<SetupModeDTO | undefined>(undefined);
+  const [liveGate, setLiveGate] = useState<{ liveReady: boolean; blockedBy: string[] } | undefined>(undefined);
+  const [profiles, setProfiles] = useState<Array<{ id: string; label: string; available: boolean }>>([]);
+  const [selectedProfile, setSelectedProfile] = useState<string>("base");
+  const [scenario, setScenario] = useState<PreparedScenarioIdDTO>("glasshouse");
   const zones = useMemo(timezones, []);
 
   const loadBusinesses = useCallback(async () => {
@@ -246,6 +251,50 @@ export default function SetupPage(): React.JSX.Element {
   }, [loadBusinesses]);
 
   useEffect(() => {
+    let cancelled = false;
+    api.getMode()
+      .then((info) => {
+        if (!cancelled) setMode(info);
+      })
+      .catch(() => undefined);
+    // ADR-006 live gate + ADR-016 profile list: owner-visible capability
+    // report. A failed read leaves the card in its disabled state — never
+    // an enabled guess.
+    fetch("/api/live-model/status?profile=base", { headers: { accept: "application/json" } })
+      .then(async (response) => {
+        if (cancelled || !response.ok) return;
+        const body = (await response.json().catch(() => undefined)) as
+          | { gate?: { liveReady?: boolean; blockedBy?: string[] }; profiles?: Array<{ id?: string; label?: string; available?: boolean }> }
+          | undefined;
+        if (body?.gate) {
+          setLiveGate({
+            liveReady: body.gate.liveReady === true,
+            blockedBy: Array.isArray(body.gate.blockedBy) ? body.gate.blockedBy.map(String) : [],
+          });
+        }
+        if (Array.isArray(body?.profiles)) {
+          setProfiles(
+            body.profiles
+              .filter((entry) => typeof entry.id === "string" && typeof entry.label === "string")
+              .map((entry) => ({ id: entry.id as string, label: entry.label as string, available: entry.available === true })),
+          );
+        }
+      })
+      .catch(() => undefined);
+    try {
+      const stored = window.localStorage.getItem("gather:integration-profile");
+      if (stored === "assemblyai" || stored === "amazon" || stored === "nebius" || stored === "base") {
+        setSelectedProfile(stored);
+      }
+    } catch {
+      // Private-mode storage never blocks setup.
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [api]);
+
+  useEffect(() => {
     if (businessId) void loadConnections(businessId);
   }, [businessId, loadConnections, callback]);
 
@@ -253,6 +302,23 @@ export default function SetupPage(): React.JSX.Element {
     setBusinessId(id);
     setStep("apps");
     setStatus("");
+  };
+
+  // ADR-016 profile selection (UI mount only): exactly one profile's mount
+  // renders in the workspace; unselected adapters receive no data. Server
+  // runs additionally honor GATHER_INTEGRATION_PROFILE (default base).
+  const chooseProfile = (id: string): void => {
+    setSelectedProfile(id);
+    try {
+      window.localStorage.setItem("gather:integration-profile", id);
+    } catch {
+      // Selection still applies to this page load.
+    }
+    try {
+      window.dispatchEvent(new CustomEvent("gather:profile-change"));
+    } catch {
+      // Older browsers ignore the event; the workspace reads on load.
+    }
   };
 
   const createBusiness = async (event: React.FormEvent): Promise<void> => {
@@ -321,13 +387,18 @@ export default function SetupPage(): React.JSX.Element {
     const run = epochAct.current.next();
     setDemoState({ kind: "loading" });
     try {
-      const demo = await api.startDemo();
+      const demo = await api.startDemo(mode?.managed === true ? scenario : undefined);
       if (!epochAct.current.isCurrent(run)) return;
       setDemoState({ kind: "ready" });
       setBusinessId(demo.businessId);
       setStep("ready");
       setStatus("Demo venue ready — nothing here is real, and your real setup is untouched.");
       await loadBusinesses();
+      try {
+        setMode(await api.getMode());
+      } catch {
+        // A stale mode read never blocks the completed seed.
+      }
     } catch (error) {
       if (!epochAct.current.isCurrent(run)) return;
       const apiError = error instanceof SetupApiError ? error.apiError : { code: "UNKNOWN", message: "Gather could not start the demo.", retryable: true };
@@ -349,7 +420,112 @@ export default function SetupPage(): React.JSX.Element {
       </header>
       <div className="setup-status" aria-live="polite">{status}</div>
       <main className="setup-main">
-        {step === "business" ? (
+        <section className="setup-panel" aria-label="Submission profile">
+          <h2>Submission profile</h2>
+          <p className="setup-muted">
+            One build, per-event configuration. Selecting a profile mounts only that profile&apos;s workspace panel —
+            unselected adapters receive no data. Server runs use <code>GATHER_INTEGRATION_PROFILE</code> (default{" "}
+            <code>base</code>).
+          </p>
+          {profiles.length > 0 ? (
+            <ul className="setup-choices">
+              {profiles.map((item) => (
+                <li key={item.id}>
+                  <button
+                    type="button"
+                    className="setup-choice"
+                    aria-pressed={selectedProfile === item.id}
+                    onClick={() => chooseProfile(item.id)}
+                  >
+                    <strong>{item.label}</strong>
+                    <span className="setup-muted">
+                      {item.id}
+                      {selectedProfile === item.id ? " — selected" : ""}
+                    </span>
+                    <span className={item.available ? "setup-pill is-ok" : "setup-pill is-attention"}>
+                      {item.available ? "Wired" : "Specified only"}
+                    </span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="setup-muted">Loading profiles…</p>
+          )}
+        </section>
+        <section className="setup-panel" aria-label="Choose how to start">
+          <h2>Choose how to start</h2>
+          <div className="setup-choice-grid">
+            <article className="setup-mode-card">
+              <h3>Prepared workspace</h3>
+              <p className="setup-muted">
+                Explore Gather with clearly marked fictional data — no Google sign-in, no real
+                messages, nothing leaves this Mac. Every record is labelled simulated.
+              </p>
+              {mode?.managed === true ? (
+                <label className="setup-field">
+                  <span>Prepared scenario</span>
+                  <select
+                    value={scenario}
+                    onChange={(event) => setScenario(event.target.value as PreparedScenarioIdDTO)}
+                    aria-label="Prepared scenario"
+                  >
+                    {mode.scenarios.map((item) => (
+                      <option key={item.id} value={item.id}>{item.label}</option>
+                    ))}
+                  </select>
+                </label>
+              ) : null}
+              {mode?.managed === true && mode.prepared ? (
+                <p className="setup-muted" role="status">
+                  Seeded: {mode.scenarios.find((item) => item.id === mode.prepared?.scenario)?.label ?? mode.prepared.scenario} — {mode.prepared.inboxCount} inbox
+                  message{mode.prepared.inboxCount === 1 ? "" : "s"}, {mode.prepared.busyBlockCount} busy
+                  block{mode.prepared.busyBlockCount === 1 ? "" : "s"}, {mode.prepared.offerCount} offers.{" "}
+                  {mode.prepared.coverageDetail}
+                </p>
+              ) : null}
+              {mode?.managed === true ? (
+                <p className="setup-muted">
+                  To reset the prepared data: stop Gather, then run{" "}
+                  <code>gather reset --confirm-reset</code> from the install directory. The next start
+                  verifies the fresh seed.
+                </p>
+              ) : null}
+              {demoState.kind === "error" ? <InlineError state={demoState} onRetry={() => void startDemo()} retryLabel="Try again" /> : null}
+              <button
+                type="button"
+                className="setup-button is-primary"
+                disabled={demoState.kind === "loading" || mode?.mode === "live"}
+                onClick={() => void startDemo()}
+              >
+                {demoState.kind === "loading" ? "Preparing…" : "Start prepared workspace"}
+              </button>
+            </article>
+            <article className="setup-mode-card is-disabled" aria-disabled="true">
+              <h3>Live workspace</h3>
+              <p className="setup-muted">
+                Connect your real Google inbox and calendar.{" "}
+                {mode?.live.reason ?? "Live onboarding is not available in this build."}
+              </p>
+              {liveGate && !liveGate.liveReady && liveGate.blockedBy.length > 0 ? (
+                <div role="status">
+                  <p className="setup-muted"><strong>Live verification is blocked — missing:</strong></p>
+                  <ul className="setup-muted">
+                    {liveGate.blockedBy.map((missing) => <li key={missing}>{missing}</li>)}
+                  </ul>
+                  <p className="setup-muted">Prepared mode above stays fully usable. No fixture evidence counts as live proof.</p>
+                </div>
+              ) : null}
+              {liveGate?.liveReady ? (
+                <p className="setup-muted" role="status">Capability gates pass. Continue below to connect Google on your own explicitly authorized accounts — live sends stay restricted to your configured test recipient.</p>
+              ) : null}
+              <button type="button" className="setup-button is-secondary" disabled>
+                Not available yet
+              </button>
+            </article>
+          </div>
+        </section>
+        {mode?.managed !== true && step === "business" ? (
           <section className="setup-panel" aria-label="Choose your venue">
             <h2>Which venue is this for?</h2>
             {businesses.kind === "loading" || businesses.kind === "idle" ? <p className="setup-muted">Loading your venues…</p> : null}
@@ -389,7 +565,7 @@ export default function SetupPage(): React.JSX.Element {
             </form>
           </section>
         ) : null}
-        {step === "apps" ? (
+        {mode?.managed !== true && step === "apps" ? (
           <section className="setup-panel" aria-label="Connect your apps">
             <h2>Connect your apps{chosen ? ` for ${chosen.name}` : ""}</h2>
             <button type="button" className="setup-text-button" onClick={() => setStep("business")}>← Change venue</button>
@@ -427,23 +603,31 @@ export default function SetupPage(): React.JSX.Element {
         {step === "ready" ? (
           <section className="setup-panel" aria-label="Ready">
             <h2>You are ready{chosen ? `, ${chosen.name}` : ""}</h2>
-            {connected ? <p>Gather can read your inbox and calendar. Every proposal still waits for your review.</p> : <p className="setup-muted">You are exploring with demo data — nothing here is real.</p>}
+            {mode?.managed === true ? (
+              <p className="setup-muted">The prepared workspace is seeded — every record is fictional and nothing contacts real services.</p>
+            ) : connected ? (
+              <p>Gather can read your inbox and calendar. Every proposal still waits for your review.</p>
+            ) : (
+              <p className="setup-muted">You are exploring with demo data — nothing here is real.</p>
+            )}
             <div className="setup-actions">
               <a className="setup-button is-primary" href="/">Enter workspace</a>
-              {step === "ready" && !connected ? (
+              {step === "ready" && !connected && mode?.managed !== true ? (
                 <button type="button" className="setup-button is-secondary" onClick={() => setStep("business")}>Set up for real</button>
               ) : null}
             </div>
           </section>
         ) : null}
-        <aside className="setup-panel is-demo" aria-label="Try the demo">
-          <h2>Just looking?</h2>
-          <p className="setup-muted">Try Gather with clearly marked fictional data. Your real setup stays untouched, and nothing here contacts Google.</p>
-          {demoState.kind === "error" ? <InlineError state={demoState} onRetry={() => void startDemo()} retryLabel="Try demo again" /> : null}
-          <button type="button" className="setup-button is-secondary" disabled={demoState.kind === "loading"} onClick={() => void startDemo()}>
-            {demoState.kind === "loading" ? "Starting demo…" : "Try demo"}
-          </button>
-        </aside>
+        {mode?.managed !== true ? (
+          <aside className="setup-panel is-demo" aria-label="Try the demo">
+            <h2>Just looking?</h2>
+            <p className="setup-muted">Try Gather with clearly marked fictional data. Your real setup stays untouched, and nothing here contacts Google.</p>
+            {demoState.kind === "error" ? <InlineError state={demoState} onRetry={() => void startDemo()} retryLabel="Try demo again" /> : null}
+            <button type="button" className="setup-button is-secondary" disabled={demoState.kind === "loading"} onClick={() => void startDemo()}>
+              {demoState.kind === "loading" ? "Starting demo…" : "Try demo"}
+            </button>
+          </aside>
+        ) : null}
       </main>
       {confirmDisconnect ? (
         <div className="setup-dialog-backdrop">

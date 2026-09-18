@@ -253,3 +253,59 @@ export function writeGatewayConfig(
   });
   return layout.configPath;
 }
+
+/**
+ * ADR-008 knowledge capability allowlist (C04 live-has-one-authority rule).
+ *
+ * The ONLY selectable knowledge authorities. `prepared-scripted` is the
+ * labelled SQLite simulator and is always available. `native-live` names
+ * the native recall/wiki adapter and selects ONLY with verified
+ * capability — otherwise selection fails closed and live stays disabled.
+ * There is deliberately no second-vendor or fallback entry: an absent
+ * capability is a blocker, never a reason to add another knowledge
+ * vendor. This allowlist is the full extent of ADR-008's change to this
+ * file.
+ */
+export const GATHER_KNOWLEDGE_AUTHORITIES = Object.freeze([
+  "prepared-scripted",
+  "native-live",
+] as const);
+
+export type GatherKnowledgeAuthority = (typeof GATHER_KNOWLEDGE_AUTHORITIES)[number];
+
+export type KnowledgeAuthorityErrorCode = "UNKNOWN_AUTHORITY" | "NATIVE_NOT_VERIFIED";
+
+export class KnowledgeAuthorityError extends Error {
+  readonly code: KnowledgeAuthorityErrorCode;
+  constructor(code: KnowledgeAuthorityErrorCode, message: string) {
+    super(message);
+    this.name = "KnowledgeAuthorityError";
+    this.code = code;
+  }
+}
+
+/**
+ * Explicit selection gate: the caller names the authority and supplies
+ * the capability verdict. Anything outside the allowlist — or
+ * `native-live` without a verified native capability — throws instead of
+ * silently falling back. Prepared remains usable; live cannot be declared
+ * complete without verification.
+ */
+export function resolveKnowledgeAuthority(
+  selection: string,
+  capability: { available: boolean; detail: string },
+): GatherKnowledgeAuthority {
+  if (!(GATHER_KNOWLEDGE_AUTHORITIES as readonly string[]).includes(selection)) {
+    throw new KnowledgeAuthorityError(
+      "UNKNOWN_AUTHORITY",
+      `Unknown knowledge authority ${JSON.stringify(selection)}; allowed: ${GATHER_KNOWLEDGE_AUTHORITIES.join(", ")} (no second knowledge vendor exists on this surface)`,
+    );
+  }
+  if (selection === "native-live" && !capability.available) {
+    throw new KnowledgeAuthorityError(
+      "NATIVE_NOT_VERIFIED",
+      `native-live authority refused: ${capability.detail}; live stays disabled on prepared-scripted`,
+    );
+  }
+  return selection as GatherKnowledgeAuthority;
+}
